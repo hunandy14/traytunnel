@@ -15,27 +15,13 @@
       {
         "label": "main",
         "title": "Traytunnel",
-        "width": 464,
-        "height": 448,
+        "width": 540,
+        "height": 620,
         "resizable": false,
         "maximizable": false,
         "decorations": false,
         "center": true,
         "visible": false
-      },
-      {
-        "label": "settings",
-        "title": "Settings",
-        "url": "settings.html",
-        "width": 436,
-        "height": 514,
-        "resizable": false,
-        "maximizable": false,
-        "minimizable": false,
-        "decorations": false,
-        "center": true,
-        "visible": false,
-        "skipTaskbar": true
       }
     ],
     "security": {

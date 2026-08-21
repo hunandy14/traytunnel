@@ -13,6 +13,9 @@ pub struct Forward {
     pub name: String,
     pub local: u16,
     pub remote: String,
+    /// 使用者是否要這個出口保持連線；舊設定檔沒有這個欄位時視為 true
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +35,17 @@ fn default_true() -> bool {
     true
 }
 
+impl Config {
+    /// 依本地埠找出口，本地埠就是出口的唯一鍵
+    pub fn forward(&self, local: u16) -> Option<&Forward> {
+        self.forwards.iter().find(|f| f.local == local)
+    }
+
+    pub fn forward_mut(&mut self, local: u16) -> Option<&mut Forward> {
+        self.forwards.iter_mut().find(|f| f.local == local)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -40,8 +54,18 @@ impl Default for Config {
             proxy_command: "cloudflared access ssh --hostname %h".into(),
             close_to_tray: true,
             forwards: vec![
-                Forward { name: "exit-a".into(), local: 1080, remote: "127.0.0.1:1080".into() },
-                Forward { name: "exit-b".into(), local: 1083, remote: "127.0.0.1:1083".into() },
+                Forward {
+                    name: "exit-a".into(),
+                    local: 1080,
+                    remote: "127.0.0.1:1080".into(),
+                    enabled: true,
+                },
+                Forward {
+                    name: "exit-b".into(),
+                    local: 1083,
+                    remote: "127.0.0.1:1083".into(),
+                    enabled: true,
+                },
             ],
         }
     }
@@ -54,7 +78,6 @@ pub enum LoadOutcome {
     Loaded(Config),
     /// 檔案不存在，已寫入預設值
     Created(Config),
-    /// 解析失敗，壞檔已備份，改用預設值且未覆寫原檔
     /// 解析或讀取失敗，改用預設值且未覆寫原檔；backup 只在確實備份成功時有值
     Broken { config: Config, backup: Option<PathBuf>, error: String },
 }
@@ -74,7 +97,7 @@ pub fn default_document() -> String {
     let c = Config::default();
     format!(
         "# traytunnel 設定檔，與執行檔放在同一個資料夾。\n\
-         # 修改後可直接在設定介面按 Save，或重新啟動程式。\n\
+         # 修改後可直接在設定介面存檔，或重新啟動程式。\n\
          host = \"{host}\"\n\
          user = \"{user}\"\n\
          # 不需要 ProxyCommand 時留空字串即可。\n\
@@ -82,16 +105,19 @@ pub fn default_document() -> String {
          # 關閉鈕（X）是否只隱藏到系統匣。\n\
          closeToTray = {close}\n\
          \n\
-         # 每個 [[forwards]] 是一組本地埠轉發，第一個埠會用來判斷隧道是否連上。\n\
+         # 每個 [[forwards]] 是一組本地埠轉發，各自跑一條獨立的 ssh 連線。\n\
+         # enabled 記錄使用者最後一次的連線／中斷選擇，省略時視為 true。\n\
          [[forwards]]\n\
          name = \"exit-a\"\n\
          local = 1080\n\
          remote = \"127.0.0.1:1080\"\n\
+         enabled = true\n\
          \n\
          [[forwards]]\n\
          name = \"exit-b\"\n\
          local = 1083\n\
-         remote = \"127.0.0.1:1083\"\n",
+         remote = \"127.0.0.1:1083\"\n\
+         enabled = true\n",
         host = c.host,
         user = c.user,
         proxy = c.proxy_command,
@@ -141,6 +167,9 @@ pub fn parse_config(raw: &str) -> Result<Config, String> {
 }
 
 /// 寫回設定，沿用既有檔案的註解與排版。
+///
+/// `[[forwards]]` 逐張桌就地改寫（多的砍掉、少的補上），使用者寫在單一
+/// forward 上方的註解才不會因為存一次檔就整批消失。
 pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     let path = dir.join(TOML_NAME);
     let mut doc = std::fs::read_to_string(&path)
@@ -153,53 +182,92 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     doc["proxyCommand"] = value(cfg.proxy_command.as_str());
     doc["closeToTray"] = value(cfg.close_to_tray);
 
-    let mut tables = ArrayOfTables::new();
-    for f in &cfg.forwards {
-        let mut t = Table::new();
-        t["name"] = value(f.name.as_str());
-        t["local"] = value(f.local as i64);
-        t["remote"] = value(f.remote.as_str());
-        tables.push(t);
+    if !matches!(doc.get("forwards"), Some(Item::ArrayOfTables(_))) {
+        doc["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
     }
-    doc["forwards"] = Item::ArrayOfTables(tables);
+    if let Some(Item::ArrayOfTables(tables)) = doc.get_mut("forwards") {
+        while tables.len() > cfg.forwards.len() {
+            tables.remove(tables.len() - 1);
+        }
+        for (i, f) in cfg.forwards.iter().enumerate() {
+            if i >= tables.len() {
+                tables.push(Table::new());
+            }
+            let t = tables.get_mut(i).expect("剛補齊過，一定拿得到");
+            t["name"] = value(f.name.as_str());
+            t["local"] = value(f.local as i64);
+            t["remote"] = value(f.remote.as_str());
+            t["enabled"] = value(f.enabled);
+        }
+    }
 
     std::fs::write(path, doc.to_string())
 }
 
-/// 由設定介面的多行文字解析 forwards，格式為「name local remote」。
-pub fn parse_forward_lines(text: &str) -> Result<Vec<Forward>, String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        let ok = parts.len() == 3
-            && parts[1].chars().all(|c| c.is_ascii_digit())
-            && !parts[1].is_empty()
-            && valid_remote(parts[2]);
-        if !ok {
-            return Err(line.to_string());
-        }
-        let local: u16 = parts[1].parse().map_err(|_| line.to_string())?;
-        out.push(Forward { name: parts[0].into(), local, remote: parts[2].into() });
-    }
-    Ok(out)
-}
-
-/// remote 必須是 host:port，host 不含冒號或空白
-fn valid_remote(s: &str) -> bool {
-    match s.rsplit_once(':') {
+/// remote 必須符合 `^[^:\s]+:\d+$`：主機不含冒號與空白，埠是純數字。
+pub fn valid_remote(s: &str) -> bool {
+    match s.split_once(':') {
         Some((h, p)) => {
             !h.is_empty()
-                && !h.contains(':')
                 && !h.chars().any(|c| c.is_whitespace())
                 && !p.is_empty()
                 && p.chars().all(|c| c.is_ascii_digit())
         }
         None => false,
     }
+}
+
+/// 出口名稱必須非空且不含空白
+pub fn valid_name(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_whitespace())
+}
+
+/// 新增／編輯出口的欄位驗證，回傳 Some(訊息) 代表不通過。
+///
+/// `original_local` 是編輯前的本地埠，None 代表新增。本地埠是出口的唯一鍵，
+/// 因此連停用中的出口也算佔用，不可重複。
+///
+/// 訊息一律以欄位名開頭（`name: `／`local: `／`remote: `），前端才能把錯誤
+/// 掛回對應的欄位上。
+pub fn validate_forward(
+    forwards: &[Forward],
+    original_local: Option<u16>,
+    name: &str,
+    local: u16,
+    remote: &str,
+) -> Option<String> {
+    if let Some(orig) = original_local {
+        if !forwards.iter().any(|f| f.local == orig) {
+            return Some(format!("local: no exit with port {orig}, it may have been deleted"));
+        }
+    }
+    if !valid_name(name) {
+        return Some("name: required, and must not contain spaces".into());
+    }
+    if local == 0 {
+        return Some("local: port must be between 1 and 65535".into());
+    }
+    if !valid_remote(remote) {
+        return Some("remote: must look like host:port, for example 127.0.0.1:1080".into());
+    }
+    let clash = forwards
+        .iter()
+        .find(|f| f.local == local && Some(f.local) != original_local);
+    if let Some(other) = clash {
+        return Some(format!("local: port {local} already used by {}", other.name));
+    }
+    None
+}
+
+/// 全域連線欄位的驗證，回傳 Some(訊息) 代表不通過。
+pub fn validate_global(host: &str, user: &str) -> Option<String> {
+    if host.trim().is_empty() {
+        return Some("Host is required.".into());
+    }
+    if user.trim().is_empty() {
+        return Some("User is required.".into());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -215,6 +283,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn fwd(name: &str, local: u16) -> Forward {
+        Forward { name: name.into(), local, remote: "127.0.0.1:1080".into(), enabled: true }
     }
 
     #[test]
@@ -237,6 +309,50 @@ remote = "127.0.0.1:1080"
         assert!(!cfg.close_to_tray);
         assert_eq!(cfg.forwards.len(), 1);
         assert_eq!(cfg.forwards[0].local, 1080);
+    }
+
+    /// 舊設定檔沒有 enabled 欄位，一律當成啟用，升級後不會有人的出口莫名不連
+    #[test]
+    fn forward_enabled_defaults_to_true() {
+        let raw = "host = \"h\"\nuser = \"u\"\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n";
+        let cfg = parse_config(raw).unwrap();
+        assert!(cfg.forwards[0].enabled);
+    }
+
+    #[test]
+    fn forward_enabled_is_read_back() {
+        let raw = "host = \"h\"\nuser = \"u\"\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = false\n";
+        let cfg = parse_config(raw).unwrap();
+        assert!(!cfg.forwards[0].enabled);
+    }
+
+    #[test]
+    fn write_persists_enabled_flag() {
+        let dir = tmp_dir("enabled-write");
+        let mut cfg = Config::default();
+        cfg.forwards[1].enabled = false;
+        write_config(&dir, &cfg).unwrap();
+        let back = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+        assert!(back.forwards[0].enabled);
+        assert!(!back.forwards[1].enabled);
+        assert_eq!(back, cfg);
+    }
+
+    /// 只改一個 forward 的 enabled 時，寫在該筆上方的註解要留著
+    #[test]
+    fn write_keeps_per_forward_comments() {
+        let dir = tmp_dir("forward-comments");
+        std::fs::write(
+            dir.join(TOML_NAME),
+            "host = \"h\"\nuser = \"u\"\n\n# 這是 A 出口\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n",
+        )
+        .unwrap();
+        let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+        cfg.forwards[0].enabled = false;
+        write_config(&dir, &cfg).unwrap();
+        let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+        assert!(saved.contains("# 這是 A 出口"));
+        assert!(saved.contains("enabled = false"));
     }
 
     #[test]
@@ -345,7 +461,12 @@ remote = "127.0.0.1:1080"
         std::fs::write(dir.join(TOML_NAME), raw).unwrap();
         let mut cfg = parse_config(raw).unwrap();
         cfg.host = "c.example.com".into();
-        cfg.forwards = vec![Forward { name: "x".into(), local: 1090, remote: "127.0.0.1:9".into() }];
+        cfg.forwards = vec![Forward {
+            name: "x".into(),
+            local: 1090,
+            remote: "127.0.0.1:9".into(),
+            enabled: true,
+        }];
         write_config(&dir, &cfg).unwrap();
         let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
         assert!(saved.contains("# 保留我"));
@@ -354,20 +475,76 @@ remote = "127.0.0.1:1080"
         assert_eq!(back, cfg);
     }
 
+    /// 刪出口後檔案裡不該留下多餘的 [[forwards]]
     #[test]
-    fn forward_lines_round_trip() {
-        let f = parse_forward_lines("exit-a  1080  127.0.0.1:1080\n\nexit-b 1083 example.com:1083\n").unwrap();
-        assert_eq!(f.len(), 2);
-        assert_eq!(f[1].name, "exit-b");
-        assert_eq!(f[1].local, 1083);
-        assert_eq!(f[1].remote, "example.com:1083");
+    fn write_drops_removed_forwards() {
+        let dir = tmp_dir("shrink");
+        let mut cfg = Config::default();
+        write_config(&dir, &cfg).unwrap();
+        cfg.forwards.remove(1);
+        write_config(&dir, &cfg).unwrap();
+        let back = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+        assert_eq!(back.forwards.len(), 1);
+        assert_eq!(back.forwards[0].local, 1080);
     }
 
     #[test]
-    fn forward_lines_reject_bad_input() {
-        assert!(parse_forward_lines("exit-a 1080").is_err());
-        assert!(parse_forward_lines("exit-a abc 127.0.0.1:1080").is_err());
-        assert!(parse_forward_lines("exit-a 1080 127.0.0.1").is_err());
-        assert_eq!(parse_forward_lines("bad line here now").unwrap_err(), "bad line here now");
+    fn remote_must_be_host_colon_port() {
+        assert!(valid_remote("127.0.0.1:1080"));
+        assert!(valid_remote("example.com:22"));
+        assert!(!valid_remote("127.0.0.1"));
+        assert!(!valid_remote("127.0.0.1:"));
+        assert!(!valid_remote(":1080"));
+        assert!(!valid_remote("127.0.0.1:abc"));
+        assert!(!valid_remote("has space:22"));
+        // 冒號只准一個，[::1]:22 這種寫法目前不支援
+        assert!(!valid_remote("::1:22"));
+    }
+
+    /// 驗證訊息要能被前端逐欄掛回去，格式固定是「欄位: 說明」
+    fn err(list: &[Forward], orig: Option<u16>, name: &str, local: u16, remote: &str) -> String {
+        validate_forward(list, orig, name, local, remote).expect("這組輸入應該要被擋下來")
+    }
+
+    #[test]
+    fn upsert_rejects_duplicate_local_port() {
+        let list = vec![fwd("exit-tw", 1080), Forward { enabled: false, ..fwd("b", 1083) }];
+        // 新增撞到既有的，訊息要點名是誰佔走的
+        assert_eq!(
+            err(&list, None, "c", 1080, "127.0.0.1:1"),
+            "local: port 1080 already used by exit-tw"
+        );
+        // 連停用中的出口也算佔用
+        assert!(err(&list, None, "c", 1083, "127.0.0.1:1").starts_with("local: "));
+        // 沒撞到就過
+        assert!(validate_forward(&list, None, "c", 1090, "127.0.0.1:1").is_none());
+        // 編輯自己時維持原埠不算重複
+        assert!(validate_forward(&list, Some(1080), "a2", 1080, "127.0.0.1:1").is_none());
+        // 編輯時改成別人的埠要擋
+        assert!(err(&list, Some(1080), "a2", 1083, "127.0.0.1:1").starts_with("local: "));
+    }
+
+    #[test]
+    fn upsert_rejects_bad_name_and_remote() {
+        let list = vec![fwd("a", 1080)];
+        assert!(err(&list, None, "", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "  ", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "two words", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "ok", 1090, "127.0.0.1").starts_with("remote: "));
+        assert!(err(&list, None, "ok", 1090, "nope").starts_with("remote: "));
+        assert!(err(&list, None, "ok", 0, "127.0.0.1:1").starts_with("local: "));
+    }
+
+    #[test]
+    fn upsert_rejects_unknown_original_port() {
+        let list = vec![fwd("a", 1080)];
+        assert!(err(&list, Some(9999), "a", 1080, "127.0.0.1:1").starts_with("local: "));
+    }
+
+    #[test]
+    fn global_validation_requires_host_and_user() {
+        assert!(validate_global("h", "u").is_none());
+        assert!(validate_global("  ", "u").is_some());
+        assert!(validate_global("h", "").is_some());
     }
 }

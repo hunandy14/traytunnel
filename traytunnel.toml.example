@@ -10,13 +10,17 @@ proxyCommand = "cloudflared access ssh --hostname %h"
 # 關閉鈕（X）是否只隱藏到系統匣，false 代表直接結束程式。
 closeToTray = true
 
-# 每個 [[forwards]] 是一組本地埠轉發，第一個埠會用來判斷隧道是否連上。
+# 每個 [[forwards]] 是一組本地埠轉發，各自跑一條獨立的 ssh 連線，
+# 並以自己的 local 埠是否進入 Listen 狀態判斷這個出口有沒有連上。
+# enabled 記錄你最後一次的連接／中斷選擇，省略時視為 true。
 [[forwards]]
 name = "exit-a"
 local = 1080
 remote = "127.0.0.1:1080"
+enabled = true
 
 [[forwards]]
 name = "exit-b"
 local = 1083
 remote = "127.0.0.1:1083"
+enabled = true

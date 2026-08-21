@@ -7,15 +7,14 @@ mod winsys;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Deserialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
-use config::{Config, LoadOutcome};
-use state::{AppState, Snapshot, MAIN_WINDOW, SETTINGS_WINDOW, TRAY_ID};
+use config::{Config, Forward, LoadOutcome};
+use state::{AppState, Snapshot, MAIN_WINDOW, TRAY_ID};
 
 type Shared = Arc<AppState>;
 
@@ -58,8 +57,7 @@ fn hide_to_tray(state: &Shared) {
 
 fn do_exit(state: &Shared) {
     state.mark_exiting();
-    state.set_want_run(false);
-    tunnel::stop(state);
+    state.kill_all_jobs();
     state.app.exit(0);
 }
 
@@ -97,46 +95,221 @@ fn heal_autostart(app: &AppHandle, state: &Shared) {
     }
 }
 
-/// 視窗高度隨出口卡片數量變動，公式沿用原版版面
-fn apply_window_size(app: &AppHandle, forwards: usize) {
-    let cards = std::cmp::max(10, 68 * forwards as i32 - 10);
-    let height = 322 + cards;
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
-        let _ = w.set_size(LogicalSize::new(464.0, height as f64));
-    }
+/// 設定檔寫入失敗一律讓使用者看得到，且記憶體狀態不會被改掉
+fn report_save_error(state: &Shared, e: std::io::Error) {
+    state.log(format!("failed to save settings: {e}"));
 }
 
 // ---------------------------------------------------------------- 前端指令
 
 #[tauri::command]
-fn get_state(app: AppHandle, state: State<'_, Shared>) -> Snapshot {
-    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
-    state.snapshot(autostart)
+fn get_state(state: State<'_, Shared>) -> Snapshot {
+    state.snapshot()
+}
+
+/// 連接單一出口：記住使用者的選擇（enabled=true）後再拉線
+#[tauri::command]
+fn start_exit(state: State<'_, Shared>, local: u16) {
+    let st = state.inner().clone();
+    if st.config().forward(local).is_none() {
+        st.log(format!("port {local} : no such exit"));
+        return;
+    }
+    if let Err(e) = st.update_config(|c| {
+        if let Some(f) = c.forward_mut(local) {
+            f.enabled = true;
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
+    }
+    st.emit_config_changed();
+    tunnel::start(&st, local);
+}
+
+/// 中斷單一出口：enabled=false 並持久化，重開程式也不會自己連回來
+#[tauri::command]
+fn stop_exit(state: State<'_, Shared>, local: u16) {
+    let st = state.inner().clone();
+    if st.config().forward(local).is_none() {
+        st.log(format!("port {local} : no such exit"));
+        return;
+    }
+    if let Err(e) = st.update_config(|c| {
+        if let Some(f) = c.forward_mut(local) {
+            f.enabled = false;
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
+    }
+    tunnel::halt(&st, local);
+    st.emit_config_changed();
 }
 
 #[tauri::command]
-fn toggle_run(state: State<'_, Shared>) {
+fn start_all(state: State<'_, Shared>) {
     let st = state.inner().clone();
-    if st.want_run() {
-        st.set_want_run(false);
-        tunnel::stop(&st);
-        st.log("tunnel stopped");
-        st.set_status("Stopped", "muted");
-        st.reset_exits();
-    } else {
-        st.set_want_run(true);
-        tunnel::start(&st);
+    if let Err(e) = st.update_config(|c| {
+        for f in c.forwards.iter_mut() {
+            f.enabled = true;
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
     }
+    st.emit_config_changed();
+    tunnel::start_enabled(&st);
 }
 
 #[tauri::command]
-fn retest(state: State<'_, Shared>) {
+fn stop_all(state: State<'_, Shared>) {
     let st = state.inner().clone();
-    if st.connected() {
-        tunnel::start_exit_tests(&st);
-    } else {
-        st.log("not connected, cannot test");
+    if let Err(e) = st.update_config(|c| {
+        for f in c.forwards.iter_mut() {
+            f.enabled = false;
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
     }
+    tunnel::halt_all(&st);
+    st.emit_config_changed();
+}
+
+/// 存全域連線設定，回傳 None 代表成功
+#[tauri::command]
+fn save_global(
+    state: State<'_, Shared>,
+    host: String,
+    user: String,
+    proxy_command: String,
+) -> Option<String> {
+    let st = state.inner().clone();
+    if let Some(err) = config::validate_global(&host, &user) {
+        return Some(err);
+    }
+    if let Err(e) = st.update_config(|c| {
+        c.host = host.trim().to_string();
+        c.user = user.trim().to_string();
+        c.proxy_command = proxy_command.trim().to_string();
+    }) {
+        let msg = format!("Failed to save settings:\n{e}");
+        report_save_error(&st, e);
+        return Some(msg);
+    }
+    st.emit_config_changed();
+    st.log("connection settings saved, restarting running exits");
+    // 新的 host/user/proxyCommand 只有重接才會生效
+    tunnel::restart_running(&st);
+    None
+}
+
+/// 新增或編輯出口，originalLocal 為 None 代表新增；回傳 None 代表成功
+#[tauri::command]
+fn upsert_forward(
+    state: State<'_, Shared>,
+    original_local: Option<u16>,
+    name: String,
+    local: u16,
+    remote: String,
+) -> Option<String> {
+    let st = state.inner().clone();
+    let cfg = st.config();
+    let name = name.trim().to_string();
+    let remote = remote.trim().to_string();
+    if let Some(err) =
+        config::validate_forward(&cfg.forwards, original_local, &name, local, &remote)
+    {
+        return Some(err);
+    }
+
+    // 編輯運行中的出口要先停掉舊的那條線（換埠時舊埠也才會放掉）；
+    // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連
+    let was_enabled = match original_local {
+        Some(orig) => cfg.forward(orig).map(|f| f.enabled).unwrap_or(false),
+        None => true,
+    };
+    if let Some(orig) = original_local {
+        tunnel::halt(&st, orig);
+    }
+
+    if let Err(e) = st.update_config(|c| match original_local {
+        Some(orig) => {
+            if let Some(f) = c.forward_mut(orig) {
+                f.name = name.clone();
+                f.local = local;
+                f.remote = remote.clone();
+            }
+        }
+        None => c.forwards.push(Forward {
+            name: name.clone(),
+            local,
+            remote: remote.clone(),
+            enabled: true,
+        }),
+    }) {
+        let msg = format!("Failed to save settings:\n{e}");
+        report_save_error(&st, e);
+        return Some(msg);
+    }
+
+    st.emit_config_changed();
+    st.log(match original_local {
+        Some(_) => format!("{name} updated"),
+        None => format!("{name} added"),
+    });
+    if was_enabled {
+        tunnel::start(&st, local);
+    }
+    None
+}
+
+/// 刪出口，運行中的先停掉
+#[tauri::command]
+fn delete_forward(state: State<'_, Shared>, local: u16) {
+    let st = state.inner().clone();
+    let Some(name) = st.config().forward(local).map(|f| f.name.clone()) else {
+        st.log(format!("port {local} : no such exit"));
+        return;
+    };
+    tunnel::halt(&st, local);
+    if let Err(e) = st.update_config(|c| c.forwards.retain(|f| f.local != local)) {
+        report_save_error(&st, e);
+        return;
+    }
+    st.emit_config_changed();
+    st.log(format!("{name} deleted"));
+}
+
+#[tauri::command]
+fn test_exit(state: State<'_, Shared>, local: u16) {
+    tunnel::test_exit(&state.inner().clone(), local);
+}
+
+#[tauri::command]
+fn test_all(state: State<'_, Shared>) {
+    tunnel::test_connected(&state.inner().clone());
+}
+
+#[tauri::command]
+fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
+    let st = state.inner().clone();
+    st.update_config(|c| c.close_to_tray = on)
+        .map_err(|e| format!("Failed to save settings:\n{e}"))?;
+    st.emit_config_changed();
+    st.log(if on { "close hides to tray" } else { "close exits app" });
+    Ok(())
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Result<(), String> {
+    let st = state.inner().clone();
+    let result = if on { app.autolaunch().enable() } else { app.autolaunch().disable() };
+    result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
+    st.log(if on { "autostart enabled" } else { "autostart disabled" });
+    st.emit_config_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -154,83 +327,6 @@ fn window_minimize(app: AppHandle) {
 #[tauri::command]
 fn exit_app(state: State<'_, Shared>) {
     do_exit(&state.inner().clone());
-}
-
-/// 設定視窗在 tauri.conf.json 就建好但預設隱藏，開關只是 show/hide，
-/// 每次打開先通知頁面重新載入目前的設定值。
-#[tauri::command]
-fn open_settings(app: AppHandle) -> Result<(), String> {
-    let w = app
-        .get_webview_window(SETTINGS_WINDOW)
-        .ok_or_else(|| "settings window is missing".to_string())?;
-    let _ = w.emit("settings-open", ());
-    w.show().map_err(|e| e.to_string())?;
-    let _ = w.unminimize();
-    let _ = w.set_focus();
-    Ok(())
-}
-
-#[tauri::command]
-fn close_settings(app: AppHandle) {
-    if let Some(w) = app.get_webview_window(SETTINGS_WINDOW) {
-        let _ = w.hide();
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SettingsInput {
-    host: String,
-    user: String,
-    proxy_command: String,
-    /// 多行文字，每行「name local remote」
-    forwards: String,
-}
-
-#[tauri::command]
-fn save_config(app: AppHandle, state: State<'_, Shared>, input: SettingsInput) -> Result<(), String> {
-    let st = state.inner().clone();
-    let forwards = config::parse_forward_lines(&input.forwards).map_err(|bad| {
-        format!("Invalid forward line:\n{bad}\n\nExpected:  name  localPort  remoteHost:remotePort")
-    })?;
-    if input.host.trim().is_empty() || input.user.trim().is_empty() || forwards.is_empty() {
-        return Err("Host, User and at least one forward are required.".into());
-    }
-    let cfg = Config {
-        host: input.host.trim().to_string(),
-        user: input.user.trim().to_string(),
-        proxy_command: input.proxy_command.trim().to_string(),
-        close_to_tray: st.config().close_to_tray,
-        forwards,
-    };
-    config::write_config(&st.dir, &cfg).map_err(|e| format!("Failed to save settings:\n{e}"))?;
-    let count = cfg.forwards.len();
-    st.set_config(cfg);
-    st.reset_exits();
-    apply_window_size(&app, count);
-    st.log("config saved, restarting tunnel");
-    tunnel::restart(&st);
-    Ok(())
-}
-
-#[tauri::command]
-fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
-    let st = state.inner().clone();
-    let mut cfg = st.config();
-    cfg.close_to_tray = on;
-    config::write_config(&st.dir, &cfg).map_err(|e| format!("Failed to save settings:\n{e}"))?;
-    st.set_config(cfg);
-    st.log(if on { "close hides to tray" } else { "close exits app" });
-    Ok(())
-}
-
-#[tauri::command]
-fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Result<(), String> {
-    let st = state.inner().clone();
-    let result = if on { app.autolaunch().enable() } else { app.autolaunch().disable() };
-    result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
-    st.log(if on { "autostart enabled" } else { "autostart disabled" });
-    Ok(())
 }
 
 // ---------------------------------------------------------------- 進入點
@@ -260,41 +356,30 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_state,
-            toggle_run,
-            retest,
+            start_exit,
+            stop_exit,
+            start_all,
+            stop_all,
+            save_global,
+            upsert_forward,
+            delete_forward,
+            test_exit,
+            test_all,
+            set_close_to_tray,
+            set_autostart,
             window_close,
             window_minimize,
             exit_app,
-            open_settings,
-            close_settings,
-            save_config,
-            set_close_to_tray,
-            set_autostart,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             let dir = exe_dir();
             let outcome = config::load_from_dir(&dir);
-            let cfg = outcome.config().clone();
+            let cfg: Config = outcome.config().clone();
             let shared: Shared = Arc::new(AppState::new(handle.clone(), dir, cfg.clone()));
             app.manage(shared.clone());
 
             build_tray(&handle, &shared)?;
-            apply_window_size(&handle, cfg.forwards.len());
-
-            // 設定視窗只藏不關，之後才能再打開
-            if let Some(win) = app.get_webview_window(SETTINGS_WINDOW) {
-                let w = win.clone();
-                let st = shared.clone();
-                win.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        if !st.is_exiting() {
-                            api.prevent_close();
-                            let _ = w.hide();
-                        }
-                    }
-                });
-            }
 
             // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
@@ -309,7 +394,7 @@ pub fn run() {
                 });
             }
 
-            shared.reset_exits();
+            shared.refresh_tooltip();
             shared.log("Traytunnel started");
             match &outcome {
                 LoadOutcome::Created(_) => {
@@ -351,7 +436,8 @@ pub fn run() {
                 show_main(&handle);
             }
 
-            tunnel::start(&shared);
+            // enabled 的出口開機就自己連
+            tunnel::start_enabled(&shared);
             Ok(())
         })
         .run(tauri::generate_context!())
