@@ -45,6 +45,8 @@ npm run tauri build
 - 免安裝執行檔：`src-tauri/target/release/traytunnel.exe`
 - NSIS 安裝檔：`src-tauri/target/release/bundle/nsis/`
 
+注意：一定要走 `npm run tauri build`。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
+
 免安裝使用時，把 `traytunnel.exe`、`traytunnel.toml` 放在同一個資料夾即可。
 
 ## 設定檔

@@ -282,6 +282,59 @@ textarea::-webkit-scrollbar-thumb:hover {
 
 /* ------------------------------------------------------------ 設定視窗 */
 
+/* 設定視窗的絕對座標，沿用原版 dialog 的版面 */
+#sec-connection {
+  top: 50px;
+}
+
+#sec-forwards {
+  top: 190px;
+}
+
+#sec-behavior {
+  top: 372px;
+}
+
+#lbl-host {
+  top: 78px;
+}
+
+#fld-host {
+  top: 72px;
+}
+
+#lbl-user {
+  top: 114px;
+}
+
+#fld-user {
+  top: 108px;
+}
+
+#lbl-proxy {
+  top: 150px;
+}
+
+#fld-proxy {
+  top: 144px;
+}
+
+#tg-autostart {
+  top: 392px;
+}
+
+#lbl-autostart {
+  top: 396px;
+}
+
+#tg-close {
+  top: 424px;
+}
+
+#lbl-close {
+  top: 428px;
+}
+
 .field-label {
   position: absolute;
   left: 20px;
@@ -319,6 +372,7 @@ textarea::-webkit-scrollbar-thumb:hover {
 .hint {
   position: absolute;
   left: 20px;
+  top: 208px;
   width: 396px;
   height: 16px;
   line-height: 16px;
@@ -396,6 +450,7 @@ textarea::-webkit-scrollbar-thumb:hover {
   height: 20px;
   line-height: 20px;
   color: var(--text);
+  cursor: pointer;
 }
 
 .btn {

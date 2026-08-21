@@ -100,9 +100,12 @@ async fn supervise(state: Arc<AppState>, generation: u64) {
         state.set_connected(false);
         state.set_status("Connecting...", "amber");
 
+        // spawn 失敗時自己交代重試，不要再補一行「disconnected」
+        let mut spawn_failed = false;
         match spawn_ssh(&cfg) {
             Err(e) => {
-                state.log(format!("tunnel failed to start: {e}"));
+                spawn_failed = true;
+                state.log(format!("tunnel failed to start: {e}, retrying in 5s"));
             }
             Ok((mut child, job, pid)) => {
                 state.store_job(generation, job);
@@ -143,7 +146,9 @@ async fn supervise(state: Arc<AppState>, generation: u64) {
             return;
         }
         state.set_connected(false);
-        state.log("disconnected, retrying in 5s");
+        if !spawn_failed {
+            state.log("disconnected, retrying in 5s");
+        }
         state.set_status("Reconnecting...", "amber");
         state.reset_exits();
 

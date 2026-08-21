@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
@@ -69,6 +69,31 @@ fn close_main(state: &Shared) {
         hide_to_tray(state);
     } else {
         do_exit(state);
+    }
+}
+
+/// 開機自啟自癒：舊版 PowerShell 留下的 Run 登錄項會讓 toggle 顯示 ON 卻其實
+/// 啟動不到這支程式，啟動時發現登錄值沒指向目前的執行檔就重寫一次。
+fn heal_autostart(app: &AppHandle, state: &Shared) {
+    if !app.autolaunch().is_enabled().unwrap_or(false) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.to_string_lossy().to_lowercase();
+    let name = app
+        .config()
+        .product_name
+        .clone()
+        .unwrap_or_else(|| app.package_info().name.clone());
+    let current = winsys::read_run_value(&name).unwrap_or_default().to_lowercase();
+    if current.contains(&exe) {
+        return;
+    }
+    match app.autolaunch().enable() {
+        Ok(()) => state.log("autostart entry refreshed"),
+        Err(e) => state.log(format!("autostart entry refresh failed: {e}")),
     }
 }
 
@@ -131,34 +156,24 @@ fn exit_app(state: State<'_, Shared>) {
     do_exit(&state.inner().clone());
 }
 
+/// 設定視窗在 tauri.conf.json 就建好但預設隱藏，開關只是 show/hide，
+/// 每次打開先通知頁面重新載入目前的設定值。
 #[tauri::command]
 fn open_settings(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window(SETTINGS_WINDOW) {
-        let _ = w.show();
-        let _ = w.set_focus();
-        return Ok(());
-    }
-    let builder =
-        WebviewWindowBuilder::new(&app, SETTINGS_WINDOW, WebviewUrl::App("settings.html".into()))
-            .title("Settings")
-            .inner_size(436.0, 514.0)
-            .resizable(false)
-            .decorations(false)
-            .skip_taskbar(true)
-            .center();
-    // 設為主視窗的子視窗，行為接近原版的 ShowDialog
-    let builder = match app.get_webview_window(MAIN_WINDOW) {
-        Some(main) => builder.parent(&main).map_err(|e| e.to_string())?,
-        None => builder,
-    };
-    builder.build().map_err(|e| e.to_string())?;
+    let w = app
+        .get_webview_window(SETTINGS_WINDOW)
+        .ok_or_else(|| "settings window is missing".to_string())?;
+    let _ = w.emit("settings-open", ());
+    w.show().map_err(|e| e.to_string())?;
+    let _ = w.unminimize();
+    let _ = w.set_focus();
     Ok(())
 }
 
 #[tauri::command]
 fn close_settings(app: AppHandle) {
     if let Some(w) = app.get_webview_window(SETTINGS_WINDOW) {
-        let _ = w.close();
+        let _ = w.hide();
     }
 }
 
@@ -267,6 +282,20 @@ pub fn run() {
             build_tray(&handle, &shared)?;
             apply_window_size(&handle, cfg.forwards.len());
 
+            // 設定視窗只藏不關，之後才能再打開
+            if let Some(win) = app.get_webview_window(SETTINGS_WINDOW) {
+                let w = win.clone();
+                let st = shared.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        if !st.is_exiting() {
+                            api.prevent_close();
+                            let _ = w.hide();
+                        }
+                    }
+                });
+            }
+
             // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
                 let st = shared.clone();
@@ -291,17 +320,32 @@ pub fn run() {
                 }
                 LoadOutcome::Broken { backup, error, .. } => {
                     shared.log(format!("config unreadable ({error}), using defaults"));
-                    shared.log(format!(
-                        "broken config kept at {}",
-                        backup.file_name().and_then(|s| s.to_str()).unwrap_or("traytunnel.toml.broken")
-                    ));
-                    balloon(
-                        &handle,
-                        "Config file could not be parsed. A backup was saved as traytunnel.toml.broken and defaults are in use.",
-                    );
+                    match backup {
+                        Some(path) => {
+                            shared.log(format!(
+                                "broken config kept at {}",
+                                path.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(config::BROKEN_NAME)
+                            ));
+                            balloon(
+                                &handle,
+                                "Config file could not be parsed. A backup was saved as traytunnel.toml.broken and defaults are in use.",
+                            );
+                        }
+                        None => {
+                            shared.log("config left untouched, no backup could be written");
+                            balloon(
+                                &handle,
+                                "Config file could not be read. It was left untouched and defaults are in use.",
+                            );
+                        }
+                    }
                 }
                 LoadOutcome::Loaded(_) => {}
             }
+
+            heal_autostart(&handle, &shared);
 
             if is_tray_start() {
                 shared.mark_tray_hint_shown();

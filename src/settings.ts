@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Snapshot } from "./types";
 
 const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -26,6 +27,7 @@ function isOn(node: HTMLElement) {
 }
 
 async function init() {
+  msgbox.classList.remove("show");
   const snap = await invoke<Snapshot>("get_state");
   inHost.value = snap.config.host;
   inUser.value = snap.config.user;
@@ -38,28 +40,24 @@ async function init() {
   inHost.focus();
 }
 
-// 兩個 toggle 都是即時生效
-tgAutostart.addEventListener("click", async () => {
-  const next = !isOn(tgAutostart);
-  setToggle(tgAutostart, next);
-  try {
-    await invoke("set_autostart", { on: next });
-  } catch (e) {
-    setToggle(tgAutostart, !next);
-    showMessage(String(e));
-  }
-});
+/** 兩個 toggle 都是即時生效，失敗就把畫面翻回去並顯示訊息 */
+function wireToggle(node: HTMLElement, label: HTMLElement, command: string) {
+  const handler = async () => {
+    const next = !isOn(node);
+    setToggle(node, next);
+    try {
+      await invoke(command, { on: next });
+    } catch (e) {
+      setToggle(node, !next);
+      showMessage(String(e));
+    }
+  };
+  node.addEventListener("click", handler);
+  label.addEventListener("click", handler);
+}
 
-tgClose.addEventListener("click", async () => {
-  const next = !isOn(tgClose);
-  setToggle(tgClose, next);
-  try {
-    await invoke("set_close_to_tray", { on: next });
-  } catch (e) {
-    setToggle(tgClose, !next);
-    showMessage(String(e));
-  }
-});
+wireToggle(tgAutostart, el<HTMLDivElement>("lbl-autostart"), "set_autostart");
+wireToggle(tgClose, el<HTMLDivElement>("lbl-close"), "set_close_to_tray");
 
 el<HTMLButtonElement>("btn-save").addEventListener("click", async () => {
   try {
@@ -80,5 +78,8 @@ el<HTMLButtonElement>("btn-save").addEventListener("click", async () => {
 el<HTMLButtonElement>("btn-cancel").addEventListener("click", () => invoke("close_settings"));
 el<HTMLButtonElement>("btn-close").addEventListener("click", () => invoke("close_settings"));
 el<HTMLButtonElement>("msgbox-ok").addEventListener("click", () => msgbox.classList.remove("show"));
+
+// 視窗是常駐隱藏的，每次被叫出來都要重新讀一次目前的設定
+listen("settings-open", () => void init());
 
 init();

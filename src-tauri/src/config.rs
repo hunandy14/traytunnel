@@ -59,7 +59,8 @@ pub enum LoadOutcome {
     /// 由舊的 traytunnel.json 轉換而來
     Migrated(Config),
     /// 解析失敗，壞檔已備份，改用預設值且未覆寫原檔
-    Broken { config: Config, backup: PathBuf, error: String },
+    /// 解析或讀取失敗，改用預設值且未覆寫原檔；backup 只在確實備份成功時有值
+    Broken { config: Config, backup: Option<PathBuf>, error: String },
 }
 
 impl LoadOutcome {
@@ -136,9 +137,9 @@ pub fn load_from_dir(dir: &Path) -> LoadOutcome {
 }
 
 fn broken(dir: &Path, toml_path: &Path, error: String) -> LoadOutcome {
-    // 絕不覆寫壞掉的設定檔，只複製一份備份出來
-    let backup = dir.join(BROKEN_NAME);
-    let _ = std::fs::copy(toml_path, &backup);
+    // 絕不覆寫壞掉的設定檔，只複製一份備份出來；連檔案都讀不到時就沒有備份可言
+    let target = dir.join(BROKEN_NAME);
+    let backup = std::fs::copy(toml_path, &target).ok().map(|_| target);
     LoadOutcome::Broken { config: Config::default(), backup, error }
 }
 
@@ -293,6 +294,24 @@ remote = "127.0.0.1:1080"
     }
 
     #[test]
+    fn rejects_empty_host_or_user() {
+        assert!(parse_config("host = \"\"\nuser = \"u\"\n").is_err());
+        assert!(parse_config("host = \"h\"\nuser = \"   \"\n").is_err());
+        // 缺欄位一樣要擋下來，不能靜靜地變成空字串
+        assert!(parse_config("user = \"u\"\n").is_err());
+    }
+
+    #[test]
+    fn empty_host_makes_the_file_broken_not_overwritten() {
+        let dir = tmp_dir("empty-host");
+        let raw = "host = \"\"\nuser = \"u\"\n";
+        std::fs::write(dir.join(TOML_NAME), raw).unwrap();
+        let out = load_from_dir(&dir);
+        assert!(matches!(out, LoadOutcome::Broken { .. }));
+        assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    }
+
+    #[test]
     fn creates_default_file_when_missing() {
         let dir = tmp_dir("create");
         let out = load_from_dir(&dir);
@@ -336,7 +355,9 @@ remote = "127.0.0.1:1080"
         std::fs::write(dir.join(TOML_NAME), bad).unwrap();
         let out = load_from_dir(&dir);
         match &out {
-            LoadOutcome::Broken { backup, .. } => assert!(backup.exists()),
+            LoadOutcome::Broken { backup, .. } => {
+                assert!(backup.as_ref().expect("應該有備份").exists());
+            }
             _ => panic!("預期 Broken"),
         }
         assert_eq!(out.config(), &Config::default());
