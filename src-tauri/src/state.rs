@@ -3,7 +3,7 @@
 //! 每個出口（以本地埠為唯一鍵）各自帶一份執行期狀態：連線狀態、自測結果、
 //! 世代序號與 Job Object handle，彼此互不影響。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -14,6 +14,9 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::Config;
 use crate::winsys::Job;
+
+/// 活動日誌保留的行數上限
+const LOG_CAPACITY: usize = 500;
 
 pub const TRAY_ID: &str = "traytunnel-tray";
 pub const MAIN_WINDOW: &str = "main";
@@ -77,6 +80,16 @@ pub struct Snapshot {
     pub close_to_tray: bool,
     pub autostart: bool,
     pub exits: Vec<ExitView>,
+    /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
+    pub logs: Vec<String>,
+}
+
+/// 推一行進環形緩衝，超過上限就丟掉最舊的，順序維持由舊到新
+fn push_log_line(logs: &mut VecDeque<String>, line: String) {
+    logs.push_back(line);
+    while logs.len() > LOG_CAPACITY {
+        logs.pop_front();
+    }
 }
 
 /// 單一出口的執行期狀態
@@ -102,6 +115,8 @@ pub struct AppState {
     /// 設定檔所在資料夾（執行檔同目錄）
     pub dir: PathBuf,
     cfg: Mutex<Config>,
+    /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
+    logs: Mutex<VecDeque<String>>,
     exits: Mutex<BTreeMap<u16, ExitRuntime>>,
     testing: Mutex<HashSet<u16>>,
     /// 全域世代計數器，發出去的號碼永不重複
@@ -117,6 +132,7 @@ impl AppState {
             app,
             dir,
             cfg: Mutex::new(cfg),
+            logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
             testing: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
@@ -157,6 +173,7 @@ impl AppState {
     pub fn log(&self, msg: impl AsRef<str>) {
         let line = format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), msg.as_ref());
         log::info!("{}", msg.as_ref());
+        push_log_line(&mut self.logs.lock().unwrap(), line.clone());
         let _ = self.app.emit("log", line);
     }
 
@@ -313,6 +330,7 @@ impl AppState {
             close_to_tray: cfg.close_to_tray,
             autostart: self.autostart(),
             exits: views,
+            logs: self.logs.lock().unwrap().iter().cloned().collect(),
         }
     }
 
@@ -340,5 +358,31 @@ impl AppState {
         if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
             let _ = tray.set_tooltip(Some(text));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 啟動當下的日誌發生在前端掛上監聽之前，靠 Snapshot 的 logs 回放，
+    /// 因此緩衝必須保住最新的 LOG_CAPACITY 行且順序是舊到新。
+    #[test]
+    fn log_buffer_keeps_newest_lines_in_order() {
+        let mut logs = VecDeque::new();
+        for i in 0..(LOG_CAPACITY + 100) {
+            push_log_line(&mut logs, format!("line {i}"));
+        }
+        assert_eq!(logs.len(), LOG_CAPACITY);
+        assert_eq!(logs.front().unwrap(), "line 100");
+        assert_eq!(logs.back().unwrap(), &format!("line {}", LOG_CAPACITY + 99));
+    }
+
+    #[test]
+    fn log_buffer_below_capacity_keeps_everything() {
+        let mut logs = VecDeque::new();
+        push_log_line(&mut logs, "a".into());
+        push_log_line(&mut logs, "b".into());
+        assert_eq!(logs.iter().cloned().collect::<Vec<_>>(), vec!["a", "b"]);
     }
 }
