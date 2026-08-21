@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use crate::config::{Config, Forward};
+use crate::config::{Forward, Source};
 use crate::exits::{probe, ExitTest};
 use crate::state::{status, test_state, AppState};
 use crate::winsys::{is_listening, Job};
@@ -24,7 +24,8 @@ const RETRY: Duration = Duration::from_secs(5);
 const PORT_GRACE: Duration = Duration::from_millis(500);
 
 /// 組單一出口的 ssh 參數，每個 token 獨立傳遞，不做字串拼接。
-pub fn build_exit_args(cfg: &Config, f: &Forward) -> Vec<String> {
+/// 連線參數一律取自這個出口所屬的源。
+pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-N".into(),
         "-o".into(),
@@ -36,13 +37,13 @@ pub fn build_exit_args(cfg: &Config, f: &Forward) -> Vec<String> {
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
     ];
-    if !cfg.proxy_command.trim().is_empty() {
+    if !src.proxy_command.trim().is_empty() {
         args.push("-o".into());
-        args.push(format!("ProxyCommand={}", cfg.proxy_command));
+        args.push(format!("ProxyCommand={}", src.proxy_command));
     }
     args.push("-L".into());
     args.push(format!("{}:{}", f.local, f.remote));
-    args.push(format!("{}@{}", cfg.user, cfg.host));
+    args.push(format!("{}@{}", src.user, src.host));
     args
 }
 
@@ -56,10 +57,10 @@ pub fn port_busy_detail(local: u16, listening: bool) -> Option<String> {
     }
 }
 
-fn spawn_ssh(cfg: &Config, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
+fn spawn_ssh(src: &Source, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
     let job = Job::new()?;
     let mut cmd = Command::new("ssh");
-    cmd.args(build_exit_args(cfg, f))
+    cmd.args(build_exit_args(src, f))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -104,30 +105,62 @@ pub fn halt(state: &Arc<AppState>, local: u16) {
     state.set_exit_status(local, status::STOPPED, None);
 }
 
-/// 啟動所有 enabled 的出口（程式啟動與 start_all 都走這裡）
+/// 重接單一出口：halt 已經把世代遞增並當場騰出監看位子，
+/// 緊接著的 start 不必等舊迴圈醒來就能接手，不會多開第二條 ssh。
+pub fn restart(state: &Arc<AppState>, local: u16) {
+    halt(state, local);
+    start(state, local);
+}
+
+/// 啟動所有源的所有 enabled 出口（程式啟動與 start_all 都走這裡）
 pub fn start_enabled(state: &Arc<AppState>) {
-    for f in state.config().forwards {
-        if f.enabled {
-            start(state, f.local);
-        }
+    for local in state.config().enabled_locals() {
+        start(state, local);
     }
 }
 
-/// 停掉所有出口
+/// 停掉所有源的所有出口
 pub fn halt_all(state: &Arc<AppState>) {
-    for f in state.config().forwards {
-        halt(state, f.local);
+    for local in state.config().locals() {
+        halt(state, local);
     }
 }
 
-/// 重接目前運行中（enabled）的出口，全域設定改變時用
-pub fn restart_running(state: &Arc<AppState>) {
-    for f in state.config().forwards {
-        if f.enabled {
-            halt(state, f.local);
-            start(state, f.local);
-        }
+/// 啟動單一源底下所有 enabled 的出口
+pub fn start_source(state: &Arc<AppState>, source: &str) {
+    for local in enabled_locals_of(state, source) {
+        start(state, local);
     }
+}
+
+/// 停掉單一源底下所有出口
+pub fn halt_source(state: &Arc<AppState>, source: &str) {
+    for local in locals_of(state, source) {
+        halt(state, local);
+    }
+}
+
+/// 重接單一源底下運行中（enabled）的出口，該源的連線欄位改變時用
+pub fn restart_running_in_source(state: &Arc<AppState>, source: &str) {
+    for local in enabled_locals_of(state, source) {
+        restart(state, local);
+    }
+}
+
+fn locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
+    state
+        .config()
+        .source(source)
+        .map(|s| s.forwards.iter().map(|f| f.local).collect())
+        .unwrap_or_default()
+}
+
+fn enabled_locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
+    state
+        .config()
+        .source(source)
+        .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
+        .unwrap_or_default()
 }
 
 /// 分段等待，中途世代作廢就立刻回 false
@@ -150,9 +183,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             return;
         }
         let cfg = state.config();
-        let Some(f) = cfg.forward(local).cloned() else {
+        let Some((src, f)) = cfg.locate(local).map(|(s, f)| (s.clone(), f.clone())) else {
             return; // 出口已經被刪掉
         };
+        let sname = src.name.as_str();
         // 這裡刻意不看 f.enabled：停止的唯一訊號是 halt 的世代遞增。
         // 中斷是「先寫 enabled=false 再 halt」兩步，中間那個微秒窗口若讓
         // 迴圈自己因為 enabled=false 就退出，會在沒有遞增世代的情況下把
@@ -169,7 +203,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         }
         if let Some(detail) = busy {
             state.set_exit_status(local, status::PORT_BUSY, Some(detail));
-            state.log(format!("{} : local port {local} busy, retrying in 5s", f.name));
+            state.log_from(sname, format!("{} : local port {local} busy, retrying in 5s", f.name));
             if !wait_alive(state, local, generation, RETRY).await {
                 return;
             }
@@ -180,18 +214,18 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
 
         // spawn 失敗時自己交代重試，不要再補一行「disconnected」
         let mut spawn_failed = false;
-        match spawn_ssh(&cfg, &f) {
+        match spawn_ssh(&src, &f) {
             Err(e) => {
                 spawn_failed = true;
                 state.set_exit_status(local, status::ERROR, Some(e.to_string()));
-                state.log(format!("{} : failed to start ssh: {e}, retrying in 5s", f.name));
+                state.log_from(sname, format!("{} : failed to start ssh: {e}, retrying in 5s", f.name));
             }
             Ok((mut child, job, pid)) => {
                 state.store_job(local, generation, job);
-                state.log(format!("{} : ssh starting (pid {pid})", f.name));
+                state.log_from(sname, format!("{} : ssh starting (pid {pid})", f.name));
                 if let Some(stderr) = child.stderr.take() {
                     // ssh 的錯誤訊息只寫進檔案日誌，維持活動區與原版一致
-                    let name = f.name.clone();
+                    let name = format!("{sname}/{}", f.name);
                     tauri::async_runtime::spawn(async move {
                         let mut lines = BufReader::new(stderr).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
@@ -211,7 +245,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                     }
                     if !state.is_connected(local) && is_listening(local) {
                         state.set_exit_status(local, status::CONNECTED, None);
-                        state.log(format!("{} : up", f.name));
+                        state.log_from(sname, format!("{} : up", f.name));
                         test_exit(state, local);
                     }
                 }
@@ -225,7 +259,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         }
         state.clear_exit_test(local);
         if !spawn_failed {
-            state.log(format!("{} : disconnected, retrying in 5s", f.name));
+            state.log_from(sname, format!("{} : disconnected, retrying in 5s", f.name));
             state.set_exit_status(local, status::RECONNECTING, None);
         }
         if !wait_alive(&state, local, generation, RETRY).await {
@@ -237,7 +271,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
 /// 對單一出口做自測，只有連上的出口才測。
 pub fn test_exit(state: &Arc<AppState>, local: u16) {
     if !state.is_connected(local) {
-        state.log(format!("port {local} : not connected, cannot test"));
+        state.log_exit(local, format!("port {local} : not connected, cannot test"));
         return;
     }
     if !state.begin_test(local) {
@@ -248,32 +282,20 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
         st.end_test(local);
-        match result {
-            Ok(ExitTest::Ok(text)) => {
-                st.set_exit_test(local, test_state::OK, &text);
-                st.log(format!("port {local} : {text}"));
-            }
-            Ok(ExitTest::Fail(msg)) => {
-                st.set_exit_test(local, test_state::FAIL, msg);
-                st.log(format!("port {local} : {msg}"));
-            }
-            Err(_) => {
-                st.set_exit_test(local, test_state::FAIL, "no response");
-                st.log(format!("port {local} : no response"));
-            }
-        }
+        let (state_name, text) = match result {
+            Ok(ExitTest::Ok(text)) => (test_state::OK, text),
+            Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
+            Err(_) => (test_state::FAIL, "no response".to_string()),
+        };
+        st.set_exit_test(local, state_name, &text);
+        st.log_exit(local, format!("port {local} : {text}"));
     });
 }
 
-/// 對所有連上的出口平行自測
+/// 對所有連上的出口平行自測（跨源）
 pub fn test_connected(state: &Arc<AppState>) {
-    let ports: Vec<u16> = state
-        .config()
-        .forwards
-        .iter()
-        .map(|f| f.local)
-        .filter(|p| state.is_connected(*p))
-        .collect();
+    let ports: Vec<u16> =
+        state.config().locals().into_iter().filter(|p| state.is_connected(*p)).collect();
     if ports.is_empty() {
         state.log("no connected exit to test");
         return;
@@ -284,28 +306,61 @@ pub fn test_connected(state: &Arc<AppState>) {
     state.log("testing exits...");
 }
 
+/// 對單一源底下所有連上的出口平行自測
+pub fn test_source(state: &Arc<AppState>, source: &str) {
+    let ports: Vec<u16> =
+        locals_of(state, source).into_iter().filter(|p| state.is_connected(*p)).collect();
+    if ports.is_empty() {
+        state.log_from(source, "no connected exit to test");
+        return;
+    }
+    for p in ports {
+        test_exit(state, p);
+    }
+    state.log_from(source, "testing exits...");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::config::Config;
+
     fn cfg() -> Config {
         Config {
-            host: "h.example.com".into(),
-            user: "bob".into(),
-            proxy_command: "cloudflared access ssh --hostname %h".into(),
             close_to_tray: true,
-            forwards: vec![
-                Forward {
-                    name: "a".into(),
-                    local: 1080,
-                    remote: "127.0.0.1:1080".into(),
-                    enabled: true,
+            sources: vec![
+                Source {
+                    name: "hk".into(),
+                    host: "h.example.com".into(),
+                    user: "bob".into(),
+                    proxy_command: "cloudflared access ssh --hostname %h".into(),
+                    forwards: vec![
+                        Forward {
+                            name: "a".into(),
+                            local: 1080,
+                            remote: "127.0.0.1:1080".into(),
+                            enabled: true,
+                        },
+                        Forward {
+                            name: "b".into(),
+                            local: 1083,
+                            remote: "127.0.0.1:1083".into(),
+                            enabled: false,
+                        },
+                    ],
                 },
-                Forward {
-                    name: "b".into(),
-                    local: 1083,
-                    remote: "127.0.0.1:1083".into(),
-                    enabled: false,
+                Source {
+                    name: "tw".into(),
+                    host: "t.example.com".into(),
+                    user: "alice".into(),
+                    proxy_command: String::new(),
+                    forwards: vec![Forward {
+                        name: "c".into(),
+                        local: 1090,
+                        remote: "127.0.0.1:1090".into(),
+                        enabled: true,
+                    }],
                 },
             ],
         }
@@ -315,7 +370,8 @@ mod tests {
     #[test]
     fn args_carry_only_one_forward() {
         let c = cfg();
-        let a = build_exit_args(&c, &c.forwards[0]);
+        let s = &c.sources[0];
+        let a = build_exit_args(s, &s.forwards[0]);
         assert_eq!(
             a,
             vec![
@@ -335,17 +391,39 @@ mod tests {
                 "bob@h.example.com",
             ]
         );
-        let b = build_exit_args(&c, &c.forwards[1]);
+        let b = build_exit_args(s, &s.forwards[1]);
         assert_eq!(b.iter().filter(|s| *s == "-L").count(), 1);
         assert!(b.contains(&"1083:127.0.0.1:1083".to_string()));
         assert!(!b.contains(&"1080:127.0.0.1:1080".to_string()));
     }
 
+    /// 每個出口的 ssh 參數都取自它所屬的源，不會串到別的源去
+    #[test]
+    fn args_come_from_the_owning_source() {
+        let c = cfg();
+        for local in c.locals() {
+            let (src, f) = c.locate(local).unwrap();
+            let args = build_exit_args(src, f);
+            assert_eq!(args.last().unwrap(), &format!("{}@{}", src.user, src.host));
+        }
+        // tw 的出口不帶 hk 的 ProxyCommand
+        let (tw, f) = c.locate(1090).unwrap();
+        let args = build_exit_args(tw, f);
+        assert_eq!(args.last().unwrap(), "alice@t.example.com");
+        assert!(!args.iter().any(|s| s.starts_with("ProxyCommand=")));
+        // hk 的出口才有
+        let (hk, f) = c.locate(1080).unwrap();
+        assert!(build_exit_args(hk, f)
+            .iter()
+            .any(|s| s == "ProxyCommand=cloudflared access ssh --hostname %h"));
+    }
+
     #[test]
     fn empty_proxy_command_is_omitted() {
         let mut c = cfg();
-        c.proxy_command = "   ".into();
-        let a = build_exit_args(&c, &c.forwards[0]);
+        c.sources[0].proxy_command = "   ".into();
+        let s = &c.sources[0];
+        let a = build_exit_args(s, &s.forwards[0]);
         assert!(!a.iter().any(|s| s.starts_with("ProxyCommand=")));
         assert_eq!(a.last().unwrap(), "bob@h.example.com");
     }

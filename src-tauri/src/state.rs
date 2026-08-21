@@ -73,13 +73,20 @@ pub struct ExitView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Snapshot {
+pub struct SourceView {
+    pub name: String,
     pub host: String,
     pub user: String,
     pub proxy_command: String,
+    pub exits: Vec<ExitView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
     pub close_to_tray: bool,
     pub autostart: bool,
-    pub exits: Vec<ExitView>,
+    pub sources: Vec<SourceView>,
     /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
     pub logs: Vec<String>,
 }
@@ -99,6 +106,24 @@ fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> Option<u64>
 fn release_slot(slot: &mut Option<u64>, generation: u64) {
     if *slot == Some(generation) {
         *slot = None;
+    }
+}
+
+/// 系統匣提示文字，數字是跨源彙總的
+fn tooltip_text(connected: usize, enabled: usize) -> String {
+    if enabled == 0 {
+        "Traytunnel - no exits enabled".to_string()
+    } else {
+        format!("Traytunnel - {connected}/{enabled} connected")
+    }
+}
+
+/// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
+fn format_log(source: Option<&str>, msg: &str) -> String {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    match source {
+        Some(s) => format!("{ts}  [{s}] {msg}"),
+        None => format!("{ts}  {msg}"),
     }
 }
 
@@ -147,7 +172,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: AppHandle, dir: PathBuf, cfg: Config) -> Self {
-        let exits = cfg.forwards.iter().map(|f| (f.local, ExitRuntime::new())).collect();
+        let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::new())).collect();
         AppState {
             app,
             dir,
@@ -182,7 +207,7 @@ impl AppState {
 
     /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態
     fn sync_exits(&self) {
-        let ports: Vec<u16> = self.config().forwards.iter().map(|f| f.local).collect();
+        let ports = self.config().locals();
         let mut exits = self.exits.lock().unwrap();
         exits.retain(|p, _| ports.contains(p));
         for p in ports {
@@ -190,9 +215,27 @@ impl AppState {
         }
     }
 
+    /// app 級事件的日誌，不帶源名
     pub fn log(&self, msg: impl AsRef<str>) {
-        let line = format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), msg.as_ref());
-        log::info!("{}", msg.as_ref());
+        self.push_log(format_log(None, msg.as_ref()));
+    }
+
+    /// 某個源底下發生的事，行首多一段 `[源名]`
+    pub fn log_from(&self, source: &str, msg: impl AsRef<str>) {
+        self.push_log(format_log(Some(source), msg.as_ref()));
+    }
+
+    /// 依本地埠自動補上所屬源的名字；出口已經被刪掉時退回 app 級格式
+    pub fn log_exit(&self, local: u16, msg: impl AsRef<str>) {
+        let cfg = self.config();
+        match cfg.source_name_of(local) {
+            Some(src) => self.log_from(src, msg),
+            None => self.log(msg),
+        }
+    }
+
+    fn push_log(&self, line: String) {
+        log::info!("{line}");
         push_log_line(&mut self.logs.lock().unwrap(), line.clone());
         let _ = self.app.emit("log", line);
     }
@@ -351,30 +394,37 @@ impl AppState {
     pub fn snapshot(&self) -> Snapshot {
         let cfg = self.config();
         let exits = self.exits.lock().unwrap();
-        let views = cfg
-            .forwards
+        let sources = cfg
+            .sources
             .iter()
-            .map(|f| {
-                let rt = exits.get(&f.local);
-                ExitView {
-                    name: f.name.clone(),
-                    local: f.local,
-                    remote: f.remote.clone(),
-                    enabled: f.enabled,
-                    status: rt
-                        .map(|r| r.status.clone())
-                        .unwrap_or_else(|| status::STOPPED.to_string()),
-                    last_test: rt.and_then(|r| r.last_test.clone()),
-                }
+            .map(|s| SourceView {
+                name: s.name.clone(),
+                host: s.host.clone(),
+                user: s.user.clone(),
+                proxy_command: s.proxy_command.clone(),
+                exits: s
+                    .forwards
+                    .iter()
+                    .map(|f| {
+                        let rt = exits.get(&f.local);
+                        ExitView {
+                            name: f.name.clone(),
+                            local: f.local,
+                            remote: f.remote.clone(),
+                            enabled: f.enabled,
+                            status: rt
+                                .map(|r| r.status.clone())
+                                .unwrap_or_else(|| status::STOPPED.to_string()),
+                            last_test: rt.and_then(|r| r.last_test.clone()),
+                        }
+                    })
+                    .collect(),
             })
             .collect();
         Snapshot {
-            host: cfg.host,
-            user: cfg.user,
-            proxy_command: cfg.proxy_command,
             close_to_tray: cfg.close_to_tray,
             autostart: self.autostart(),
-            exits: views,
+            sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
         }
     }
@@ -385,20 +435,15 @@ impl AppState {
         self.refresh_tooltip();
     }
 
-    /// 系統匣提示改成彙總，例如「Traytunnel - 2/2 connected」
+    /// 系統匣提示彙總所有源的出口，例如「Traytunnel - 3/4 connected」
     pub fn refresh_tooltip(&self) {
-        let cfg = self.config();
+        let enabled = self.config().enabled_locals();
         let exits = self.exits.lock().unwrap();
-        let enabled: Vec<u16> = cfg.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect();
         let connected = enabled
             .iter()
             .filter(|p| exits.get(p).map(|r| r.status.as_str()) == Some(status::CONNECTED))
             .count();
-        let text = if enabled.is_empty() {
-            "Traytunnel - no exits enabled".to_string()
-        } else {
-            format!("Traytunnel - {}/{} connected", connected, enabled.len())
-        };
+        let text = tooltip_text(connected, enabled.len());
         drop(exits);
         if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
             let _ = tray.set_tooltip(Some(text));
@@ -447,6 +492,28 @@ mod tests {
         assert_eq!(claim_slot(&mut slot, || 8), Some(8));
     }
 
+    /// restart_exit＝halt 後立刻 start：halt 當場把位子清掉，所以新的 start
+    /// 不必等舊迴圈醒來就搶得到，而晚退出的舊迴圈也不能把它的位子還掉
+    #[test]
+    fn restart_hands_the_slot_over_without_a_race() {
+        let mut slot = None;
+        let mut seq = 0;
+        let mut next = || {
+            seq += 1;
+            seq
+        };
+        assert_eq!(claim_slot(&mut slot, &mut next), Some(1));
+        // halt：遞增世代並當場騰出位子
+        slot = None;
+        // 緊接著的 start 立刻接手，中間不會有第二條 ssh 並存
+        assert_eq!(claim_slot(&mut slot, &mut next), Some(2));
+        // 舊迴圈這時才醒來退出
+        release_slot(&mut slot, 1);
+        assert_eq!(slot, Some(2));
+        // 位子還被佔著，重複的 start 依舊會被擋下
+        assert_eq!(claim_slot(&mut slot, &mut next), None);
+    }
+
     /// halt 之後舊迴圈才慢半拍退出，不能讓它把新迴圈的位子清掉
     #[test]
     fn stale_supervisor_cannot_release_a_newer_one() {
@@ -455,6 +522,25 @@ mod tests {
         slot = Some(2); // 舊的被作廢、新的已接手
         release_slot(&mut slot, 1);
         assert_eq!(slot, Some(2));
+    }
+
+    /// 日誌行格式：源底下的事件帶 [源名]，app 級事件不帶
+    #[test]
+    fn log_line_carries_source_name_only_when_it_has_one() {
+        let with = format_log(Some("hk"), "exit-a : up");
+        assert!(with.ends_with("  [hk] exit-a : up"), "{with}");
+        let without = format_log(None, "Traytunnel started");
+        assert!(without.ends_with("  Traytunnel started"), "{without}");
+        assert!(!without.contains('['));
+        // 時間戳仍是 HH:mm:ss，長度固定 8
+        assert_eq!(with.split("  ").next().unwrap().len(), 8);
+    }
+
+    /// 系統匣提示是跨源彙總的
+    #[test]
+    fn tooltip_aggregates_across_sources() {
+        assert_eq!(tooltip_text(3, 4), "Traytunnel - 3/4 connected");
+        assert_eq!(tooltip_text(0, 0), "Traytunnel - no exits enabled");
     }
 
     #[test]

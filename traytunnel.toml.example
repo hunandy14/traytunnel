@@ -1,26 +1,43 @@
 # traytunnel 設定檔範本，複製成 traytunnel.toml 後放在執行檔同一個資料夾。
 # 也可以直接在程式的設定介面填寫，存檔時會寫回這個檔案並保留註解。
 
-host = "your-host.example.com"
-user = "your-user"
-
-# 不需要 ProxyCommand 時留空字串即可。
-proxyCommand = "cloudflared access ssh --hostname %h"
-
 # 關閉鈕（X）是否只隱藏到系統匣，false 代表直接結束程式。
 closeToTray = true
 
-# 每個 [[forwards]] 是一組本地埠轉發，各自跑一條獨立的 ssh 連線，
+# 每個 [[sources]] 是一組 ssh 連線參數（一個「連線源」），底下可以掛多個出口。
+# name 是這個源的識別名稱，不可空白也不可含空格，且不可與其他源重複。
+[[sources]]
+name = "hk"
+host = "hk.example.com"
+user = "your-user"
+# 不需要 ProxyCommand 時留空字串即可。
+proxyCommand = "cloudflared access ssh --hostname %h"
+
+# 每個 [[sources.forwards]] 是一組本地埠轉發，各自跑一條獨立的 ssh 連線，
 # 並以自己的 local 埠是否進入 Listen 狀態判斷這個出口有沒有連上。
+# local 是出口的唯一鍵，跨源也不可以重複。
 # enabled 記錄你最後一次的連接／中斷選擇，省略時視為 true。
-[[forwards]]
+[[sources.forwards]]
 name = "exit-a"
 local = 1080
 remote = "127.0.0.1:1080"
 enabled = true
 
-[[forwards]]
+[[sources.forwards]]
 name = "exit-b"
 local = 1083
 remote = "127.0.0.1:1083"
+enabled = true
+
+# 第二個連線源，連到另一台機器，出口的本地埠不可以跟上面的重複。
+[[sources]]
+name = "tokyo"
+host = "tokyo.example.com"
+user = "another-user"
+proxyCommand = ""
+
+[[sources.forwards]]
+name = "exit-jp"
+local = 1090
+remote = "127.0.0.1:1080"
 enabled = true

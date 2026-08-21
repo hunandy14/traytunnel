@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
-use config::{Config, Forward, LoadOutcome};
+use config::{Config, Forward, LoadOutcome, Source};
 use state::{AppState, Snapshot, MAIN_WINDOW, TRAY_ID};
 
 type Shared = Arc<AppState>;
@@ -107,12 +107,29 @@ fn get_state(state: State<'_, Shared>) -> Snapshot {
     state.snapshot()
 }
 
+/// 出口不存在時記一行就回，回傳 false 代表沒有這個出口
+fn require_exit(st: &Shared, local: u16) -> bool {
+    if st.config().forward(local).is_none() {
+        st.log(format!("port {local} : no such exit"));
+        return false;
+    }
+    true
+}
+
+/// 源不存在時記一行就回
+fn require_source(st: &Shared, name: &str) -> bool {
+    if st.config().source(name).is_none() {
+        st.log(format!("no such source: {name}"));
+        return false;
+    }
+    true
+}
+
 /// 連接單一出口：記住使用者的選擇（enabled=true）後再拉線
 #[tauri::command]
 fn start_exit(state: State<'_, Shared>, local: u16) {
     let st = state.inner().clone();
-    if st.config().forward(local).is_none() {
-        st.log(format!("port {local} : no such exit"));
+    if !require_exit(&st, local) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -131,8 +148,7 @@ fn start_exit(state: State<'_, Shared>, local: u16) {
 #[tauri::command]
 fn stop_exit(state: State<'_, Shared>, local: u16) {
     let st = state.inner().clone();
-    if st.config().forward(local).is_none() {
-        st.log(format!("port {local} : no such exit"));
+    if !require_exit(&st, local) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -147,14 +163,76 @@ fn stop_exit(state: State<'_, Shared>, local: u16) {
     st.emit_config_changed();
 }
 
+/// 重接單一出口：halt 後立刻 start，套用最新設定。
+/// 停用中的出口按重接視同要它連起來，順手把 enabled 補成 true。
+#[tauri::command]
+fn restart_exit(state: State<'_, Shared>, local: u16) {
+    let st = state.inner().clone();
+    if !require_exit(&st, local) {
+        return;
+    }
+    let enabled = st.config().forward(local).map(|f| f.enabled).unwrap_or(false);
+    if !enabled {
+        if let Err(e) = st.update_config(|c| {
+            if let Some(f) = c.forward_mut(local) {
+                f.enabled = true;
+            }
+        }) {
+            report_save_error(&st, e);
+            return;
+        }
+        st.emit_config_changed();
+    }
+    st.log_exit(local, format!("port {local} : restarting"));
+    tunnel::restart(&st, local);
+}
+
+/// 連接一個源底下全部的出口
+#[tauri::command]
+fn start_source(state: State<'_, Shared>, name: String) {
+    let st = state.inner().clone();
+    if !require_source(&st, &name) {
+        return;
+    }
+    if let Err(e) = st.update_config(|c| {
+        if let Some(s) = c.source_mut(&name) {
+            for f in s.forwards.iter_mut() {
+                f.enabled = true;
+            }
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
+    }
+    st.emit_config_changed();
+    tunnel::start_source(&st, &name);
+}
+
+/// 中斷一個源底下全部的出口
+#[tauri::command]
+fn stop_source(state: State<'_, Shared>, name: String) {
+    let st = state.inner().clone();
+    if !require_source(&st, &name) {
+        return;
+    }
+    if let Err(e) = st.update_config(|c| {
+        if let Some(s) = c.source_mut(&name) {
+            for f in s.forwards.iter_mut() {
+                f.enabled = false;
+            }
+        }
+    }) {
+        report_save_error(&st, e);
+        return;
+    }
+    tunnel::halt_source(&st, &name);
+    st.emit_config_changed();
+}
+
 #[tauri::command]
 fn start_all(state: State<'_, Shared>) {
     let st = state.inner().clone();
-    if let Err(e) = st.update_config(|c| {
-        for f in c.forwards.iter_mut() {
-            f.enabled = true;
-        }
-    }) {
+    if let Err(e) = st.update_config(set_all_enabled(true)) {
         report_save_error(&st, e);
         return;
     }
@@ -165,11 +243,7 @@ fn start_all(state: State<'_, Shared>) {
 #[tauri::command]
 fn stop_all(state: State<'_, Shared>) {
     let st = state.inner().clone();
-    if let Err(e) = st.update_config(|c| {
-        for f in c.forwards.iter_mut() {
-            f.enabled = false;
-        }
-    }) {
+    if let Err(e) = st.update_config(set_all_enabled(false)) {
         report_save_error(&st, e);
         return;
     }
@@ -177,38 +251,106 @@ fn stop_all(state: State<'_, Shared>) {
     st.emit_config_changed();
 }
 
-/// 存全域連線設定，回傳 None 代表成功
+fn set_all_enabled(on: bool) -> impl FnOnce(&mut Config) {
+    move |c: &mut Config| {
+        for s in c.sources.iter_mut() {
+            for f in s.forwards.iter_mut() {
+                f.enabled = on;
+            }
+        }
+    }
+}
+
+/// 新增或編輯連線源，originalName 為 None 代表新增；回傳 None 代表成功。
+/// 改到連線欄位時會重接這個源底下運行中的出口。
 #[tauri::command]
-fn save_global(
+fn upsert_source(
     state: State<'_, Shared>,
+    original_name: Option<String>,
+    name: String,
     host: String,
     user: String,
     proxy_command: String,
 ) -> Option<String> {
     let st = state.inner().clone();
-    if let Some(err) = config::validate_global(&host, &user) {
+    let cfg = st.config();
+    let name = name.trim().to_string();
+    let host = host.trim().to_string();
+    let user = user.trim().to_string();
+    let proxy_command = proxy_command.trim().to_string();
+    if let Some(err) =
+        config::validate_source(&cfg.sources, original_name.as_deref(), &name, &host, &user)
+    {
         return Some(err);
     }
-    if let Err(e) = st.update_config(|c| {
-        c.host = host.trim().to_string();
-        c.user = user.trim().to_string();
-        c.proxy_command = proxy_command.trim().to_string();
+
+    // 連線欄位有沒有真的變，決定要不要把這個源的出口重接一輪
+    let changed = match original_name.as_deref().and_then(|n| cfg.source(n)) {
+        Some(old) => old.host != host || old.user != user || old.proxy_command != proxy_command,
+        None => false,
+    };
+
+    let target = name.clone();
+    if let Err(e) = st.update_config(|c| match original_name.as_deref() {
+        Some(orig) => {
+            if let Some(s) = c.source_mut(orig) {
+                s.name = target.clone();
+                s.host = host.clone();
+                s.user = user.clone();
+                s.proxy_command = proxy_command.clone();
+            }
+        }
+        // 新的源底下還沒有任何出口
+        None => c.sources.push(Source {
+            name: target.clone(),
+            host: host.clone(),
+            user: user.clone(),
+            proxy_command: proxy_command.clone(),
+            forwards: Vec::new(),
+        }),
     }) {
         let msg = format!("Failed to save settings:\n{e}");
         report_save_error(&st, e);
         return Some(msg);
     }
+
     st.emit_config_changed();
-    st.log("connection settings saved, restarting running exits");
-    // 新的 host/user/proxyCommand 只有重接才會生效
-    tunnel::restart_running(&st);
+    st.log_from(
+        &name,
+        match original_name {
+            Some(_) => "source updated",
+            None => "source added",
+        },
+    );
+    if changed {
+        st.log_from(&name, "connection settings changed, restarting running exits");
+        tunnel::restart_running_in_source(&st, &name);
+    }
     None
 }
 
-/// 新增或編輯出口，originalLocal 為 None 代表新增；回傳 None 代表成功
+/// 刪源，底下的出口先全部停掉；刪到零源也是允許的
+#[tauri::command]
+fn delete_source(state: State<'_, Shared>, name: String) {
+    let st = state.inner().clone();
+    if !require_source(&st, &name) {
+        return;
+    }
+    tunnel::halt_source(&st, &name);
+    if let Err(e) = st.update_config(|c| c.sources.retain(|s| s.name != name)) {
+        report_save_error(&st, e);
+        return;
+    }
+    st.emit_config_changed();
+    st.log(format!("source {name} deleted"));
+}
+
+/// 新增或編輯出口，originalLocal 為 None 代表新增；回傳 None 代表成功。
+/// source 是這個出口要掛進去的源，編輯時也可以藉此把出口搬到別的源。
 #[tauri::command]
 fn upsert_forward(
     state: State<'_, Shared>,
+    source: String,
     original_local: Option<u16>,
     name: String,
     local: u16,
@@ -218,13 +360,15 @@ fn upsert_forward(
     let cfg = st.config();
     let name = name.trim().to_string();
     let remote = remote.trim().to_string();
-    if let Some(err) =
-        config::validate_forward(&cfg.forwards, original_local, &name, local, &remote)
+    if cfg.source(&source).is_none() {
+        return Some(format!("no such source: {source}"));
+    }
+    if let Some(err) = config::validate_forward(&cfg.sources, original_local, &name, local, &remote)
     {
         return Some(err);
     }
 
-    // 編輯運行中的出口要先停掉舊的那條線（換埠時舊埠也才會放掉）；
+    // 編輯運行中的出口要先停掉舊的那條線（換埠或換源時舊埠也才會放掉）；
     // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連
     let was_enabled = match original_local {
         Some(orig) => cfg.forward(orig).map(|f| f.enabled).unwrap_or(false),
@@ -234,20 +378,21 @@ fn upsert_forward(
         tunnel::halt(&st, orig);
     }
 
-    if let Err(e) = st.update_config(|c| match original_local {
-        Some(orig) => {
-            if let Some(f) = c.forward_mut(orig) {
-                f.name = name.clone();
-                f.local = local;
-                f.remote = remote.clone();
+    if let Err(e) = st.update_config(|c| {
+        if let Some(orig) = original_local {
+            // 先從原本的源拔掉，再掛進目標源，同源編輯也走同一條路
+            for s in c.sources.iter_mut() {
+                s.forwards.retain(|f| f.local != orig);
             }
         }
-        None => c.forwards.push(Forward {
-            name: name.clone(),
-            local,
-            remote: remote.clone(),
-            enabled: true,
-        }),
+        if let Some(s) = c.source_mut(&source) {
+            s.forwards.push(Forward {
+                name: name.clone(),
+                local,
+                remote: remote.clone(),
+                enabled: was_enabled,
+            });
+        }
     }) {
         let msg = format!("Failed to save settings:\n{e}");
         report_save_error(&st, e);
@@ -255,10 +400,13 @@ fn upsert_forward(
     }
 
     st.emit_config_changed();
-    st.log(match original_local {
-        Some(_) => format!("{name} updated"),
-        None => format!("{name} added"),
-    });
+    st.log_from(
+        &source,
+        match original_local {
+            Some(_) => format!("{name} updated"),
+            None => format!("{name} added"),
+        },
+    );
     if was_enabled {
         tunnel::start(&st, local);
     }
@@ -269,22 +417,37 @@ fn upsert_forward(
 #[tauri::command]
 fn delete_forward(state: State<'_, Shared>, local: u16) {
     let st = state.inner().clone();
-    let Some(name) = st.config().forward(local).map(|f| f.name.clone()) else {
+    let cfg = st.config();
+    let Some((src, f)) = cfg.locate(local) else {
         st.log(format!("port {local} : no such exit"));
         return;
     };
+    let (sname, fname) = (src.name.clone(), f.name.clone());
     tunnel::halt(&st, local);
-    if let Err(e) = st.update_config(|c| c.forwards.retain(|f| f.local != local)) {
+    if let Err(e) = st.update_config(|c| {
+        for s in c.sources.iter_mut() {
+            s.forwards.retain(|f| f.local != local);
+        }
+    }) {
         report_save_error(&st, e);
         return;
     }
     st.emit_config_changed();
-    st.log(format!("{name} deleted"));
+    st.log_from(&sname, format!("{fname} deleted"));
 }
 
 #[tauri::command]
 fn test_exit(state: State<'_, Shared>, local: u16) {
     tunnel::test_exit(&state.inner().clone(), local);
+}
+
+#[tauri::command]
+fn test_source(state: State<'_, Shared>, name: String) {
+    let st = state.inner().clone();
+    if !require_source(&st, &name) {
+        return;
+    }
+    tunnel::test_source(&st, &name);
 }
 
 #[tauri::command]
@@ -358,12 +521,17 @@ pub fn run() {
             get_state,
             start_exit,
             stop_exit,
+            restart_exit,
+            start_source,
+            stop_source,
             start_all,
             stop_all,
-            save_global,
+            upsert_source,
+            delete_source,
             upsert_forward,
             delete_forward,
             test_exit,
+            test_source,
             test_all,
             set_close_to_tray,
             set_autostart,
@@ -399,6 +567,12 @@ pub fn run() {
             match &outcome {
                 LoadOutcome::Created(_) => {
                     shared.log("config created with defaults, open Settings to edit");
+                }
+                LoadOutcome::Migrated(cfg) => {
+                    shared.log(format!(
+                        "config migrated to the multi-source format ({} source(s))",
+                        cfg.sources.len()
+                    ));
                 }
                 LoadOutcome::Broken { backup, error, .. } => {
                     shared.log(format!("config unreadable ({error}), using defaults"));
