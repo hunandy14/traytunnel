@@ -226,6 +226,9 @@ pub fn valid_name(s: &str) -> bool {
 ///
 /// `original_local` 是編輯前的本地埠，None 代表新增。本地埠是出口的唯一鍵，
 /// 因此連停用中的出口也算佔用，不可重複。
+///
+/// 訊息一律以欄位名開頭（`name: `／`local: `／`remote: `），前端才能把錯誤
+/// 掛回對應的欄位上。
 pub fn validate_forward(
     forwards: &[Forward],
     original_local: Option<u16>,
@@ -235,23 +238,23 @@ pub fn validate_forward(
 ) -> Option<String> {
     if let Some(orig) = original_local {
         if !forwards.iter().any(|f| f.local == orig) {
-            return Some(format!("No exit with local port {orig}."));
+            return Some(format!("local: no exit with port {orig}, it may have been deleted"));
         }
     }
     if !valid_name(name) {
-        return Some("Name is required and must not contain spaces.".into());
+        return Some("name: required, and must not contain spaces".into());
     }
     if local == 0 {
-        return Some("Local port must be between 1 and 65535.".into());
+        return Some("local: port must be between 1 and 65535".into());
     }
     if !valid_remote(remote) {
-        return Some("Remote must look like host:port, for example 127.0.0.1:1080.".into());
+        return Some("remote: must look like host:port, for example 127.0.0.1:1080".into());
     }
-    let taken = forwards
+    let clash = forwards
         .iter()
-        .any(|f| f.local == local && Some(f.local) != original_local);
-    if taken {
-        return Some(format!("Local port {local} is already used by another exit."));
+        .find(|f| f.local == local && Some(f.local) != original_local);
+    if let Some(other) = clash {
+        return Some(format!("local: port {local} already used by {}", other.name));
     }
     None
 }
@@ -498,36 +501,44 @@ remote = "127.0.0.1:1080"
         assert!(!valid_remote("::1:22"));
     }
 
+    /// 驗證訊息要能被前端逐欄掛回去，格式固定是「欄位: 說明」
+    fn err(list: &[Forward], orig: Option<u16>, name: &str, local: u16, remote: &str) -> String {
+        validate_forward(list, orig, name, local, remote).expect("這組輸入應該要被擋下來")
+    }
+
     #[test]
     fn upsert_rejects_duplicate_local_port() {
-        let list = vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }];
-        // 新增撞到既有的
-        assert!(validate_forward(&list, None, "c", 1080, "127.0.0.1:1").is_some());
+        let list = vec![fwd("exit-tw", 1080), Forward { enabled: false, ..fwd("b", 1083) }];
+        // 新增撞到既有的，訊息要點名是誰佔走的
+        assert_eq!(
+            err(&list, None, "c", 1080, "127.0.0.1:1"),
+            "local: port 1080 already used by exit-tw"
+        );
         // 連停用中的出口也算佔用
-        assert!(validate_forward(&list, None, "c", 1083, "127.0.0.1:1").is_some());
+        assert!(err(&list, None, "c", 1083, "127.0.0.1:1").starts_with("local: "));
         // 沒撞到就過
         assert!(validate_forward(&list, None, "c", 1090, "127.0.0.1:1").is_none());
         // 編輯自己時維持原埠不算重複
         assert!(validate_forward(&list, Some(1080), "a2", 1080, "127.0.0.1:1").is_none());
         // 編輯時改成別人的埠要擋
-        assert!(validate_forward(&list, Some(1080), "a2", 1083, "127.0.0.1:1").is_some());
+        assert!(err(&list, Some(1080), "a2", 1083, "127.0.0.1:1").starts_with("local: "));
     }
 
     #[test]
     fn upsert_rejects_bad_name_and_remote() {
         let list = vec![fwd("a", 1080)];
-        assert!(validate_forward(&list, None, "", 1090, "127.0.0.1:1").is_some());
-        assert!(validate_forward(&list, None, "  ", 1090, "127.0.0.1:1").is_some());
-        assert!(validate_forward(&list, None, "two words", 1090, "127.0.0.1:1").is_some());
-        assert!(validate_forward(&list, None, "ok", 1090, "127.0.0.1").is_some());
-        assert!(validate_forward(&list, None, "ok", 1090, "nope").is_some());
-        assert!(validate_forward(&list, None, "ok", 0, "127.0.0.1:1").is_some());
+        assert!(err(&list, None, "", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "  ", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "two words", 1090, "127.0.0.1:1").starts_with("name: "));
+        assert!(err(&list, None, "ok", 1090, "127.0.0.1").starts_with("remote: "));
+        assert!(err(&list, None, "ok", 1090, "nope").starts_with("remote: "));
+        assert!(err(&list, None, "ok", 0, "127.0.0.1:1").starts_with("local: "));
     }
 
     #[test]
     fn upsert_rejects_unknown_original_port() {
         let list = vec![fwd("a", 1080)];
-        assert!(validate_forward(&list, Some(9999), "a", 1080, "127.0.0.1:1").is_some());
+        assert!(err(&list, Some(9999), "a", 1080, "127.0.0.1:1").starts_with("local: "));
     }
 
     #[test]

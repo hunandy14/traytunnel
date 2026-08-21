@@ -77,13 +77,22 @@ fn spawn_ssh(cfg: &Config, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
 
 /// 啟動單一出口的監看迴圈；出口不在設定裡就什麼都不做。
 /// 呼叫端負責先把 enabled 寫進設定。
+///
+/// 語意是「確保這個出口有一條線在跑」：已經有監看迴圈時直接 no-op，
+/// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
+/// 還佔著的埠，白白誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
     if state.config().forward(local).is_none() {
         return;
     }
-    let generation = state.next_generation(local);
+    let Some(generation) = state.claim_supervisor(local) else {
+        return; // 已經有一條線在跑
+    };
     let st = state.clone();
-    tauri::async_runtime::spawn(async move { supervise(st, local, generation).await });
+    tauri::async_runtime::spawn(async move {
+        supervise(&st, local, generation).await;
+        st.release_supervisor(local, generation);
+    });
 }
 
 /// 停掉單一出口：世代遞增讓監看迴圈作廢，關 job handle 收掉整棵程序樹。
@@ -135,7 +144,7 @@ async fn wait_alive(state: &Arc<AppState>, local: u16, generation: u64, total: D
     true
 }
 
-async fn supervise(state: Arc<AppState>, local: u16, generation: u64) {
+async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
     loop {
         if !state.generation_alive(local, generation) {
             return;
@@ -160,7 +169,7 @@ async fn supervise(state: Arc<AppState>, local: u16, generation: u64) {
         if let Some(detail) = busy {
             state.set_exit_status(local, status::PORT_BUSY, Some(detail));
             state.log(format!("{} : local port {local} busy, retrying in 5s", f.name));
-            if !wait_alive(&state, local, generation, RETRY).await {
+            if !wait_alive(state, local, generation, RETRY).await {
                 return;
             }
             continue;
@@ -202,7 +211,7 @@ async fn supervise(state: Arc<AppState>, local: u16, generation: u64) {
                     if !state.is_connected(local) && is_listening(local) {
                         state.set_exit_status(local, status::CONNECTED, None);
                         state.log(format!("{} : up", f.name));
-                        test_exit(&state, local);
+                        test_exit(state, local);
                     }
                 }
                 // ssh 退了，順手把 ProxyCommand 生出來的子程序一起收掉

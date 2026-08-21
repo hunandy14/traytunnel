@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
 
@@ -92,15 +92,6 @@ fn heal_autostart(app: &AppHandle, state: &Shared) {
     match app.autolaunch().enable() {
         Ok(()) => state.log("autostart entry refreshed"),
         Err(e) => state.log(format!("autostart entry refresh failed: {e}")),
-    }
-}
-
-/// 視窗高度隨出口卡片數量變動，公式沿用原版版面
-fn apply_window_size(app: &AppHandle, forwards: usize) {
-    let cards = std::cmp::max(10, 68 * forwards as i32 - 10);
-    let height = 322 + cards;
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
-        let _ = w.set_size(LogicalSize::new(464.0, height as f64));
     }
 }
 
@@ -217,7 +208,6 @@ fn save_global(
 /// 新增或編輯出口，originalLocal 為 None 代表新增；回傳 None 代表成功
 #[tauri::command]
 fn upsert_forward(
-    app: AppHandle,
     state: State<'_, Shared>,
     original_local: Option<u16>,
     name: String,
@@ -264,7 +254,6 @@ fn upsert_forward(
         return Some(msg);
     }
 
-    apply_window_size(&app, st.config().forwards.len());
     st.emit_config_changed();
     st.log(match original_local {
         Some(_) => format!("{name} updated"),
@@ -278,7 +267,7 @@ fn upsert_forward(
 
 /// 刪出口，運行中的先停掉
 #[tauri::command]
-fn delete_forward(app: AppHandle, state: State<'_, Shared>, local: u16) {
+fn delete_forward(state: State<'_, Shared>, local: u16) {
     let st = state.inner().clone();
     let Some(name) = st.config().forward(local).map(|f| f.name.clone()) else {
         st.log(format!("port {local} : no such exit"));
@@ -289,7 +278,6 @@ fn delete_forward(app: AppHandle, state: State<'_, Shared>, local: u16) {
         report_save_error(&st, e);
         return;
     }
-    apply_window_size(&app, st.config().forwards.len());
     st.emit_config_changed();
     st.log(format!("{name} deleted"));
 }
@@ -392,7 +380,6 @@ pub fn run() {
             app.manage(shared.clone());
 
             build_tray(&handle, &shared)?;
-            apply_window_size(&handle, cfg.forwards.len());
 
             // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {

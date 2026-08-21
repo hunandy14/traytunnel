@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主視窗與設定視窗的權限，子程序與設定檔都在 Rust 側處理，前端不需要 shell/fs 權限",
-  "windows": ["main", "settings"],
+  "description": "主視窗的權限，子程序與設定檔都在 Rust 側處理，前端不需要 shell/fs 權限",
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

@@ -84,6 +84,24 @@ pub struct Snapshot {
     pub logs: Vec<String>,
 }
 
+/// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
+/// 號碼是拿到位子之後才取的，沒搶到就不白燒一個世代序號。
+fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> Option<u64> {
+    if slot.is_some() {
+        return None;
+    }
+    let generation = next();
+    *slot = Some(generation);
+    Some(generation)
+}
+
+/// 退出的監看迴圈才有資格清位子，晚到的舊迴圈不能把新迴圈的位子清掉
+fn release_slot(slot: &mut Option<u64>, generation: u64) {
+    if *slot == Some(generation) {
+        *slot = None;
+    }
+}
+
 /// 推一行進環形緩衝，超過上限就丟掉最舊的，順序維持由舊到新
 fn push_log_line(logs: &mut VecDeque<String>, line: String) {
     logs.push_back(line);
@@ -101,6 +119,8 @@ struct ExitRuntime {
     /// 目前有效的世代序號，換號即代表舊的監看迴圈作廢；
     /// 號碼取自全域計數器，出口被刪掉又重建也不會撞號
     generation: u64,
+    /// 目前活著的監看迴圈是哪一代，None 代表這個出口沒人在跑
+    supervisor: Option<u64>,
     job: Option<(u64, Job)>,
 }
 
@@ -232,13 +252,37 @@ impl AppState {
         self.testing.lock().unwrap().remove(&local);
     }
 
-    /// 讓該出口進入新世代，舊的監看迴圈看到世代不符就會自行退出
+    /// 讓該出口進入新世代並騰出位子，舊的監看迴圈看到世代不符就會自行退出。
+    /// 位子當場清掉，緊接著的 start 不必等舊迴圈醒來就能接手。
     pub fn next_generation(&self, local: u16) -> u64 {
         let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut exits = self.exits.lock().unwrap();
         let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
         rt.generation = next;
+        rt.supervisor = None;
         next
+    }
+
+    /// 搶下這個出口的監看位子，回傳 None 代表已經有一條線在跑，不要再起第二條
+    pub fn claim_supervisor(&self, local: u16) -> Option<u64> {
+        let counter = &self.generation;
+        let mut exits = self.exits.lock().unwrap();
+        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+        let claimed = claim_slot(&mut rt.supervisor, || {
+            counter.fetch_add(1, Ordering::SeqCst) + 1
+        });
+        if let Some(generation) = claimed {
+            rt.generation = generation;
+        }
+        claimed
+    }
+
+    /// 監看迴圈結束時歸還位子
+    pub fn release_supervisor(&self, local: u16, generation: u64) {
+        let mut exits = self.exits.lock().unwrap();
+        if let Some(rt) = exits.get_mut(&local) {
+            release_slot(&mut rt.supervisor, generation);
+        }
     }
 
     pub fn generation(&self, local: u16) -> u64 {
@@ -279,6 +323,7 @@ impl AppState {
         let mut exits = self.exits.lock().unwrap();
         for rt in exits.values_mut() {
             rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.supervisor = None;
             let _ = rt.job.take();
         }
     }
@@ -376,6 +421,40 @@ mod tests {
         assert_eq!(logs.len(), LOG_CAPACITY);
         assert_eq!(logs.front().unwrap(), "line 100");
         assert_eq!(logs.back().unwrap(), &format!("line {}", LOG_CAPACITY + 99));
+    }
+
+    /// F2：start 對已經在跑的出口不能再起一條 ssh，否則舊的 ssh 還佔著埠，
+    /// 新的監看迴圈會掃到自己人而誤報 port_busy
+    #[test]
+    fn second_claim_is_refused_while_one_is_running() {
+        let mut slot = None;
+        let mut seq = 0;
+        let mut next = || {
+            seq += 1;
+            seq
+        };
+        assert_eq!(claim_slot(&mut slot, &mut next), Some(1));
+        assert_eq!(claim_slot(&mut slot, &mut next), None);
+        // 沒搶到就不該白燒世代序號
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn released_slot_can_be_claimed_again() {
+        let mut slot = None;
+        assert_eq!(claim_slot(&mut slot, || 7), Some(7));
+        release_slot(&mut slot, 7);
+        assert_eq!(claim_slot(&mut slot, || 8), Some(8));
+    }
+
+    /// halt 之後舊迴圈才慢半拍退出，不能讓它把新迴圈的位子清掉
+    #[test]
+    fn stale_supervisor_cannot_release_a_newer_one() {
+        let mut slot = None;
+        claim_slot(&mut slot, || 1);
+        slot = Some(2); // 舊的被作廢、新的已接手
+        release_slot(&mut slot, 1);
+        assert_eq!(slot, Some(2));
     }
 
     #[test]
