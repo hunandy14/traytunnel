@@ -303,8 +303,8 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
     let mut seen_names: Vec<&str> = Vec::new();
     let mut seen_locals: Vec<u16> = Vec::new();
     for s in &cfg.sources {
-        if !valid_name(&s.name) {
-            return Err("source 的 name 不可為空，也不可含空白".into());
+        if !valid_source_name(&s.name) {
+            return Err("source 的 name 不可為空，也不可含空白或中括號".into());
         }
         if seen_names.contains(&s.name.as_str()) {
             return Err(format!("source 名稱重複：{}", s.name));
@@ -441,6 +441,12 @@ pub fn valid_name(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace())
 }
 
+/// 源名還多一條限制：不可含中括號。日誌行前綴是 `[源名]`，
+/// 名字裡再冒出一個 `]` 會讓前端切不出正確的源名。
+pub fn valid_source_name(s: &str) -> bool {
+    valid_name(s) && !s.contains('[') && !s.contains(']')
+}
+
 /// 新增／編輯出口的欄位驗證，回傳 Some(訊息) 代表不通過。
 ///
 /// `original_local` 是編輯前的本地埠，None 代表新增。本地埠是出口的全域唯一鍵，
@@ -474,10 +480,7 @@ pub fn validate_forward(
         .flat_map(|s| s.forwards.iter().map(move |f| (s, f)))
         .find(|(_, f)| f.local == local && Some(f.local) != original_local);
     if let Some((s, f)) = clash {
-        return Some(format!(
-            "local: port {local} already used by {} in source {}",
-            f.name, s.name
-        ));
+        return Some(format!("local: port {local} already used by {} in {}", f.name, s.name));
     }
     None
 }
@@ -498,8 +501,8 @@ pub fn validate_source(
             return Some(format!("name: no source called {orig}, it may have been deleted"));
         }
     }
-    if !valid_name(name) {
-        return Some("name: required, and must not contain spaces".into());
+    if !valid_source_name(name) {
+        return Some("name: required, and must not contain spaces or brackets".into());
     }
     if host.trim().is_empty() {
         return Some("host: required".into());
@@ -963,7 +966,7 @@ enabled = false
         // 新增撞到既有的，訊息要點名是誰佔走的
         assert_eq!(
             err(&list, None, "c", 1080, "127.0.0.1:1"),
-            "local: port 1080 already used by exit-tw in source hk"
+            "local: port 1080 already used by exit-tw in hk"
         );
         // 連停用中的出口也算佔用
         assert!(err(&list, None, "c", 1083, "127.0.0.1:1").starts_with("local: "));
@@ -980,7 +983,7 @@ enabled = false
     fn upsert_rejects_local_port_used_by_another_source() {
         let list = vec![src("hk", vec![fwd("a", 1080)]), src("tw", vec![fwd("b", 1083)])];
         let msg = err(&list, None, "c", 1083, "127.0.0.1:1");
-        assert_eq!(msg, "local: port 1083 already used by b in source tw");
+        assert_eq!(msg, "local: port 1083 already used by b in tw");
         // 把 hk 的出口改成 tw 已經佔走的埠也要擋
         assert!(err(&list, Some(1080), "a", 1083, "127.0.0.1:1").starts_with("local: "));
     }
@@ -1009,6 +1012,9 @@ enabled = false
         assert!(validate_source(&list, None, "", "h", "u").unwrap().starts_with("name: "));
         assert!(validate_source(&list, None, "  ", "h", "u").unwrap().starts_with("name: "));
         assert!(validate_source(&list, None, "two words", "h", "u").unwrap().starts_with("name: "));
+        // 日誌行前綴是 [源名]，名字裡不可以再有中括號
+        assert!(validate_source(&list, None, "a]b", "h", "u").unwrap().starts_with("name: "));
+        assert!(parse_config("[[sources]]\nname=\"a]b\"\nhost=\"h\"\nuser=\"u\"\n").is_err());
         assert!(validate_source(&list, None, "tw", "  ", "u").unwrap().starts_with("host: "));
         assert!(validate_source(&list, None, "tw", "h", "").unwrap().starts_with("user: "));
     }
