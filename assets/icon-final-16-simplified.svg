@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- 系統匣 16px 專用簡化變體：去除底板漸層陰影改實色、環寬加粗、內外環間隙放大、前景改單一實色，
+       以在極小尺寸下維持最高銳利度與可辨識度。 -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#17191f"/>
+  <rect x="52" y="52" width="152" height="152" rx="40" fill="none" stroke="#2dd4a7" stroke-width="32"/>
+  <rect x="104" y="104" width="48" height="48" rx="14" fill="#2dd4a7"/>
+</svg>
