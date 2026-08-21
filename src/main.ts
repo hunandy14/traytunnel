@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { bootstrap } from "./bootstrap";
 import type { Config, ExitPayload, Snapshot, StatusPayload } from "./types";
 
 // Segoe MDL2 Assets：E71A 是 Stop，E768 是 Play
@@ -176,4 +177,4 @@ el<HTMLButtonElement>("btn-settings").addEventListener("click", () => invoke("op
 el<HTMLButtonElement>("btn-retest").addEventListener("click", () => invoke("retest"));
 btnToggle.addEventListener("click", () => invoke("toggle_run"));
 
-init();
+bootstrap(init);

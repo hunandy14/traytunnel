@@ -34,6 +34,26 @@ npm install
 npm run tauri dev
 ```
 
+### 瀏覽器 UI 開發模式
+
+只想調畫面、不想每次都等 Rust 編譯時，可以只開前端：
+
+```
+npm run dev
+```
+
+然後用瀏覽器打開 http://localhost:1420/index.html （設定畫面是 http://localhost:1420/settings.html ）。
+
+這個模式下沒有 Tauri runtime，前端會自動掛上一層假後端：
+
+- 用官方的 `@tauri-apps/api/mocks` 的 `mockIPC`（開啟 `shouldMockEvents`）攔截所有 `invoke`，並讓 `listen`／`emit` 走記憶體，所以前端程式碼完全不用為了 mock 改寫
+- 偵測方式是 Tauri v2 官方提供的 `isTauri()`，偵測不到才啟用
+- 假資料包含兩組轉發、Connecting → Connected 的狀態流轉、出口自測結果與日誌流，Stop／Start、重測、存檔都能實際操作
+- 設定存檔只寫進 `sessionStorage`，不會碰到真的 `traytunnel.toml`
+- 瀏覽器沒有多視窗，齒輪與 Cancel 改成在 `index.html` 與 `settings.html` 之間換頁
+
+假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
+
 ## 建置
 
 ```
