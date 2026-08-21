@@ -10,3 +10,6 @@ traytunnel.json
 traytunnel.json.bak
 traytunnel-error.log
 config.yml
+
+# Claude 工作目錄
+.claude/
