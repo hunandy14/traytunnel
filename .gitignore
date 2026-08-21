@@ -1,3 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# 使用者本機設定與執行期產物
+traytunnel.toml
+traytunnel.toml.broken
 traytunnel.json
+traytunnel.json.bak
 traytunnel-error.log
 config.yml
