@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { bootstrap } from "./bootstrap";
 import type { Snapshot } from "./types";
 
 const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -82,4 +83,4 @@ el<HTMLButtonElement>("msgbox-ok").addEventListener("click", () => msgbox.classL
 // 視窗是常駐隱藏的，每次被叫出來都要重新讀一次目前的設定
 listen("settings-open", () => void init());
 
-init();
+bootstrap(init);
