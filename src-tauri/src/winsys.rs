@@ -14,7 +14,11 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -130,11 +134,109 @@ fn listening_v6(port: u16) -> bool {
     }
 }
 
+/// 系統匣圖示這台機器實際要的像素尺寸。
+///
+/// 100% DPI 是 16，175% 就是 28——Windows 會照這個尺寸向 tray-icon 要圖，
+/// 給錯尺寸就由 GDI 拉伸，高 DPI 下糊掉的根源。
+pub fn small_icon_size() -> (u32, u32) {
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSMICON);
+        let h = GetSystemMetrics(SM_CYSMICON);
+        if w <= 0 || h <= 0 {
+            (16, 16)
+        } else {
+            (w as u32, h as u32)
+        }
+    }
+}
+
+/// 從多層 ICO 的尺寸清單裡挑一層，回傳索引。
+///
+/// 優先完全相符（完全不縮放）；沒有就取「大於它的最小一層」，讓系統縮小而不是
+/// 放大（縮小遠比放大乾淨）；再沒有就退而取最大的一層。
+pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
+    if sizes.is_empty() {
+        return None;
+    }
+    let exact = sizes.iter().position(|s| *s == want);
+    if exact.is_some() {
+        return exact;
+    }
+    let bigger = sizes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s > want)
+        .min_by_key(|(_, s)| **s)
+        .map(|(i, _)| i);
+    bigger.or_else(|| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i))
+}
+
+/// 在 HKCU 底下寫一個字串值，subkey 不存在就建出來。
+pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()> {
+    let sub = wide(subkey);
+    let value = wide(name);
+    let payload = wide(data);
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let rc = RegSetValueExW(
+            key,
+            value.as_ptr(),
+            0,
+            REG_SZ,
+            payload.as_ptr() as *const u8,
+            (payload.len() * 2) as u32,
+        );
+        RegCloseKey(key);
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+    }
+    Ok(())
+}
+
+/// 刪掉 HKCU 底下的一個 subkey（只用在測試收尾）
+#[cfg(test)]
+pub fn delete_hkcu_key(subkey: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Registry::RegDeleteKeyW;
+    let sub = wide(subkey);
+    unsafe {
+        let rc = RegDeleteKeyW(HKEY_CURRENT_USER, sub.as_ptr());
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+    }
+    Ok(())
+}
+
+/// Rust 字串轉成結尾帶 NUL 的 UTF-16
+pub fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// 讀 HKCU 的 Run 登錄值，用來判斷開機自啟項是不是還指向這支執行檔。
 pub fn read_run_value(name: &str) -> Option<String> {
     const SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    let subkey: Vec<u16> = SUBKEY.encode_utf16().chain(std::iter::once(0)).collect();
-    let value: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    read_hkcu_string(SUBKEY, name)
+}
+
+/// 讀 HKCU 底下的字串值
+pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
+    let subkey = wide(subkey);
+    let value = wide(name);
     unsafe {
         let mut size: u32 = 0;
         let rc = RegGetValueW(
@@ -164,5 +266,41 @@ pub fn read_run_value(name: &str) -> Option<String> {
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 完全相符的層優先，這樣 GDI 完全不用縮放
+    #[test]
+    fn exact_layer_wins() {
+        let sizes = [16, 20, 24, 28, 32, 48, 64, 256];
+        assert_eq!(pick_icon_layer(&sizes, 16), Some(0));
+        // 175% DPI 的 28px 現在有專用層
+        assert_eq!(pick_icon_layer(&sizes, 28), Some(3));
+        assert_eq!(pick_icon_layer(&sizes, 32), Some(4));
+    }
+
+    /// 沒有專用層時寧可讓系統縮小，也不要放大
+    #[test]
+    fn falls_back_to_the_next_size_up() {
+        let sizes = [16, 24, 32];
+        assert_eq!(pick_icon_layer(&sizes, 20), Some(1)); // 24 縮到 20
+        assert_eq!(pick_icon_layer(&sizes, 28), Some(2)); // 32 縮到 28
+    }
+
+    /// 要的比所有層都大時只能拿最大的那層
+    #[test]
+    fn falls_back_to_the_largest_layer() {
+        assert_eq!(pick_icon_layer(&[16, 32, 24], 64), Some(1));
+        assert_eq!(pick_icon_layer(&[], 16), None);
+    }
+
+    #[test]
+    fn wide_is_nul_terminated() {
+        assert_eq!(wide("ab"), vec![0x61, 0x62, 0]);
+        assert_eq!(wide(""), vec![0]);
     }
 }

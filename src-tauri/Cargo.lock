@@ -4269,6 +4269,7 @@ name = "traytunnel"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "ico",
  "log",
  "serde",
  "serde_json",
@@ -4281,6 +4282,7 @@ dependencies = [
  "tokio",
  "toml_edit 0.22.27",
  "ureq",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

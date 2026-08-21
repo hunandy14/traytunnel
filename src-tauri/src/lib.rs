@@ -1,12 +1,15 @@
+mod aumid;
 mod config;
 mod exits;
 mod state;
 mod tunnel;
 mod winsys;
 
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State, WindowEvent};
@@ -93,6 +96,21 @@ fn heal_autostart(app: &AppHandle, state: &Shared) {
         Ok(()) => state.log("autostart entry refreshed"),
         Err(e) => state.log(format!("autostart entry refresh failed: {e}")),
     }
+}
+
+/// AUMID 自註冊：AUMID 字串就是 tauri.conf.json 的 identifier，必須完全一致，
+/// 通知外掛在正式部署路徑下用的也是它。
+fn prepare_notifications(app: &AppHandle) -> Vec<String> {
+    let aumid = app.config().identifier.clone();
+    let product = app
+        .config()
+        .product_name
+        .clone()
+        .unwrap_or_else(|| app.package_info().name.clone());
+    let Ok(exe) = std::env::current_exe() else {
+        return vec!["could not resolve the executable path for notifications".into()];
+    };
+    aumid::prepare(&aumid, &product, &exe)
 }
 
 /// 設定檔寫入失敗一律讓使用者看得到，且記憶體狀態不會被改掉
@@ -541,6 +559,8 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            // 通知掛名要在任何 UI／toast 之前處理掉
+            let aumid_notes = prepare_notifications(&handle);
             let dir = exe_dir();
             let outcome = config::load_from_dir(&dir);
             let cfg: Config = outcome.config().clone();
@@ -564,6 +584,9 @@ pub fn run() {
 
             shared.refresh_tooltip();
             shared.log("Traytunnel started");
+            for note in aumid_notes {
+                shared.log(note);
+            }
             match &outcome {
                 LoadOutcome::Created(_) => {
                     shared.log("config created with defaults, open Settings to edit");
@@ -618,14 +641,60 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// 多層 ICO 直接內嵌，才不必依賴磁碟上有沒有圖示檔
+const TRAY_ICO: &[u8] = include_bytes!("../icons/icon.ico");
+
+/// 依這台機器實際要的系統匣圖示尺寸，從多層 ICO 裡挑一層原生尺寸的出來。
+///
+/// Tauri codegen 的 `default_window_icon()` 只取 ICO 的第一層固定尺寸，
+/// 高 DPI（例如 175% 要 28px）時交給 GDI 拉伸就會糊掉（tauri#14596、#9335）。
+fn tray_icon() -> Option<Image<'static>> {
+    let (want, _) = winsys::small_icon_size();
+    let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).ok()?;
+    let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
+    let idx = winsys::pick_icon_layer(&sizes, want)?;
+    let img = dir.entries()[idx].decode().ok()?;
+    log::info!("tray icon: system wants {want}px, using the {}px layer", img.width());
+    Some(Image::new_owned(img.rgba_data().to_vec(), img.width(), img.height()))
+}
+
+#[cfg(test)]
+mod tray_icon_tests {
+    use super::*;
+
+    /// 內嵌的 ICO 必須含系統匣常用的整數縮放尺寸，尤其 175% DPI 的 28px，
+    /// 少了哪一層就會退回讓 GDI 拉伸而糊掉
+    #[test]
+    fn embedded_ico_has_the_tray_layers() {
+        let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).expect("內嵌的 ICO 要解得開");
+        let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
+        for want in [16u32, 20, 24, 28, 32] {
+            assert!(sizes.contains(&want), "缺 {want}px 層，現有 {sizes:?}");
+        }
+    }
+
+    /// 這台機器實際要的尺寸要挑得到層，而且解得出對應大小的點陣圖
+    #[test]
+    fn picks_a_layer_for_this_machine() {
+        let (want, _) = winsys::small_icon_size();
+        assert!(want >= 16, "SM_CXSMICON = {want}");
+        let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).unwrap();
+        let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
+        let idx = winsys::pick_icon_layer(&sizes, want).expect("一定挑得到一層");
+        let img = dir.entries()[idx].decode().expect("該層要解得開");
+        assert_eq!(img.rgba_data().len(), (img.width() * img.height() * 4) as usize);
+    }
+}
+
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open window", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
 
+    let icon = tray_icon().unwrap_or_else(|| app.default_window_icon().unwrap().clone());
     let st = shared.clone();
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(icon)
         .tooltip("Traytunnel")
         .menu(&menu)
         .show_menu_on_left_click(false)

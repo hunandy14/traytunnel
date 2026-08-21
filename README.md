@@ -16,6 +16,8 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
 - 單一實例：重複啟動只會把既有的主視窗叫出來
 - 系統匣提示跨源彙總所有出口狀態，例如 `Traytunnel - 3/4 connected`
+- 系統匣圖示依 `SM_CXSMICON` 從多層 ICO 挑原生尺寸的那一層（含 16／20／24／28／32px），高 DPI 下不會被 GDI 拉伸糊掉
+- 通知掛在自己的 AppUserModelID 底下：啟動時自註冊開始選單捷徑與 `HKCU\Software\Classes\AppUserModelId`，toast 顯示的是 Traytunnel 而不是 Windows PowerShell
 - 每條 ssh 子程序各自放在一個 Windows Job Object 內，出口停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
 
 ## 需求
@@ -108,7 +110,7 @@ copy traytunnel.toml.example traytunnel.toml
 
 每個出口各自跑一條 `ssh`，連線參數（`host`／`user`／`proxyCommand`）取自它所屬的源，並以自己的 `local` 埠是否進入 Listen 狀態判斷該出口是否連上。在介面上按連接／中斷會即時寫回對應的 `enabled`。
 
-也可以在程式裡編輯：齒輪會在主視窗內開啟全域設定的覆蓋層（Host／User／ProxyCommand 與兩個即時生效的開關），轉發則是在出口卡片上就地展開編輯，清單最後的虛線卡片可以新增。存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單筆 `[[forwards]]` 上方的註解）。
+也可以在程式裡編輯，存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單一 `[[sources]]` 或單筆 `[[sources.forwards]]` 上方的註解）。
 
 其他行為：
 

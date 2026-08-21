@@ -26,6 +26,8 @@ tokio = { version = "1", features = ["process", "time", "sync", "io-util", "rt",
 ureq = { version = "2", features = ["socks-proxy", "json"] }
 chrono = "0.4"
 log = "0.4"
+# 系統匣圖示要照 SM_CXSMICON 從多層 ICO 挑層，得自己解 ICO
+ico = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -36,4 +38,15 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
+  "Win32_UI_WindowsAndMessaging",
+] }
+# 開始選單捷徑要走 COM（IShellLinkW + IPropertyStore），用高階綁定省掉手刻 vtable
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_PropertiesSystem",
 ] }
