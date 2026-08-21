@@ -154,8 +154,10 @@ function paintCard(exit: ExitInfo) {
   refs.detail.classList.toggle("show", Boolean(detail));
 
   const running = isRunning(exit);
-  refs.toggle.textContent = running ? "Disconnect" : "Connect";
-  refs.toggle.title = running ? `Stop ${exit.name}` : `Start ${exit.name}`;
+  refs.toggle.innerHTML = running ? GLYPH_STOP : GLYPH_START;
+  refs.toggle.title = running ? "Disconnect" : "Connect";
+  refs.toggle.classList.toggle("danger", running);
+  refs.toggle.classList.toggle("go", !running);
 }
 
 /** 後端沒帶 detail 時至少讓紅點有句話可看 */
@@ -170,7 +172,7 @@ function buildCard(exit: ExitInfo): HTMLElement {
   const test = h("div", { class: "card-test" });
   const detail = h("div", { class: "card-detail" });
 
-  const toggle = h("button", { class: "btn ghost" });
+  const toggle = h("button", { class: "iconbtn sm" });
   toggle.addEventListener("click", () => {
     if (isRunning(exit)) void stopExit(exit.local);
     else void startExit(exit.local);
