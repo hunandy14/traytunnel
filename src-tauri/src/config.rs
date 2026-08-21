@@ -261,13 +261,29 @@ fn is_legacy(doc: &DocumentMut) -> bool {
     doc.get("host").is_some()
 }
 
+/// 從 host 派生源名：源名不可含空白與中括號，但 host 兩者都可能有
+/// （`[::1]` 這種字面 IPv6 位址就同時踩到），因此剝掉再用；
+/// 剝完是空的就退回一個固定名字，總之要生得出合法的源名。
+fn source_name_from_host(host: &str) -> String {
+    let cleaned: String = host
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']')
+        .collect();
+    if cleaned.is_empty() {
+        "default".to_string()
+    } else {
+        cleaned
+    }
+}
+
 impl LegacyConfig {
-    /// 舊制包成單一 source，源名預設用 host 的值
+    /// 舊制包成單一 source，源名預設用 host 的值（消毒過）
     fn into_config(self) -> Config {
         Config {
             close_to_tray: self.close_to_tray,
             sources: vec![Source {
-                name: self.host.trim().to_string(),
+                name: source_name_from_host(&self.host),
                 host: self.host.trim().to_string(),
                 user: self.user.trim().to_string(),
                 proxy_command: self.proxy_command,
@@ -738,6 +754,33 @@ enabled = false
         assert_eq!(s.proxy_command, "cloudflared access ssh --hostname %h");
         assert_eq!(s.forwards.len(), 1);
         assert!(!s.forwards[0].enabled);
+    }
+
+    /// host 是 [::1] 這種字面 IPv6 位址時，中括號要被剝掉才生得出合法的源名，
+    /// 否則遷移出來的設定會當場過不了自己的驗證
+    #[test]
+    fn legacy_host_with_brackets_migrates() {
+        let raw = "host = \"[::1]\"\nuser = \"bob\"\n";
+        let (cfg, migrated) = parse_document(raw).unwrap();
+        assert!(migrated);
+        assert_eq!(cfg.sources[0].name, "::1");
+        // host 本身不動，ssh 還是要拿到原本的字面位址
+        assert_eq!(cfg.sources[0].host, "[::1]");
+        // 派生出來的源名必須是合法源名
+        assert!(valid_source_name(&cfg.sources[0].name));
+    }
+
+    /// 消毒規則：剝掉空白與中括號，全被剝光就退回 default
+    #[test]
+    fn derived_source_name_is_sanitised() {
+        assert_eq!(source_name_from_host("h.example.com"), "h.example.com");
+        assert_eq!(source_name_from_host("  h.example.com  "), "h.example.com");
+        assert_eq!(source_name_from_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(source_name_from_host("a b"), "ab");
+        assert_eq!(source_name_from_host("[ ]"), "default");
+        for h in ["h.example.com", "[::1]", "a b", "[ ]", "[]"] {
+            assert!(valid_source_name(&source_name_from_host(h)), "{h}");
+        }
     }
 
     /// 新制檔案不該被誤判成需要遷移

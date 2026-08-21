@@ -114,7 +114,8 @@ copy traytunnel.toml.example traytunnel.toml
 
 其他行為：
 
-- **舊制設定檔自動遷移**：偵測到頂層還有 `host` 欄位（單一連線源的舊格式）時，會把它整包成一個 `[[sources]]`（源名預設用 `host` 的值）、把原本的 `[[forwards]]` 搬成 `[[sources.forwards]]`，並就地寫回新格式；檔頭與逐筆出口上方的註解都會保留
+- **舊制設定檔自動遷移**：偵測到頂層還有 `host` 欄位（單一連線源的舊格式）時，會把它整包成一個 `[[sources]]`（源名預設用 `host` 的值，其中的空白與中括號會被剝掉，例如 `[::1]` 會變成源名 `::1`）、把原本的 `[[forwards]]` 搬成 `[[sources.forwards]]`，並就地寫回新格式；檔頭與逐筆出口上方的註解都會保留
+- 升級注意：舊設定檔如果含有**重複的 `local` 埠**（舊版沒擋下來的話），升級時會被判為無法解析，改名成 `traytunnel.toml.broken` 並改用預設值啟動，請手動把重複的埠改掉再放回 `traytunnel.toml`
 - 設定檔解析失敗時**不會被覆寫**，程式會另存一份 `traytunnel.toml.broken` 並改用預設值繼續執行；內容自相矛盾（源名重複、跨源撞埠、`host`／`user` 空白）也算解析失敗
 - 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
 

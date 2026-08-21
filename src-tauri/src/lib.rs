@@ -691,10 +691,18 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
 
-    let icon = tray_icon().unwrap_or_else(|| app.default_window_icon().unwrap().clone());
+    // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可讓系統匣先長出來
+    // 也不要 panic 掉整支程式，圖示之後照樣可以補
+    let icon = tray_icon().or_else(|| app.default_window_icon().cloned());
+    if icon.is_none() {
+        log::warn!("no tray icon available, building the tray without one");
+    }
     let st = shared.clone();
-    TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon)
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID);
+    if let Some(icon) = icon {
+        builder = builder.icon(icon);
+    }
+    builder
         .tooltip("Traytunnel")
         .menu(&menu)
         .show_menu_on_left_click(false)
