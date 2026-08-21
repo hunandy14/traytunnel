@@ -230,9 +230,16 @@ body {
   overflow: hidden;
 }
 
+/* ACTIVITY 兩塊的 top 會由 JS 依出口數量重算，這裡先給預設值（兩個出口的版面），
+   否則萬一 JS 沒跑起來，不透明的日誌區會落在 y=0 把整個畫面蓋掉 */
+#section-log {
+  top: 278px;
+}
+
 #log-panel {
   position: absolute;
   left: 18px;
+  top: 300px;
   width: 428px;
   height: 132px;
   background: var(--log-bg);

@@ -132,19 +132,42 @@ function applyRunState(on: boolean) {
   btnToggle.title = on ? "Stop" : "Start";
 }
 
-async function init() {
-  const snap = await invoke<Snapshot>("get_state");
+function applySnapshot(snap: Snapshot) {
   applyConfig(snap.config);
   applyStatus(snap.status);
   applyRunState(snap.wantRun);
+  logBox.textContent = "";
   for (const line of snap.logs) appendLog(line);
   for (const e of snap.exits) applyExit(e);
+}
 
-  await listen<string>("log", (e) => appendLog(e.payload));
-  await listen<StatusPayload>("status", (e) => applyStatus(e.payload));
-  await listen<ExitPayload>("exit", (e) => applyExit(e.payload));
-  await listen<Config>("config", (e) => applyConfig(e.payload));
-  await listen<boolean>("run-state", (e) => applyRunState(e.payload));
+/**
+ * 視窗是在 setup() 之前就建好的，頁面有可能比 Rust 端 manage 狀態還早問，
+ * 所以第一次取狀態失敗時重試幾輪，真的拿不到才把錯誤寫進活動區。
+ */
+async function loadSnapshot() {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      applySnapshot(await invoke<Snapshot>("get_state"));
+      return;
+    } catch (e) {
+      if (attempt === 19) appendLog(`ui error: ${String(e)}`);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+}
+
+async function init() {
+  try {
+    await listen<string>("log", (e) => appendLog(e.payload));
+    await listen<StatusPayload>("status", (e) => applyStatus(e.payload));
+    await listen<ExitPayload>("exit", (e) => applyExit(e.payload));
+    await listen<Config>("config", (e) => applyConfig(e.payload));
+    await listen<boolean>("run-state", (e) => applyRunState(e.payload));
+  } catch (e) {
+    appendLog(`ui error: ${String(e)}`);
+  }
+  await loadSnapshot();
 }
 
 el<HTMLButtonElement>("btn-min").addEventListener("click", () => invoke("window_minimize"));
