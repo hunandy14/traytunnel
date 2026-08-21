@@ -153,9 +153,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         let Some(f) = cfg.forward(local).cloned() else {
             return; // 出口已經被刪掉
         };
-        if !f.enabled {
-            return; // 使用者中途按了中斷
-        }
+        // 這裡刻意不看 f.enabled：停止的唯一訊號是 halt 的世代遞增。
+        // 中斷是「先寫 enabled=false 再 halt」兩步，中間那個微秒窗口若讓
+        // 迴圈自己因為 enabled=false 就退出，會在沒有遞增世代的情況下把
+        // 監看位子還掉，剛好插進來的 start 就會被這個早退吃掉一次 claim。
 
         // (b) spawn 前先看埠是不是已經被系統上的其他程序佔住
         let mut busy = port_busy_detail(local, is_listening(local));
