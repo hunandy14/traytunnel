@@ -407,13 +407,14 @@ body {
   overflow: hidden;
 }
 
-.card.editing .card-edit-inner {
+/* 分隔線與內距放在 inner 裡面，收合時才會跟著被裁掉，不會在關閉的瞬間跳一下 */
+.card-edit-body {
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
 }
 
-.card.new .card-edit-inner {
+.card.new .card-edit-body {
   margin-top: 0;
   padding-top: 0;
   border-top: 0;
@@ -731,6 +732,11 @@ body {
 .toast.in {
   opacity: 1;
   transform: translateY(0);
+}
+
+.toast.error {
+  border-color: rgba(240, 68, 56, 0.45);
+  color: var(--red);
 }
 
 .toast-text {

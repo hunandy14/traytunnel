@@ -215,12 +215,6 @@ function handle(cmd: string, args: Args): unknown {
       for (const e of state.exits) if (e.status !== "stopped") stop(e);
       return null;
 
-    case "test_exit": {
-      const exit = find(args.local as number);
-      if (exit) runTest(exit);
-      return null;
-    }
-
     case "test_all":
       log("testing all exits...");
       for (const e of state.exits) runTest(e);

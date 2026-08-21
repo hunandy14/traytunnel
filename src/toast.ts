@@ -14,9 +14,24 @@ export interface UndoToast {
   flush: () => void;
 }
 
+/** 沒有 Undo 的一般提示，主要拿來報「刪除失敗」這種後端錯誤 */
+export function showErrorToast(text: string) {
+  const stack = el<HTMLDivElement>("toasts");
+  const toast = h("div", { class: "toast error" }, [
+    h("span", { class: "toast-text", text }),
+  ]);
+  stack.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("in"));
+  window.setTimeout(() => {
+    toast.classList.remove("in");
+    window.setTimeout(() => toast.remove(), 400);
+  }, UNDO_MS);
+}
+
 export function showUndoToast(
   text: string,
-  onCommit: () => void,
+  /** 倒數結束才執行；失敗處理由呼叫端在這個 callback 內自己做完 */
+  onCommit: () => void | Promise<void>,
   onUndo: () => void,
 ): UndoToast {
   const stack = el<HTMLDivElement>("toasts");
@@ -33,14 +48,14 @@ export function showUndoToast(
   requestAnimationFrame(() => toast.classList.add("in"));
 
   let done = false;
-  const finish = (fn: () => void) => {
+  const finish = (fn: () => void | Promise<void>) => {
     if (done) return;
     done = true;
     window.clearTimeout(timer);
     toast.classList.remove("in");
     toast.addEventListener("transitionend", () => toast.remove(), { once: true });
     window.setTimeout(() => toast.remove(), 400);
-    fn();
+    void fn();
   };
 
   const timer = window.setTimeout(() => finish(onCommit), UNDO_MS);

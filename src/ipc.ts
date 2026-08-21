@@ -22,7 +22,6 @@ export const stopExit = (local: number) => invoke<void>("stop_exit", { local });
 export const startAll = () => invoke<void>("start_all");
 export const stopAll = () => invoke<void>("stop_all");
 
-export const testExit = (local: number) => invoke<void>("test_exit", { local });
 export const testAll = () => invoke<void>("test_all");
 
 /** 回傳錯誤字串代表驗證失敗，null 代表成功 */

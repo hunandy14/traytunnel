@@ -17,7 +17,7 @@ import {
   windowMinimize,
 } from "./ipc";
 import { closeSheet, initSheet, isSheetOpen, openSheet, syncSheet } from "./sheet";
-import { showUndoToast } from "./toast";
+import { showErrorToast, showUndoToast } from "./toast";
 import type { ExitInfo, ExitStatus, ExitStatusEvent, ExitTestEvent, Snapshot } from "./types";
 
 // Segoe MDL2 Assets 的字元：E71A Stop、E768 Play、E713 齒輪、E72C 重新整理、E70F 鉛筆
@@ -61,6 +61,11 @@ interface CardRefs {
 }
 
 const cardRefs = new Map<number, CardRefs>();
+
+/** 這一輪 renderCards 裡要展開的那張卡 */
+let openNode: HTMLElement | null = null;
+/** 只有「剛按下編輯／新增」那次才播展開動畫，重繪（例如顯示驗證錯誤）不重播 */
+let animateOpen = false;
 
 // ---------------------------------------------------------------- 狀態彙總
 
@@ -187,8 +192,8 @@ function buildCard(exit: ExitInfo): HTMLElement {
   cardRefs.set(exit.local, { root, dot, test, detail, toggle });
 
   if (draft && draft.originalLocal === exit.local) {
-    root.classList.add("editing");
     root.appendChild(buildEditor());
+    openNode = root;
   }
   return root;
 }
@@ -204,17 +209,42 @@ function beginEdit(exit: ExitInfo) {
     errors: {},
     busy: false,
   };
+  animateOpen = true;
   renderCards();
 }
 
 function beginCreate() {
   draft = { originalLocal: null, name: "", local: "", remote: "", errors: {}, busy: false };
+  animateOpen = true;
   renderCards();
 }
 
+/**
+ * 收合要等動畫跑完才能把節點抽掉，否則 renderCards 一重繪就是瞬間消失。
+ * transitionend 沒來（例如頁面在背景）就靠逾時保底。
+ */
+function collapseEditor(after: () => void) {
+  const node = document.querySelector<HTMLElement>("#cards .card.editing");
+  if (!node) {
+    after();
+    return;
+  }
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    after();
+  };
+  node.classList.remove("editing");
+  node.querySelector(".card-edit")?.addEventListener("transitionend", finish, { once: true });
+  window.setTimeout(finish, 320);
+}
+
 function cancelEdit() {
-  draft = null;
-  renderCards();
+  collapseEditor(() => {
+    draft = null;
+    renderCards();
+  });
 }
 
 function field(
@@ -279,19 +309,22 @@ function buildEditor(): HTMLElement {
     general.classList.add("show");
   }
 
+  // card-edit（grid 0fr→1fr）> inner（overflow hidden）> body（分隔線與內距，收合時一起被裁掉）
   return h("div", { class: "card-edit" }, [
     h("div", { class: "card-edit-inner" }, [
-      h("div", { class: "edit-grid" }, [
-        field("name", "Name", "exit-a"),
-        field("local", "Local port", "1080", true),
-        field("remote", "Remote", "127.0.0.1:1080", true),
-      ]),
-      general,
-      h("div", { class: "edit-actions" }, [
-        ...actions,
-        h("div", { class: "spacer" }),
-        cancel,
-        save,
+      h("div", { class: "card-edit-body" }, [
+        h("div", { class: "edit-grid" }, [
+          field("name", "Name", "exit-a"),
+          field("local", "Local port", "1080", true),
+          field("remote", "Remote", "127.0.0.1:1080", true),
+        ]),
+        general,
+        h("div", { class: "edit-actions" }, [
+          ...actions,
+          h("div", { class: "spacer" }),
+          cancel,
+          save,
+        ]),
       ]),
     ]),
   ]);
@@ -345,8 +378,10 @@ async function commitEdit() {
       renderCards();
       return;
     }
-    draft = null;
-    renderCards();
+    collapseEditor(() => {
+      draft = null;
+      renderCards();
+    });
   } catch (e) {
     d.busy = false;
     assignError(d, String(e));
@@ -359,22 +394,33 @@ async function commitEdit() {
 function requestDelete(local: number) {
   const exit = snap.exits.find((e) => e.local === local);
   if (!exit) return;
-  draft = null;
-  pendingDelete.add(local);
-  renderCards();
+  const name = exit.name;
 
-  showUndoToast(
-    `Deleted ${exit.name}`,
-    () => {
-      void deleteForward(local);
-      // 真的刪掉之後靠 config-changed 收斂，這裡先讓畫面保持一致
-      pendingDelete.delete(local);
-    },
-    () => {
-      pendingDelete.delete(local);
-      renderCards();
-    },
-  );
+  collapseEditor(() => {
+    draft = null;
+    pendingDelete.add(local);
+    renderCards();
+
+    showUndoToast(
+      `Deleted ${name}`,
+      async () => {
+        try {
+          await deleteForward(local);
+          // 刪成功才收掉暫存旗標，之後靠 config-changed 把卡片真的移除
+          pendingDelete.delete(local);
+        } catch (e) {
+          // 後端拒絕就把卡片放回來，不要無聲復活
+          pendingDelete.delete(local);
+          renderCards();
+          showErrorToast(`Could not delete ${name}: ${String(e)}`);
+        }
+      },
+      () => {
+        pendingDelete.delete(local);
+        renderCards();
+      },
+    );
+  });
 }
 
 // ---------------------------------------------------------------- 清單
@@ -383,6 +429,7 @@ function renderCards() {
   const box = el<HTMLDivElement>("cards");
   box.textContent = "";
   cardRefs.clear();
+  openNode = null;
 
   for (const exit of visibleExits()) {
     box.appendChild(buildCard(exit));
@@ -390,8 +437,9 @@ function renderCards() {
   }
 
   if (draft && draft.originalLocal === null) {
-    const card = h("article", { class: "card editing new" }, [buildEditor()]);
+    const card = h("article", { class: "card new" }, [buildEditor()]);
     box.appendChild(card);
+    openNode = card;
   } else {
     const ghost = h("button", { class: "ghost-card" }, [
       h("span", { class: "ghost-plus", text: "+" }),
@@ -399,6 +447,18 @@ function renderCards() {
     ]);
     ghost.addEventListener("click", beginCreate);
     box.appendChild(ghost);
+  }
+
+  if (openNode) {
+    const node = openNode;
+    if (animateOpen) {
+      animateOpen = false;
+      // 節點剛進 DOM，要先讓瀏覽器把 0fr 的起始狀態畫出來，下一幀再切 1fr，
+      // 否則兩個值同一幀套上去，transition 不會有中間幀
+      requestAnimationFrame(() => requestAnimationFrame(() => node.classList.add("editing")));
+    } else {
+      node.classList.add("editing");
+    }
   }
 
   renderSummary();
