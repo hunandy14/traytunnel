@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>Settings</title>
+    <script type="module" src="/src/settings.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="titlebar" data-tauri-drag-region>
+      <img class="app-icon" src="/icon.png" alt="" data-tauri-drag-region />
+      <span class="app-title" data-tauri-drag-region>Settings</span>
+      <button class="tbtn close" id="btn-close" title="Close">&#xE8BB;</button>
+    </div>
+
+    <div class="section" style="top: 50px">CONNECTION</div>
+
+    <label class="field-label" style="top: 78px" for="in-host">Host</label>
+    <div class="field" style="top: 72px"><input id="in-host" spellcheck="false" /></div>
+
+    <label class="field-label" style="top: 114px" for="in-user">User</label>
+    <div class="field" style="top: 108px"><input id="in-user" spellcheck="false" /></div>
+
+    <label class="field-label" style="top: 150px" for="in-proxy">ProxyCommand</label>
+    <div class="field" style="top: 144px"><input id="in-proxy" spellcheck="false" /></div>
+
+    <div class="section" style="top: 190px">FORWARDS</div>
+    <div class="hint" style="top: 208px">name&nbsp;&nbsp;&nbsp;localPort&nbsp;&nbsp;&nbsp;remoteHost:remotePort</div>
+    <div class="fwd-wrap"><textarea id="in-forwards" spellcheck="false" wrap="off"></textarea></div>
+
+    <div class="section" style="top: 372px">BEHAVIOR</div>
+
+    <div class="toggle" id="tg-autostart" style="top: 392px"></div>
+    <div class="toggle-label" style="top: 396px">Start on Windows login</div>
+
+    <div class="toggle" id="tg-close" style="top: 424px"></div>
+    <div class="toggle-label" style="top: 428px">Close button (X) hides to tray</div>
+
+    <button class="btn primary" id="btn-save">Save</button>
+    <button class="btn" id="btn-cancel">Cancel</button>
+
+    <div class="msgbox" id="msgbox">
+      <div class="panel">
+        <div class="text" id="msgbox-text"></div>
+        <button class="btn" id="msgbox-ok">OK</button>
+      </div>
+    </div>
+  </body>
+</html>
