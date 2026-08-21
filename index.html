@@ -17,72 +17,136 @@
       <button class="tbtn close" id="btn-close" title="Close">&#xE8BB;</button>
     </div>
 
-    <main class="page">
-      <section class="panel summary">
-        <span class="dot tone-grey" id="summary-dot"></span>
-        <div class="summary-text">
-          <div class="summary-title" id="summary-title">Starting…</div>
-          <div class="summary-sub" id="summary-sub">ssh tunnel</div>
+    <div class="shell">
+      <!-- 左側源軌道：上半是可捲動的源清單＋新增，下半固定住日誌與設定 -->
+      <nav class="rail" aria-label="Sources">
+        <div class="rail-list" id="rail-list"></div>
+        <div class="rail-foot">
+          <button class="rail-btn" id="btn-logs" title="Activity log">&#xE81C;</button>
+          <button class="rail-btn" id="btn-settings" title="Settings">&#xE713;</button>
         </div>
-        <div class="summary-actions">
-          <button class="iconbtn go" id="btn-toggle-all" title="Start all">&#xE768;</button>
-          <button class="iconbtn" id="btn-retest" title="Test all exits">&#xE72C;</button>
-          <button class="iconbtn" id="btn-settings" title="Global settings">&#xE713;</button>
-        </div>
-      </section>
+      </nav>
 
-      <h2 class="section-label">Exit nodes</h2>
-      <div class="cards" id="cards"></div>
+      <main class="main">
+        <!-- ---------------------------------------------- 選中的源 -->
+        <section class="view" id="view-source">
+          <div class="panel summary">
+            <span class="dot tone-grey" id="summary-dot"></span>
+            <div class="summary-text">
+              <div class="summary-title" id="summary-title">Starting…</div>
+              <div class="summary-sub" id="summary-sub">ssh tunnel</div>
+            </div>
+            <div class="summary-actions">
+              <button class="iconbtn" id="btn-add-exit" title="Add exit">&#xE710;</button>
+              <button class="iconbtn go" id="btn-toggle-source" title="Start source">&#xE768;</button>
+              <button class="iconbtn" id="btn-test-source" title="Test this source">&#xE72C;</button>
+              <button class="iconbtn" id="btn-edit-source" title="Edit source">&#xE70F;</button>
+            </div>
+          </div>
 
-      <h2 class="section-label">Activity</h2>
-      <div class="panel log-panel"><div class="log-box" id="log-box"></div></div>
-    </main>
+          <div class="cards-scroll">
+            <div class="cards" id="cards"></div>
+          </div>
 
-    <!-- 全域設定的置中 sheet -->
-    <div class="sheet-backdrop" id="sheet-backdrop" hidden>
-      <div class="sheet" role="dialog" aria-modal="true" aria-label="Global settings">
+          <div class="panel mini-log">
+            <div class="mini-log-head">
+              <span class="mini-log-label">Activity</span>
+              <span class="mini-log-scope" id="mini-log-scope"></span>
+            </div>
+            <div class="log-box mini" id="mini-log"></div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------- 零源引導 -->
+        <section class="view center-view" id="view-empty" hidden>
+          <button class="big-ghost" id="btn-first-source">
+            <span class="big-ghost-plus">+</span>
+            <span class="big-ghost-title">Add source</span>
+            <span class="big-ghost-hint">An ssh host that your exits tunnel through</span>
+          </button>
+        </section>
+
+        <!-- ---------------------------------------------- 全域日誌頁 -->
+        <section class="view" id="view-log" hidden>
+          <h2 class="page-title">Activity log</h2>
+          <div class="panel log-full-panel">
+            <div class="log-box full" id="full-log"></div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------- 全域設定頁 -->
+        <section class="view scroll-view" id="view-settings" hidden>
+          <h2 class="page-title">Settings</h2>
+
+          <h3 class="setting-group">General</h3>
+          <div class="setting-row">
+            <span class="setting-icon">&#xE7B8;</span>
+            <div class="setting-text">
+              <div class="setting-name">Close to tray</div>
+              <div class="setting-hint">Keep tunnels running in the notification area when the window is closed</div>
+            </div>
+            <button class="toggle" id="tg-close" role="switch" aria-checked="false"></button>
+          </div>
+          <div class="setting-row">
+            <span class="setting-icon">&#xE7E8;</span>
+            <div class="setting-text">
+              <div class="setting-name">Start with Windows</div>
+              <div class="setting-hint">Launch Traytunnel at sign-in</div>
+            </div>
+            <button class="toggle" id="tg-autostart" role="switch" aria-checked="false"></button>
+          </div>
+
+          <div class="field-error" id="settings-error"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- 源的新增／編輯 sheet（情境式，維持覆蓋層） -->
+    <div class="sheet-backdrop" id="src-backdrop" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="Source">
         <header class="sheet-head">
-          <span class="sheet-title">Global settings</span>
-          <button class="tbtn" id="sheet-close" title="Close">&#xE8BB;</button>
+          <span class="sheet-title" id="src-title">Add source</span>
+          <button class="tbtn" id="src-close" title="Close">&#xE8BB;</button>
         </header>
 
         <div class="sheet-body">
-          <label class="sheet-field">
+          <label class="sheet-field field-name">
+            <span class="edit-label">Name</span>
+            <span class="input"><input id="src-name" spellcheck="false" placeholder="tokyo" /></span>
+            <span class="field-error"></span>
+          </label>
+          <label class="sheet-field field-host">
             <span class="edit-label">Host</span>
-            <span class="input"><input id="in-host" spellcheck="false" placeholder="ssh.example.com" /></span>
+            <span class="input"><input id="src-host" spellcheck="false" placeholder="gateway.example.com" /></span>
+            <span class="field-error"></span>
           </label>
-          <label class="sheet-field">
+          <label class="sheet-field field-user">
             <span class="edit-label">User</span>
-            <span class="input"><input id="in-user" spellcheck="false" placeholder="ubuntu" /></span>
+            <span class="input"><input id="src-user" spellcheck="false" placeholder="ubuntu" /></span>
+            <span class="field-error"></span>
           </label>
-          <label class="sheet-field">
+          <label class="sheet-field field-proxyCommand">
             <span class="edit-label">ProxyCommand</span>
-            <span class="input"><input id="in-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
+            <span class="input"><input id="src-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
+            <span class="field-error"></span>
           </label>
 
-          <div class="field-error" id="sheet-error"></div>
-
-          <div class="sheet-divider"></div>
-
-          <div class="toggle-row">
-            <button class="toggle" id="tg-close" role="switch" aria-checked="false"></button>
-            <div class="toggle-text">
-              <div class="toggle-name">Close to tray</div>
-              <div class="toggle-hint">Keep running in the notification area</div>
-            </div>
-          </div>
-          <div class="toggle-row">
-            <button class="toggle" id="tg-autostart" role="switch" aria-checked="false"></button>
-            <div class="toggle-text">
-              <div class="toggle-name">Start with Windows</div>
-              <div class="toggle-hint">Launch Traytunnel at sign-in</div>
-            </div>
-          </div>
+          <div class="field-error general" id="src-error"></div>
         </div>
 
-        <footer class="sheet-foot">
-          <button class="btn ghost" id="btn-sheet-cancel">Cancel</button>
-          <button class="btn primary" id="btn-sheet-save">Save</button>
+        <!-- 一般狀態的頁腳 -->
+        <footer class="sheet-foot" id="src-foot">
+          <button class="btn danger-ghost" id="src-delete">Delete</button>
+          <div class="spacer"></div>
+          <button class="btn ghost" id="src-cancel">Cancel</button>
+          <button class="btn primary" id="src-save">Save</button>
+        </footer>
+
+        <!-- 刪除源用一次確認，就地換掉頁腳 -->
+        <footer class="sheet-foot confirm" id="src-confirm" hidden>
+          <span class="confirm-text" id="src-confirm-text">Delete this source and its exits?</span>
+          <button class="btn ghost" id="src-confirm-no">Cancel</button>
+          <button class="btn danger" id="src-confirm-yes">Delete</button>
         </footer>
       </div>
     </div>

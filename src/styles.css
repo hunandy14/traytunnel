@@ -1,11 +1,12 @@
 /*
  * VS Code "Modern UI / floating panels" 的設計語言：
- * 統一深底上放浮動卡片，層次靠亮度階梯（底 ~11% → 卡片 ~17% → 覆蓋層 ~22% →
- * toast ~26% L）加 1px 淡邊框做出來，完全不用陰影。間距走 4px 格。
+ * 統一深底上放浮動卡片，層次靠亮度階梯（軌道 ~8% → 底 ~11% → 卡片 ~17% →
+ * 覆蓋層 ~22% → toast ~26% L）加 1px 淡邊框做出來，完全不用陰影。間距走 4px 格。
  */
 
 :root {
   --bg: #181a1f; /* L ≈ 11% */
+  --rail: #131519; /* L ≈ 8%，比內容區再凹一階 */
   --panel: #272a31; /* L ≈ 17% */
   --sunken: #1e2026; /* 輸入框／日誌這種凹下去的面 */
   --overlay: #34373f; /* L ≈ 22% */
@@ -30,6 +31,7 @@
   --hover-strong: rgba(255, 255, 255, 0.11);
   --close-hover: #c42b1c;
 
+  --rail-w: 64px;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -115,32 +117,229 @@ body {
   color: #fff;
 }
 
-/* ------------------------------------------------------------ 版面 */
+/* ------------------------------------------------------------ 骨架 */
 
-.page {
+.shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 12px 12px;
+}
+
+.view[hidden] {
+  display: none;
+}
+
+.scroll-view {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.center-view {
+  align-items: center;
+  justify-content: center;
+}
+
+.page-title {
+  flex: none;
+  margin: 2px 2px 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------ 左側源軌道 */
+
+.rail {
+  flex: none;
+  width: var(--rail-w);
+  display: flex;
+  flex-direction: column;
+  background: var(--rail);
+}
+
+.rail-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 8px;
+  scrollbar-width: none;
 }
+
+.rail-list::-webkit-scrollbar {
+  width: 0;
+}
+
+.rail-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* 源 icon：首字方塊＋名稱 hash 配色，左緣的選中指示條走 Discord 那套 */
+.src-icon {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border: 0;
+  border-radius: 12px;
+  background: var(--src-bg, #3a3f47);
+  color: var(--src-ink, var(--text));
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 40px;
+  cursor: pointer;
+  transition: border-radius 160ms var(--ease), filter 130ms var(--ease);
+}
+
+.src-icon:hover {
+  border-radius: 10px;
+  filter: brightness(1.15);
+}
+
+.src-icon.active {
+  border-radius: 10px;
+}
+
+/* 指示條：未選中是小圓點、hover 拉長、選中拉滿 */
+.src-icon::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 0 3px 3px 0;
+  background: var(--text);
+  transform: translateY(-50%);
+  transition: height 160ms var(--ease);
+}
+
+.src-icon:hover::before {
+  height: 16px;
+}
+
+.src-icon.active::before {
+  height: 24px;
+  background: var(--accent);
+}
+
+/* 角落狀態小點，用底色做環讓它從方塊上跳出來 */
+.src-status {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 3px solid var(--rail);
+  background: #5b6069;
+  transition: background 150ms var(--ease);
+}
+
+.src-status.tone-green {
+  background: var(--green);
+}
+
+.src-status.tone-amber {
+  background: var(--amber);
+}
+
+.src-status.tone-red {
+  background: var(--red);
+}
+
+/* 軌道上的方形按鈕（＋新增源、日誌、設定） */
+.rail-btn {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-family: "Segoe MDL2 Assets";
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 130ms var(--ease), color 130ms var(--ease),
+    border-radius 160ms var(--ease), border-color 130ms var(--ease);
+}
+
+.rail-btn:hover {
+  border-radius: 10px;
+  background: var(--hover-strong);
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.rail-btn.add {
+  border-style: dashed;
+  border-color: var(--line-dashed);
+  font-size: 15px;
+}
+
+.rail-btn.add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.rail-btn.active {
+  border-radius: 10px;
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.rail-btn::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  transform: translateY(-50%);
+  transition: height 160ms var(--ease);
+}
+
+.rail-btn.active::before {
+  height: 24px;
+}
+
+/* ------------------------------------------------------------ 面板／狀態點 */
 
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
 }
-
-.section-label {
-  margin: 16px 0 8px 2px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.8px;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-/* ------------------------------------------------------------ 狀態點 */
 
 .dot {
   flex: none;
@@ -167,13 +366,14 @@ body {
   background: var(--red);
 }
 
-/* ------------------------------------------------------------ 彙總列 */
+/* ------------------------------------------------------------ 頂部彙總列 */
 
 .summary {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 14px 14px 14px 16px;
+  padding: 12px 12px 12px 16px;
 }
 
 .summary .dot {
@@ -205,6 +405,7 @@ body {
 }
 
 .summary-actions {
+  flex: none;
   display: flex;
   gap: 6px;
 }
@@ -283,6 +484,17 @@ body {
   border-color: var(--accent-hover);
 }
 
+.btn.danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn.danger:hover {
+  filter: brightness(1.1);
+}
+
 .btn.danger-ghost {
   background: transparent;
   border-color: rgba(240, 68, 56, 0.35);
@@ -295,6 +507,15 @@ body {
 }
 
 /* ------------------------------------------------------------ 出口卡片 */
+
+.cards-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin-top: 8px;
+  padding-right: 2px;
+}
 
 .cards {
   display: flex;
@@ -325,7 +546,7 @@ body {
 }
 
 .card-id {
-  flex: 1;
+  flex: 1 1 44%;
   min-width: 0;
 }
 
@@ -350,7 +571,8 @@ body {
 
 /* 自測結果沿用原版「ip  city, country」的兩個空白，所以要 pre 不能塌掉 */
 .card-test {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   max-width: 168px;
   font-size: 11px;
   text-align: right;
@@ -494,7 +716,7 @@ body {
 }
 
 .field-error.general {
-  margin-top: 8px;
+  margin-top: 4px;
 }
 
 .edit-actions {
@@ -504,11 +726,12 @@ body {
   margin-top: 12px;
 }
 
-.edit-actions .spacer {
+.edit-actions .spacer,
+.sheet-foot .spacer {
   flex: 1;
 }
 
-/* ------------------------------------------------------------ ghost card */
+/* ------------------------------------------------------------ 空狀態 */
 
 .ghost-card {
   display: flex;
@@ -516,7 +739,7 @@ body {
   justify-content: center;
   gap: 8px;
   width: 100%;
-  height: 40px;
+  height: 72px;
   border: 1px dashed var(--line-dashed);
   border-radius: 8px;
   background: transparent;
@@ -535,18 +758,54 @@ body {
 }
 
 .ghost-plus {
-  font-size: 15px;
+  font-size: 17px;
+  line-height: 17px;
+}
+
+/* 零源的大引導卡 */
+.big-ghost {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 280px;
+  max-width: 100%;
+  padding: 28px 20px;
+  border: 1px dashed var(--line-dashed);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  cursor: pointer;
+  transition: border-color 130ms var(--ease), background 130ms var(--ease);
+}
+
+.big-ghost:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--accent);
+}
+
+.big-ghost-plus {
+  font-size: 28px;
+  line-height: 30px;
+  color: var(--accent);
+}
+
+.big-ghost-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.big-ghost-hint {
+  font-size: 11px;
   line-height: 15px;
+  text-align: center;
 }
 
-/* ------------------------------------------------------------ 活動日誌 */
-
-.log-panel {
-  padding: 10px 4px 10px 12px;
-}
+/* ------------------------------------------------------------ 日誌 */
 
 .log-box {
-  height: 140px;
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 6px;
@@ -557,6 +816,60 @@ body {
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* 主區底部的縮小即時日誌：只顯示目前這個源（與沒有前綴的 app 級訊息） */
+.mini-log {
+  flex: none;
+  margin-top: 8px;
+  padding: 8px 4px 8px 12px;
+}
+
+.mini-log-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 4px;
+  padding-right: 8px;
+}
+
+.mini-log-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.mini-log-scope {
+  flex: 1;
+  font-size: 10px;
+  color: #61656e;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-box.mini {
+  height: 96px;
+}
+
+.log-full-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 10px 4px 10px 12px;
+}
+
+.log-box.full {
+  flex: 1;
+  min-height: 0;
+}
+
+.log-empty {
+  color: #61656e;
+  font-style: italic;
 }
 
 ::-webkit-scrollbar {
@@ -579,72 +892,60 @@ body {
   background-clip: padding-box;
 }
 
-/* ------------------------------------------------------------ 設定 sheet */
+/* ------------------------------------------------------------ 設定頁
+   Win11 工作管理員的設定版式：分節標題＋一列一項的設定卡片列 */
 
-.sheet-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
+.setting-group {
+  flex: none;
+  margin: 4px 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.setting-row {
+  flex: none;
   display: flex;
   align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.5);
-  opacity: 0;
-  transition: opacity 180ms var(--ease);
-}
-
-.sheet-backdrop[hidden] {
-  display: none;
-}
-
-.sheet-backdrop.open {
-  opacity: 1;
-}
-
-.sheet {
-  width: 420px;
-  max-width: calc(100% - 48px);
-  background: var(--overlay);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  transform: scale(0.96);
-  transition: transform 180ms var(--ease);
+  transition: border-color 130ms var(--ease);
 }
 
-.sheet-backdrop.open .sheet {
-  transform: scale(1);
+.setting-row:hover {
+  border-color: var(--line-strong);
 }
 
-.sheet-head {
-  display: flex;
-  align-items: center;
-  padding: 10px 8px 10px 14px;
-  border-bottom: 1px solid var(--line);
+.setting-icon {
+  flex: none;
+  width: 20px;
+  font-family: "Segoe MDL2 Assets";
+  font-size: 15px;
+  color: var(--muted);
+  text-align: center;
 }
 
-.sheet-title {
+.setting-text {
   flex: 1;
+  min-width: 0;
+}
+
+.setting-name {
   font-size: 12px;
   font-weight: 600;
 }
 
-.sheet-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px;
-}
-
-.sheet-divider {
-  height: 1px;
-  margin: 2px 0;
-  background: var(--line);
-}
-
-.toggle-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.setting-hint {
+  margin-top: 2px;
+  font-size: 10.5px;
+  line-height: 15px;
+  color: var(--muted);
 }
 
 .toggle {
@@ -679,29 +980,96 @@ body {
   left: 19px;
 }
 
-.toggle-name {
-  font-size: 12px;
+/* ------------------------------------------------------------ 源編輯 sheet */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 180ms var(--ease);
 }
 
-.toggle-hint {
-  margin-top: 1px;
-  font-size: 10.5px;
-  color: var(--muted);
+.sheet-backdrop[hidden] {
+  display: none;
+}
+
+.sheet-backdrop.open {
+  opacity: 1;
+}
+
+.sheet {
+  width: 400px;
+  max-width: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--overlay);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  transform: scale(0.96);
+  transition: transform 180ms var(--ease);
+}
+
+.sheet-backdrop.open .sheet {
+  transform: scale(1);
+}
+
+.sheet-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 10px 8px 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sheet-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
 }
 
 .sheet-foot {
+  flex: none;
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
   gap: 8px;
   padding: 12px 14px;
   border-top: 1px solid var(--line);
+}
+
+.sheet-foot[hidden] {
+  display: none;
+}
+
+.confirm-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 15px;
+  color: var(--text);
 }
 
 /* ------------------------------------------------------------ undo toast */
 
 .toast-stack {
   position: fixed;
-  left: 0;
+  left: var(--rail-w);
   right: 0;
   bottom: 14px;
   z-index: 60;
@@ -718,6 +1086,7 @@ body {
   align-items: center;
   gap: 14px;
   min-width: 268px;
+  max-width: calc(100% - 24px);
   padding: 9px 10px 9px 14px;
   overflow: hidden;
   background: var(--toast);
@@ -761,5 +1130,32 @@ body {
   }
   to {
     transform: scaleX(0);
+  }
+}
+
+/* ------------------------------------------------------------ 窄視窗
+   縮到 480×420 時把就地編輯改成單欄堆疊，自測文字讓位給按鈕 */
+
+@media (max-width: 560px) {
+  .edit-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .edit-grid .field-remote {
+    grid-column: 1 / -1;
+  }
+
+  .card-test {
+    max-width: 96px;
+  }
+
+  .summary-title {
+    font-size: 17px;
+  }
+}
+
+@media (max-height: 460px) {
+  .log-box.mini {
+    height: 64px;
   }
 }

@@ -20,6 +20,16 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 通知掛在自己的 AppUserModelID 底下：啟動時自註冊開始選單捷徑與 `HKCU\Software\Classes\AppUserModelId`，toast 顯示的是 Traytunnel 而不是 Windows PowerShell
 - 每條 ssh 子程序各自放在一個 Windows Job Object 內，出口停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
 
+## 介面
+
+視窗分成左側的源軌道與右側的主區，兩者都可隨視窗縮放（最小 480×420）：
+
+- **左側源軌道**：每個源一個圓角方塊，圖案是源名首字，底色由名稱 hash 決定，右下角的小點是該源的彙總狀態（全連綠／部分琥珀／全停灰／有出口出錯紅）。清單底部的虛線「＋」新增源；左下角固定放活動日誌與設定兩個鈕。
+- **主區（選中的源）**：頂部彙總列顯示 `n/m Connected` 與 `ssh user@host`，右側依序是新增出口、啟停此源、重測此源、編輯此源。下方是出口卡清單，每張卡右側是連接／中斷、重新連接、編輯三個鈕，編輯就地展開；底部是縮小的即時日誌窗，只顯示屬於這個源的行。
+- **活動日誌頁**：左下的時鐘鈕把主區換成所有源的完整日誌，點任一源 icon 即返回。小日誌窗是照日誌行的 `[源名]` 前綴過濾的，所以源改名之後，改名前既有的那些行會留在舊名字下、不再出現在這個源的小日誌窗裡；完整日誌頁一律看得到。
+- **設定頁**：左下的齒輪把主區換成設定頁，目前有「關閉時縮到系統匣」與「開機自動啟動」兩個即時生效的開關。
+- **源編輯**：頂部的鉛筆或側欄的「＋」會開出源的編輯面板（name／host／user／ProxyCommand），驗證錯誤逐欄顯示；刪除源需要一次確認，刪除出口則是先從畫面移除、5 秒內可以按 Undo 收回。
+
 ## 需求
 
 執行：
@@ -48,15 +58,15 @@ npm run tauri dev
 npm run dev
 ```
 
-然後用瀏覽器打開 http://localhost:1420/ 。整個 UI 只有這一頁，全域設定是主視窗內的覆蓋層。
+然後用瀏覽器打開 http://localhost:1420/ 。整個 UI 只有這一頁，主區靠左側欄切換。
 
 這個模式下沒有 Tauri runtime，前端會自動掛上一層假後端：
 
 - 用官方的 `@tauri-apps/api/mocks` 的 `mockIPC`（開啟 `shouldMockEvents`）攔截所有 `invoke`，並讓 `listen`／`emit` 走記憶體，所以前端程式碼完全不用為了 mock 改寫
 - 偵測方式是 Tauri v2 官方提供的 `isTauri()`，偵測不到才啟用
-- 假資料有三組轉發，涵蓋每個出口獨立的 `connecting → connected`、自測 `testing → ok`／`fail`，以及固定會撞埠的 `port_busy`；單一出口的連接／中斷、全停／全啟、重測、就地編輯、新增與刪除（含 undo）都能實際操作
-- 設定存檔只寫進 `sessionStorage`，不會碰到真的 `traytunnel.toml`
-- 另外掛了 `window.__mock` 供演練特定狀態：`__mock.drop(1080)` 模擬斷線重連、`__mock.status(1080, "error", "…")` 直接指定狀態、`__mock.reset()` 清掉暫存重來
+- 假資料有三個源（`tokyo` 兩個出口、`taipei` 兩個出口、`lab` 零出口示範空狀態），涵蓋每個出口獨立的 `connecting → connected`、自測 `testing → ok`／`fail`、固定會撞埠的 `port_busy`，以及跨源的本地埠衝突；出口的連接／中斷／重新連接、源的啟停與重測、出口就地編輯與刪除（含 undo）、源的新增／編輯／刪除都能實際操作
+- 設定存檔只寫進 `sessionStorage`，不會碰到真的設定檔
+- 另外掛了 `window.__mock` 供演練特定狀態：`__mock.drop(1080)` 模擬斷線重連、`__mock.status(1080, "error", "…")` 直接指定狀態、`__mock.wipe()` 清掉所有源看零源空狀態、`__mock.configDelay(1500)` 讓 `config-changed` 晚於 invoke 的 resolve 送達（真後端就是這個順序，用來驗證改名後的選中不會被回退吃掉）、`__mock.reset()` 清掉暫存重來
 
 假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
 
