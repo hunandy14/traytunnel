@@ -1,48 +1,100 @@
 //! 應用程式共用狀態，所有狀態變化都由這裡推事件給前端。
+//!
+//! 每個出口（以本地埠為唯一鍵）各自帶一份執行期狀態：連線狀態、自測結果、
+//! 世代序號與 Job Object handle，彼此互不影響。
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::Config;
 use crate::winsys::Job;
 
-/// 活動日誌保留的行數上限
-const LOG_CAPACITY: usize = 500;
-
 pub const TRAY_ID: &str = "traytunnel-tray";
 pub const MAIN_WINDOW: &str = "main";
-pub const SETTINGS_WINDOW: &str = "settings";
 
+/// 出口連線狀態，字面值即為 IPC 契約上的值
+pub mod status {
+    pub const STOPPED: &str = "stopped";
+    pub const CONNECTING: &str = "connecting";
+    pub const CONNECTED: &str = "connected";
+    pub const RECONNECTING: &str = "reconnecting";
+    pub const PORT_BUSY: &str = "port_busy";
+    pub const ERROR: &str = "error";
+}
+
+/// 出口自測狀態
+pub mod test_state {
+    pub const TESTING: &str = "testing";
+    pub const OK: &str = "ok";
+    pub const FAIL: &str = "fail";
+}
+
+/// 事件：exit-status
 #[derive(Debug, Clone, Serialize)]
-pub struct StatusPayload {
+pub struct ExitStatusPayload {
+    pub local: u16,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+/// 事件：exit-test，同時也是 Snapshot 裡的 lastTest
+#[derive(Debug, Clone, Serialize)]
+pub struct ExitTestPayload {
+    pub local: u16,
+    pub state: String,
     pub text: String,
-    /// muted / amber / accent / red，對應前端配色
-    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ExitPayload {
-    pub port: u16,
-    /// idle / testing / ok / fail
+pub struct TestView {
     pub state: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExitView {
+    pub name: String,
+    pub local: u16,
+    pub remote: String,
+    pub enabled: bool,
+    pub status: String,
+    pub last_test: Option<TestView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
-    pub config: Config,
-    pub status: StatusPayload,
-    pub want_run: bool,
-    pub connected: bool,
-    pub logs: Vec<String>,
-    pub exits: Vec<ExitPayload>,
+    pub host: String,
+    pub user: String,
+    pub proxy_command: String,
+    pub close_to_tray: bool,
     pub autostart: bool,
+    pub exits: Vec<ExitView>,
+}
+
+/// 單一出口的執行期狀態
+#[derive(Debug, Default)]
+struct ExitRuntime {
+    status: String,
+    detail: Option<String>,
+    last_test: Option<TestView>,
+    /// 目前有效的世代序號，換號即代表舊的監看迴圈作廢；
+    /// 號碼取自全域計數器，出口被刪掉又重建也不會撞號
+    generation: u64,
+    job: Option<(u64, Job)>,
+}
+
+impl ExitRuntime {
+    fn new() -> Self {
+        ExitRuntime { status: status::STOPPED.into(), ..Default::default() }
+    }
 }
 
 pub struct AppState {
@@ -50,33 +102,24 @@ pub struct AppState {
     /// 設定檔所在資料夾（執行檔同目錄）
     pub dir: PathBuf,
     cfg: Mutex<Config>,
-    logs: Mutex<VecDeque<String>>,
-    status: Mutex<StatusPayload>,
-    exits: Mutex<BTreeMap<u16, ExitPayload>>,
+    exits: Mutex<BTreeMap<u16, ExitRuntime>>,
     testing: Mutex<HashSet<u16>>,
-    want_run: AtomicBool,
-    connected: AtomicBool,
-    /// 隧道世代，遞增即代表舊的監看迴圈作廢
+    /// 全域世代計數器，發出去的號碼永不重複
     generation: AtomicU64,
-    job: Mutex<Option<(u64, Job)>>,
     tray_hint_shown: AtomicBool,
     exiting: AtomicBool,
 }
 
 impl AppState {
     pub fn new(app: AppHandle, dir: PathBuf, cfg: Config) -> Self {
+        let exits = cfg.forwards.iter().map(|f| (f.local, ExitRuntime::new())).collect();
         AppState {
             app,
             dir,
             cfg: Mutex::new(cfg),
-            logs: Mutex::new(VecDeque::new()),
-            status: Mutex::new(StatusPayload { text: "Starting...".into(), kind: "muted".into() }),
-            exits: Mutex::new(BTreeMap::new()),
+            exits: Mutex::new(exits),
             testing: Mutex::new(HashSet::new()),
-            want_run: AtomicBool::new(true),
-            connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            job: Mutex::new(None),
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
         }
@@ -86,97 +129,140 @@ impl AppState {
         self.cfg.lock().unwrap().clone()
     }
 
-    /// 更新設定並通知前端，出口卡片狀態由呼叫端決定要不要重設
-    pub fn set_config(&self, cfg: Config) {
-        *self.cfg.lock().unwrap() = cfg.clone();
-        let _ = self.app.emit("config", cfg);
+    /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）
+    pub fn update_config<F, T>(&self, edit: F) -> std::io::Result<T>
+    where
+        F: FnOnce(&mut Config) -> T,
+    {
+        let mut guard = self.cfg.lock().unwrap();
+        let mut next = guard.clone();
+        let out = edit(&mut next);
+        crate::config::write_config(&self.dir, &next)?;
+        *guard = next;
+        drop(guard);
+        self.sync_exits();
+        Ok(out)
+    }
+
+    /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態
+    fn sync_exits(&self) {
+        let ports: Vec<u16> = self.config().forwards.iter().map(|f| f.local).collect();
+        let mut exits = self.exits.lock().unwrap();
+        exits.retain(|p, _| ports.contains(p));
+        for p in ports {
+            exits.entry(p).or_insert_with(ExitRuntime::new);
+        }
     }
 
     pub fn log(&self, msg: impl AsRef<str>) {
         let line = format!("{}  {}", chrono::Local::now().format("%H:%M:%S"), msg.as_ref());
         log::info!("{}", msg.as_ref());
-        {
-            let mut logs = self.logs.lock().unwrap();
-            logs.push_back(line.clone());
-            while logs.len() > LOG_CAPACITY {
-                logs.pop_front();
-            }
-        }
         let _ = self.app.emit("log", line);
     }
 
-    pub fn set_status(&self, text: &str, kind: &str) {
-        let payload = StatusPayload { text: text.into(), kind: kind.into() };
-        *self.status.lock().unwrap() = payload.clone();
-        if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
-            let _ = tray.set_tooltip(Some(format!("Traytunnel - {text}")));
+    /// 更新某個出口的連線狀態並推事件；狀態沒變就不重複推。
+    pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
+        {
+            let mut exits = self.exits.lock().unwrap();
+            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+            if rt.status == status && rt.detail == detail {
+                return;
+            }
+            rt.status = status.into();
+            rt.detail = detail.clone();
         }
-        let _ = self.app.emit("status", payload);
+        let _ = self
+            .app
+            .emit("exit-status", ExitStatusPayload { local, status: status.into(), detail });
+        self.refresh_tooltip();
     }
 
-    pub fn set_exit(&self, port: u16, state: &str, text: &str) {
-        let payload = ExitPayload { port, state: state.into(), text: text.into() };
-        self.exits.lock().unwrap().insert(port, payload.clone());
-        let _ = self.app.emit("exit", payload);
+    pub fn exit_status(&self, local: u16) -> Option<String> {
+        self.exits.lock().unwrap().get(&local).map(|r| r.status.clone())
     }
 
-    /// 依目前設定把所有出口卡片重設回未知狀態
-    pub fn reset_exits(&self) {
-        let ports: Vec<u16> = self.config().forwards.iter().map(|f| f.local).collect();
-        self.exits.lock().unwrap().clear();
-        for p in ports {
-            self.set_exit(p, "idle", "-");
+    pub fn is_connected(&self, local: u16) -> bool {
+        self.exit_status(local).as_deref() == Some(status::CONNECTED)
+    }
+
+    /// 更新某個出口的自測狀態並推事件
+    pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
+        {
+            let mut exits = self.exits.lock().unwrap();
+            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+            rt.last_test = Some(TestView { state: state.into(), text: text.into() });
+        }
+        let _ = self.app.emit(
+            "exit-test",
+            ExitTestPayload { local, state: state.into(), text: text.into() },
+        );
+    }
+
+    /// 出口斷線或停掉時把舊的自測結果清乾淨
+    pub fn clear_exit_test(&self, local: u16) {
+        let mut exits = self.exits.lock().unwrap();
+        if let Some(rt) = exits.get_mut(&local) {
+            rt.last_test = None;
         }
     }
 
     /// 標記某個埠開始測試，回傳 false 代表已經在測了
-    pub fn begin_test(&self, port: u16) -> bool {
-        self.testing.lock().unwrap().insert(port)
+    pub fn begin_test(&self, local: u16) -> bool {
+        self.testing.lock().unwrap().insert(local)
     }
 
-    pub fn end_test(&self, port: u16) {
-        self.testing.lock().unwrap().remove(&port);
+    pub fn end_test(&self, local: u16) {
+        self.testing.lock().unwrap().remove(&local);
     }
 
-    pub fn want_run(&self) -> bool {
-        self.want_run.load(Ordering::SeqCst)
+    /// 讓該出口進入新世代，舊的監看迴圈看到世代不符就會自行退出
+    pub fn next_generation(&self, local: u16) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut exits = self.exits.lock().unwrap();
+        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+        rt.generation = next;
+        next
     }
 
-    pub fn set_want_run(&self, on: bool) {
-        self.want_run.store(on, Ordering::SeqCst);
-        let _ = self.app.emit("run-state", on);
+    pub fn generation(&self, local: u16) -> u64 {
+        self.exits.lock().unwrap().get(&local).map(|r| r.generation).unwrap_or(0)
     }
 
-    pub fn connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+    /// 世代還活著才算數，用來判斷監看迴圈要不要繼續
+    pub fn generation_alive(&self, local: u16, generation: u64) -> bool {
+        self.generation(local) == generation
     }
 
-    pub fn set_connected(&self, on: bool) {
-        self.connected.store(on, Ordering::SeqCst);
+    pub fn store_job(&self, local: u16, generation: u64, job: Job) {
+        let mut exits = self.exits.lock().unwrap();
+        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+        rt.job = Some((generation, job));
     }
 
-    pub fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    pub fn store_job(&self, generation: u64, job: Job) {
-        *self.job.lock().unwrap() = Some((generation, job));
-    }
-
-    /// 關掉 job handle，整棵 ssh 程序樹一起結束
-    pub fn kill_job(&self) {
-        let _ = self.job.lock().unwrap().take();
+    /// 關掉 job handle，該出口的 ssh 程序樹一起結束
+    pub fn kill_job(&self, local: u16) {
+        let mut exits = self.exits.lock().unwrap();
+        if let Some(rt) = exits.get_mut(&local) {
+            let _ = rt.job.take();
+        }
     }
 
     /// 只在世代相符時清掉 job，避免誤殺新的一輪連線
-    pub fn kill_job_of(&self, generation: u64) {
-        let mut guard = self.job.lock().unwrap();
-        if guard.as_ref().map(|(g, _)| *g) == Some(generation) {
-            let _ = guard.take();
+    pub fn kill_job_of(&self, local: u16, generation: u64) {
+        let mut exits = self.exits.lock().unwrap();
+        if let Some(rt) = exits.get_mut(&local) {
+            if rt.job.as_ref().map(|(g, _)| *g) == Some(generation) {
+                let _ = rt.job.take();
+            }
+        }
+    }
+
+    /// 收掉所有出口的 ssh 程序，離開程式時用
+    pub fn kill_all_jobs(&self) {
+        let mut exits = self.exits.lock().unwrap();
+        for rt in exits.values_mut() {
+            rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = rt.job.take();
         }
     }
 
@@ -196,15 +282,63 @@ impl AppState {
         self.exiting.store(true, Ordering::SeqCst);
     }
 
-    pub fn snapshot(&self, autostart: bool) -> Snapshot {
+    pub fn autostart(&self) -> bool {
+        self.app.autolaunch().is_enabled().unwrap_or(false)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let cfg = self.config();
+        let exits = self.exits.lock().unwrap();
+        let views = cfg
+            .forwards
+            .iter()
+            .map(|f| {
+                let rt = exits.get(&f.local);
+                ExitView {
+                    name: f.name.clone(),
+                    local: f.local,
+                    remote: f.remote.clone(),
+                    enabled: f.enabled,
+                    status: rt
+                        .map(|r| r.status.clone())
+                        .unwrap_or_else(|| status::STOPPED.to_string()),
+                    last_test: rt.and_then(|r| r.last_test.clone()),
+                }
+            })
+            .collect();
         Snapshot {
-            config: self.config(),
-            status: self.status.lock().unwrap().clone(),
-            want_run: self.want_run(),
-            connected: self.connected(),
-            logs: self.logs.lock().unwrap().iter().cloned().collect(),
-            exits: self.exits.lock().unwrap().values().cloned().collect(),
-            autostart,
+            host: cfg.host,
+            user: cfg.user,
+            proxy_command: cfg.proxy_command,
+            close_to_tray: cfg.close_to_tray,
+            autostart: self.autostart(),
+            exits: views,
+        }
+    }
+
+    /// 任何設定變更後全量推一次
+    pub fn emit_config_changed(&self) {
+        let _ = self.app.emit("config-changed", self.snapshot());
+        self.refresh_tooltip();
+    }
+
+    /// 系統匣提示改成彙總，例如「Traytunnel - 2/2 connected」
+    pub fn refresh_tooltip(&self) {
+        let cfg = self.config();
+        let exits = self.exits.lock().unwrap();
+        let enabled: Vec<u16> = cfg.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect();
+        let connected = enabled
+            .iter()
+            .filter(|p| exits.get(p).map(|r| r.status.as_str()) == Some(status::CONNECTED))
+            .count();
+        let text = if enabled.is_empty() {
+            "Traytunnel - no exits enabled".to_string()
+        } else {
+            format!("Traytunnel - {}/{} connected", connected, enabled.len())
+        };
+        drop(exits);
+        if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
+            let _ = tray.set_tooltip(Some(text));
         }
     }
 }
