@@ -12,6 +12,12 @@ const UNDO_MS = 5000;
 export interface UndoToast {
   /** 立刻結束倒數並執行 commit（例如視窗要關掉前） */
   flush: () => void;
+  /**
+   * 直接收掉這個 toast，commit 與 undo 都不執行。
+   * 用在「要刪的東西已經連根被刪掉了」這種情境，例如整個源被刪掉時，
+   * 底下出口還掛著的 undo 倒數就沒有意義了。
+   */
+  dismiss: () => void;
 }
 
 /** 沒有 Undo 的一般提示，主要拿來報「刪除失敗」這種後端錯誤 */
@@ -61,5 +67,8 @@ export function showUndoToast(
   const timer = window.setTimeout(() => finish(onCommit), UNDO_MS);
   undoBtn.addEventListener("click", () => finish(onUndo));
 
-  return { flush: () => finish(onCommit) };
+  return {
+    flush: () => finish(onCommit),
+    dismiss: () => finish(() => {}),
+  };
 }

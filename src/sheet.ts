@@ -66,12 +66,14 @@ function showGeneral(msg: string) {
 
 /** 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤 */
 function assignError(msg: string) {
-  const m = /^\s*(name|host|user|proxyCommand|proxycommand)\s*:\s*([\s\S]+)$/.exec(msg);
+  const m = /^\s*(name|host|user|proxycommand)\s*:\s*([\s\S]+)$/i.exec(msg);
   if (!m) {
     showGeneral(msg);
     return;
   }
-  const key = m[1].toLowerCase() === "proxycommand" ? "proxyCommand" : (m[1] as SourceField);
+  // 欄位鍵是 camelCase，比對過的前綴要轉回來
+  const lower = m[1].toLowerCase();
+  const key: SourceField = lower === "proxycommand" ? "proxyCommand" : (lower as SourceField);
   setFieldError(key, m[2].trim());
 }
 

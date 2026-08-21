@@ -102,9 +102,20 @@ function log(source: string | null, msg: string) {
   void emit("log", line);
 }
 
+/**
+ * config-changed 的送達延遲，預設 0。
+ *
+ * 真後端是 invoke 先 resolve、config-changed 才到，兩者之間有真實的時間差；
+ * 把延遲拉大就能在瀏覽器裡演練那個順序（例如驗證改名後的選中不會被吃掉）。
+ */
+let configDelay = 0;
+
 function pushConfig() {
   persist();
-  void emit("config-changed", structuredClone(state));
+  // 先照相：真後端也是序列化當下的狀態再送出，之後的變動不該回頭改到這一份
+  const payload = structuredClone(state);
+  if (configDelay > 0) window.setTimeout(() => void emit("config-changed", payload), configDelay);
+  else void emit("config-changed", payload);
 }
 
 function findSource(name: string): SourceInfo | undefined {
@@ -463,6 +474,11 @@ function installScenarioHooks() {
       log(null, "all sources removed");
     },
     owner: ownerOf,
+    /** 演練「config-changed 晚於 invoke resolve」的事件順序，0 是預設的即時送達 */
+    configDelay(ms: number) {
+      configDelay = Math.max(0, ms);
+      return configDelay;
+    },
     reset() {
       sessionStorage.removeItem(STORE_KEY);
       location.reload();

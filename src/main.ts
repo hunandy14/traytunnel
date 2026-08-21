@@ -25,7 +25,7 @@ import {
   openSourceSheet,
   syncSettingsPage,
 } from "./sheet";
-import { showErrorToast, showUndoToast } from "./toast";
+import { showErrorToast, showUndoToast, type UndoToast } from "./toast";
 import type {
   ExitInfo,
   ExitStatus,
@@ -49,6 +49,15 @@ let snap: Snapshot = EMPTY;
 /** 目前選中的源名稱；null 代表還沒有源 */
 let selected: string | null = null;
 
+/**
+ * 剛送出 upsert_source、還在等 config-changed 把這個名字帶回來。
+ *
+ * 真後端的事件順序是 invoke 先 resolve、config-changed 才到，所以存檔當下快照裡
+ * 還是舊名字。這段期間不能讓 render() 的「選中不存在就回退第一個」把改名後的
+ * 選中吃掉，得等快照真的出現這個名字才切過去。
+ */
+let pendingSelect: string | null = null;
+
 type View = "source" | "log" | "settings";
 let view: View = "source";
 
@@ -58,6 +67,12 @@ const LOG_CAP = 500;
 
 /** 已按下刪除、但 undo 倒數還沒結束的出口：畫面先當它不存在 */
 const pendingDelete = new Set<number>();
+/**
+ * 還在倒數的 undo toast，整個源被刪掉時要能把底下出口的倒數一起收乾淨。
+ * 一併記下當初的源名稱：刪源時快照可能已經被 config-changed 更新過了，
+ * 不能靠當下的 snap 反查出口屬於誰。
+ */
+const undoToasts = new Map<number, { source: string; toast: UndoToast }>();
 
 interface Draft {
   /** 這張草稿屬於哪個源 */
@@ -82,6 +97,8 @@ interface CardRefs {
 }
 
 const cardRefs = new Map<number, CardRefs>();
+/** 側欄每個源 icon 的狀態小點，讓 exit-status 事件不用整列重建就能更新 */
+const railStatusRefs = new Map<string, HTMLElement>();
 
 /** 這一輪 renderCards 裡要展開的那張卡 */
 let openNode: HTMLElement | null = null;
@@ -131,12 +148,22 @@ function currentSource(): SourceInfo | null {
 const visibleExits = (src: SourceInfo | null) =>
   (src?.exits ?? []).filter((e) => !pendingDelete.has(e.local));
 
-function findExit(local: number): ExitInfo | undefined {
-  for (const s of snap.sources) {
-    const hit = s.exits.find((e) => e.local === local);
-    if (hit) return hit;
+/** local 全域唯一，所以出口一律用埠號跨源找，順便把它所屬的源帶回來 */
+function locate(local: number): { exit: ExitInfo; source: SourceInfo } | undefined {
+  for (const source of snap.sources) {
+    const exit = source.exits.find((e) => e.local === local);
+    if (exit) return { exit, source };
   }
   return undefined;
+}
+
+/** 指令送出後統一的失敗處理：後端拒絕就跳錯誤 toast，不要無聲吞掉 */
+async function run(action: () => Promise<unknown>, what: string) {
+  try {
+    await action();
+  } catch (e) {
+    showErrorToast(`Could not ${what}: ${String(e)}`);
+  }
 }
 
 // ---------------------------------------------------------------- 左側源軌道
@@ -153,9 +180,17 @@ function initial(name: string): string {
   return ch ? ch.toUpperCase() : "?";
 }
 
+/** 只重畫某個源 icon 的狀態小點，不動整列（避免密集事件下重建 DOM 與丟焦點） */
+function paintRailStatus(name: string) {
+  const node = railStatusRefs.get(name);
+  const src = snap.sources.find((s) => s.name === name);
+  if (node && src) node.className = `src-status tone-${sourceTone(src)}`;
+}
+
 function renderRail() {
   const list = el<HTMLDivElement>("rail-list");
   list.textContent = "";
+  railStatusRefs.clear();
 
   for (const src of sources()) {
     const hue = hashHue(src.name);
@@ -164,7 +199,9 @@ function renderRail() {
     btn.style.setProperty("--src-ink", `hsl(${hue} 70% 86%)`);
     btn.title = `${src.name} — ssh ${src.user}@${src.host}`;
     btn.classList.toggle("active", view === "source" && src.name === selected);
-    btn.appendChild(h("span", { class: `src-status tone-${sourceTone(src)}` }));
+    const status = h("span", { class: `src-status tone-${sourceTone(src)}` });
+    railStatusRefs.set(src.name, status);
+    btn.appendChild(status);
     btn.addEventListener("click", () => selectSource(src.name));
     list.appendChild(btn);
   }
@@ -181,12 +218,15 @@ function renderRail() {
 
 function setView(next: View) {
   if (view !== next && draft) cancelEditNow();
+  // 使用者自己動了畫面，等快照的旗標就作廢，免得等不到時永遠卡著
+  pendingSelect = null;
   view = next;
   render();
 }
 
 function selectSource(name: string) {
   if (selected !== name && draft) cancelEditNow();
+  pendingSelect = null;
   selected = name;
   view = "source";
   render();
@@ -203,8 +243,15 @@ function applyViewVisibility() {
 
 /** 一次把整個畫面對齊到目前的 snap／selected／view */
 function render() {
-  // 選中的源被刪掉或還沒選過，就落回第一個
-  if (!currentSource()) selected = sources()[0]?.name ?? null;
+  // 存檔後的名字一旦出現在快照裡就切過去，切完才解除等待
+  if (pendingSelect !== null && snap.sources.some((s) => s.name === pendingSelect)) {
+    selected = pendingSelect;
+    pendingSelect = null;
+  }
+
+  // 選中的源被刪掉或還沒選過，就落回第一個；
+  // 但還在等 config-changed 時不回退，否則改名會被打回舊的源
+  if (pendingSelect === null && !currentSource()) selected = sources()[0]?.name ?? null;
 
   applyViewVisibility();
   renderRail();
@@ -303,12 +350,14 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
 
   const toggle = h("button", { class: "iconbtn sm" });
   toggle.addEventListener("click", () => {
-    if (isRunning(exit)) void stopExit(exit.local);
-    else void startExit(exit.local);
+    if (isRunning(exit)) void run(() => stopExit(exit.local), `disconnect ${exit.name}`);
+    else void run(() => startExit(exit.local), `connect ${exit.name}`);
   });
 
   const restart = h("button", { class: "iconbtn sm", html: GLYPH_RESTART, title: "Reconnect" });
-  restart.addEventListener("click", () => void restartExit(exit.local));
+  restart.addEventListener("click", () =>
+    void run(() => restartExit(exit.local), `reconnect ${exit.name}`),
+  );
 
   const edit = h("button", { class: "iconbtn sm", html: GLYPH_EDIT, title: "Edit" });
   edit.addEventListener("click", () => beginEdit(exit, source));
@@ -583,18 +632,20 @@ async function commitEdit() {
 // ---------------------------------------------------------------- 刪除／undo
 
 function requestDelete(local: number) {
-  const exit = findExit(local);
-  if (!exit) return;
-  const name = exit.name;
+  const hit = locate(local);
+  if (!hit) return;
+  const name = hit.exit.name;
+  const owner = hit.source.name;
 
   collapseEditor(() => {
     draft = null;
     pendingDelete.add(local);
     render();
 
-    showUndoToast(
+    const toast = showUndoToast(
       `Deleted ${name}`,
       async () => {
+        undoToasts.delete(local);
         try {
           await deleteForward(local);
           // 刪成功才收掉暫存旗標，之後靠 config-changed 把卡片真的移除
@@ -607,11 +658,33 @@ function requestDelete(local: number) {
         }
       },
       () => {
+        undoToasts.delete(local);
         pendingDelete.delete(local);
         render();
       },
     );
+    undoToasts.set(local, { source: owner, toast });
   });
+}
+
+/**
+ * 整個源被刪掉時，底下出口還掛著的 undo 倒數就沒有意義了：
+ * 讓它到期去 deleteForward 一個已經不存在的埠只會噴錯，
+ * pendingDelete 裡的殘留旗標也會一直卡著。這裡一次收乾淨。
+ */
+function dropPendingDeletesOf(sourceName: string) {
+  // 快照可能已經被 config-changed 洗掉這個源了，所以以登記的來源為準，
+  // 快照裡還在的話就再併一次，兩邊都不漏
+  const locals = new Set<number>();
+  for (const [local, entry] of undoToasts) if (entry.source === sourceName) locals.add(local);
+  const still = snap.sources.find((s) => s.name === sourceName);
+  if (still) for (const e of still.exits) locals.add(e.local);
+
+  for (const local of locals) {
+    undoToasts.get(local)?.toast.dismiss();
+    undoToasts.delete(local);
+    pendingDelete.delete(local);
+  }
 }
 
 // ---------------------------------------------------------------- 日誌
@@ -628,13 +701,15 @@ function logSourceOf(line: string): string | null {
 }
 
 function fill(box: HTMLElement, lines: string[], emptyText: string) {
+  // 比照 appendLine：使用者自己往上捲去看舊訊息時就不要硬把他拉回底部
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
   box.textContent = "";
   if (lines.length === 0) {
     box.appendChild(h("div", { class: "log-empty", text: emptyText }));
     return;
   }
   for (const line of lines) box.appendChild(h("div", { text: line }));
-  box.scrollTop = box.scrollHeight;
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
 function renderLogs() {
@@ -704,21 +779,22 @@ function applySnapshot(next: Snapshot, replayLogs = false) {
 }
 
 function applyExitStatus(ev: ExitStatusEvent) {
-  const exit = findExit(ev.local);
-  if (!exit) return;
+  const hit = locate(ev.local);
+  if (!hit) return;
+  const { exit } = hit;
   exit.status = ev.status;
   exit.detailText = ev.detail ?? null;
   if (ev.status === "stopped") exit.lastTest = null;
   paintCard(exit);
   if (view === "source") renderSummary();
-  renderRail();
+  paintRailStatus(hit.source.name);
 }
 
 function applyExitTest(ev: ExitTestEvent) {
-  const exit = findExit(ev.local);
-  if (!exit) return;
-  exit.lastTest = { state: ev.state, text: ev.text };
-  paintCard(exit);
+  const hit = locate(ev.local);
+  if (!hit) return;
+  hit.exit.lastTest = { state: ev.state, text: ev.text };
+  paintCard(hit.exit);
 }
 
 // ---------------------------------------------------------------- 啟動
@@ -751,21 +827,26 @@ async function init() {
   await loadSnapshot();
 }
 
-el<HTMLButtonElement>("btn-min").addEventListener("click", () => void windowMinimize());
-el<HTMLButtonElement>("btn-close").addEventListener("click", () => void windowClose());
+el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
+  void run(windowMinimize, "minimize the window"),
+);
+el<HTMLButtonElement>("btn-close").addEventListener("click", () =>
+  void run(windowClose, "close the window"),
+);
 
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
 el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("settings"));
 
 el<HTMLButtonElement>("btn-add-exit").addEventListener("click", beginCreate);
 el<HTMLButtonElement>("btn-test-source").addEventListener("click", () => {
-  if (selected) void testSource(selected);
+  const src = currentSource();
+  if (src) void run(() => testSource(src.name), `test ${src.name}`);
 });
 el<HTMLButtonElement>("btn-toggle-source").addEventListener("click", () => {
   const src = currentSource();
   if (!src) return;
-  if (visibleExits(src).some(isRunning)) void stopSource(src.name);
-  else void startSource(src.name);
+  if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
+  else void run(() => startSource(src.name), `start ${src.name}`);
 });
 el<HTMLButtonElement>("btn-edit-source").addEventListener("click", () => {
   const src = currentSource();
@@ -777,11 +858,18 @@ el<HTMLButtonElement>("btn-first-source").addEventListener("click", () => openSo
 
 initSourceSheet({
   onSaved: (name) => {
-    selected = name;
+    // 快照這時候還是舊的（config-changed 比 invoke 的 resolve 晚），
+    // 先記下要選誰，等 render() 在快照裡看到這個名字再真的切過去
+    pendingSelect = name;
     view = "source";
     render();
   },
   onDeleted: (name) => {
+    dropPendingDeletesOf(name);
+    // 同樣不等 config-changed，先把它從本地快照拿掉，
+    // 免得回退第一個源時又挑回這個剛被刪掉的
+    snap = { ...snap, sources: snap.sources.filter((s) => s.name !== name) };
+    pendingSelect = null;
     if (selected === name) selected = null;
     view = "source";
     render();
