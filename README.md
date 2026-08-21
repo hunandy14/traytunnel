@@ -2,17 +2,20 @@
 
 Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri.app/) 撰寫，前端是 vanilla TypeScript + Vite，隧道管理、設定檔讀寫與出口檢測全部在 Rust 側完成。
 
-程式讀取 `traytunnel.toml`，自動維持 SSH 連線並在斷線時重連，同時對每個轉發出口做連通自我檢測，狀態即時顯示在系統匣圖示與主視窗中。
+程式讀取 `traytunnel.toml`，**每個出口各自維持一條獨立的 SSH 連線**並在斷線時各自重連，同時對每個轉發出口做連通自我檢測，狀態即時顯示在系統匣圖示與主視窗中。
 
 ## 功能
 
 - 系統匣常駐，可設定開機自動啟動（啟動時帶 `--tray` 直接隱藏到系統匣）
-- 依設定檔啟動 `ssh.exe` 建立多組本地埠轉發（Local Forward）
-- 斷線後固定 5 秒重連，無退避、無次數上限
+- 每個 `[[forwards]]` 出口一條獨立的 `ssh.exe -N -L`，可個別連接／中斷，一個出口斷線或重連不會影響其他出口
+- 出口的連接／中斷選擇會寫回設定檔的 `enabled`，下次啟動只自動連線 `enabled` 的出口
+- 斷線後固定 5 秒重連，無退避、無次數上限，每個出口自己數自己的
+- 本地埠衝突三層防護：設定階段擋重複埠、spawn 前偵測埠是否已被其他程序佔用（狀態顯示 `port_busy`，每 5 秒重查而不盲目 spawn），最後由 ssh 的 `ExitOnForwardFailure=yes` 兜底
 - 各出口經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
 - 單一實例：重複啟動只會把既有的主視窗叫出來
-- ssh 子程序放在 Windows Job Object 內，程式結束時整棵程序樹（含 `cloudflared`）一起收掉
+- 系統匣提示彙總所有出口狀態，例如 `Traytunnel - 2/2 connected`
+- 每條 ssh 子程序各自放在一個 Windows Job Object 內，出口停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
 
 ## 需求
 
@@ -85,11 +88,20 @@ copy traytunnel.toml.example traytunnel.toml
 | `user` | SSH 使用者 |
 | `proxyCommand` | ssh 的 `ProxyCommand`，不需要時留空字串 |
 | `closeToTray` | 關閉鈕（X）是否只隱藏到系統匣 |
-| `[[forwards]]` | 一組本地埠轉發，含 `name`、`local`、`remote` |
+| `[[forwards]]` | 一組本地埠轉發，含 `name`、`local`、`remote`、`enabled` |
 
-第一個 `[[forwards]]` 的 `local` 埠會用來判斷隧道是否連上：該埠進入 Listen 狀態即視為已連線。
+`[[forwards]]` 的欄位：
 
-也可以在程式裡按齒輪開啟設定介面編輯，存檔會寫回同一個檔案並保留你手寫的註解。
+| 欄位 | 說明 |
+| --- | --- |
+| `name` | 出口名稱，不可空白也不可含空格 |
+| `local` | 本地埠，同時是這個出口的唯一鍵，不可與其他出口重複（含停用中的） |
+| `remote` | 轉發目的地，格式 `host:port` |
+| `enabled` | 是否要保持連線；省略時視為 `true`，舊設定檔不用改也能直接用 |
+
+每個出口各自跑一條 `ssh`，並以自己的 `local` 埠是否進入 Listen 狀態判斷該出口是否連上。在介面上按連接／中斷會即時寫回對應的 `enabled`。
+
+也可以直接編輯這個檔案，或在程式介面裡改；存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單筆 `[[forwards]]` 上方的註解）。
 
 其他行為：
 
