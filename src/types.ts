@@ -1,4 +1,4 @@
-/** IPC 契約 v2 的型別定義，欄位名稱與 Rust 端逐字對齊。 */
+/** IPC 契約 v3 的型別定義，欄位名稱與 Rust 端逐字對齊（參數平鋪 camelCase）。 */
 
 /** 出口的連線狀態（六態） */
 export type ExitStatus =
@@ -32,14 +32,20 @@ export interface ExitInfo {
   detailText?: string | null;
 }
 
-export interface Snapshot {
+/** 一個 ssh 來源（一組 user@host + ProxyCommand），底下掛自己的出口 */
+export interface SourceInfo {
+  name: string;
   host: string;
   user: string;
   proxyCommand: string;
+  exits: ExitInfo[];
+}
+
+export interface Snapshot {
   closeToTray: boolean;
   autostart: boolean;
-  exits: ExitInfo[];
-  /** 活動日誌的整行（含時間戳），舊到新 */
+  sources: SourceInfo[];
+  /** 活動日誌的整行（含時間戳與 [源名] 前綴），舊到新 */
   logs: string[];
 }
 
@@ -58,8 +64,10 @@ export interface ExitTestEvent {
   text: string;
 }
 
-/** save_global 的輸入 */
-export interface GlobalInput {
+/** upsert_source 的輸入；originalName 為 null 代表新增 */
+export interface SourceInput {
+  originalName: string | null;
+  name: string;
   host: string;
   user: string;
   proxyCommand: string;
@@ -67,6 +75,8 @@ export interface GlobalInput {
 
 /** upsert_forward 的輸入；originalLocal 為 null 代表新增 */
 export interface ForwardInput {
+  /** 這個出口屬於哪個源（用源名稱指定） */
+  source: string;
   originalLocal: number | null;
   name: string;
   local: number;
