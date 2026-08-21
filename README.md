@@ -73,7 +73,7 @@ copy traytunnel.toml.example traytunnel.toml
 
 其他行為：
 
-- 舊版的 `traytunnel.json` 若還在，首次啟動會自動轉成 TOML，舊檔改名為 `traytunnel.json.bak`
 - 設定檔解析失敗時**不會被覆寫**，程式會另存一份 `traytunnel.toml.broken` 並改用預設值繼續執行
+- 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
 
 `traytunnel.toml` 為個人本機設定，已加入 `.gitignore`，不會被提交。

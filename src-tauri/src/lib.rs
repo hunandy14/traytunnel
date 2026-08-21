@@ -315,9 +315,6 @@ pub fn run() {
                 LoadOutcome::Created(_) => {
                     shared.log("config created with defaults, open Settings to edit");
                 }
-                LoadOutcome::Migrated(_) => {
-                    shared.log("config migrated from traytunnel.json");
-                }
                 LoadOutcome::Broken { backup, error, .. } => {
                     shared.log(format!("config unreadable ({error}), using defaults"));
                     match backup {

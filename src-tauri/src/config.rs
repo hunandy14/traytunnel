@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 pub const TOML_NAME: &str = "traytunnel.toml";
-pub const JSON_NAME: &str = "traytunnel.json";
-pub const JSON_BAK_NAME: &str = "traytunnel.json.bak";
 pub const BROKEN_NAME: &str = "traytunnel.toml.broken";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,8 +54,6 @@ pub enum LoadOutcome {
     Loaded(Config),
     /// 檔案不存在，已寫入預設值
     Created(Config),
-    /// 由舊的 traytunnel.json 轉換而來
-    Migrated(Config),
     /// 解析失敗，壞檔已備份，改用預設值且未覆寫原檔
     /// 解析或讀取失敗，改用預設值且未覆寫原檔；backup 只在確實備份成功時有值
     Broken { config: Config, backup: Option<PathBuf>, error: String },
@@ -68,7 +64,6 @@ impl LoadOutcome {
         match self {
             LoadOutcome::Loaded(c)
             | LoadOutcome::Created(c)
-            | LoadOutcome::Migrated(c)
             | LoadOutcome::Broken { config: c, .. } => c,
         }
     }
@@ -104,7 +99,7 @@ pub fn default_document() -> String {
     )
 }
 
-/// 從指定資料夾讀設定，必要時做 json→toml 遷移。
+/// 從指定資料夾讀設定，檔案不存在就寫一份預設值。
 pub fn load_from_dir(dir: &Path) -> LoadOutcome {
     let toml_path = dir.join(TOML_NAME);
 
@@ -119,21 +114,14 @@ pub fn load_from_dir(dir: &Path) -> LoadOutcome {
         };
     }
 
-    // 舊版 json 設定：轉換一次，並把舊檔改名保存
-    let json_path = dir.join(JSON_NAME);
-    if json_path.exists() {
-        if let Ok(raw) = std::fs::read_to_string(&json_path) {
-            if let Some(cfg) = parse_legacy_json(&raw) {
-                let _ = write_config(dir, &cfg);
-                let _ = std::fs::rename(&json_path, dir.join(JSON_BAK_NAME));
-                return LoadOutcome::Migrated(cfg);
-            }
-        }
-    }
-
     let cfg = Config::default();
     let _ = std::fs::write(&toml_path, default_document());
     LoadOutcome::Created(cfg)
+}
+
+/// 用 PowerShell 之類的工具存檔可能會帶 UTF-8 BOM，解析前先剝掉。
+fn strip_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
 fn broken(dir: &Path, toml_path: &Path, error: String) -> LoadOutcome {
@@ -144,7 +132,7 @@ fn broken(dir: &Path, toml_path: &Path, error: String) -> LoadOutcome {
 }
 
 pub fn parse_config(raw: &str) -> Result<Config, String> {
-    let doc: DocumentMut = raw.parse::<DocumentMut>().map_err(|e| e.to_string())?;
+    let doc: DocumentMut = strip_bom(raw).parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let cfg: Config = toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
     if cfg.host.trim().is_empty() || cfg.user.trim().is_empty() {
         return Err("host 與 user 不可為空".into());
@@ -157,7 +145,7 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     let path = dir.join(TOML_NAME);
     let mut doc = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|s| s.parse::<DocumentMut>().ok())
+        .and_then(|s| strip_bom(&s).parse::<DocumentMut>().ok())
         .unwrap_or_else(|| default_document().parse::<DocumentMut>().unwrap());
 
     doc["host"] = value(cfg.host.as_str());
@@ -176,40 +164,6 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     doc["forwards"] = Item::ArrayOfTables(tables);
 
     std::fs::write(path, doc.to_string())
-}
-
-/// 舊版 json 設定的寬鬆解析，local 允許數字或字串。
-fn parse_legacy_json(raw: &str) -> Option<Config> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let host = s("host");
-    let user = s("user");
-    if host.is_empty() || user.is_empty() {
-        return None;
-    }
-    let mut forwards = Vec::new();
-    if let Some(arr) = v.get("forwards").and_then(|x| x.as_array()) {
-        for f in arr {
-            let name = f.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let remote = f.get("remote").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let local = match f.get("local") {
-                Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u16,
-                Some(serde_json::Value::String(t)) => t.parse::<u16>().unwrap_or(0),
-                _ => 0,
-            };
-            if name.is_empty() || remote.is_empty() || local == 0 {
-                continue;
-            }
-            forwards.push(Forward { name, local, remote });
-        }
-    }
-    Some(Config {
-        host,
-        user,
-        proxy_command: s("proxyCommand"),
-        close_to_tray: v.get("closeToTray").and_then(|x| x.as_bool()).unwrap_or(true),
-        forwards,
-    })
 }
 
 /// 由設定介面的多行文字解析 forwards，格式為「name local remote」。
@@ -324,28 +278,46 @@ remote = "127.0.0.1:1080"
         assert_eq!(again.config(), &Config::default());
     }
 
+    /// PowerShell 5 存檔會帶 UTF-8 BOM，不能因此就把設定當成壞檔
     #[test]
-    fn migrates_legacy_json() {
-        let dir = tmp_dir("migrate");
+    fn parses_toml_with_utf8_bom() {
+        let raw = "\u{feff}host = \"bom.example.com\"\nuser = \"bob\"\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n";
+        let cfg = parse_config(raw).unwrap();
+        assert_eq!(cfg.host, "bom.example.com");
+        assert_eq!(cfg.forwards.len(), 1);
+    }
+
+    #[test]
+    fn loads_bom_file_from_disk_without_treating_it_as_broken() {
+        let dir = tmp_dir("bom");
         std::fs::write(
-            dir.join(JSON_NAME),
-            r#"{"host":"old.example.com","user":"alice","proxyCommand":"cloudflared access ssh --hostname %h","closeToTray":false,
-                "forwards":[{"name":"exit-a","local":1080,"remote":"127.0.0.1:1080"}]}"#,
+            dir.join(TOML_NAME),
+            "\u{feff}host = \"bom.example.com\"\nuser = \"bob\"\nproxyCommand = \"\"\ncloseToTray = false\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n",
         )
         .unwrap();
         let out = load_from_dir(&dir);
-        assert!(matches!(out, LoadOutcome::Migrated(_)));
-        let cfg = out.config();
-        assert_eq!(cfg.host, "old.example.com");
-        assert_eq!(cfg.user, "alice");
-        assert!(!cfg.close_to_tray);
-        assert_eq!(cfg.forwards.len(), 1);
-        assert!(dir.join(TOML_NAME).exists());
-        assert!(!dir.join(JSON_NAME).exists());
-        assert!(dir.join(JSON_BAK_NAME).exists());
-        // 轉出來的 toml 要能被自己讀回來
-        let again = load_from_dir(&dir);
-        assert_eq!(again.config(), cfg);
+        assert!(matches!(out, LoadOutcome::Loaded(_)));
+        assert_eq!(out.config().host, "bom.example.com");
+        assert!(!out.config().close_to_tray);
+        // 不該產生壞檔備份
+        assert!(!dir.join(BROKEN_NAME).exists());
+    }
+
+    /// 帶 BOM 的檔案存檔後也要保留註解，不能退回預設模板
+    #[test]
+    fn write_keeps_comments_of_bom_file() {
+        let dir = tmp_dir("bom-write");
+        std::fs::write(
+            dir.join(TOML_NAME),
+            "\u{feff}# 保留我\nhost = \"a\"\nuser = \"b\"\nproxyCommand = \"\"\ncloseToTray = true\n",
+        )
+        .unwrap();
+        let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+        cfg.host = "c.example.com".into();
+        write_config(&dir, &cfg).unwrap();
+        let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+        assert!(saved.contains("# 保留我"));
+        assert!(saved.contains("c.example.com"));
     }
 
     #[test]
