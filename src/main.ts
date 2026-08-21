@@ -33,6 +33,17 @@ function color(kind: string): string {
   }
 }
 
+let renderedForwards = "";
+
+/** 只在 forwards 真的變動時重建卡片，避免切換其他設定時清掉自測結果 */
+function applyConfig(cfg: Config) {
+  statusSub.textContent = `ssh ${cfg.user}@${cfg.host}`;
+  const signature = JSON.stringify(cfg.forwards);
+  if (signature === renderedForwards) return;
+  renderedForwards = signature;
+  renderCards(cfg);
+}
+
 function renderCards(cfg: Config) {
   cards.textContent = "";
   dots.clear();
@@ -123,7 +134,7 @@ function applyRunState(on: boolean) {
 
 async function init() {
   const snap = await invoke<Snapshot>("get_state");
-  renderCards(snap.config);
+  applyConfig(snap.config);
   applyStatus(snap.status);
   applyRunState(snap.wantRun);
   for (const line of snap.logs) appendLog(line);
@@ -132,7 +143,7 @@ async function init() {
   await listen<string>("log", (e) => appendLog(e.payload));
   await listen<StatusPayload>("status", (e) => applyStatus(e.payload));
   await listen<ExitPayload>("exit", (e) => applyExit(e.payload));
-  await listen<Config>("config", (e) => renderCards(e.payload));
+  await listen<Config>("config", (e) => applyConfig(e.payload));
   await listen<boolean>("run-state", (e) => applyRunState(e.payload));
 }
 

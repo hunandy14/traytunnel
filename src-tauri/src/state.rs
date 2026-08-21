@@ -86,9 +86,9 @@ impl AppState {
         self.cfg.lock().unwrap().clone()
     }
 
+    /// 更新設定並通知前端，出口卡片狀態由呼叫端決定要不要重設
     pub fn set_config(&self, cfg: Config) {
         *self.cfg.lock().unwrap() = cfg.clone();
-        self.reset_exits();
         let _ = self.app.emit("config", cfg);
     }
 

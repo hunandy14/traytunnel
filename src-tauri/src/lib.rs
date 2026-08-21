@@ -191,6 +191,7 @@ fn save_config(app: AppHandle, state: State<'_, Shared>, input: SettingsInput) -
     config::write_config(&st.dir, &cfg).map_err(|e| format!("Failed to save settings:\n{e}"))?;
     let count = cfg.forwards.len();
     st.set_config(cfg);
+    st.reset_exits();
     apply_window_size(&app, count);
     st.log("config saved, restarting tunnel");
     tunnel::restart(&st);
