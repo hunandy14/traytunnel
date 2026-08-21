@@ -1,0 +1,18 @@
+{
+    "host":  "your-host.example.com",
+    "user":  "your-user",
+    "proxyCommand":  "cloudflared access ssh --hostname %h",
+    "closeToTray":  true,
+    "forwards":  [
+                     {
+                         "name":  "exit-a",
+                         "local":  1080,
+                         "remote":  "127.0.0.1:1080"
+                     },
+                     {
+                         "name":  "exit-b",
+                         "local":  1083,
+                         "remote":  "127.0.0.1:1083"
+                     }
+                 ]
+}
