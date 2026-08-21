@@ -1,18 +1,36 @@
-/* 深色主題，配色沿用原本 PowerShell 版的 ARGB 值 */
+/*
+ * VS Code "Modern UI / floating panels" 的設計語言：
+ * 統一深底上放浮動卡片，層次靠亮度階梯（底 ~11% → 卡片 ~17% → 覆蓋層 ~22% →
+ * toast ~26% L）加 1px 淡邊框做出來，完全不用陰影。間距走 4px 格。
+ */
+
 :root {
-  --bg: #181a1f;          /* 24,26,31 */
-  --title: #131519;       /* 19,21,25 */
-  --card: #22252c;        /* 34,37,44 */
-  --log-bg: #131519;
-  --text: #e6e7eb;        /* 230,231,235 */
-  --muted: #8a8e98;       /* 138,142,152 */
-  --accent: #2dd4a7;      /* 45,212,167 */
-  --accent-hover: #4adebb;/* 74,222,187 */
-  --amber: #fbbf24;       /* 251,191,36 */
-  --red: #f87171;         /* 248,113,113 */
-  --btn: #2d313a;         /* 45,49,58 */
-  --btn-hover: #3a3f4a;   /* 58,63,74 */
-  --close-hover: #c42b1c; /* 196,43,28 */
+  --bg: #181a1f; /* L ≈ 11% */
+  --panel: #272a31; /* L ≈ 17% */
+  --sunken: #1e2026; /* 輸入框／日誌這種凹下去的面 */
+  --overlay: #34373f; /* L ≈ 22% */
+  --toast: #3d4149; /* L ≈ 26% */
+
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.12);
+  --line-dashed: rgba(255, 255, 255, 0.16);
+
+  --text: #e6e7eb;
+  --muted: #8a8e98;
+
+  --accent: #2dd4a7;
+  --accent-hover: #4adebb;
+  --accent-ink: #0e2620;
+
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --red: #f04438;
+
+  --hover: rgba(255, 255, 255, 0.06);
+  --hover-strong: rgba(255, 255, 255, 0.11);
+  --close-hover: #c42b1c;
+
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 * {
@@ -27,6 +45,8 @@ body {
 }
 
 body {
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font-family: "Segoe UI", system-ui, sans-serif;
@@ -37,22 +57,27 @@ body {
   -webkit-user-select: none;
 }
 
-/* ------------------------------------------------------------ 標題列 */
+.mono,
+.card-route,
+.log-box,
+.summary-sub {
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+
+/* ------------------------------------------------------------ 標題列
+   高密度區：透明貼底、不做卡片化，只有按鈕帶小圓角 */
 
 .titlebar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 36px;
-  background: var(--title);
+  flex: none;
+  height: 34px;
   display: flex;
   align-items: center;
+  background: transparent;
 }
 
 .titlebar .app-icon {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   margin-left: 12px;
   pointer-events: none;
 }
@@ -60,311 +85,381 @@ body {
 .titlebar .app-title {
   margin-left: 8px;
   flex: 1;
-  font-weight: 600;
   font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
   pointer-events: none;
 }
 
 .tbtn {
-  width: 44px;
-  height: 36px;
+  width: 34px;
+  height: 26px;
+  margin-right: 4px;
   border: 0;
-  background: var(--title);
-  color: var(--text);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
   font-family: "Segoe MDL2 Assets";
-  font-size: 12px;
+  font-size: 10px;
   cursor: default;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
 
 .tbtn:hover {
-  background: var(--btn-hover);
+  background: var(--hover-strong);
+  color: var(--text);
 }
 
 .tbtn.close:hover {
   background: var(--close-hover);
+  color: #fff;
 }
 
-/* ------------------------------------------------------------ 主視窗 */
+/* ------------------------------------------------------------ 版面 */
 
-.status-dot {
-  position: absolute;
-  left: 18px;
-  top: 56px;
-  width: 30px;
-  height: 32px;
-  font-size: 21px;
-  line-height: 32px;
+.page {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 12px 12px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.section-label {
+  margin: 16px 0 8px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.status-text {
-  position: absolute;
-  left: 50px;
-  top: 52px;
-  width: 190px;
-  height: 28px;
-  line-height: 28px;
-  font-size: 19px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
+/* ------------------------------------------------------------ 狀態點 */
+
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background 150ms var(--ease);
 }
 
-.status-sub {
-  position: absolute;
-  left: 52px;
-  top: 81px;
-  width: 240px;
-  height: 18px;
-  line-height: 18px;
+.dot.tone-grey {
+  background: #5b6069;
+}
+
+.dot.tone-green {
+  background: var(--green);
+}
+
+.dot.tone-amber {
+  background: var(--amber);
+}
+
+.dot.tone-red {
+  background: var(--red);
+}
+
+/* ------------------------------------------------------------ 彙總列 */
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 14px 14px 16px;
+}
+
+.summary .dot {
+  width: 10px;
+  height: 10px;
+}
+
+.summary-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.summary-title {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.summary-sub {
+  margin-top: 2px;
+  font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.summary-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ------------------------------------------------------------ 按鈕 */
+
 .iconbtn {
-  position: absolute;
-  top: 58px;
   width: 30px;
-  height: 32px;
-  border: 0;
-  background: var(--btn);
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--hover);
   color: var(--text);
   font-family: "Segoe MDL2 Assets";
-  font-size: 15px;
+  font-size: 13px;
   cursor: pointer;
+  transition: background 130ms var(--ease), border-color 130ms var(--ease);
 }
 
 .iconbtn:hover {
-  background: var(--btn-hover);
+  background: var(--hover-strong);
+  border-color: var(--line-strong);
 }
 
-#btn-settings {
-  left: 350px;
+.iconbtn.sm {
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
 }
 
-#btn-retest {
-  left: 384px;
+.iconbtn.go {
+  color: var(--accent);
 }
 
-#btn-toggle {
-  left: 418px;
+.iconbtn.danger {
   color: var(--red);
 }
 
-.section {
-  position: absolute;
-  left: 20px;
-  height: 18px;
-  line-height: 18px;
-  font-size: 11px;
-  color: var(--muted);
+.btn {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--hover);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 130ms var(--ease), border-color 130ms var(--ease),
+    color 130ms var(--ease);
 }
 
-#section-exits {
-  top: 116px;
+.btn.sm {
+  height: 24px;
+  padding: 0 10px;
 }
 
-#cards {
-  position: absolute;
-  left: 18px;
-  top: 138px;
-  width: 428px;
+.btn.ghost {
+  border-color: var(--line-strong);
+}
+
+.btn.ghost:hover {
+  background: var(--hover-strong);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.btn.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn.danger-ghost {
+  background: transparent;
+  border-color: rgba(240, 68, 56, 0.35);
+  color: var(--red);
+}
+
+.btn.danger-ghost:hover {
+  background: rgba(240, 68, 56, 0.14);
+  border-color: rgba(240, 68, 56, 0.55);
+}
+
+/* ------------------------------------------------------------ 出口卡片 */
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .card {
-  position: relative;
-  width: 428px;
-  height: 58px;
-  margin-bottom: 10px;
-  background: var(--card);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 12px 12px 14px;
+  transition: border-color 130ms var(--ease);
 }
 
-.card .dot {
-  position: absolute;
-  left: 14px;
-  top: 17px;
-  width: 22px;
-  height: 24px;
-  line-height: 24px;
-  font-size: 15px;
-  color: var(--muted);
+.card:hover {
+  border-color: var(--line-strong);
 }
 
-.card .name {
-  position: absolute;
-  left: 42px;
-  top: 10px;
-  width: 150px;
-  height: 20px;
-  line-height: 20px;
+.card.editing {
+  border-color: var(--line-strong);
+}
+
+.card-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-id {
+  flex: 1;
+  min-width: 0;
+}
+
+.card-name {
   font-size: 13px;
   font-weight: 600;
+  line-height: 17px;
   white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.card .port {
-  position: absolute;
-  left: 42px;
-  top: 32px;
-  width: 180px;
-  height: 16px;
-  line-height: 16px;
-  font-family: Consolas, monospace;
+.card-route {
+  margin-top: 2px;
   font-size: 11px;
-  color: var(--muted);
-}
-
-.card .result {
-  position: absolute;
-  left: 198px;
-  top: 19px;
-  width: 216px;
-  height: 20px;
-  line-height: 20px;
-  text-align: right;
+  line-height: 14px;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* ACTIVITY 兩塊的 top 會由 JS 依出口數量重算，這裡先給預設值（兩個出口的版面），
-   否則萬一 JS 沒跑起來，不透明的日誌區會落在 y=0 把整個畫面蓋掉 */
-#section-log {
-  top: 278px;
+/* 自測結果沿用原版「ip  city, country」的兩個空白，所以要 pre 不能塌掉 */
+.card-test {
+  flex: none;
+  max-width: 168px;
+  font-size: 11px;
+  text-align: right;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-#log-panel {
-  position: absolute;
-  left: 18px;
-  top: 300px;
-  width: 428px;
-  height: 132px;
-  background: var(--log-bg);
+.tone-text-muted {
+  color: var(--muted);
 }
 
-#log-box {
-  position: absolute;
-  left: 10px;
-  top: 8px;
-  right: 2px;
-  bottom: 8px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  font-family: Consolas, monospace;
+.tone-text-text {
+  color: var(--text);
+}
+
+.tone-text-red {
+  color: var(--red);
+}
+
+.card-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.card-detail {
+  display: none;
+  margin: 8px 0 0 18px;
   font-size: 11px;
   line-height: 15px;
-  color: var(--muted);
-  white-space: pre-wrap;
-  word-break: break-word;
-  user-select: text;
-  -webkit-user-select: text;
+  color: var(--red);
 }
 
-/* 細捲軸，樣式比照原版自繪的 6px 拉桿 */
-#log-box::-webkit-scrollbar,
-textarea::-webkit-scrollbar {
-  width: 10px;
+.card-detail.show {
+  display: block;
 }
 
-#log-box::-webkit-scrollbar-track,
-textarea::-webkit-scrollbar-track {
-  background: transparent;
+/* ------------------------------------------------------------ 就地編輯 */
+
+.card-edit {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 220ms var(--ease);
 }
 
-#log-box::-webkit-scrollbar-thumb,
-textarea::-webkit-scrollbar-thumb {
-  background: var(--btn);
-  border: 2px solid transparent;
-  background-clip: padding-box;
+.card.editing .card-edit {
+  grid-template-rows: 1fr;
 }
 
-#log-box::-webkit-scrollbar-thumb:hover,
-textarea::-webkit-scrollbar-thumb:hover {
-  background: var(--btn-hover);
-  background-clip: padding-box;
+.card-edit-inner {
+  min-height: 0;
+  overflow: hidden;
 }
 
-/* ------------------------------------------------------------ 設定視窗 */
-
-/* 設定視窗的絕對座標，沿用原版 dialog 的版面 */
-#sec-connection {
-  top: 50px;
+.card.editing .card-edit-inner {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
 }
 
-#sec-forwards {
-  top: 190px;
+.card.new .card-edit-inner {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 
-#sec-behavior {
-  top: 372px;
+.edit-grid {
+  display: grid;
+  grid-template-columns: 1fr 104px 1.25fr;
+  gap: 8px;
 }
 
-#lbl-host {
-  top: 78px;
+.edit-field,
+.sheet-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
-#fld-host {
-  top: 72px;
-}
-
-#lbl-user {
-  top: 114px;
-}
-
-#fld-user {
-  top: 108px;
-}
-
-#lbl-proxy {
-  top: 150px;
-}
-
-#fld-proxy {
-  top: 144px;
-}
-
-#tg-autostart {
-  top: 392px;
-}
-
-#lbl-autostart {
-  top: 396px;
-}
-
-#tg-close {
-  top: 424px;
-}
-
-#lbl-close {
-  top: 428px;
-}
-
-.field-label {
-  position: absolute;
-  left: 20px;
-  width: 96px;
-  height: 20px;
-  line-height: 20px;
+.edit-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.field {
-  position: absolute;
-  left: 120px;
-  width: 296px;
-  height: 30px;
-  background: var(--card);
-  border: 1px solid var(--btn);
+.input {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  background: var(--sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  transition: border-color 130ms var(--ease);
 }
 
-.field:focus-within {
+.input:focus-within {
   border-color: var(--accent);
 }
 
-.field input {
+.input.invalid {
+  border-color: var(--red);
+}
+
+.input input {
   width: 100%;
   height: 100%;
   padding: 0 8px;
@@ -374,60 +469,193 @@ textarea::-webkit-scrollbar-thumb:hover {
   color: var(--text);
   font-family: "Segoe UI", system-ui, sans-serif;
   font-size: 12px;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
-.hint {
-  position: absolute;
-  left: 20px;
-  top: 208px;
-  width: 396px;
-  height: 16px;
-  line-height: 16px;
-  font-family: Consolas, monospace;
-  font-size: 11px;
-  color: var(--muted);
+.input input.mono {
+  font-family: Consolas, "Cascadia Mono", monospace;
 }
 
-.fwd-wrap {
-  position: absolute;
-  left: 20px;
-  top: 228px;
-  width: 396px;
-  height: 128px;
-  background: var(--card);
-  border: 1px solid var(--btn);
+.input input::placeholder {
+  color: #61656e;
 }
 
-.fwd-wrap:focus-within {
-  border-color: var(--accent);
+.field-error {
+  display: none;
+  font-size: 10.5px;
+  line-height: 14px;
+  color: var(--red);
 }
 
-.fwd-wrap textarea {
-  position: absolute;
-  left: 8px;
-  top: 6px;
-  width: 378px;
-  height: 114px;
-  border: 0;
-  outline: none;
-  resize: none;
+.field-error.show {
+  display: block;
+}
+
+.field-error.general {
+  margin-top: 8px;
+}
+
+.edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.edit-actions .spacer {
+  flex: 1;
+}
+
+/* ------------------------------------------------------------ ghost card */
+
+.ghost-card {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 40px;
+  border: 1px dashed var(--line-dashed);
+  border-radius: 8px;
   background: transparent;
+  color: var(--muted);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 130ms var(--ease), border-color 130ms var(--ease),
+    background 130ms var(--ease);
+}
+
+.ghost-card:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--accent);
   color: var(--text);
-  font-family: Consolas, monospace;
-  font-size: 13px;
-  line-height: 18px;
-  white-space: pre;
-  overflow: auto;
+}
+
+.ghost-plus {
+  font-size: 15px;
+  line-height: 15px;
+}
+
+/* ------------------------------------------------------------ 活動日誌 */
+
+.log-panel {
+  padding: 10px 4px 10px 12px;
+}
+
+.log-box {
+  height: 140px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+
+/* ------------------------------------------------------------ 設定 sheet */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 180ms var(--ease);
+}
+
+.sheet-backdrop[hidden] {
+  display: none;
+}
+
+.sheet-backdrop.open {
+  opacity: 1;
+}
+
+.sheet {
+  width: 420px;
+  max-width: calc(100% - 48px);
+  background: var(--overlay);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  transform: scale(0.96);
+  transition: transform 180ms var(--ease);
+}
+
+.sheet-backdrop.open .sheet {
+  transform: scale(1);
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  padding: 10px 8px 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sheet-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sheet-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+}
+
+.sheet-divider {
+  height: 1px;
+  margin: 2px 0;
+  background: var(--line);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .toggle {
-  position: absolute;
-  left: 20px;
-  width: 44px;
-  height: 24px;
-  border-radius: 12px;
-  background: var(--btn);
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.16);
   cursor: pointer;
+  transition: background 140ms var(--ease);
 }
 
 .toggle.on {
@@ -439,96 +667,93 @@ textarea::-webkit-scrollbar-thumb:hover {
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   background: #fff;
-  transition: left 0.12s ease;
+  transition: left 140ms var(--ease);
 }
 
 .toggle.on::after {
-  left: 23px;
+  left: 19px;
 }
 
-.toggle-label {
-  position: absolute;
-  left: 74px;
-  width: 320px;
-  height: 20px;
-  line-height: 20px;
-  color: var(--text);
-  cursor: pointer;
-}
-
-.btn {
-  position: absolute;
-  height: 34px;
-  border: 0;
-  background: var(--btn);
-  color: var(--text);
-  font-family: "Segoe UI", system-ui, sans-serif;
+.toggle-name {
   font-size: 12px;
-  cursor: pointer;
 }
 
-.btn:hover {
-  background: var(--btn-hover);
+.toggle-hint {
+  margin-top: 1px;
+  font-size: 10.5px;
+  color: var(--muted);
 }
 
-.btn.primary {
-  background: var(--accent);
-  color: var(--bg);
-  font-weight: 600;
+.sheet-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
 }
 
-.btn.primary:hover {
-  background: var(--accent-hover);
-}
+/* ------------------------------------------------------------ undo toast */
 
-#btn-save {
-  left: 258px;
-  top: 466px;
-  width: 76px;
-}
-
-#btn-cancel {
-  left: 342px;
-  top: 466px;
-  width: 74px;
-}
-
-/* 取代原版 MessageBox 的訊息面板 */
-.msgbox {
-  position: absolute;
+.toast-stack {
+  position: fixed;
   left: 0;
   right: 0;
-  top: 36px;
-  bottom: 0;
-  background: rgba(24, 26, 31, 0.88);
-  display: none;
-  align-items: center;
-  justify-content: center;
-}
-
-.msgbox.show {
+  bottom: 14px;
+  z-index: 60;
   display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
 }
 
-.msgbox .panel {
-  width: 360px;
-  background: var(--card);
-  padding: 16px;
+.toast {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 268px;
+  padding: 9px 10px 9px 14px;
+  overflow: hidden;
+  background: var(--toast);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 160ms var(--ease), transform 160ms var(--ease);
 }
 
-.msgbox .text {
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin-bottom: 14px;
-  color: var(--text);
+.toast.in {
+  opacity: 1;
+  transform: translateY(0);
 }
 
-.msgbox .btn {
-  position: static;
-  width: 76px;
-  float: right;
+.toast-text {
+  flex: 1;
+  font-size: 12px;
+}
+
+.toast-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  animation: toast-countdown 5s linear forwards;
+}
+
+@keyframes toast-countdown {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
 }

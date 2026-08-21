@@ -16,18 +16,76 @@
       <button class="tbtn close" id="btn-close" title="Close">&#xE8BB;</button>
     </div>
 
-    <div class="status-dot" id="status-dot">&#x25CF;</div>
-    <div class="status-text" id="status-text">Starting...</div>
-    <div class="status-sub" id="status-sub">ssh tunnel</div>
+    <main class="page">
+      <section class="panel summary">
+        <span class="dot tone-grey" id="summary-dot"></span>
+        <div class="summary-text">
+          <div class="summary-title" id="summary-title">Starting…</div>
+          <div class="summary-sub" id="summary-sub">ssh tunnel</div>
+        </div>
+        <div class="summary-actions">
+          <button class="iconbtn" id="btn-settings" title="Global settings">&#xE713;</button>
+          <button class="iconbtn" id="btn-retest" title="Test all exits">&#xE72C;</button>
+          <button class="iconbtn go" id="btn-toggle-all" title="Start all">&#xE768;</button>
+        </div>
+      </section>
 
-    <button class="iconbtn" id="btn-settings" title="Settings">&#xE713;</button>
-    <button class="iconbtn" id="btn-retest" title="Retest exits">&#xE72C;</button>
-    <button class="iconbtn" id="btn-toggle" title="Stop">&#xE71A;</button>
+      <h2 class="section-label">Exit nodes</h2>
+      <div class="cards" id="cards"></div>
 
-    <div class="section" id="section-exits">EXIT NODES</div>
-    <div id="cards"></div>
+      <h2 class="section-label">Activity</h2>
+      <div class="panel log-panel"><div class="log-box" id="log-box"></div></div>
+    </main>
 
-    <div class="section" id="section-log">ACTIVITY</div>
-    <div id="log-panel"><div id="log-box"></div></div>
+    <!-- 全域設定的置中 sheet -->
+    <div class="sheet-backdrop" id="sheet-backdrop" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="Global settings">
+        <header class="sheet-head">
+          <span class="sheet-title">Global settings</span>
+          <button class="tbtn" id="sheet-close" title="Close">&#xE8BB;</button>
+        </header>
+
+        <div class="sheet-body">
+          <label class="sheet-field">
+            <span class="edit-label">Host</span>
+            <span class="input"><input id="in-host" spellcheck="false" placeholder="ssh.example.com" /></span>
+          </label>
+          <label class="sheet-field">
+            <span class="edit-label">User</span>
+            <span class="input"><input id="in-user" spellcheck="false" placeholder="ubuntu" /></span>
+          </label>
+          <label class="sheet-field">
+            <span class="edit-label">ProxyCommand</span>
+            <span class="input"><input id="in-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
+          </label>
+
+          <div class="field-error" id="sheet-error"></div>
+
+          <div class="sheet-divider"></div>
+
+          <div class="toggle-row">
+            <button class="toggle" id="tg-close" role="switch" aria-checked="false"></button>
+            <div class="toggle-text">
+              <div class="toggle-name">Close to tray</div>
+              <div class="toggle-hint">Keep running in the notification area</div>
+            </div>
+          </div>
+          <div class="toggle-row">
+            <button class="toggle" id="tg-autostart" role="switch" aria-checked="false"></button>
+            <div class="toggle-text">
+              <div class="toggle-name">Start with Windows</div>
+              <div class="toggle-hint">Launch Traytunnel at sign-in</div>
+            </div>
+          </div>
+        </div>
+
+        <footer class="sheet-foot">
+          <button class="btn ghost" id="btn-sheet-cancel">Cancel</button>
+          <button class="btn primary" id="btn-sheet-save">Save</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="toast-stack" id="toasts"></div>
   </body>
 </html>
