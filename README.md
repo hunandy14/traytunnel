@@ -12,7 +12,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 隧道的 Connect／Disconnect 選擇會寫回設定檔的 `enabled`，下次啟動只自動連線 `enabled` 的隧道（所有連線一起）
 - 斷線後固定 5 秒重連，無退避、無次數上限，每條隧道自己數自己的
 - 本地埠衝突三層防護：設定階段擋重複埠（跨連線也擋，訊息會點名佔用者與它所屬的連線）、spawn 前偵測埠是否已被其他程序佔用（狀態顯示 `port_busy`，每 5 秒重查而不盲目 spawn），最後由 ssh 的 `ExitOnForwardFailure=yes` 兜底
-- 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地
+- 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地（此功能會經隧道向第三方服務 ipinfo.io 發出請求）
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
 - 單一實例：重複啟動只會把既有的主視窗叫出來
 - 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Test all`，多組連線時每組收成一個子選單（底下有 `Test connectivity`）
@@ -175,3 +175,7 @@ copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
 - 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
 
 設定檔為個人本機設定，`traytunnel.toml` 已加入 `.gitignore`，不會被提交。
+
+## 授權
+
+MIT License，詳見 [LICENSE](LICENSE)。

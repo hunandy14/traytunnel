@@ -3,6 +3,7 @@ name = "traytunnel"
 version = "0.4.0"
 description = "Windows 系統匣 SSH 隧道管理工具"
 authors = ["Charlotte.HonG"]
+license = "MIT"
 edition = "2021"
 
 [lib]
