@@ -33,6 +33,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -44,6 +45,16 @@ jobs:
 
       - name: Build frontend (tsc + vite)
         run: npm run build
+
+      # 排版與 lint 擋在測試之前：這兩關失敗的修法都是機械式的，
+      # 不必等一輪測試跑完才知道。
+      # clippy 一定要排在「Build frontend」之後——tauri 的 generate_context!
+      # 會把 ../dist 的前端產物嵌進去，dist 不存在的話連 check 都過不了。
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Run clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
