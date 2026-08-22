@@ -188,7 +188,7 @@ function renderRail() {
     list.appendChild(btn);
   }
 
-  const add = h("button", { class: "rail-btn add", text: "+", title: "Add source" });
+  const add = h("button", { class: "rail-btn add", text: "+", title: "Add connection" });
   add.addEventListener("click", () => openSourceSheet(null));
   list.appendChild(add);
 
