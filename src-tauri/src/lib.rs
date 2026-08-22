@@ -165,6 +165,9 @@ fn enable_exit(st: &Shared, local: u16) {
         }
     }) {
         report_save_error(st, e);
+        // 存檔失敗代表 enabled 沒改成，但系統匣的勾選已經被原生選單自己翻掉了，
+        // 重建一次把它拉回設定裡的真值
+        st.refresh_tray();
         return;
     }
     st.emit_config_changed();
@@ -182,6 +185,8 @@ fn disable_exit(st: &Shared, local: u16) {
         }
     }) {
         report_save_error(st, e);
+        // 同上：勾選已被原生選單翻掉，設定卻沒改成，重建把它拉回真值
+        st.refresh_tray();
         return;
     }
     tunnel::halt(st, local);
@@ -754,6 +759,8 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
         traymenu::ID_EXIT => do_exit(st),
         traymenu::ID_ALL_TOGGLE => toggle_all(st),
         traymenu::ID_TEST_ALL => tunnel::test_connected(st),
+        // 狀態行是停用的，照理點不到，真收到也是什麼都不做
+        traymenu::ID_STATUS => {}
         _ => {
             if let Some(local) = id.strip_prefix(traymenu::EXIT_PREFIX).and_then(|p| p.parse().ok())
             {
@@ -762,6 +769,8 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
                 if require_source(st, name) {
                     tunnel::test_source(st, name);
                 }
+            } else {
+                log::warn!("unhandled tray menu id: {id}");
             }
         }
     }
@@ -772,7 +781,11 @@ fn toggle_exit(st: &Shared, local: u16) {
     match st.config().forward(local) {
         Some(f) if f.enabled => disable_exit(st, local),
         Some(_) => enable_exit(st, local),
-        None => st.log(format!("port {local} : no such exit")),
+        // 選單比設定舊了（出口已經被刪掉），重建一次讓它跟上
+        None => {
+            st.log(format!("port {local} : no such exit"));
+            st.refresh_tray();
+        }
     }
 }
 

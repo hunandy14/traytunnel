@@ -53,17 +53,33 @@ fn all_exits(sources: &[SourceView]) -> impl Iterator<Item = &ExitView> {
     sources.iter().flat_map(|s| s.exits.iter())
 }
 
+/// 連線數與出口總數，跨源彙總。提示文字與狀態行共用這一組分數，
+/// hover 與右鍵才不會給出兩個不一樣的分母。
+fn totals(sources: &[SourceView]) -> (usize, usize) {
+    let connected = all_exits(sources).filter(|e| e.status == status::CONNECTED).count();
+    (connected, all_exits(sources).count())
+}
+
 /// 狀態行：連線數／出口總數，跟主視窗的彙總列同一套算法
 fn status_line(sources: &[SourceView]) -> String {
     if sources.is_empty() {
         return "No sources".into();
     }
-    let total = all_exits(sources).count();
+    let (connected, total) = totals(sources);
     if total == 0 {
         return "No exits".into();
     }
-    let connected = all_exits(sources).filter(|e| e.status == status::CONNECTED).count();
     format!("{connected}/{total} Connected")
+}
+
+/// 系統匣的 hover 提示，分數與狀態行同一份
+fn tooltip_text(sources: &[SourceView]) -> String {
+    let (connected, total) = totals(sources);
+    if total == 0 {
+        "Traytunnel - no exits".to_string()
+    } else {
+        format!("Traytunnel - {connected}/{total} connected")
+    }
 }
 
 /// 有任何出口 enabled 就給 Stop all，全停時給 Start all
@@ -129,6 +145,18 @@ pub fn menu_model(sources: &[SourceView]) -> Vec<Node> {
     join(sections)
 }
 
+/// 一次要換上系統匣的全部東西。提示與選單出自同一份快照，也一起套用，
+/// 免得連線風暴時兩者各跑各的、還各自來回主執行緒一趟。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayView {
+    pub tooltip: String,
+    pub menu: Vec<Node>,
+}
+
+pub fn tray_view(sources: &[SourceView]) -> TrayView {
+    TrayView { tooltip: tooltip_text(sources), menu: menu_model(sources) }
+}
+
 // ---------------------------------------------------------------- 貼到系統匣
 
 type Items = Vec<Box<dyn IsMenuItem<Wry>>>;
@@ -176,32 +204,40 @@ pub fn build(app: &AppHandle, nodes: &[Node]) -> tauri::Result<Menu<Wry>> {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static APPLY: Mutex<()> = Mutex::new(());
 
-/// 重建整份選單並換上系統匣。
+/// 配一張套用號碼牌。
 ///
-/// 模型在呼叫端的執行緒上就算好（純函式，不碰鎖也不碰 tray），真正生選單與
-/// `set_menu` 丟到背景執行：選單事件是在主執行緒上處理的，若在事件處理途中同步
-/// 把選單換掉，等於在自己的回呼裡抽掉正在用的那一份。
-pub fn refresh(app: &AppHandle, sources: &[SourceView]) {
-    let nodes = menu_model(sources);
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+/// 呼叫端必須「取完快照後立刻配號」，兩者中間不做別的事：號碼與快照一旦錯開，
+/// 就會出現號碼較大卻載著較舊快照的情況，晚到的舊狀態反而蓋掉新的。
+pub fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// 重算整份提示與選單並換上系統匣，`seq` 是這份快照的號碼牌。
+///
+/// 模型在呼叫端的執行緒上就算好（純函式，不碰鎖也不碰 tray），真正碰系統匣的
+/// 動作丟到背景執行：選單事件是在主執行緒上處理的，若在事件處理途中同步把選單
+/// 換掉，等於在自己的回呼裡抽掉正在用的那一份。
+pub fn refresh(app: &AppHandle, sources: &[SourceView], seq: u64) {
+    let view = tray_view(sources);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = APPLY.lock().unwrap_or_else(|e| e.into_inner());
-        // 已經有更新的模型排在後面，這一份貼上去只會讓畫面倒退
+        // 已經有更新的快照排在後面，這一份貼上去只會讓畫面倒退
         if SEQ.load(Ordering::SeqCst) != seq {
             return;
         }
-        if let Err(e) = apply(&app, &nodes) {
-            log::warn!("could not refresh the tray menu: {e}");
+        if let Err(e) = apply(&app, &view) {
+            log::warn!("could not refresh the tray: {e}");
         }
     });
 }
 
-fn apply(app: &AppHandle, nodes: &[Node]) -> tauri::Result<()> {
+fn apply(app: &AppHandle, view: &TrayView) -> tauri::Result<()> {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return Ok(()); // 系統匣還沒長出來（或已經收掉），沒什麼好更新的
     };
-    tray.set_menu(Some(build(app, nodes)?))
+    tray.set_tooltip(Some(&view.tooltip))?;
+    tray.set_menu(Some(build(app, &view.menu)?))
 }
 
 #[cfg(test)]
@@ -295,6 +331,43 @@ mod tests {
             }
         }
         assert_eq!(status_line(&sources), "0/3 Connected");
+    }
+
+    /// hover 提示與右鍵狀態行必須是同一個分數，分母都是全部出口（含停用的），
+    /// 不然滑過去看到的與按下去看到的會互相打架
+    #[test]
+    fn tooltip_and_status_line_share_one_score() {
+        let mut sources = two_sources();
+        assert_eq!(tooltip_text(&sources), "Traytunnel - 2/3 connected");
+        assert_eq!(status_line(&sources), "2/3 Connected");
+        // 停用一個出口不會讓分母縮水
+        sources[0].exits[0].enabled = false;
+        assert_eq!(tooltip_text(&sources), "Traytunnel - 2/3 connected");
+        assert_eq!(status_line(&sources), "2/3 Connected");
+        // 兩邊永遠報同一組數字
+        for s in sources.iter_mut() {
+            for e in s.exits.iter_mut() {
+                e.status = status::STOPPED.into();
+            }
+        }
+        assert_eq!(tooltip_text(&sources), "Traytunnel - 0/3 connected");
+        assert_eq!(status_line(&sources), "0/3 Connected");
+    }
+
+    /// 一個出口都沒有時不報 0/0
+    #[test]
+    fn tooltip_says_no_exits_when_there_are_none() {
+        assert_eq!(tooltip_text(&[]), "Traytunnel - no exits");
+        assert_eq!(tooltip_text(&[source("hk", vec![])]), "Traytunnel - no exits");
+    }
+
+    /// 提示與選單出自同一份快照，才能一起套用
+    #[test]
+    fn tray_view_carries_both_halves() {
+        let sources = two_sources();
+        let view = tray_view(&sources);
+        assert_eq!(view.tooltip, tooltip_text(&sources));
+        assert_eq!(view.menu, menu_model(&sources));
     }
 
     /// 單源且出口不多：出口直接放根層，沒有子選單也沒有 Retest source

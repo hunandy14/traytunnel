@@ -109,15 +109,6 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     }
 }
 
-/// 系統匣提示文字，數字是跨源彙總的
-fn tooltip_text(connected: usize, enabled: usize) -> String {
-    if enabled == 0 {
-        "Traytunnel - no exits enabled".to_string()
-    } else {
-        format!("Traytunnel - {connected}/{enabled} connected")
-    }
-}
-
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
 fn format_log(source: Option<&str>, msg: &str) -> String {
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -440,18 +431,13 @@ impl AppState {
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
     ///
-    /// 鎖紀律：先取快照（鎖在 `source_views` 裡取完就放掉），之後只碰快照與
-    /// tray API，絕不持鎖呼叫系統匣。
+    /// 鎖紀律：先取快照（鎖在 `source_views` 裡取完就放掉），之後只碰快照，
+    /// 真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
+    /// 號碼牌緊貼快照配出，中間不插任何事，才不會有「號碼新、快照舊」的交錯。
     pub fn refresh_tray(&self) {
         let sources = self.source_views();
-        let enabled: Vec<&ExitView> =
-            sources.iter().flat_map(|s| s.exits.iter()).filter(|e| e.enabled).collect();
-        let connected = enabled.iter().filter(|e| e.status == status::CONNECTED).count();
-        let text = tooltip_text(connected, enabled.len());
-        if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
-            let _ = tray.set_tooltip(Some(text));
-        }
-        crate::traymenu::refresh(&self.app, &sources);
+        let seq = crate::traymenu::next_seq();
+        crate::traymenu::refresh(&self.app, &sources, seq);
     }
 }
 
@@ -538,13 +524,6 @@ mod tests {
         assert!(!without.contains('['));
         // 時間戳仍是 HH:mm:ss，長度固定 8
         assert_eq!(with.split("  ").next().unwrap().len(), 8);
-    }
-
-    /// 系統匣提示是跨源彙總的
-    #[test]
-    fn tooltip_aggregates_across_sources() {
-        assert_eq!(tooltip_text(3, 4), "Traytunnel - 3/4 connected");
-        assert_eq!(tooltip_text(0, 0), "Traytunnel - no exits enabled");
     }
 
     #[test]
