@@ -2,6 +2,7 @@
 # 全庫本來就是 100 欄、短的呼叫與結構實字盡量留在同一行（例如
 # `ConfigLocation { path: portable, portable: true }`），預設的
 # fn_call_width=60 會把這些全部拆開，跟現況差 82 個 hunk。
-# CI 的 `cargo fmt --check` 讀的就是這份，維持一致。
+# 供本地 `cargo fmt` 與未來若加上 fmt gate 的 CI 使用（目前 CI 還沒有 fmt
+# 步驟），兩邊讀的都是這份，格式化結果才會一致。
 max_width = 100
 use_small_heuristics = "Max"
