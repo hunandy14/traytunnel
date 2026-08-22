@@ -414,15 +414,26 @@ impl LegacyConfig {
 pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     let doc: DocumentMut = strip_bom(raw).parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let legacy = is_legacy(&doc);
-    let cfg = if legacy {
+    let mut cfg: Config = if legacy {
         let old: LegacyConfig =
             toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
         old.into_config()
     } else {
         toml_edit::de::from_document(doc).map_err(|e| e.to_string())?
     };
+    normalize_remotes(&mut cfg);
     validate_config(&cfg)?;
     Ok((cfg, legacy))
+}
+
+/// 讀進來的設定也吃埠號糖：手寫 `remote = "8080"` 一樣算數，在這裡就補成完整形式。
+///
+/// 補在解析的出口處，程式其他地方（ssh 參數、介面顯示、下次存檔）拿到的就永遠是
+/// `host:port`，不必各自再判斷一次；下次存檔時檔案裡那個 `8080` 也會被寫成完整形式。
+fn normalize_remotes(cfg: &mut Config) {
+    for f in cfg.sources.iter_mut().flat_map(|s| s.forwards.iter_mut()) {
+        f.remote = normalize_remote(&f.remote);
+    }
 }
 
 /// 只要設定不管遷移旗標的簡便版
@@ -578,8 +589,9 @@ pub fn valid_remote(s: &str) -> bool {
 /// 補成 `127.0.0.1:<port>`。其他寫法原樣送回去給 `valid_remote` 判，
 /// 所以越界的埠（`0`、`70000`）不會被補成合法值，而是照舊被擋在 remote 這欄。
 ///
-/// 補完的完整形式才是存進 toml 的值：設定檔看起來永遠是 `host:port`，
-/// 手改檔案的人不必知道這層糖。
+/// 補完的完整形式才是存進 toml 的值：設定檔看起來永遠是 `host:port`。
+/// 介面輸入（[`prepare_forward`]）與讀檔（[`normalize_remotes`]）兩條路都經過這裡，
+/// 手寫檔案的人一樣可以只寫埠號。
 pub fn normalize_remote(remote: &str) -> String {
     let s = remote.trim();
     // parse 會放行 `+80` 這種寫法，所以先自己確認是純數字
@@ -645,6 +657,31 @@ pub fn validate_forward(
         return Some(format!("local: port {local} already used by {} in {}", f.name, s.name));
     }
     None
+}
+
+/// 新增／編輯出口的前處理：欄位正規化 + 驗證，通過就直接給出要存進設定的那一筆。
+///
+/// 這是介面輸入進到設定裡的唯一入口。驗證看的是這裡組出來的 [`Forward`]，
+/// 呼叫端也只准把回傳的這一筆原封不動存下去，「驗過的字串」與「落檔的字串」
+/// 才不可能各走各的——remote 的埠號糖也只在這裡加一次。
+pub fn prepare_forward(
+    sources: &[Source],
+    original_local: Option<u16>,
+    name: &str,
+    local: u16,
+    remote: &str,
+    enabled: bool,
+) -> Result<Forward, String> {
+    let f = Forward {
+        name: name.trim().to_string(),
+        local,
+        remote: normalize_remote(remote),
+        enabled,
+    };
+    match validate_forward(sources, original_local, &f.name, f.local, &f.remote) {
+        Some(err) => Err(err),
+        None => Ok(f),
+    }
 }
 
 /// 新增／編輯連線源的欄位驗證，回傳 Some(訊息) 代表不通過。
@@ -1388,9 +1425,23 @@ enabled = false
         assert_eq!(normalize_remote("65535"), "127.0.0.1:65535");
         // 前後空白算使用者手滑，一起吃掉
         assert_eq!(normalize_remote("  8080  "), "127.0.0.1:8080");
+        // 前導零是有意放行的：0080 就是 80，parse 出來的值才算數
+        assert_eq!(normalize_remote("0080"), "127.0.0.1:80");
+        assert_eq!(normalize_remote("000001080"), "127.0.0.1:1080");
         // 補完的形式本身就是合法 remote，接得上既有驗證
         let list = vec![src("hk", vec![fwd("a", 1080)])];
         assert!(validate_forward(&list, None, "ok", 1090, "1080").is_none());
+    }
+
+    /// 純數字的守衛是載重的：`parse::<u16>()` 自己會放行 `+80`，
+    /// 補糖時把它當成 80 會讓一個 ssh 絕對不認的字串偷偷變成合法值
+    #[test]
+    fn a_signed_number_is_not_a_bare_port() {
+        assert_eq!(normalize_remote("+80"), "+80");
+        assert_eq!(normalize_remote("-80"), "-80");
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        assert!(err(&list, None, "ok", 1090, "+80").starts_with("remote: "));
+        assert!(err(&list, None, "ok", 1090, "-80").starts_with("remote: "));
     }
 
     /// 越界的埠不補糖，照舊擋在 remote 這欄（`0`／`70000` 都不是合法目的地）
@@ -1422,26 +1473,86 @@ enabled = false
         assert!(err(&list, None, "ok", 1090, "127.0.0.1").starts_with("remote: "));
     }
 
-    /// 補完的完整形式才是寫進 toml 的值
+    /// 介面輸入 `8080`，產出的那一筆與落檔的那一行都必須是 `127.0.0.1:8080`。
+    ///
+    /// upsert_forward 只是把 [`prepare_forward`] 的回傳值原樣存下去，所以這條
+    /// 從「輸入」一路釘到「檔案內容」的不變量就是那條路徑的規格。
     #[test]
-    fn normalized_remote_is_what_lands_in_the_file() {
+    fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        let made = prepare_forward(&list, None, "  web  ", 1090, "8080", true)
+            .expect("補完的形式是合法 remote，應該過");
+        // 產出：名字順手 trim，remote 是完整形式
+        assert_eq!(
+            made,
+            Forward {
+                name: "web".into(),
+                local: 1090,
+                remote: "127.0.0.1:8080".into(),
+                enabled: true,
+            }
+        );
+
+        // 落檔：command 端就是把這一筆原樣塞進設定再存，這裡照做一次
         let dir = tmp_dir("normalize-remote");
-        let cfg = Config {
-            close_to_tray: true,
-            sources: vec![src(
-                "hk",
-                vec![Forward {
-                    name: "a".into(),
-                    local: 1080,
-                    remote: normalize_remote("8080"),
-                    enabled: true,
-                }],
-            )],
-        };
+        let mut cfg = Config { close_to_tray: true, sources: list };
+        cfg.sources[0].forwards.push(made.clone());
         write_config(&dir, &cfg).unwrap();
         let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
         assert!(saved.contains("remote = \"127.0.0.1:8080\""), "實際存成：{saved}");
+        // 再讀回來還是同一筆，不會因為存檔或讀檔又變形
         assert_eq!(parse_config(&saved).unwrap(), cfg);
+        assert_eq!(parse_config(&saved).unwrap().forward(1090).unwrap().remote, "127.0.0.1:8080");
+    }
+
+    /// 驗證不過時不給出半成品：呼叫端沒有東西可以誤存
+    #[test]
+    fn prepare_forward_hands_back_the_error_instead_of_a_forward() {
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        // 撞埠、壞名字、壞 remote 都走同一個回傳
+        let bad = |name: &str, local: u16, remote: &str| {
+            prepare_forward(&list, None, name, local, remote, true)
+                .expect_err("這組輸入應該要被擋下來")
+        };
+        assert!(bad("b", 1080, "8080").starts_with("local: "));
+        assert!(bad("", 1090, "8080").starts_with("name: "));
+        assert!(bad("b", 1090, "70000").starts_with("remote: "));
+        // enabled 原樣帶過去，前處理不擅自改使用者的連線選擇
+        assert!(!prepare_forward(&list, None, "b", 1090, "8080", false).unwrap().enabled);
+    }
+
+    /// 檔案裡手寫 `remote = "8080"` 也算數：讀進來就是完整形式
+    #[test]
+    fn a_hand_written_bare_port_loads_as_the_full_form() {
+        let cfg = parse_config(
+            "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"8080\"\n",
+        )
+        .expect("手寫純埠號是合法設定");
+        assert_eq!(cfg.forward(1080).unwrap().remote, "127.0.0.1:8080");
+    }
+
+    /// 手寫純埠號的檔案：載入正常，重存之後檔案裡就變成完整形式
+    #[test]
+    fn rewriting_a_hand_written_bare_port_file_lands_the_full_form() {
+        let dir = tmp_dir("bare-port-file");
+        std::fs::write(
+            dir.join(TOML_NAME),
+            "closeToTray = true\n\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\n\n\
+             # 這條註解要活過重存\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"8080\"\n",
+        )
+        .unwrap();
+
+        let out = load_from_dir(&dir);
+        assert!(matches!(out, LoadOutcome::Loaded(_)), "純埠號不該被當成壞檔");
+        let cfg = out.config().clone();
+        assert_eq!(cfg.forward(1080).unwrap().remote, "127.0.0.1:8080");
+
+        write_config(&dir, &cfg).unwrap();
+        let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+        assert!(saved.contains("remote = \"127.0.0.1:8080\""), "重存後應該是完整形式：{saved}");
+        assert!(!saved.contains("remote = \"8080\""));
+        assert!(saved.contains("# 這條註解要活過重存"));
     }
 
     /// 驗證訊息要能被前端逐欄掛回去，格式固定是「欄位: 說明」

@@ -15,7 +15,7 @@ use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_winrt_notification::{IconCrop, Toast};
 
-use config::{Config, Forward, LoadOutcome, Source};
+use config::{Config, LoadOutcome, Source};
 use state::{AppState, Snapshot, MAIN_WINDOW, TRAY_ID};
 
 type Shared = Arc<AppState>;
@@ -397,23 +397,24 @@ fn upsert_forward(
 ) -> Option<String> {
     let st = state.inner().clone();
     let cfg = st.config();
-    let name = name.trim().to_string();
-    // 只填埠號的寫法在這裡就補成 127.0.0.1:<port>，之後的驗證與落檔都用完整形式
-    let remote = config::normalize_remote(&remote);
     if cfg.source(&source).is_none() {
         return Some(format!("no such source: {source}"));
     }
-    if let Some(err) = config::validate_forward(&cfg.sources, original_local, &name, local, &remote)
-    {
-        return Some(err);
-    }
-
-    // 編輯運行中的出口要先停掉舊的那條線（換埠或換源時舊埠也才會放掉）；
-    // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連
+    // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
     let was_enabled = match original_local {
         Some(orig) => cfg.forward(orig).map(|f| f.enabled).unwrap_or(false),
         None => true,
     };
+    // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去
+    let prepared =
+        config::prepare_forward(&cfg.sources, original_local, &name, local, &remote, was_enabled);
+    let forward = match prepared {
+        Ok(f) => f,
+        Err(err) => return Some(err),
+    };
+    let name = forward.name.clone();
+
+    // 編輯運行中的出口要先停掉舊的那條線（換埠或換源時舊埠也才會放掉）
     if let Some(orig) = original_local {
         tunnel::halt(&st, orig);
     }
@@ -426,12 +427,7 @@ fn upsert_forward(
             }
         }
         if let Some(s) = c.source_mut(&source) {
-            s.forwards.push(Forward {
-                name: name.clone(),
-                local,
-                remote: remote.clone(),
-                enabled: was_enabled,
-            });
+            s.forwards.push(forward.clone());
         }
     }) {
         let msg = format!("Failed to save settings:\n{e}");
