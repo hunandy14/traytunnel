@@ -85,7 +85,17 @@ fn local_port(raw: u32) -> u16 {
     (((raw & 0xff) << 8) | ((raw >> 8) & 0xff)) as u16
 }
 
-fn listener_table(family: u32) -> Option<Vec<u8>> {
+/// 問長度與真正取表是兩次呼叫，中間表可能又長大了（別的程序剛開了 socket）。
+/// 那時第二次會回 ERROR_INSUFFICIENT_BUFFER 並告訴我們新的長度，照著再試一次
+/// 就好；重試次數給得夠寬，仍然失敗才放棄。
+const TABLE_ATTEMPTS: usize = 4;
+
+/// 取一份 listener 表的原始位元組。
+///
+/// 緩衝以 u64 為單位配置：MIB_TCPTABLE_OWNER_PID 與 MIB_TCP6TABLE_OWNER_PID
+/// 都只由 DWORD 與位元組陣列組成，u64 的對齊必定足夠，指標轉型才不會踩到
+/// 未對齊讀取（`Vec<u8>` 只保證 1 位元組對齊）。
+fn listener_table(family: u32) -> Option<Vec<u64>> {
     unsafe {
         let mut size: u32 = 0;
         let rc = GetExtendedTcpTable(
@@ -99,19 +109,25 @@ fn listener_table(family: u32) -> Option<Vec<u8>> {
         if (rc != NO_ERROR && rc != ERROR_INSUFFICIENT_BUFFER) || size == 0 {
             return None;
         }
-        let mut buf = vec![0u8; size as usize];
-        let rc = GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut size,
-            0,
-            family,
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        );
-        if rc != NO_ERROR {
-            return None;
+        for _ in 0..TABLE_ATTEMPTS {
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+            let mut len = size;
+            let rc = GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut len,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            match rc {
+                NO_ERROR => return Some(buf),
+                // 表長大了，照它給的新長度再配一次
+                ERROR_INSUFFICIENT_BUFFER if len > size => size = len,
+                _ => return None,
+            }
         }
-        Some(buf)
+        None
     }
 }
 
@@ -383,6 +399,15 @@ mod tests {
     fn falls_back_to_the_largest_layer() {
         assert_eq!(pick_icon_layer(&[16, 32, 24], 64), Some(1));
         assert_eq!(pick_icon_layer(&[], 16), None);
+    }
+
+    /// 取表那段是手寫 FFI，緩衝配置與重試都改過，用一個真的 listener 釘住行為：
+    /// 綁得起來的埠一定要被看見，否則 spawn 前的埠檢查就失去意義
+    #[test]
+    fn detects_a_real_listener() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("綁得起來");
+        let port = l.local_addr().unwrap().port();
+        assert!(is_listening(port), "剛綁上的 {port} 應該查得到");
     }
 
     #[test]
