@@ -67,7 +67,7 @@ fn do_exit(state: &Shared) {
 
 /// 關閉鈕行為由 closeToTray 決定
 fn close_main(state: &Shared) {
-    if state.config().close_to_tray {
+    if state.with_config(|c| c.close_to_tray) {
         hide_to_tray(state);
     } else {
         do_exit(state);
@@ -299,9 +299,9 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
 
 /// 勾選＝設定裡的 enabled，所以點一下就是反過來
 fn toggle_exit(st: &Shared, local: u16) {
-    match st.config().forward(local) {
-        Some(f) if f.enabled => commands::disable_exit(st, local),
-        Some(_) => commands::enable_exit(st, local),
+    match st.with_config(|c| c.forward(local).map(|f| f.enabled)) {
+        Some(true) => commands::disable_exit(st, local),
+        Some(false) => commands::enable_exit(st, local),
         // 選單比設定舊了（出口已經被刪掉），重建一次讓它跟上
         None => {
             st.log(format!("port {local} : no such exit"));
@@ -312,7 +312,7 @@ fn toggle_exit(st: &Shared, local: u16) {
 
 /// 有任何出口 enabled 就是 Stop all，全停時就是 Start all
 fn toggle_all(st: &Shared) {
-    if st.config().enabled_locals().is_empty() {
+    if st.with_config(|c| c.enabled_locals().is_empty()) {
         commands::enable_all(st);
     } else {
         commands::disable_all(st);

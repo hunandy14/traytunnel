@@ -26,7 +26,7 @@ pub fn get_state(state: State<'_, Shared>) -> Snapshot {
 
 /// 出口不存在時記一行就回，回傳 false 代表沒有這個出口
 fn require_exit(st: &Shared, local: u16) -> bool {
-    if st.config().forward(local).is_none() {
+    if st.with_config(|c| c.forward(local).is_none()) {
         st.log(format!("port {local} : no such exit"));
         return false;
     }
@@ -35,7 +35,7 @@ fn require_exit(st: &Shared, local: u16) -> bool {
 
 /// 源不存在時記一行就回
 pub fn require_source(st: &Shared, name: &str) -> bool {
-    if st.config().source(name).is_none() {
+    if st.with_config(|c| c.source(name).is_none()) {
         st.log(format!("no such source: {name}"));
         return false;
     }
@@ -100,7 +100,7 @@ pub fn restart_exit(state: State<'_, Shared>, local: u16) {
     if !require_exit(&st, local) {
         return;
     }
-    let enabled = st.config().forward(local).map(|f| f.enabled).unwrap_or(false);
+    let enabled = st.with_config(|c| c.forward(local).is_some_and(|f| f.enabled));
     if !enabled {
         if let Err(e) = st.update_config(|c| {
             if let Some(f) = c.forward_mut(local) {
@@ -210,22 +210,24 @@ pub fn upsert_source(
     proxy_command: String,
 ) -> Option<String> {
     let st = state.inner().clone();
-    let cfg = st.config();
     let name = name.trim().to_string();
     let host = host.trim().to_string();
     let user = user.trim().to_string();
     let proxy_command = proxy_command.trim().to_string();
-    if let Some(err) =
-        config::validate_source(&cfg.sources, original_name.as_deref(), &name, &host, &user)
-    {
+    // 驗證與「連線欄位有沒有真的變」看的是同一份設定，一次讀完
+    let (invalid, changed) = st.with_config(|c| {
+        let invalid =
+            config::validate_source(&c.sources, original_name.as_deref(), &name, &host, &user);
+        // 連線欄位有沒有真的變，決定要不要把這個源的出口重接一輪
+        let changed = match original_name.as_deref().and_then(|n| c.source(n)) {
+            Some(old) => old.host != host || old.user != user || old.proxy_command != proxy_command,
+            None => false,
+        };
+        (invalid, changed)
+    });
+    if let Some(err) = invalid {
         return Some(err);
     }
-
-    // 連線欄位有沒有真的變，決定要不要把這個源的出口重接一輪
-    let changed = match original_name.as_deref().and_then(|n| cfg.source(n)) {
-        Some(old) => old.host != host || old.user != user || old.proxy_command != proxy_command,
-        None => false,
-    };
 
     let target = name.clone();
     if let Err(e) = st.update_config(|c| match original_name.as_deref() {
@@ -275,11 +277,9 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
     }
     // 先存檔成功才停線。反過來做的話，存檔失敗就會留下「隧道已經停了、設定裡卻還
     // 在而且是 enabled」的錯位狀態。要停的埠得在刪掉之前先抄下來，刪完就查不到了。
-    let ports: Vec<u16> = st
-        .config()
-        .source(&name)
-        .map(|s| s.forwards.iter().map(|f| f.local).collect())
-        .unwrap_or_default();
+    let ports: Vec<u16> = st.with_config(|c| {
+        c.source(&name).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
+    });
     if let Err(e) = st.update_config(|c| c.sources.retain(|s| s.name != name)) {
         report_save_error(&st, e);
         return;
@@ -303,22 +303,24 @@ pub fn upsert_forward(
     remote: String,
 ) -> Option<String> {
     let st = state.inner().clone();
-    let cfg = st.config();
-    if cfg.source(&source).is_none() {
-        return Some(format!("no such connection: {source}"));
-    }
-    // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
-    let was_enabled = match original_local {
-        Some(orig) => cfg.forward(orig).map(|f| f.enabled).unwrap_or(false),
-        None => true,
-    };
-    // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去
-    let prepared =
-        config::prepare_forward(&cfg.sources, original_local, &name, local, &remote, was_enabled);
+    // 查源、抄原本的 enabled、正規化與驗證，全部看同一份設定
+    let prepared = st.with_config(|c| {
+        if c.source(&source).is_none() {
+            return Err(format!("no such connection: {source}"));
+        }
+        // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
+        let was_enabled = match original_local {
+            Some(orig) => c.forward(orig).is_some_and(|f| f.enabled),
+            None => true,
+        };
+        // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去
+        config::prepare_forward(&c.sources, original_local, &name, local, &remote, was_enabled)
+    });
     let forward = match prepared {
         Ok(f) => f,
         Err(err) => return Some(err),
     };
+    let was_enabled = forward.enabled;
     let name = forward.name.clone();
 
     if let Err(e) = st.update_config(|c| {
@@ -361,12 +363,11 @@ pub fn upsert_forward(
 #[tauri::command]
 pub fn delete_forward(state: State<'_, Shared>, local: u16) {
     let st = state.inner().clone();
-    let cfg = st.config();
-    let Some((src, f)) = cfg.locate(local) else {
+    let names = st.with_config(|c| c.locate(local).map(|(s, f)| (s.name.clone(), f.name.clone())));
+    let Some((sname, fname)) = names else {
         st.log(format!("port {local} : no such exit"));
         return;
     };
-    let (sname, fname) = (src.name.clone(), f.name.clone());
     // 同 delete_source：先存檔成功才停線，存檔失敗時隧道維持原狀
     if let Err(e) = st.update_config(|c| {
         for s in c.sources.iter_mut() {

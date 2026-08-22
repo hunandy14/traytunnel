@@ -191,8 +191,16 @@ impl AppState {
         self.read_only.load(Ordering::SeqCst)
     }
 
-    pub fn config(&self) -> Config {
-        self.cfg.lock().unwrap().clone()
+    /// 唯讀地看一眼設定：閉包帶進鎖裡跑，整份 Config 不必複製。
+    ///
+    /// 絕大多數呼叫點只是問一個布林或抄幾個埠號，卻要為此深拷貝整份設定
+    /// （源、出口、字串全部），而狀態一變就會連推好幾次事件，複製量相當可觀。
+    ///
+    /// 閉包裡不可以再碰任何會鎖 cfg 的方法（`update_config`、`with_config`
+    /// 自己），否則當場自我死鎖。要跨鎖持有的話，在閉包裡複製需要的那幾筆
+    /// 出來就好——目前全程式沒有任何一處真的需要整份 owned 設定。
+    pub fn with_config<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&self.cfg.lock().unwrap())
     }
 
     /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）。
@@ -224,7 +232,7 @@ impl AppState {
     /// 出口那條 ssh 程序樹當場就收掉了；刪除流程因此可以先存檔再停線，
     /// 不必為了收程序而搶在存檔之前 halt。
     fn sync_exits(&self) {
-        let ports = self.config().locals();
+        let ports = self.with_config(|c| c.locals());
         let mut exits = self.exits.lock().unwrap();
         exits.retain(|p, _| ports.contains(p));
         for p in ports {
@@ -244,9 +252,8 @@ impl AppState {
 
     /// 依本地埠自動補上所屬源的名字；出口已經被刪掉時退回 app 級格式
     pub fn log_exit(&self, local: u16, msg: impl AsRef<str>) {
-        let cfg = self.config();
-        match cfg.source_name_of(local) {
-            Some(src) => self.log_from(src, msg),
+        match self.with_config(|c| c.source_name_of(local).map(str::to_string)) {
+            Some(src) => self.log_from(&src, msg),
             None => self.log(msg),
         }
     }
@@ -423,9 +430,11 @@ impl AppState {
         self.app.autolaunch().is_enabled().unwrap_or(false)
     }
 
-    /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法
+    /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
+    ///
+    /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
     pub fn source_views(&self) -> Vec<SourceView> {
-        let cfg = self.config();
+        self.with_config(|cfg| {
         let exits = self.exits.lock().unwrap();
         cfg.sources
             .iter()
@@ -453,11 +462,12 @@ impl AppState {
                     .collect(),
             })
             .collect()
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            close_to_tray: self.config().close_to_tray,
+            close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
             sources: self.source_views(),
             logs: self.logs.lock().unwrap().iter().cloned().collect(),

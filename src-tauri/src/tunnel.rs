@@ -83,7 +83,7 @@ fn spawn_ssh(src: &Source, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
 /// 還佔著的埠，白白誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
-    if state.config().forward(local).is_none() {
+    if state.with_config(|c| c.forward(local).is_none()) {
         return;
     }
     let Some(generation) = state.claim_supervisor(local) else {
@@ -114,14 +114,14 @@ pub fn restart(state: &Arc<AppState>, local: u16) {
 
 /// 啟動所有源的所有 enabled 出口（程式啟動與 start_all 都走這裡）
 pub fn start_enabled(state: &Arc<AppState>) {
-    for local in state.config().enabled_locals() {
+    for local in state.with_config(|c| c.enabled_locals()) {
         start(state, local);
     }
 }
 
 /// 停掉所有源的所有出口
 pub fn halt_all(state: &Arc<AppState>) {
-    for local in state.config().locals() {
+    for local in state.with_config(|c| c.locals()) {
         halt(state, local);
     }
 }
@@ -148,19 +148,17 @@ pub fn restart_running_in_source(state: &Arc<AppState>, source: &str) {
 }
 
 fn locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state
-        .config()
-        .source(source)
-        .map(|s| s.forwards.iter().map(|f| f.local).collect())
-        .unwrap_or_default()
+    state.with_config(|c| {
+        c.source(source).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
+    })
 }
 
 fn enabled_locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state
-        .config()
-        .source(source)
-        .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
-        .unwrap_or_default()
+    state.with_config(|c| {
+        c.source(source)
+            .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// 分段等待，中途世代作廢就立刻回 false
@@ -182,8 +180,9 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         if !state.generation_alive(local, generation) {
             return;
         }
-        let cfg = state.config();
-        let Some((src, f)) = cfg.locate(local).map(|(s, f)| (s.clone(), f.clone())) else {
+        // 只複製這個出口與它所屬的源，不為了兩筆資料深拷貝整份設定
+        let Some((src, f)) = state.with_config(|c| c.locate(local).map(|(s, f)| (s.clone(), f.clone())))
+        else {
             return; // 出口已經被刪掉
         };
         let sname = src.name.as_str();
@@ -308,7 +307,7 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
 /// 維持停用，不會被這個動作拉起來。對應托盤根層的「Reconnect all」。
 pub fn reconnect_all(state: &Arc<AppState>) {
     let ports: Vec<u16> =
-        state.config().locals().into_iter().filter(|p| state.is_running(*p)).collect();
+        state.with_config(|c| c.locals()).into_iter().filter(|p| state.is_running(*p)).collect();
     if ports.is_empty() {
         state.log("no running exit to reconnect");
         return;
