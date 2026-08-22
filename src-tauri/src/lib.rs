@@ -398,7 +398,7 @@ fn upsert_forward(
     let st = state.inner().clone();
     let cfg = st.config();
     if cfg.source(&source).is_none() {
-        return Some(format!("no such source: {source}"));
+        return Some(format!("no such connection: {source}"));
     }
     // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
     let was_enabled = match original_local {

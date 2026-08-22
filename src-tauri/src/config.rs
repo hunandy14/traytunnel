@@ -448,18 +448,18 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
     let mut seen_locals: Vec<u16> = Vec::new();
     for s in &cfg.sources {
         if !valid_source_name(&s.name) {
-            return Err("source 的 name 不可為空，也不可含空白或中括號".into());
+            return Err("[[sources]] 的 name 不可為空，也不可含空白或中括號".into());
         }
         if seen_names.contains(&s.name.as_str()) {
-            return Err(format!("source 名稱重複：{}", s.name));
+            return Err(format!("連線名稱重複：{}", s.name));
         }
         seen_names.push(&s.name);
         if s.host.trim().is_empty() || s.user.trim().is_empty() {
-            return Err(format!("source {} 的 host 與 user 不可為空", s.name));
+            return Err(format!("連線 {} 的 host 與 user 不可為空", s.name));
         }
         for f in &s.forwards {
             if seen_locals.contains(&f.local) {
-                return Err(format!("本地埠重複：{}（跨源也不可以重複）", f.local));
+                return Err(format!("本地埠重複：{}（跨連線也不可以重複）", f.local));
             }
             seen_locals.push(f.local);
         }
@@ -635,7 +635,7 @@ pub fn validate_forward(
 ) -> Option<String> {
     if let Some(orig) = original_local {
         if !sources.iter().any(|s| s.forward(orig).is_some()) {
-            return Some(format!("local: no exit with port {orig}, it may have been deleted"));
+            return Some(format!("local: no tunnel with port {orig}, it may have been deleted"));
         }
     }
     if !valid_name(name) {
@@ -697,7 +697,7 @@ pub fn validate_source(
 ) -> Option<String> {
     if let Some(orig) = original_name {
         if !sources.iter().any(|s| s.name == orig) {
-            return Some(format!("name: no source called {orig}, it may have been deleted"));
+            return Some(format!("name: no connection called {orig}, it may have been deleted"));
         }
     }
     if !valid_source_name(name) {
@@ -710,7 +710,7 @@ pub fn validate_source(
         return Some("user: required".into());
     }
     if sources.iter().any(|s| s.name == name && Some(s.name.as_str()) != original_name) {
-        return Some(format!("name: source {name} already exists"));
+        return Some(format!("name: connection {name} already exists"));
     }
     None
 }
@@ -1602,10 +1602,15 @@ enabled = false
         assert!(err(&list, None, "ok", 0, "127.0.0.1:1").starts_with("local: "));
     }
 
+    /// 編輯途中那條隧道被別處刪掉了。訊息整句都釘住：這是使用者在編輯面板上
+    /// 讀得到的字，用詞要跟介面一致（Tunnel，不是 exit）
     #[test]
     fn upsert_rejects_unknown_original_port() {
         let list = vec![src("hk", vec![fwd("a", 1080)])];
-        assert!(err(&list, Some(9999), "a", 1080, "127.0.0.1:1").starts_with("local: "));
+        assert_eq!(
+            err(&list, Some(9999), "a", 1080, "127.0.0.1:1"),
+            "local: no tunnel with port 9999, it may have been deleted"
+        );
     }
 
     #[test]
@@ -1627,13 +1632,16 @@ enabled = false
         let list = vec![src("hk", vec![]), src("tw", vec![])];
         assert_eq!(
             validate_source(&list, None, "hk", "h", "u").unwrap(),
-            "name: source hk already exists"
+            "name: connection hk already exists"
         );
         // 編輯自己時不算重複
         assert!(validate_source(&list, Some("hk"), "hk", "h", "u").is_none());
         // 改成別人的名字要擋
         assert!(validate_source(&list, Some("hk"), "tw", "h", "u").unwrap().starts_with("name: "));
-        // 原本的源已經被刪掉
-        assert!(validate_source(&list, Some("gone"), "x", "h", "u").unwrap().starts_with("name: "));
+        // 原本那組連線已經被刪掉，訊息整句釘住，用詞要跟介面一致（Connection，不是 source）
+        assert_eq!(
+            validate_source(&list, Some("gone"), "x", "h", "u").unwrap(),
+            "name: no connection called gone, it may have been deleted"
+        );
     }
 }
