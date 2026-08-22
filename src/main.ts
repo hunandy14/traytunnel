@@ -1,6 +1,7 @@
 import { bootstrap } from "./bootstrap";
 import { installContextMenuGuard } from "./context-menu";
 import { el, h } from "./dom";
+import { hydrateIcons, icon, setIcon } from "./icons";
 import {
   deleteForward,
   getState,
@@ -35,13 +36,6 @@ import type {
   Snapshot,
   SourceInfo,
 } from "./types";
-
-// Segoe MDL2 Assets：E71A Stop、E768 Play、E70F 鉛筆、E895 Sync（重新連接）。
-// 一律用跳脫寫法，PUA 字元直接貼進原始碼很容易在編輯途中被吃掉。
-const GLYPH_STOP = "";
-const GLYPH_START = "";
-const GLYPH_EDIT = "";
-const GLYPH_RESTART = "";
 
 const EMPTY: Snapshot = { closeToTray: true, autostart: false, sources: [], logs: [] };
 
@@ -188,7 +182,7 @@ function renderRail() {
     list.appendChild(btn);
   }
 
-  const add = h("button", { class: "rail-btn add", text: "+", title: "Add connection" });
+  const add = h("button", { class: "rail-btn add", title: "Add connection" }, [icon("plus", 18)]);
   add.addEventListener("click", () => openSourceSheet(null));
   list.appendChild(add);
 
@@ -296,7 +290,7 @@ function renderSummary() {
   el<HTMLDivElement>("summary-score-label").textContent = label;
 
   // 右段：⋯ 選單裡的連／斷那一項跟著整條連線的狀態換字
-  el<HTMLSpanElement>("menu-toggle-ico").innerHTML = running ? GLYPH_STOP : GLYPH_START;
+  setIcon(el<HTMLSpanElement>("menu-toggle-ico"), running ? "square" : "play", 14);
   el<HTMLSpanElement>("menu-toggle-text").textContent = running ? "Disconnect" : "Connect";
   const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
   toggleItem.classList.toggle("danger", running);
@@ -421,7 +415,7 @@ function paintCard(exit: ExitInfo) {
   refs.detail.classList.toggle("show", Boolean(detail));
 
   const running = isRunning(exit);
-  refs.toggle.innerHTML = running ? GLYPH_STOP : GLYPH_START;
+  setIcon(refs.toggle, running ? "square" : "play", 15);
   refs.toggle.title = running ? "Disconnect" : "Connect";
   refs.toggle.classList.toggle("danger", running);
   refs.toggle.classList.toggle("go", !running);
@@ -440,12 +434,12 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
     else void run(() => startExit(exit.local), `connect ${exit.name}`);
   });
 
-  const restart = h("button", { class: "iconbtn sm", html: GLYPH_RESTART, title: "Reconnect" });
+  const restart = h("button", { class: "iconbtn sm", title: "Reconnect" }, [icon("refresh-cw", 15)]);
   restart.addEventListener("click", () =>
     void run(() => restartExit(exit.local), `reconnect ${exit.name}`),
   );
 
-  const edit = h("button", { class: "iconbtn sm", html: GLYPH_EDIT, title: "Edit" });
+  const edit = h("button", { class: "iconbtn sm", title: "Edit" }, [icon("pencil", 15)]);
   edit.addEventListener("click", () => openTunnelSheet(source, exit));
 
   const main = h("div", { class: "card-main" }, [
@@ -482,7 +476,7 @@ function renderCards() {
   if (exits.length === 0) {
     // 大虛線卡只在這條連線零隧道時出現，其餘時候用 ⋯ 選單的 Add tunnel
     const ghost = h("button", { class: "ghost-card" }, [
-      h("span", { class: "ghost-plus", text: "+" }),
+      h("span", { class: "ghost-plus" }, [icon("plus", 18)]),
       h("span", { text: "Add tunnel" }),
     ]);
     ghost.addEventListener("click", beginCreate);
@@ -662,6 +656,9 @@ async function init() {
 }
 
 installContextMenuGuard();
+
+// index.html 只用 data-icon 宣告位置，真正的 SVG 在這裡一次補齊
+hydrateIcons();
 
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),

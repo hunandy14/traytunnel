@@ -66,6 +66,28 @@ body {
   font-family: Consolas, "Cascadia Mono", monospace;
 }
 
+/* ------------------------------------------------------------ 圖示
+   全部走 Lucide 的 SVG（src/icons.ts 出圖）。stroke 是 currentColor，
+   所以顏色一律由外層的 color 決定，.tone-* / .danger / .go 都原樣生效。
+   block 是為了殺掉 inline 元素的基線間隙，容器再用 flex 置中。 */
+
+.icon {
+  display: block;
+  flex: none;
+}
+
+.tbtn,
+.rail-btn,
+.iconbtn,
+.setting-icon,
+.ghost-plus,
+.big-ghost-plus,
+.summary-menu-item .ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* ------------------------------------------------------------ 標題列
    高密度區：透明貼底、不做卡片化，只有按鈕帶小圓角 */
 
@@ -101,8 +123,6 @@ body {
   border-radius: 4px;
   background: transparent;
   color: var(--muted);
-  font-family: "Segoe MDL2 Assets";
-  font-size: 10px;
   cursor: default;
   transition: background 120ms var(--ease), color 120ms var(--ease);
 }
@@ -284,8 +304,6 @@ body {
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted);
-  font-family: "Segoe MDL2 Assets";
-  font-size: 14px;
   cursor: pointer;
   transition: background 130ms var(--ease), color 130ms var(--ease),
     border-radius 160ms var(--ease), border-color 130ms var(--ease);
@@ -301,7 +319,6 @@ body {
 .rail-btn.add {
   border-style: dashed;
   border-color: var(--line-dashed);
-  font-size: 15px;
 }
 
 .rail-btn.add:hover {
@@ -504,10 +521,7 @@ body {
 .summary-menu-item .ico {
   flex: none;
   width: 14px;
-  font-family: "Segoe MDL2 Assets";
-  font-size: 12px;
   color: var(--muted);
-  text-align: center;
 }
 
 .summary-menu-item.go .ico {
@@ -527,8 +541,6 @@ body {
   border-radius: 4px;
   background: var(--hover);
   color: var(--text);
-  font-family: "Segoe MDL2 Assets";
-  font-size: 13px;
   cursor: pointer;
   transition: background 130ms var(--ease), border-color 130ms var(--ease);
 }
@@ -541,7 +553,6 @@ body {
 .iconbtn.sm {
   width: 26px;
   height: 26px;
-  font-size: 11px;
 }
 
 .iconbtn.go {
@@ -896,8 +907,7 @@ body {
 }
 
 .ghost-plus {
-  font-size: 17px;
-  line-height: 17px;
+  flex: none;
 }
 
 /* 零源的大引導卡 */
@@ -924,8 +934,7 @@ body {
 }
 
 .big-ghost-plus {
-  font-size: 28px;
-  line-height: 30px;
+  margin-bottom: 2px;
   color: var(--accent);
 }
 
@@ -1026,10 +1035,7 @@ body {
 .setting-icon {
   flex: none;
   width: 20px;
-  font-family: "Segoe MDL2 Assets";
-  font-size: 15px;
   color: var(--muted);
-  text-align: center;
 }
 
 .setting-text {

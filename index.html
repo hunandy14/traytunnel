@@ -13,8 +13,8 @@
     <div class="titlebar" data-tauri-drag-region>
       <img class="app-icon" src="/icon.svg" alt="" data-tauri-drag-region />
       <span class="app-title" data-tauri-drag-region>Traytunnel</span>
-      <button class="tbtn" id="btn-min" title="Minimize">&#xE921;</button>
-      <button class="tbtn close" id="btn-close" title="Close">&#xE8BB;</button>
+      <button class="tbtn" id="btn-min" title="Minimize" data-icon="minus"></button>
+      <button class="tbtn close" id="btn-close" title="Close" data-icon="x"></button>
     </div>
 
     <div class="shell">
@@ -22,8 +22,8 @@
       <nav class="rail" aria-label="Connections">
         <div class="rail-list" id="rail-list"></div>
         <div class="rail-foot">
-          <button class="rail-btn" id="btn-logs" title="Activity log">&#xE81C;</button>
-          <button class="rail-btn" id="btn-settings" title="Settings">&#xE713;</button>
+          <button class="rail-btn" id="btn-logs" title="Activity log" data-icon="history" data-icon-size="18"></button>
+          <button class="rail-btn" id="btn-settings" title="Settings" data-icon="settings" data-icon-size="18"></button>
         </div>
       </nav>
 
@@ -48,24 +48,25 @@
                   title="More"
                   aria-haspopup="menu"
                   aria-expanded="false"
-                >&#xE712;</button>
+                  data-icon="ellipsis"
+                ></button>
                 <div class="summary-menu" id="summary-menu" role="menu" hidden>
                   <button class="summary-menu-item" id="menu-add-exit" role="menuitem">
-                    <span class="ico">&#xE710;</span>Add tunnel
+                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add tunnel
                   </button>
                   <button class="summary-menu-item" id="menu-toggle-source" role="menuitem">
-                    <span class="ico" id="menu-toggle-ico">&#xE71A;</span>
+                    <span class="ico" id="menu-toggle-ico"></span>
                     <span id="menu-toggle-text">Disconnect</span>
                   </button>
                   <button class="summary-menu-item" id="menu-test-source" role="menuitem">
-                    <span class="ico">&#xE72C;</span>Test connectivity
+                    <span class="ico" data-icon="rotate-cw" data-icon-size="14"></span>Test connectivity
                   </button>
                   <button class="summary-menu-item" id="menu-activity" role="menuitem">
-                    <span class="ico">&#xE81C;</span>Activity
+                    <span class="ico" data-icon="history" data-icon-size="14"></span>Activity
                   </button>
                   <hr />
                   <button class="summary-menu-item" id="menu-edit-source" role="menuitem">
-                    <span class="ico">&#xE70F;</span>Edit connection
+                    <span class="ico" data-icon="pencil" data-icon-size="14"></span>Edit connection
                   </button>
                 </div>
               </div>
@@ -83,7 +84,7 @@
         <!-- ---------------------------------------------- 零連線引導 -->
         <section class="view center-view" id="view-empty" hidden>
           <button class="big-ghost" id="btn-first-source">
-            <span class="big-ghost-plus">+</span>
+            <span class="big-ghost-plus" data-icon="plus" data-icon-size="28"></span>
             <span class="big-ghost-title">Add connection</span>
             <span class="big-ghost-hint">An ssh host that your tunnels run through</span>
           </button>
@@ -103,7 +104,7 @@
 
           <h3 class="setting-group">General</h3>
           <div class="setting-row">
-            <span class="setting-icon">&#xE7B8;</span>
+            <span class="setting-icon" data-icon="panel-bottom" data-icon-size="17"></span>
             <div class="setting-text">
               <div class="setting-name">Close to tray</div>
               <div class="setting-hint">Keep tunnels running in the notification area when the window is closed</div>
@@ -111,7 +112,7 @@
             <button class="toggle" id="tg-close" role="switch" aria-checked="false"></button>
           </div>
           <div class="setting-row">
-            <span class="setting-icon">&#xE7E8;</span>
+            <span class="setting-icon" data-icon="power" data-icon-size="17"></span>
             <div class="setting-text">
               <div class="setting-name">Start with Windows</div>
               <div class="setting-hint">Launch Traytunnel at sign-in</div>
@@ -131,12 +132,12 @@
           </div>
           <!-- 整列不可互動，開資料夾的動作收進右側獨立的圖示按鈕 -->
           <div class="setting-row" id="row-config-path">
-            <span class="setting-icon">&#xE8A5;</span>
+            <span class="setting-icon" data-icon="file-text" data-icon-size="17"></span>
             <div class="setting-text">
               <div class="setting-name">Config file</div>
               <div class="setting-hint path mono" id="config-path">…</div>
             </div>
-            <button class="iconbtn sm" id="btn-open-config-dir" type="button" title="Open containing folder" disabled>&#xE838;</button>
+            <button class="iconbtn sm" id="btn-open-config-dir" type="button" title="Open containing folder" data-icon="folder-open" data-icon-size="15" disabled></button>
           </div>
         </section>
       </main>
@@ -147,7 +148,7 @@
       <div class="sheet" role="dialog" aria-modal="true" aria-label="Connection">
         <header class="sheet-head">
           <span class="sheet-title" id="src-title">Add connection</span>
-          <button class="tbtn" id="src-close" title="Close">&#xE8BB;</button>
+          <button class="tbtn" id="src-close" title="Close" data-icon="x"></button>
         </header>
 
         <div class="sheet-body">
@@ -197,7 +198,7 @@
       <div class="sheet" role="dialog" aria-modal="true" aria-label="Tunnel">
         <header class="sheet-head">
           <span class="sheet-title" id="fwd-title">Edit tunnel</span>
-          <button class="tbtn" id="fwd-close" title="Close">&#xE8BB;</button>
+          <button class="tbtn" id="fwd-close" title="Close" data-icon="x"></button>
         </header>
 
         <div class="sheet-body">
