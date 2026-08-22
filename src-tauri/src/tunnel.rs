@@ -56,12 +56,8 @@ pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
 /// 只是不帶 -N -L，改用 BatchMode 避免卡在互動提示、ConnectTimeout 讓 ssh
 /// 自己先設一道逾時。
 pub fn build_test_args(user: &str, host: &str, proxy_command: &str) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-    ];
+    let mut args: Vec<String> =
+        vec!["-o".into(), "BatchMode=yes".into(), "-o".into(), "ConnectTimeout=10".into()];
     if !proxy_command.trim().is_empty() {
         args.push("-o".into());
         args.push(format!("ProxyCommand={proxy_command}"));
@@ -568,7 +564,8 @@ mod tests {
     /// 表單有填 ProxyCommand 就照 build_exit_args 的作法帶一個 -o ProxyCommand=
     #[test]
     fn test_args_carry_proxy_command_when_present() {
-        let args = build_test_args("alice", "t.example.com", "cloudflared access ssh --hostname %h");
+        let args =
+            build_test_args("alice", "t.example.com", "cloudflared access ssh --hostname %h");
         assert_eq!(
             args,
             vec![
@@ -589,6 +586,9 @@ mod tests {
     fn test_args_omit_blank_proxy_command() {
         let args = build_test_args("bob", "h.example.com", "   ");
         assert!(!args.iter().any(|a| a.starts_with("ProxyCommand=")));
-        assert_eq!(args, vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "bob@h.example.com", "exit"]);
+        assert_eq!(
+            args,
+            vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "bob@h.example.com", "exit"]
+        );
     }
 }
