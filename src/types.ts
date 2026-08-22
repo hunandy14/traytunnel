@@ -69,6 +69,8 @@ export interface UpdateInfo {
 export interface Snapshot {
   closeToTray: boolean;
   autostart: boolean;
+  /** 實際生效的值：設定檔沒寫時，一般模式是 true、可攜模式是 false */
+  checkForUpdates: boolean;
   sources: SourceInfo[];
   /** 活動日誌的整行（含時間戳與 [源名] 前綴），舊到新 */
   logs: string[];

@@ -96,6 +96,8 @@ pub struct UpdateInfo {
 pub struct Snapshot {
     pub close_to_tray: bool,
     pub autostart: bool,
+    /// 實際生效的值（設定檔沒寫時已經照模式決定好了），設定頁的開關直接吃它
+    pub check_for_updates: bool,
     pub sources: Vec<SourceView>,
     /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
     pub logs: Vec<String>,
@@ -179,6 +181,9 @@ pub struct AppState {
     /// 這次執行生效的設定檔完整路徑，由 config::config_location() 解析而來；
     /// 全程式的回寫、備份與「開啟設定資料夾」都以它為準
     pub path: PathBuf,
+    /// 這次是不是可攜模式（設定檔就在執行檔旁邊），同樣來自 config_location()。
+    /// 目前只有「檢查更新」這一項的預設值跟著它走
+    portable: bool,
     cfg: Mutex<Config>,
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
@@ -195,11 +200,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
+    pub fn new(app: AppHandle, path: PathBuf, portable: bool, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         AppState {
             app,
             path,
+            portable,
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
@@ -470,6 +476,11 @@ impl AppState {
         crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
+    /// 這次執行要不要檢查更新：設定檔沒寫的話，一般模式開、可攜模式關
+    pub fn checks_for_updates(&self) -> bool {
+        self.with_config(|c| c.checks_for_updates(self.portable))
+    }
+
     /// 記下背景檢查的結果並推事件；跟上次一樣就不重推。
     ///
     /// 每 24 小時會再查一次，同一個新版本重複推的話，設定頁那一列會無謂重畫，
@@ -533,6 +544,7 @@ impl AppState {
         Snapshot {
             close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
+            check_for_updates: self.checks_for_updates(),
             sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
             update: self.update_info(),

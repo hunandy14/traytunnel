@@ -149,6 +149,7 @@ pub fn run() {
             commands::set_autostart,
             commands::get_config_path,
             commands::open_config_dir,
+            commands::set_check_for_updates,
             commands::install_update,
             commands::open_releases_page,
             commands::window_close,
@@ -164,7 +165,7 @@ pub fn run() {
             let outcome = config::load_from_path(&loc.path);
             let cfg: Config = outcome.config().clone();
             let shared: Shared =
-                Arc::new(AppState::new(handle.clone(), loc.path.clone(), cfg.clone()));
+                Arc::new(AppState::new(handle.clone(), loc.path.clone(), loc.portable, cfg.clone()));
             // 壞檔又備份不出來時，原檔是使用者僅存的一份，這次執行一律不准回寫。
             // 要趕在任何存檔路徑（含系統匣、自啟自癒）跑起來之前拉閘。
             if outcome.read_only() {

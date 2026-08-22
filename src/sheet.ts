@@ -18,6 +18,7 @@ import {
   openConfigDir,
   openReleasesPage,
   setAutostart,
+  setCheckForUpdates,
   setCloseToTray,
   testConnection,
   upsertForward,
@@ -462,6 +463,7 @@ export function initTunnelSheet(h: TunnelHandlers) {
 
 const tgClose = () => el<HTMLButtonElement>("tg-close");
 const tgAutostart = () => el<HTMLButtonElement>("tg-autostart");
+const tgUpdates = () => el<HTMLButtonElement>("tg-updates");
 
 function setToggle(node: HTMLElement, on: boolean) {
   node.classList.toggle("on", on);
@@ -503,6 +505,7 @@ function syncUpdateRow(update: Snapshot["update"]) {
 export function syncSettingsPage(snap: Snapshot) {
   setToggle(tgClose(), snap.closeToTray);
   setToggle(tgAutostart(), snap.autostart);
+  setToggle(tgUpdates(), snap.checkForUpdates);
   syncUpdateRow(snap.update ?? null);
 }
 
@@ -574,6 +577,7 @@ function initUpdateRow() {
 export function initSettingsPage() {
   wireToggle(tgClose(), setCloseToTray);
   wireToggle(tgAutostart(), setAutostart);
+  wireToggle(tgUpdates(), setCheckForUpdates);
   initUpdateRow();
   initConfigPathRow();
   void loadAppVersion().then((v) => {

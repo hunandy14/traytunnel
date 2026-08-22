@@ -57,6 +57,10 @@ export const deleteForward = (local: number) => invoke<void>("delete_forward", {
 export const setCloseToTray = (on: boolean) => invoke<void>("set_close_to_tray", { on });
 export const setAutostart = (on: boolean) => invoke<void>("set_autostart", { on });
 
+/** 背景檢查更新的開關；關掉之後完全不連外 */
+export const setCheckForUpdates = (on: boolean) =>
+  invoke<void>("set_check_for_updates", { on });
+
 /** 這次執行實際生效的設定檔完整路徑（可攜模式與家目錄模式會不一樣） */
 export const getConfigPath = () => invoke<string>("get_config_path");
 

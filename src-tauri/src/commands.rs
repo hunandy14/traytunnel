@@ -423,6 +423,25 @@ pub fn open_config_dir(state: State<'_, Shared>) {
     }
 }
 
+/// 背景檢查更新的開關。
+///
+/// 關掉之後完全不再連外，順手把已經找到的那一版也從畫面上收掉——使用者說了
+/// 不要再被更新的事情打擾，留著那一列只是繼續打擾他。打開則立刻查一次，
+/// 不必等到明天的排程。
+#[tauri::command]
+pub fn set_check_for_updates(state: State<'_, Shared>, on: bool) -> Result<(), String> {
+    let st = state.inner();
+    st.update_config(|c| c.check_for_updates = Some(on)).map_err(|e| save_error_message(st, e))?;
+    st.emit_config_changed();
+    st.log(if on { "update checks enabled" } else { "update checks disabled" });
+    if on {
+        update::check_now(st);
+    } else {
+        st.set_update(None);
+    }
+    Ok(())
+}
+
 /// 安裝版的「Restart to update」：下載並交棒給 NSIS 安裝程式。
 ///
 /// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，

@@ -443,6 +443,7 @@ mod tests {
     fn cfg() -> Config {
         Config {
             close_to_tray: true,
+            check_for_updates: None,
             sources: vec![
                 Source {
                     name: "hk".into(),

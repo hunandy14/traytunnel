@@ -24,6 +24,7 @@ const STORE_KEY = "traytunnel-dev-mock-v3";
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
   autostart: false,
+  checkForUpdates: true,
   sources: [
     {
       name: "tokyo",
@@ -468,6 +469,14 @@ function handle(cmd: string, args: Args): unknown {
       state.autostart = Boolean(args.on);
       pushConfig();
       log(null, state.autostart ? "autostart enabled" : "autostart disabled");
+      return null;
+
+    // 真後端關掉時會順手把已經找到的那一版從畫面上收掉，這裡照做
+    case "set_check_for_updates":
+      state.checkForUpdates = Boolean(args.on);
+      if (!state.checkForUpdates) state.update = null;
+      pushConfig();
+      log(null, state.checkForUpdates ? "update checks enabled" : "update checks disabled");
       return null;
 
     // 瀏覽器裡沒有真的設定檔，給一條看得出樣子的假路徑（夠長，順便驗省略號）

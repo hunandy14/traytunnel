@@ -110,9 +110,19 @@ pub fn spawn_checker(state: &Shared) {
     });
 }
 
+/// 使用者剛把「檢查更新」打開時立刻查一次，不必等到明天這個時候。
+pub fn check_now(state: &Shared) {
+    let st = state.clone();
+    tauri::async_runtime::spawn(async move { check_once(&st).await });
+}
+
 /// 查一次。任何失敗都只記一行就算了——更新檢查不成功不影響程式本身能不能用，
 /// 沒有理由為它彈通知或改變任何狀態。
 async fn check_once(st: &Shared) {
+    // 關掉就是完全不連外：這道閘在任何請求送出之前
+    if !st.checks_for_updates() {
+        return;
+    }
     let found = if is_installed(&st.app) {
         check_installed(&st.app).await
     } else {

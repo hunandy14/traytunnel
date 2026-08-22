@@ -338,6 +338,7 @@ enabled = false
 fn locals_of_only_covers_that_source() {
     let cfg = Config {
         close_to_tray: true,
+        check_for_updates: None,
         sources: vec![
             src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
             src("tw", vec![fwd("c", 1090)]),
@@ -371,6 +372,54 @@ fn missing_fields_fall_back_to_defaults() {
     assert!(cfg.close_to_tray);
     assert_eq!(cfg.sources[0].proxy_command, "");
     assert!(cfg.sources[0].forwards.is_empty());
+}
+
+/// checkForUpdates 的預設值跟著模式走：設定檔沒寫時，一般模式開、可攜模式關。
+/// 這是可攜版「不主動連外」承諾的落點，寫死成單一預設值就等於毀約。
+#[test]
+fn check_for_updates_defaults_follow_the_mode() {
+    let cfg = parse_config("closeToTray = true\n").unwrap();
+    assert_eq!(cfg.check_for_updates, None, "沒寫就該是 None，不可以在解析時就決定");
+    assert!(cfg.checks_for_updates(false), "一般模式預設要檢查");
+    assert!(!cfg.checks_for_updates(true), "可攜模式預設不檢查");
+}
+
+/// 寫了就照使用者寫的算，兩種模式下都一樣——明示永遠蓋過預設
+#[test]
+fn an_explicit_check_for_updates_wins_in_both_modes() {
+    let on = parse_config("checkForUpdates = true\n").unwrap();
+    assert_eq!(on.check_for_updates, Some(true));
+    assert!(on.checks_for_updates(true) && on.checks_for_updates(false));
+
+    let off = parse_config("checkForUpdates = false\n").unwrap();
+    assert_eq!(off.check_for_updates, Some(false));
+    assert!(!off.checks_for_updates(true) && !off.checks_for_updates(false));
+}
+
+/// 沒設定過就不要把鍵寫進檔案：一寫下去，當下算出來的預設值就被固定住了，
+/// 同一份可攜設定之後被一般模式讀到（或反過來）時就跟不動模式了
+#[test]
+fn write_only_persists_check_for_updates_when_set() {
+    let dir = tmp_dir("check-updates");
+    let mut cfg = Config::default();
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(!saved.contains("\ncheckForUpdates"), "不該寫出這個鍵：{saved}");
+    assert_eq!(parse_config(&saved).unwrap().check_for_updates, None);
+
+    cfg.check_for_updates = Some(false);
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(saved.contains("checkForUpdates = false"), "{saved}");
+    assert_eq!(parse_config(&saved).unwrap().check_for_updates, Some(false));
+
+    // 改回 true 是就地改寫，不會多長出第二個鍵
+    cfg.check_for_updates = Some(true);
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    // 只數沒有被井字號註解掉的那一行（預設檔本來就帶一行說明用的註解）
+    assert_eq!(saved.matches("\ncheckForUpdates = ").count(), 1, "{saved}");
+    assert_eq!(parse_config(&saved).unwrap().check_for_updates, Some(true));
 }
 
 /// 一個源都沒有也是合法設定（使用者可以刪到零源）
@@ -771,6 +820,7 @@ fn write_drops_removed_sources() {
     let dir = tmp_dir("shrink-src");
     let mut cfg = Config {
         close_to_tray: true,
+        check_for_updates: None,
         sources: vec![src("a", vec![fwd("x", 1080)]), src("b", vec![fwd("y", 1083)])],
     };
     write_config(&dir, &cfg).unwrap();
@@ -792,7 +842,11 @@ fn write_drops_removed_sources() {
 #[test]
 fn write_appends_new_source() {
     let dir = tmp_dir("grow-src");
-    let mut cfg = Config { close_to_tray: true, sources: vec![src("a", vec![fwd("x", 1080)])] };
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: vec![src("a", vec![fwd("x", 1080)])],
+    };
     write_config(&dir, &cfg).unwrap();
     cfg.sources.push(src("b", vec![fwd("y", 1083), fwd("z", 1084)]));
     write_config(&dir, &cfg).unwrap();
@@ -888,7 +942,7 @@ fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
 
     // 落檔：command 端就是把這一筆原樣塞進設定再存，這裡照做一次
     let dir = tmp_dir("normalize-remote");
-    let mut cfg = Config { close_to_tray: true, sources: list };
+    let mut cfg = Config { close_to_tray: true, check_for_updates: None, sources: list };
     cfg.sources[0].forwards.push(made.clone());
     write_config(&dir, &cfg).unwrap();
     let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();

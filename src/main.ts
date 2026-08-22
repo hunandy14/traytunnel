@@ -43,6 +43,7 @@ import type { ExitInfo, ExitStatusEvent, ExitTestEvent, Snapshot, SourceInfo } f
 const EMPTY: Snapshot = {
   closeToTray: true,
   autostart: false,
+  checkForUpdates: true,
   sources: [],
   logs: [],
   update: null,
