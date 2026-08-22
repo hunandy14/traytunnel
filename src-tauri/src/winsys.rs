@@ -572,16 +572,29 @@ mod tests {
         let _ = delete_hkcu_key("Software\\traytunnel-test");
     }
 
-    /// 工作管理員的停用紀錄：後 8 個位元組是停用時間，全 0 才算啟用
+    /// 工作管理員的「啟動」分頁把使用者的停用記在 StartupApproved\Run：Run 值還在，
+    /// 但開機不會被執行。這裡實際寫進那個 subkey，走真的 approved_enabled 判定，
+    /// 三種情形都釘住：啟用（時間戳全 0）、停用（時間戳非 0）、沒有紀錄。
     #[test]
     fn task_manager_disable_is_respected() {
-        let subkey = format!("Software\\traytunnel-test-approved\\{}", std::process::id());
-        // 直接驗判斷規則本身：啟用的那 12 個位元組後 8 個全是 0
-        assert!(APPROVED_ENABLED.iter().rev().take(8).all(|b| *b == 0));
-        // 停用時後 8 個位元組是 FILETIME，不會全 0
-        let disabled: [u8; 12] = [0x03, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0];
-        assert!(!disabled.iter().rev().take(8).all(|b| *b == 0));
-        let _ = delete_hkcu_key(&subkey);
+        // 值名帶 pid，碰不到真正的 traytunnel 那一筆
+        let name = format!("traytunnel-test-{}", std::process::id());
+
+        // 啟用：後 8 個位元組（停用時間的 FILETIME）全是 0
+        write_hkcu_binary(APPROVED_SUBKEY, &name, &APPROVED_ENABLED).unwrap();
+        assert!(approved_enabled(&name), "全零時間戳代表使用者沒有停用");
+
+        // 停用：工作管理員把停用當下的 FILETIME 寫進後 8 個位元組
+        let disabled: [u8; 12] = [0x03, 0, 0, 0, 0x2b, 0x7c, 0x1d, 0xa9, 0x5f, 0xd4, 0xdb, 0x01];
+        write_hkcu_binary(APPROVED_SUBKEY, &name, &disabled).unwrap();
+        assert!(!approved_enabled(&name), "非零時間戳代表使用者在工作管理員按了停用");
+        // 這個測試名稱沒有對應的 Run 值，整體判定當然也是關的
+        assert!(!autostart_enabled(&name));
+
+        // 收尾：測試值刪掉，沒有紀錄時一律當成啟用（乾淨系統的常態）
+        delete_hkcu_value(APPROVED_SUBKEY, &name).unwrap();
+        assert!(read_hkcu_binary(APPROVED_SUBKEY, &name).is_none(), "測試值要清乾淨");
+        assert!(approved_enabled(&name), "沒有紀錄就當成啟用");
     }
 
     /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss
