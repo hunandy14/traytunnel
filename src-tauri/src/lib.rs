@@ -398,7 +398,8 @@ fn upsert_forward(
     let st = state.inner().clone();
     let cfg = st.config();
     let name = name.trim().to_string();
-    let remote = remote.trim().to_string();
+    // 只填埠號的寫法在這裡就補成 127.0.0.1:<port>，之後的驗證與落檔都用完整形式
+    let remote = config::normalize_remote(&remote);
     if cfg.source(&source).is_none() {
         return Some(format!("no such source: {source}"));
     }

@@ -574,6 +574,25 @@ pub fn valid_remote(s: &str) -> bool {
     }
 }
 
+/// REMOTE 欄位的輸入糖：只填埠號（純數字且落在 1-65535）時視為「伺服器本機的那個埠」，
+/// 補成 `127.0.0.1:<port>`。其他寫法原樣送回去給 `valid_remote` 判，
+/// 所以越界的埠（`0`、`70000`）不會被補成合法值，而是照舊被擋在 remote 這欄。
+///
+/// 補完的完整形式才是存進 toml 的值：設定檔看起來永遠是 `host:port`，
+/// 手改檔案的人不必知道這層糖。
+pub fn normalize_remote(remote: &str) -> String {
+    let s = remote.trim();
+    // parse 會放行 `+80` 這種寫法，所以先自己確認是純數字
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(port) = s.parse::<u16>() {
+            if port > 0 {
+                return format!("127.0.0.1:{port}");
+            }
+        }
+    }
+    s.to_string()
+}
+
 /// 名稱必須非空且不含空白，源名與出口名共用這條規則
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace())
@@ -592,6 +611,9 @@ pub fn valid_source_name(s: &str) -> bool {
 ///
 /// 訊息一律以欄位名開頭（`name: `／`local: `／`remote: `），前端才能把錯誤
 /// 掛回對應的欄位上；撞埠時會點名佔用者與它所屬的源。
+///
+/// `remote` 先過一次 [`normalize_remote`]，只填埠號的寫法才會被放行；
+/// 呼叫端存檔時也要存正規化後的值，驗證與落檔看的才是同一個字串。
 pub fn validate_forward(
     sources: &[Source],
     original_local: Option<u16>,
@@ -610,8 +632,10 @@ pub fn validate_forward(
     if local == 0 {
         return Some("local: port must be between 1 and 65535".into());
     }
-    if !valid_remote(remote) {
-        return Some("remote: must look like host:port, for example 127.0.0.1:1080".into());
+    if !valid_remote(&normalize_remote(remote)) {
+        return Some(
+            "remote: must look like host:port, for example 127.0.0.1:1080, or just a port".into(),
+        );
     }
     let clash = sources
         .iter()
@@ -1354,6 +1378,70 @@ enabled = false
         assert!(!valid_remote("has space:22"));
         // 冒號只准一個，[::1]:22 這種寫法目前不支援
         assert!(!valid_remote("::1:22"));
+    }
+
+    /// 只填埠號＝伺服器本機的那個埠，補成完整形式再存檔
+    #[test]
+    fn bare_port_normalizes_to_loopback() {
+        assert_eq!(normalize_remote("1080"), "127.0.0.1:1080");
+        assert_eq!(normalize_remote("1"), "127.0.0.1:1");
+        assert_eq!(normalize_remote("65535"), "127.0.0.1:65535");
+        // 前後空白算使用者手滑，一起吃掉
+        assert_eq!(normalize_remote("  8080  "), "127.0.0.1:8080");
+        // 補完的形式本身就是合法 remote，接得上既有驗證
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        assert!(validate_forward(&list, None, "ok", 1090, "1080").is_none());
+    }
+
+    /// 越界的埠不補糖，照舊擋在 remote 這欄（`0`／`70000` 都不是合法目的地）
+    #[test]
+    fn out_of_range_bare_port_is_rejected() {
+        assert_eq!(normalize_remote("0"), "0");
+        assert_eq!(normalize_remote("65536"), "65536");
+        assert_eq!(normalize_remote("70000"), "70000");
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        for bad in ["0", "65536", "70000", "999999999999"] {
+            assert!(
+                err(&list, None, "ok", 1090, bad).starts_with("remote: "),
+                "{bad} 應該被擋在 remote 這欄"
+            );
+        }
+    }
+
+    /// 既有的 host:port 路徑不受影響：原樣通過，也原樣落檔
+    #[test]
+    fn host_port_remotes_pass_through_untouched() {
+        assert_eq!(normalize_remote("127.0.0.1:1080"), "127.0.0.1:1080");
+        assert_eq!(normalize_remote("example.com:22"), "example.com:22");
+        assert_eq!(normalize_remote("10.0.0.5:8080"), "10.0.0.5:8080");
+        // 不是純數字也不是 host:port 的照樣被擋，糖不會把它救回來
+        assert_eq!(normalize_remote("nope"), "nope");
+        assert_eq!(normalize_remote("127.0.0.1"), "127.0.0.1");
+        let list = vec![src("hk", vec![fwd("a", 1080)])];
+        assert!(validate_forward(&list, None, "ok", 1090, "example.com:22").is_none());
+        assert!(err(&list, None, "ok", 1090, "127.0.0.1").starts_with("remote: "));
+    }
+
+    /// 補完的完整形式才是寫進 toml 的值
+    #[test]
+    fn normalized_remote_is_what_lands_in_the_file() {
+        let dir = tmp_dir("normalize-remote");
+        let cfg = Config {
+            close_to_tray: true,
+            sources: vec![src(
+                "hk",
+                vec![Forward {
+                    name: "a".into(),
+                    local: 1080,
+                    remote: normalize_remote("8080"),
+                    enabled: true,
+                }],
+            )],
+        };
+        write_config(&dir, &cfg).unwrap();
+        let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+        assert!(saved.contains("remote = \"127.0.0.1:8080\""), "實際存成：{saved}");
+        assert_eq!(parse_config(&saved).unwrap(), cfg);
     }
 
     /// 驗證訊息要能被前端逐欄掛回去，格式固定是「欄位: 說明」
