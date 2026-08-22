@@ -21,6 +21,9 @@ pub const HOME_TOML_NAME: &str = ".traytunnel.toml";
 /// 壞檔備份一律是「生效檔名 + 這個後綴」，所以兩種模式的備份也各自不同名
 const BROKEN_SUFFIX: &str = ".broken";
 
+/// 存檔用的暫存檔後綴，寫完就 rename 蓋回生效檔名
+const TMP_SUFFIX: &str = ".tmp";
+
 #[cfg(test)]
 pub const BROKEN_NAME: &str = "traytunnel.toml.broken";
 
@@ -572,7 +575,31 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
         }
     }
 
-    std::fs::write(path, doc.to_string())
+    write_atomic(path, &doc.to_string())
+}
+
+/// 落檔一律先寫暫存檔再 rename 蓋過去。
+///
+/// `fs::write` 是「先截斷再寫」，中途斷電、磁碟滿或行程被砍都會留下一個半截的
+/// 設定檔，下次啟動就是壞檔。rename 在同一個資料夾內是原子的（Windows 的
+/// `MoveFileEx` 帶 REPLACE_EXISTING），使用者手上永遠只會看到完整的舊版或新版。
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = tmp_path(path);
+    std::fs::write(&tmp, contents)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // 換名失敗就別把半成品留在使用者的設定資料夾裡
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 暫存檔路徑：生效檔名直接接上 `.tmp`，與備份檔同樣跟著實際檔名走，
+/// 而且一定落在同一個資料夾，rename 才會是同磁碟區的原子換名
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_else(|| TOML_NAME.as_ref()).to_os_string();
+    name.push(TMP_SUFFIX);
+    path.with_file_name(name)
 }
 
 /// 資料夾版的薄包裝，只給測試用
@@ -1393,6 +1420,28 @@ enabled = false
         let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
         assert!(saved.contains("# 保留我"));
         assert!(saved.contains("c.example.com"));
+    }
+
+    /// 存檔走「暫存檔 + rename」，成功之後資料夾裡不可以留下暫存檔，
+    /// 生效檔名也必須還是原來那一個
+    #[test]
+    fn write_goes_through_a_temp_file_and_leaves_none_behind() {
+        let dir = tmp_dir("atomic-write");
+        let path = dir.join(TOML_NAME);
+        assert_eq!(tmp_path(&path), dir.join("traytunnel.toml.tmp"));
+        assert_eq!(
+            tmp_path(Path::new("C:\\Users\\bob\\.traytunnel.toml")),
+            PathBuf::from("C:\\Users\\bob\\.traytunnel.toml.tmp")
+        );
+
+        let cfg = Config::default();
+        write_config(&dir, &cfg).unwrap();
+        assert!(!tmp_path(&path).exists(), "暫存檔要被 rename 掉");
+        let names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![TOML_NAME.to_string()]);
+        // 換名之後的內容是完整的一份，不是半截檔
+        assert_eq!(parse_config(&std::fs::read_to_string(&path).unwrap()).unwrap(), cfg);
     }
 
     /// 刪出口後檔案裡不該留下多餘的 [[sources.forwards]]
