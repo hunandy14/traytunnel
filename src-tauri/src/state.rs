@@ -266,22 +266,31 @@ impl AppState {
         push_log_line(&mut self.logs.lock().unwrap(), line);
     }
 
+    /// 對既存出口的執行期狀態就地改一筆，回傳 None 代表這個出口已經不在了。
+    ///
+    /// 執行期狀態的項目只由 `AppState::new` 與 `sync_exits` 依設定建立，
+    /// 其餘地方一律只改既存項：晚到的狀態更新若順手把項目補回來，就會生出
+    /// 設定裡根本不存在的幽靈出口。
+    fn with_exit_mut<T>(&self, local: u16, f: impl FnOnce(&mut ExitRuntime) -> T) -> Option<T> {
+        self.exits.lock().unwrap().get_mut(&local).map(f)
+    }
+
     /// 更新某個出口的連線狀態並推事件；狀態沒變就不重複推。
     ///
     /// 只更新既存的出口：出口一旦被刪掉，執行期狀態也跟著被 `sync_exits` 清掉，
     /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
     /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
-        {
-            let mut exits = self.exits.lock().unwrap();
-            let Some(rt) = exits.get_mut(&local) else {
-                return;
-            };
+        let changed = self.with_exit_mut(local, |rt| {
             if rt.status == status && rt.detail == detail {
-                return;
+                return false;
             }
             rt.status = status.into();
             rt.detail = detail.clone();
+            true
+        });
+        if changed != Some(true) {
+            return;
         }
         let _ = self
             .app
@@ -306,12 +315,9 @@ impl AppState {
     /// 更新某個出口的自測狀態並推事件。與 `set_exit_status` 同理，
     /// 只更新既存的出口，不讓已刪掉的埠靠一次晚到的自測結果復活
     pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
-        {
-            let mut exits = self.exits.lock().unwrap();
-            let Some(rt) = exits.get_mut(&local) else {
-                return;
-            };
-            rt.last_test = Some(TestView { state: state.into(), text: text.into() });
+        let view = TestView { state: state.into(), text: text.into() };
+        if self.with_exit_mut(local, |rt| rt.last_test = Some(view)).is_none() {
+            return;
         }
         let _ = self.app.emit(
             "exit-test",
@@ -321,10 +327,7 @@ impl AppState {
 
     /// 出口斷線或停掉時把舊的自測結果清乾淨
     pub fn clear_exit_test(&self, local: u16) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            rt.last_test = None;
-        }
+        self.with_exit_mut(local, |rt| rt.last_test = None);
     }
 
     /// 標記某個埠開始測試，回傳 false 代表已經在測了
@@ -338,35 +341,31 @@ impl AppState {
 
     /// 讓該出口進入新世代並騰出位子，舊的監看迴圈看到世代不符就會自行退出。
     /// 位子當場清掉，緊接著的 start 不必等舊迴圈醒來就能接手。
-    pub fn next_generation(&self, local: u16) -> u64 {
-        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        rt.generation = next;
-        rt.supervisor = None;
-        next
+    pub fn next_generation(&self, local: u16) {
+        let counter = &self.generation;
+        self.with_exit_mut(local, |rt| {
+            rt.generation = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.supervisor = None;
+        });
     }
 
     /// 搶下這個出口的監看位子，回傳 None 代表已經有一條線在跑，不要再起第二條
     pub fn claim_supervisor(&self, local: u16) -> Option<u64> {
         let counter = &self.generation;
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        let claimed = claim_slot(&mut rt.supervisor, || {
-            counter.fetch_add(1, Ordering::SeqCst) + 1
-        });
-        if let Some(generation) = claimed {
-            rt.generation = generation;
-        }
-        claimed
+        self.with_exit_mut(local, |rt| {
+            let claimed =
+                claim_slot(&mut rt.supervisor, || counter.fetch_add(1, Ordering::SeqCst) + 1);
+            if let Some(generation) = claimed {
+                rt.generation = generation;
+            }
+            claimed
+        })
+        .flatten()
     }
 
     /// 監看迴圈結束時歸還位子
     pub fn release_supervisor(&self, local: u16, generation: u64) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            release_slot(&mut rt.supervisor, generation);
-        }
+        self.with_exit_mut(local, |rt| release_slot(&mut rt.supervisor, generation));
     }
 
     pub fn generation(&self, local: u16) -> u64 {
@@ -378,28 +377,24 @@ impl AppState {
         self.generation(local) == generation
     }
 
+    /// 記下這一輪連線的 job handle。出口已經被刪掉時 job 當場 drop，
+    /// 那條剛 spawn 出來的 ssh 也就跟著收掉，正是我們要的結果。
     pub fn store_job(&self, local: u16, generation: u64, job: Job) {
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        rt.job = Some((generation, job));
+        self.with_exit_mut(local, |rt| rt.job = Some((generation, job)));
     }
 
     /// 關掉 job handle，該出口的 ssh 程序樹一起結束
     pub fn kill_job(&self, local: u16) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            let _ = rt.job.take();
-        }
+        self.with_exit_mut(local, |rt| rt.job.take());
     }
 
     /// 只在世代相符時清掉 job，避免誤殺新的一輪連線
     pub fn kill_job_of(&self, local: u16, generation: u64) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
+        self.with_exit_mut(local, |rt| {
             if rt.job.as_ref().map(|(g, _)| *g) == Some(generation) {
-                let _ = rt.job.take();
+                rt.job.take();
             }
-        }
+        });
     }
 
     /// 收掉所有出口的 ssh 程序，離開程式時用
