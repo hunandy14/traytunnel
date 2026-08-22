@@ -402,6 +402,18 @@ mod tests {
         assert!(arg.starts_with("/select,\""), "逗號後面不可以有空白：{arg}");
     }
 
+    /// 路徑本身含逗號時特別危險：`/select,` 靠的就是逗號分隔，
+    /// 沒有引號的話 explorer 會從路徑中間的逗號斷開而選錯東西
+    #[test]
+    fn explorer_quotes_a_path_containing_commas() {
+        let path = Path::new("C:\\Users\\Bob\\Documents, old\\.traytunnel.toml");
+        let arg = explorer_arg(path, true);
+        assert_eq!(arg, "/select,\"C:\\Users\\Bob\\Documents, old\\.traytunnel.toml\"");
+        // 引號恰好包住整條路徑：開頭與結尾各一個，中間不再有
+        assert_eq!(arg.matches('"').count(), 2);
+        assert!(arg.ends_with('"'));
+    }
+
     /// 檔案不在了就退而開啟它所在的資料夾，一樣要帶引號
     #[test]
     fn explorer_falls_back_to_the_folder() {

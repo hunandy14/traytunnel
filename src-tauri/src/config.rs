@@ -50,19 +50,20 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-/// 執行檔主檔名裡的可攜記號：Rufus 的 `rufus-4.5p.exe` 那套。
+/// 執行檔主檔名裡的可攜記號：Rufus 的 `rufus-4.5p.exe` 那套，記號是**結尾**的 p。
 ///
-/// `traytunnel` 這個名字本身一個 p 都沒有，所以主檔名（去掉副檔名）裡只要出現
-/// 任何一個 p，就是使用者刻意加上去的記號，例如 `traytunnel-p.exe`、
-/// `traytunnel-0.2.0p.exe`。大小寫不敏感。
+/// 只認結尾而不是任意位置，否則 Windows 複製檔案自動取的
+/// 「traytunnel - Copy.exe」（Copy 裡有 p）會莫名其妙變成可攜模式。
+/// `traytunnel` 本身不是 p 結尾，所以結尾的 p 一定是使用者刻意加的，
+/// 例如 `traytunnel-p.exe`、`traytunnel-0.2.0p.exe`。大小寫不敏感。
 pub fn stem_marks_portable(exe_stem: &str) -> bool {
-    exe_stem.chars().any(|c| c.eq_ignore_ascii_case(&'p'))
+    matches!(exe_stem.chars().next_back(), Some(c) if c.eq_ignore_ascii_case(&'p'))
 }
 
 /// 路徑優先序的純邏輯，實機與測試共用。可攜模式兩個觸發條件**任一成立**即可，
 /// 兩者都指向執行檔旁邊的 `traytunnel.toml`：
 ///
-/// 1. 執行檔主檔名含 p（[`stem_marks_portable`]）→ 可攜模式；檔案還不存在也算，
+/// 1. 執行檔主檔名以 p 結尾（[`stem_marks_portable`]）→ 可攜模式；檔案還不存在也算，
 ///    後面 `load_from_path` 會就地建一份預設檔（Rufus 建 ini 的行為）；
 /// 2. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
 /// 3. 都不成立就用家目錄的 `.traytunnel.toml`；
@@ -321,9 +322,16 @@ pub fn default_document() -> String {
     )
 }
 
-/// 從指定路徑讀設定，檔案不存在就寫一份預設值。
+/// 檔案存在但長度是 0。可攜模式的常見用法就是先 `type nul > traytunnel.toml`
+/// 生一個空檔當開關，那種檔案要當成「還沒有設定」而不是壞檔。
+/// 問不到 metadata 時保守地當成非空，後面照原路走讀取／壞檔流程。
+fn is_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false)
+}
+
+/// 從指定路徑讀設定，檔案不存在（或存在但是空檔）就寫一份預設值。
 pub fn load_from_path(toml_path: &Path) -> LoadOutcome {
-    if toml_path.exists() {
+    if toml_path.exists() && !is_empty_file(toml_path) {
         let raw = match std::fs::read_to_string(toml_path) {
             Ok(s) => s,
             Err(e) => return broken(toml_path, format!("讀取失敗：{e}")),
@@ -728,29 +736,46 @@ mod tests {
 
     // ------------------------------ 檔名含 p 的可攜記號（Rufus 那套）
 
-    /// 產品名 traytunnel 本身一個 p 都沒有，這是整個記號成立的前提
+    /// 產品名 traytunnel 不是 p 結尾，這是整個記號成立的前提
     #[test]
-    fn the_product_name_itself_has_no_p() {
+    fn the_product_name_itself_does_not_end_with_p() {
         assert!(!stem_marks_portable("traytunnel"));
         assert!(!stem_marks_portable("traytunnel-0.2.0"));
         assert!(!stem_marks_portable(""));
     }
 
-    /// p 在哪裡都算：結尾、中間、開頭，大小寫都不敏感
+    /// 記號是結尾的 p，大小寫不敏感（Rufus 本尊就是 rufus-4.5p.exe 這種寫法）
     #[test]
-    fn any_p_in_the_stem_marks_portable() {
-        // Rufus 式的版本號後綴
+    fn a_trailing_p_marks_portable() {
         assert!(stem_marks_portable("traytunnel-0.2.0p"));
         assert!(stem_marks_portable("traytunnel-p"));
         assert!(stem_marks_portable("traytunnelp"));
-        // p 在中間
-        assert!(stem_marks_portable("traytunnel-portable"));
-        assert!(stem_marks_portable("tray-p-tunnel"));
-        // 大寫
+        // 大寫一樣算
         assert!(stem_marks_portable("traytunnel-0.2.0P"));
         assert!(stem_marks_portable("TRAYTUNNEL-P"));
-        // 開頭
-        assert!(stem_marks_portable("portable-traytunnel"));
+    }
+
+    /// p 在中間或開頭都不算，只看最後一個字元
+    #[test]
+    fn a_p_elsewhere_in_the_stem_does_not_mark_portable() {
+        assert!(!stem_marks_portable("traytunnel-portable"));
+        assert!(!stem_marks_portable("portable-traytunnel"));
+        assert!(!stem_marks_portable("tray-p-tunnel"));
+        assert!(!stem_marks_portable("traytunnel-preview"));
+    }
+
+    /// Windows 複製檔案自動取的名字含 Copy（裡面有 p），
+    /// 絕對不可以因此就把使用者的設定改讀到 exe 旁邊去
+    #[test]
+    fn a_windows_copy_is_not_portable() {
+        assert!(!stem_marks_portable("traytunnel - Copy"));
+        assert!(!stem_marks_portable("traytunnel - Copy (2)"));
+
+        let exe = tmp_dir("loc-copy");
+        let home = tmp_dir("loc-home-copy");
+        let loc = resolve_location(&exe, "traytunnel - Copy", Some(&home));
+        assert!(!loc.portable);
+        assert_eq!(loc.path, home.join(HOME_TOML_NAME));
     }
 
     /// 檔名含 p 時，設定檔就在 exe 旁邊，即使檔案還不存在、家目錄也問得出來
@@ -781,7 +806,39 @@ mod tests {
         assert!(!home.join(HOME_TOML_NAME).exists());
     }
 
-    /// 兩個觸發條件同時成立（檔名含 p ＋ exe 旁已有檔案）時是同一個結果，
+    /// 空檔是可攜模式的開關（`type nul > traytunnel.toml`），要被補成預設內容，
+    /// 不可以當成壞檔
+    #[test]
+    fn an_empty_file_is_filled_in_with_defaults() {
+        let dir = tmp_dir("empty-file");
+        let path = dir.join(TOML_NAME);
+        std::fs::write(&path, "").unwrap();
+
+        let out = load_from_path(&path);
+        assert!(matches!(out, LoadOutcome::Created(_)), "空檔應該走 Created");
+        assert_eq!(out.config(), &Config::default());
+        // 內容真的被補上去了，而且不該留下壞檔備份
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert!(!broken_path(&path).exists());
+        // 補完之後再讀一次就是正常的 Loaded
+        assert!(matches!(load_from_path(&path), LoadOutcome::Loaded(_)));
+    }
+
+    /// 空檔擺在 exe 旁邊就是可攜模式的開關：程式補內容，家目錄那份不碰
+    #[test]
+    fn an_empty_file_beside_the_exe_turns_on_portable_mode() {
+        let exe = tmp_dir("empty-portable");
+        let home = tmp_dir("empty-portable-home");
+        std::fs::write(exe.join(TOML_NAME), "").unwrap();
+
+        let loc = resolve_location(&exe, PLAIN, Some(&home));
+        assert!(loc.portable);
+        assert!(matches!(load_from_path(&loc.path), LoadOutcome::Created(_)));
+        assert!(std::fs::metadata(exe.join(TOML_NAME)).unwrap().len() > 0);
+        assert!(!home.join(HOME_TOML_NAME).exists());
+    }
+
+    /// 兩個觸發條件同時成立（檔名 p 結尾 ＋ exe 旁已有檔案）時是同一個結果，
     /// 而且既有檔案要被讀進來，不可以被預設值蓋掉
     #[test]
     fn both_portable_triggers_agree_on_the_same_file() {

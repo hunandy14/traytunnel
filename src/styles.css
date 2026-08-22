@@ -968,11 +968,15 @@ body {
   opacity: 1;
 }
 
-/* 路徑可能很長，單行省略掉尾巴即可，整列不會被撐開（.setting-text 已經有
-   min-width: 0，省略號才生效） */
+/* 路徑可能很長，整列不會被撐開（.setting-text 已經有 min-width: 0，
+   省略號才生效）。這裡要省略的是**開頭**：路徑尾端的檔名才是使用者要認的東西
+   （.traytunnel.toml 還是 traytunnel.toml，決定現在是哪一種模式），
+   所以用 direction: rtl 讓省略號長在左邊，再用 text-align: left 把字靠回左側。 */
 .setting-hint.path {
   overflow: hidden;
+  direction: rtl;
   white-space: nowrap;
+  text-align: left;
   text-overflow: ellipsis;
 }
 
