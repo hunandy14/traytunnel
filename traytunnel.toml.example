@@ -1,4 +1,5 @@
-# traytunnel 設定檔範本，複製成 traytunnel.toml 後放在執行檔同一個資料夾。
+# traytunnel 設定檔範本，複製成 %USERPROFILE%\.traytunnel.toml；
+# 想走可攜模式就改成複製到執行檔旁邊的 traytunnel.toml。
 # 也可以直接在程式的設定介面填寫，存檔時會寫回這個檔案並保留註解。
 
 # 關閉鈕（X）是否只隱藏到系統匣，false 代表直接結束程式。

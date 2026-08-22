@@ -51,6 +51,12 @@ export const deleteForward = (local: number) => invoke<void>("delete_forward", {
 export const setCloseToTray = (on: boolean) => invoke<void>("set_close_to_tray", { on });
 export const setAutostart = (on: boolean) => invoke<void>("set_autostart", { on });
 
+/** 這次執行實際生效的設定檔完整路徑（可攜模式與家目錄模式會不一樣） */
+export const getConfigPath = () => invoke<string>("get_config_path");
+
+/** 在檔案總管開啟設定檔所在資料夾並選中它 */
+export const openConfigDir = () => invoke<void>("open_config_dir");
+
 /** 自繪標題列用的視窗指令，close 的行為（縮到匣或結束）由 Rust 端決定 */
 export const windowMinimize = () => invoke<void>("window_minimize");
 export const windowClose = () => invoke<void>("window_close");

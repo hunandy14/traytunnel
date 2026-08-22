@@ -148,8 +148,9 @@ impl ExitRuntime {
 
 pub struct AppState {
     pub app: AppHandle,
-    /// 設定檔所在資料夾（執行檔同目錄）
-    pub dir: PathBuf,
+    /// 這次執行生效的設定檔完整路徑，由 config::config_location() 解析而來；
+    /// 全程式的回寫、備份與「開啟設定資料夾」都以它為準
+    pub path: PathBuf,
     cfg: Mutex<Config>,
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
@@ -162,11 +163,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(app: AppHandle, dir: PathBuf, cfg: Config) -> Self {
+    pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::new())).collect();
         AppState {
             app,
-            dir,
+            path,
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
@@ -189,7 +190,7 @@ impl AppState {
         let mut guard = self.cfg.lock().unwrap();
         let mut next = guard.clone();
         let out = edit(&mut next);
-        crate::config::write_config(&self.dir, &next)?;
+        crate::config::write_config_at(&self.path, &next)?;
         *guard = next;
         drop(guard);
         self.sync_exits();

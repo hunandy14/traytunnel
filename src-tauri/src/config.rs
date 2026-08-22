@@ -1,5 +1,8 @@
-//! 設定檔：TOML，放在執行檔同目錄的 traytunnel.toml。
+//! 設定檔：TOML，預設放在使用者家目錄的 `.traytunnel.toml`。
 //! 讀寫走 toml_edit，保留使用者手寫的註解與排版。
+//!
+//! 位置由 [`config_location`] 一次解析完（資料夾與檔名綁在一起），全程式的讀、
+//! 寫、壞檔備份都跟著同一個結果走，不再各自拼路徑。
 //!
 //! 契約 v3 起改成多連線源：頂層只剩 closeToTray，其餘全部收進 `[[sources]]`，
 //! 每個源自己帶 host／user／proxyCommand 與巢狀的 `[[sources.forwards]]`。
@@ -9,8 +12,88 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
+/// 可攜模式的檔名：放在執行檔旁邊就生效（KeePass／Rufus 那套同名檔慣例）
 pub const TOML_NAME: &str = "traytunnel.toml";
+
+/// 家目錄模式的檔名，點開頭，不去污染使用者家目錄的檔案清單
+pub const HOME_TOML_NAME: &str = ".traytunnel.toml";
+
+/// 壞檔備份一律是「生效檔名 + 這個後綴」，所以兩種模式的備份也各自不同名
+const BROKEN_SUFFIX: &str = ".broken";
+
+#[cfg(test)]
 pub const BROKEN_NAME: &str = "traytunnel.toml.broken";
+
+/// 設定檔的落腳處。資料夾與檔名是一起決定的（可攜模式與家目錄模式連檔名都不同），
+/// 因此解析結果整包傳遞，任何地方都不要再自己拼一次路徑。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigLocation {
+    /// 生效的完整路徑
+    pub path: PathBuf,
+    /// 是不是可攜模式（設定檔就在執行檔旁邊）
+    pub portable: bool,
+}
+
+impl ConfigLocation {
+    /// 設定檔所在資料夾，建資料夾與開檔案總管時用
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+}
+
+/// 日誌與通知要顯示的檔名。兩種模式檔名不同（`traytunnel.toml` 與
+/// `.traytunnel.toml`，備份再各自加 `.broken`），訊息裡一律不可寫死。
+/// 拿不到檔名時退回可攜模式的檔名。
+pub fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| TOML_NAME.to_string())
+}
+
+/// 路徑優先序的純邏輯，實機與測試共用：
+///
+/// 1. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
+/// 2. 否則用家目錄的 `.traytunnel.toml`；
+/// 3. 連家目錄都問不出來時退回執行檔目錄，檔名仍維持點檔，
+///    才不會反過來把自己變成可攜模式。
+pub fn resolve_location(exe_dir: &Path, home: Option<&Path>) -> ConfigLocation {
+    let portable = exe_dir.join(TOML_NAME);
+    if portable.is_file() {
+        return ConfigLocation { path: portable, portable: true };
+    }
+    let base = home.unwrap_or(exe_dir);
+    ConfigLocation { path: base.join(HOME_TOML_NAME), portable: false }
+}
+
+/// 執行檔所在資料夾，取不到就退回工作目錄
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 使用者家目錄；空字串視同沒有
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
+/// 全程式只有這一個入口，讀寫與備份都從回傳值派生。
+pub fn config_location() -> ConfigLocation {
+    let loc = resolve_location(&exe_dir(), home_dir().as_deref());
+    let _ = std::fs::create_dir_all(loc.dir());
+    loc
+}
+
+/// 壞檔備份的路徑：生效檔名直接接上 `.broken`
+pub fn broken_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_else(|| TOML_NAME.as_ref()).to_os_string();
+    name.push(BROKEN_SUFFIX);
+    path.with_file_name(name)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Forward {
@@ -174,7 +257,7 @@ pub fn default_document() -> String {
     let c = Config::default();
     let s = &c.sources[0];
     format!(
-        "# traytunnel 設定檔，與執行檔放在同一個資料夾。\n\
+        "# traytunnel 設定檔。設定頁的 Config file 一列會顯示它實際的位置。\n\
          # 修改後可直接在設定介面存檔，或重新啟動程式。\n\
          \n\
          # 關閉鈕（X）是否只隱藏到系統匣。\n\
@@ -216,32 +299,36 @@ pub fn default_document() -> String {
     )
 }
 
-/// 從指定資料夾讀設定，檔案不存在就寫一份預設值。
-pub fn load_from_dir(dir: &Path) -> LoadOutcome {
-    let toml_path = dir.join(TOML_NAME);
-
+/// 從指定路徑讀設定，檔案不存在就寫一份預設值。
+pub fn load_from_path(toml_path: &Path) -> LoadOutcome {
     if toml_path.exists() {
-        let raw = match std::fs::read_to_string(&toml_path) {
+        let raw = match std::fs::read_to_string(toml_path) {
             Ok(s) => s,
-            Err(e) => return broken(dir, &toml_path, format!("讀取失敗：{e}")),
+            Err(e) => return broken(toml_path, format!("讀取失敗：{e}")),
         };
         return match parse_document(&raw) {
             Ok((cfg, migrated)) => {
                 if migrated {
                     // 遷移只改結構，寫回時走同一套就地改寫，註解照樣留著
-                    let _ = write_config(dir, &cfg);
+                    let _ = write_config_at(toml_path, &cfg);
                     LoadOutcome::Migrated(cfg)
                 } else {
                     LoadOutcome::Loaded(cfg)
                 }
             }
-            Err(e) => broken(dir, &toml_path, e),
+            Err(e) => broken(toml_path, e),
         };
     }
 
     let cfg = Config::default();
-    let _ = std::fs::write(&toml_path, default_document());
+    let _ = std::fs::write(toml_path, default_document());
     LoadOutcome::Created(cfg)
+}
+
+/// 資料夾版的薄包裝，只給測試用（實機一律走 [`config_location`] 解析出來的完整路徑）
+#[cfg(test)]
+pub fn load_from_dir(dir: &Path) -> LoadOutcome {
+    load_from_path(&dir.join(TOML_NAME))
 }
 
 /// 用 PowerShell 之類的工具存檔可能會帶 UTF-8 BOM，解析前先剝掉。
@@ -249,9 +336,9 @@ fn strip_bom(raw: &str) -> &str {
     raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
-fn broken(dir: &Path, toml_path: &Path, error: String) -> LoadOutcome {
+fn broken(toml_path: &Path, error: String) -> LoadOutcome {
     // 絕不覆寫壞掉的設定檔，只複製一份備份出來；連檔案都讀不到時就沒有備份可言
-    let target = dir.join(BROKEN_NAME);
+    let target = broken_path(toml_path);
     let backup = std::fs::copy(toml_path, &target).ok().map(|_| target);
     LoadOutcome::Broken { config: Config::default(), backup, error }
 }
@@ -398,9 +485,8 @@ fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
 ///
 /// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張桌就地改寫；讀到的是
 /// 舊制檔案時先把結構遷移成新制再寫。
-pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
-    let path = dir.join(TOML_NAME);
-    let mut doc = std::fs::read_to_string(&path)
+pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
+    let mut doc = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| strip_bom(&s).parse::<DocumentMut>().ok())
         .unwrap_or_else(|| default_document().parse::<DocumentMut>().unwrap());
@@ -437,6 +523,12 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     }
 
     std::fs::write(path, doc.to_string())
+}
+
+/// 資料夾版的薄包裝，只給測試用
+#[cfg(test)]
+pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
+    write_config_at(&dir.join(TOML_NAME), cfg)
 }
 
 /// remote 必須符合 `^[^:\s]+:\d+$`：主機不含冒號與空白，埠是純數字。
@@ -559,6 +651,118 @@ mod tests {
             proxy_command: String::new(),
             forwards,
         }
+    }
+
+    // ------------------------------------------------------------ 路徑優先序
+
+    /// 四象限之一：exe 旁有同名檔、家目錄問得出來 → 可攜模式優先
+    #[test]
+    fn portable_file_beside_the_exe_wins() {
+        let exe = tmp_dir("loc-portable");
+        let home = tmp_dir("loc-home");
+        std::fs::write(exe.join(TOML_NAME), "closeToTray = true\n").unwrap();
+        let loc = resolve_location(&exe, Some(&home));
+        assert!(loc.portable);
+        assert_eq!(loc.path, exe.join(TOML_NAME));
+        assert_eq!(loc.dir(), exe);
+        assert_eq!(file_name_of(&loc.path), TOML_NAME);
+    }
+
+    /// 之二：exe 旁沒有同名檔、家目錄問得出來 → 家目錄的點檔
+    #[test]
+    fn falls_back_to_the_home_dotfile() {
+        let exe = tmp_dir("loc-noportable");
+        let home = tmp_dir("loc-home2");
+        let loc = resolve_location(&exe, Some(&home));
+        assert!(!loc.portable);
+        assert_eq!(loc.path, home.join(HOME_TOML_NAME));
+        assert_eq!(loc.dir(), home);
+        assert_eq!(file_name_of(&loc.path), HOME_TOML_NAME);
+    }
+
+    /// 之三：exe 旁有同名檔、家目錄問不出來 → 一樣是可攜模式
+    #[test]
+    fn portable_wins_even_without_a_home_dir() {
+        let exe = tmp_dir("loc-portable-nohome");
+        std::fs::write(exe.join(TOML_NAME), "closeToTray = true\n").unwrap();
+        let loc = resolve_location(&exe, None);
+        assert!(loc.portable);
+        assert_eq!(loc.path, exe.join(TOML_NAME));
+    }
+
+    /// 之四：兩邊都沒有 → 退回 exe 目錄，但檔名維持點檔，
+    /// 免得自己生出來的檔案下次啟動被當成可攜模式
+    #[test]
+    fn without_a_home_dir_it_uses_the_exe_dir_dotfile() {
+        let exe = tmp_dir("loc-nohome");
+        let loc = resolve_location(&exe, None);
+        assert!(!loc.portable);
+        assert_eq!(loc.path, exe.join(HOME_TOML_NAME));
+        assert_ne!(loc.path, exe.join(TOML_NAME));
+    }
+
+    /// 資料夾不算數，同名的資料夾不該讓程式誤判成可攜模式
+    #[test]
+    fn a_directory_named_like_the_config_is_not_portable() {
+        let exe = tmp_dir("loc-dir");
+        let home = tmp_dir("loc-home3");
+        std::fs::create_dir_all(exe.join(TOML_NAME)).unwrap();
+        assert!(!resolve_location(&exe, Some(&home)).portable);
+    }
+
+    /// 壞檔備份跟著生效檔名走，兩種模式各自不同名
+    #[test]
+    fn broken_path_follows_the_live_file_name() {
+        assert_eq!(
+            broken_path(Path::new("C:\\app\\traytunnel.toml")),
+            PathBuf::from("C:\\app\\traytunnel.toml.broken")
+        );
+        assert_eq!(
+            broken_path(Path::new("C:\\Users\\bob\\.traytunnel.toml")),
+            PathBuf::from("C:\\Users\\bob\\.traytunnel.toml.broken")
+        );
+    }
+
+    // ------------------------------------------------------------ 完整路徑讀寫
+
+    /// 讀寫一律吃完整路徑，家目錄那個點檔也要能建、能讀、能寫回
+    #[test]
+    fn loads_and_writes_a_dotfile_by_path() {
+        let dir = tmp_dir("dotfile");
+        let path = dir.join(HOME_TOML_NAME);
+
+        let out = load_from_path(&path);
+        assert!(matches!(out, LoadOutcome::Created(_)));
+        assert!(path.exists());
+        // 不可以順手在旁邊生出可攜模式的檔案
+        assert!(!dir.join(TOML_NAME).exists());
+
+        let mut cfg = out.config().clone();
+        cfg.close_to_tray = false;
+        write_config_at(&path, &cfg).unwrap();
+        let back = load_from_path(&path);
+        assert!(matches!(back, LoadOutcome::Loaded(_)));
+        assert_eq!(back.config(), &cfg);
+    }
+
+    /// 點檔壞掉時備份是 .traytunnel.toml.broken，而且原檔不被覆寫
+    #[test]
+    fn broken_dotfile_is_backed_up_next_to_itself() {
+        let dir = tmp_dir("dotfile-broken");
+        let path = dir.join(HOME_TOML_NAME);
+        let bad = "closeToTray = true\nthis is not toml @@@\n";
+        std::fs::write(&path, bad).unwrap();
+
+        let out = load_from_path(&path);
+        match &out {
+            LoadOutcome::Broken { backup, .. } => {
+                let backup = backup.as_ref().expect("應該有備份");
+                assert_eq!(backup, &dir.join(".traytunnel.toml.broken"));
+                assert_eq!(std::fs::read_to_string(backup).unwrap(), bad);
+            }
+            _ => panic!("預期 Broken"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
     }
 
     // ------------------------------------------------------------ 新制解析

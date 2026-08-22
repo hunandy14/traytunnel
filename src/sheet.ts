@@ -8,7 +8,14 @@
  */
 
 import { el } from "./dom";
-import { deleteSource, setAutostart, setCloseToTray, upsertSource } from "./ipc";
+import {
+  deleteSource,
+  getConfigPath,
+  openConfigDir,
+  setAutostart,
+  setCloseToTray,
+  upsertSource,
+} from "./ipc";
 import type { Snapshot, SourceInfo } from "./types";
 import { loadAppVersion } from "./version";
 
@@ -250,9 +257,32 @@ function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>)
   });
 }
 
+/**
+ * About 的「Config file」一列：副標顯示實際生效的完整路徑，整列點下去
+ * 就開檔案總管並選中它。路徑問不到時（後端還沒起來之類）留一個破折號，
+ * 不讓這一列開天窗。dev-mock 模式的假路徑與 no-op 由 mockIPC 那邊給。
+ */
+function initConfigPathRow() {
+  const label = el<HTMLDivElement>("config-path");
+  void getConfigPath()
+    .then((p) => {
+      label.textContent = p;
+      // 省略號會吃掉路徑尾巴，滑過去至少看得到全文
+      label.title = p;
+    })
+    .catch(() => {
+      label.textContent = "—";
+    });
+
+  el<HTMLButtonElement>("row-config-path").addEventListener("click", () => {
+    void openConfigDir().catch((e) => settingsError(String(e)));
+  });
+}
+
 export function initSettingsPage() {
   wireToggle(tgClose(), setCloseToTray);
   wireToggle(tgAutostart(), setAutostart);
+  initConfigPathRow();
   void loadAppVersion().then((v) => {
     el<HTMLSpanElement>("app-version").textContent = v;
   });

@@ -7,7 +7,6 @@ mod tunnel;
 mod winsys;
 
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::image::Image;
@@ -27,14 +26,6 @@ fn is_tray_start() -> bool {
         let a = a.trim_start_matches('-').to_ascii_lowercase();
         a == "tray"
     })
-}
-
-/// 設定檔與執行檔放在一起，維持可攜性
-fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn show_main(app: &AppHandle) {
@@ -523,6 +514,21 @@ fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Result<(
     Ok(())
 }
 
+/// 這次執行實際生效的設定檔完整路徑，設定頁的 About 直接顯示它
+#[tauri::command]
+fn get_config_path(state: State<'_, Shared>) -> String {
+    state.path.to_string_lossy().into_owned()
+}
+
+/// 在檔案總管裡開啟設定檔所在資料夾，並選中設定檔本身
+#[tauri::command]
+fn open_config_dir(state: State<'_, Shared>) {
+    let st = state.inner().clone();
+    if let Err(e) = winsys::reveal_in_explorer(&st.path) {
+        st.log(format!("could not open the config folder: {e}"));
+    }
+}
+
 #[tauri::command]
 fn window_close(state: State<'_, Shared>) {
     close_main(&state.inner().clone());
@@ -583,6 +589,8 @@ pub fn run() {
             test_all,
             set_close_to_tray,
             set_autostart,
+            get_config_path,
+            open_config_dir,
             window_close,
             window_minimize,
             exit_app,
@@ -591,10 +599,12 @@ pub fn run() {
             let handle = app.handle().clone();
             // 通知掛名要在任何 UI／toast 之前處理掉
             let aumid_notes = prepare_notifications(&handle);
-            let dir = exe_dir();
-            let outcome = config::load_from_dir(&dir);
+            // 設定檔位置只解析這一次，之後的讀寫與備份都跟著這個結果走
+            let loc = config::config_location();
+            let outcome = config::load_from_path(&loc.path);
             let cfg: Config = outcome.config().clone();
-            let shared: Shared = Arc::new(AppState::new(handle.clone(), dir, cfg.clone()));
+            let shared: Shared =
+                Arc::new(AppState::new(handle.clone(), loc.path.clone(), cfg.clone()));
             app.manage(shared.clone());
 
             build_tray(&handle, &shared)?;
@@ -625,6 +635,11 @@ pub fn run() {
 
             shared.refresh_tray();
             shared.log("Traytunnel started");
+            shared.log(format!(
+                "config: {}{}",
+                loc.path.display(),
+                if loc.portable { " (portable, next to the executable)" } else { "" }
+            ));
             for note in aumid_notes {
                 shared.log(note);
             }
@@ -642,15 +657,14 @@ pub fn run() {
                     shared.log(format!("config unreadable ({error}), using defaults"));
                     match backup {
                         Some(path) => {
-                            shared.log(format!(
-                                "broken config kept at {}",
-                                path.file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or(config::BROKEN_NAME)
-                            ));
+                            // 可攜模式與家目錄模式的檔名不同，訊息一律用實際檔名
+                            let name = config::file_name_of(path);
+                            shared.log(format!("broken config kept at {name}"));
                             balloon(
                                 &handle,
-                                "Config file could not be parsed. A backup was saved as traytunnel.toml.broken and defaults are in use.",
+                                &format!(
+                                    "Config file could not be parsed. A backup was saved as {name} and defaults are in use."
+                                ),
                             );
                         }
                         None => {

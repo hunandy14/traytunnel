@@ -251,6 +251,32 @@ pub fn delete_hkcu_key(subkey: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// 在檔案總管裡開啟並選中一個檔案。
+///
+/// `explorer.exe /select,<path>` 的逗號後面不能再多一個空白，路徑本身又可能含空白，
+/// 所以整段命令列自己組（`raw_arg`）而不是交給 `arg()` 逐段加引號。
+/// 檔案還不存在（例如剛被使用者刪掉）時退而開啟它所在的資料夾。
+/// explorer 是 GUI 程式，仍加上 CREATE_NO_WINDOW 杜絕黑窗一閃。
+pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    std::process::Command::new("explorer.exe")
+        .raw_arg(explorer_arg(path, path.is_file()))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+/// 組 explorer 的命令列。`exists` 拆成參數，路徑組法才測得到。
+fn explorer_arg(path: &std::path::Path, exists: bool) -> String {
+    if exists {
+        return format!("/select,\"{}\"", path.display());
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    format!("\"{}\"", dir.display())
+}
+
 /// Rust 字串轉成結尾帶 NUL 的 UTF-16
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

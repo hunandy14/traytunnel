@@ -427,6 +427,15 @@ function handle(cmd: string, args: Args): unknown {
       log(null, state.autostart ? "autostart enabled" : "autostart disabled");
       return null;
 
+    // 瀏覽器裡沒有真的設定檔，給一條看得出樣子的假路徑（夠長，順便驗省略號）
+    case "get_config_path":
+      return "C:\\Users\\browser-mock\\.traytunnel.toml";
+
+    // 也沒有檔案總管可開，只記一行
+    case "open_config_dir":
+      log(null, `(browser mock) ${cmd}`);
+      return null;
+
     default:
       log(null, `(browser mock) unhandled command: ${cmd}`);
       return null;
