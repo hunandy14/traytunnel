@@ -254,10 +254,16 @@ impl AppState {
     }
 
     /// 更新某個出口的連線狀態並推事件；狀態沒變就不重複推。
+    ///
+    /// 只更新既存的出口：出口一旦被刪掉，執行期狀態也跟著被 `sync_exits` 清掉，
+    /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
+    /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
         {
             let mut exits = self.exits.lock().unwrap();
-            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+            let Some(rt) = exits.get_mut(&local) else {
+                return;
+            };
             if rt.status == status && rt.detail == detail {
                 return;
             }
@@ -284,11 +290,14 @@ impl AppState {
         !matches!(self.exit_status(local).as_deref(), None | Some(status::STOPPED))
     }
 
-    /// 更新某個出口的自測狀態並推事件
+    /// 更新某個出口的自測狀態並推事件。與 `set_exit_status` 同理，
+    /// 只更新既存的出口，不讓已刪掉的埠靠一次晚到的自測結果復活
     pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
         {
             let mut exits = self.exits.lock().unwrap();
-            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+            let Some(rt) = exits.get_mut(&local) else {
+                return;
+            };
             rt.last_test = Some(TestView { state: state.into(), text: text.into() });
         }
         let _ = self.app.emit(
