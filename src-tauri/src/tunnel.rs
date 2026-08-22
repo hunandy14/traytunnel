@@ -253,7 +253,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             state.log_from(sname, format!("{} : disconnected, retrying in 5s", f.name));
             state.set_exit_status(local, status::RECONNECTING, None);
         }
-        if !wait_alive(&state, local, generation, RETRY).await {
+        if !wait_alive(state, local, generation, RETRY).await {
             return;
         }
     }

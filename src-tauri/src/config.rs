@@ -725,7 +725,7 @@ pub fn validate_forward(
     let clash = sources
         .iter()
         .flat_map(|s| s.forwards.iter().map(move |f| (s, f)))
-        .find(|(_, f)| f.local == local && Some(f.local) != original_local);
+        .find(|(_, f)| f.local == local && Some(local) != original_local);
     if let Some((s, f)) = clash {
         return Some(format!("local: port {local} already used by {} in {}", f.name, s.name));
     }
