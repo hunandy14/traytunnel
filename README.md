@@ -53,6 +53,8 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 | `traytunnel-<版本>p.exe` | 可攜版，與上面**同一顆二進位**，檔名以 `p` 結尾＝設定檔跟著 exe 走 |
 | `traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
+每個 Release 也會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）。
+
 ## 介面
 
 介面上的用詞與設定檔的結構對應：一個 `[[sources]]` 在畫面上叫一條**連線**（connection），底下的每個 `[[sources.forwards]]` 叫一條**隧道**（tunnel）。
@@ -149,7 +151,7 @@ npm run bump <x.y.z>
 npm run bump <x.y.z>
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json
 git commit -m "版本升級至 <x.y.z>"
-git tag v<x.y.z>
+git tag -a v<x.y.z> -m "v<x.y.z>"
 git push --tags
 ```
 
