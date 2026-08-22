@@ -586,6 +586,11 @@ pub fn run() {
             let cfg: Config = outcome.config().clone();
             let shared: Shared =
                 Arc::new(AppState::new(handle.clone(), loc.path.clone(), cfg.clone()));
+            // 壞檔又備份不出來時，原檔是使用者僅存的一份，這次執行一律不准回寫。
+            // 要趕在任何存檔路徑（含系統匣、自啟自癒）跑起來之前拉閘。
+            if outcome.read_only() {
+                shared.mark_read_only();
+            }
             app.manage(shared.clone());
 
             build_tray(&handle, &shared)?;
@@ -650,9 +655,10 @@ pub fn run() {
                         }
                         None => {
                             shared.log("config left untouched, no backup could be written");
+                            shared.log("settings are read-only this session, fix the config file to save again");
                             balloon(
                                 &handle,
-                                "Config file could not be read. It was left untouched and defaults are in use.",
+                                "Config file could not be read and no backup could be written. Settings are read-only this session.",
                             );
                         }
                     }

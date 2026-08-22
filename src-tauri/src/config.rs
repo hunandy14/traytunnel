@@ -265,6 +265,15 @@ pub enum LoadOutcome {
 }
 
 impl LoadOutcome {
+    /// 這次執行要不要把設定切成唯讀。
+    ///
+    /// 壞檔本身不可怕（備份留著，之後存檔是拿預設值蓋掉一份已經備份過的檔案），
+    /// 真正致命的是「壞檔而且連備份都寫不出來」：使用者那份手寫設定只剩磁碟上
+    /// 這一份，任何一次回寫都會把它靜靜輾成預設值。這種情況一律拒絕寫入。
+    pub fn read_only(&self) -> bool {
+        matches!(self, LoadOutcome::Broken { backup: None, .. })
+    }
+
     pub fn config(&self) -> &Config {
         match self {
             LoadOutcome::Loaded(c)
@@ -1133,6 +1142,38 @@ enabled = false
         // 原檔完全沒被動過
         assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), bad);
         assert_eq!(std::fs::read_to_string(dir.join(BROKEN_NAME)).unwrap(), bad);
+    }
+
+    /// 唯讀只在「壞檔 ＋ 備份不出來」這一格成立：那時原檔是使用者僅存的一份，
+    /// 任何回寫都會把它輾成預設值。其餘結果一律照常可寫。
+    #[test]
+    fn only_a_broken_file_without_a_backup_turns_read_only() {
+        let broken_no_backup = LoadOutcome::Broken {
+            config: Config::default(),
+            backup: None,
+            error: "boom".into(),
+        };
+        assert!(broken_no_backup.read_only());
+
+        let broken_with_backup = LoadOutcome::Broken {
+            config: Config::default(),
+            backup: Some(PathBuf::from("C:\\app\\traytunnel.toml.broken")),
+            error: "boom".into(),
+        };
+        assert!(!broken_with_backup.read_only());
+        assert!(!LoadOutcome::Loaded(Config::default()).read_only());
+        assert!(!LoadOutcome::Created(Config::default()).read_only());
+        assert!(!LoadOutcome::Migrated(Config::default()).read_only());
+    }
+
+    /// 壞檔但備份成功的那條路仍然可寫，這是唯讀規則的下邊界
+    #[test]
+    fn a_backed_up_broken_file_stays_writable() {
+        let dir = tmp_dir("broken-writable");
+        std::fs::write(dir.join(TOML_NAME), "not toml @@@\n").unwrap();
+        let out = load_from_dir(&dir);
+        assert!(matches!(out, LoadOutcome::Broken { backup: Some(_), .. }));
+        assert!(!out.read_only());
     }
 
     /// 舊制但內容壞掉（host 空字串）時，一樣是壞檔而不是遷移

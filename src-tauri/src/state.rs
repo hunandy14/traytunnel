@@ -160,6 +160,8 @@ pub struct AppState {
     generation: AtomicU64,
     tray_hint_shown: AtomicBool,
     exiting: AtomicBool,
+    /// 設定檔壞掉又備份不出來時會被拉起來，之後一律拒絕回寫
+    read_only: AtomicBool,
 }
 
 impl AppState {
@@ -175,18 +177,37 @@ impl AppState {
             generation: AtomicU64::new(0),
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
         }
+    }
+
+    /// 把設定切成唯讀，之後每一次 `update_config` 都會直接回 Err。
+    /// 只有「設定檔壞掉且備份不出來」時會走到這裡，見 `LoadOutcome::read_only`。
+    pub fn mark_read_only(&self) {
+        self.read_only.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
     }
 
     pub fn config(&self) -> Config {
         self.cfg.lock().unwrap().clone()
     }
 
-    /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）
+    /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）。
+    /// 唯讀模式下一律回 Err，絕不拿預設值去輾使用者那份救不回來的原檔。
     pub fn update_config<F, T>(&self, edit: F) -> std::io::Result<T>
     where
         F: FnOnce(&mut Config) -> T,
     {
+        if self.is_read_only() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the config file is unreadable and could not be backed up, \
+                 settings are read-only until it is fixed",
+            ));
+        }
         let mut guard = self.cfg.lock().unwrap();
         let mut next = guard.clone();
         let out = edit(&mut next);
