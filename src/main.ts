@@ -649,7 +649,11 @@ async function loadSnapshot() {
       applySnapshot(await getState(), true);
       return;
     } catch (e) {
-      if (attempt === 19) appendLog(`ui error: ${String(e)}`);
+      if (attempt === 19) {
+        // 最後一輪已經不會再重試，寫錯誤就直接結束，不用再空等 250ms
+        appendLog(`ui error: ${String(e)}`);
+        break;
+      }
       await new Promise((r) => setTimeout(r, 250));
     }
   }
@@ -710,7 +714,18 @@ initSourceSheet({
 });
 initTunnelSheet({ onDelete: requestDelete });
 render();
-// initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
-// 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，
-// 這個順序不影響任何行為（invoke 一開始就能用）。
-void bootstrap(init).then(() => initSettingsPage());
+/**
+ * initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
+ * 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，
+ * invoke 一開始就能用，不用等。
+ *
+ * 但 bootstrap／init 這條鏈可能慢（loadSnapshot 最多重試 5 秒）也可能失敗
+ * （bootstrap 動態 import dev-mock 出錯就是 rejected promise）：慢啟動時
+ * 設定頁的 toggle／開資料夾按鈕在這條鏈跑完前都還沒接上事件，點了沒反應；
+ * 若整條鏈 reject，沒有 catch 就是沒人接的 unhandled rejection，
+ * initSettingsPage() 也永遠不會被呼叫、設定頁從此死掉。用 finally 保證
+ * initSettingsPage 一定會跑到，用 catch 把失敗寫進活動區。
+ */
+void bootstrap(init)
+  .catch((e) => appendLog(`ui error: ${String(e)}`))
+  .finally(() => initSettingsPage());
