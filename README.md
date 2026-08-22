@@ -149,7 +149,7 @@ npm run bump <x.y.z>
 npm run bump <x.y.z>
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json
 git commit -m "版本升級至 <x.y.z>"
-git tag v<x.y.z>
+git tag -a v<x.y.z> -m "v<x.y.z>"
 git push --tags
 ```
 

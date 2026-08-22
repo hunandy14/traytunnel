@@ -110,5 +110,5 @@ console.log(`${oldVersion} → ${newVersion}，2 檔已同步`);
 console.log("");
 console.log("建議指令（不會自動執行，複製貼上）：");
 console.log(
-  `  git add src-tauri/Cargo.toml package.json && git commit -m "版本升級至 ${newVersion}" && git tag v${newVersion}`,
+  `  git add src-tauri/Cargo.toml package.json && git commit -m "版本升級至 ${newVersion}" && git tag -a v${newVersion} -m "v${newVersion}"`,
 );
