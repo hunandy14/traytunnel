@@ -37,11 +37,21 @@ pub enum Node {
     Status(String),
     Separator,
     /// 一般可點項目
-    Item { id: String, label: String },
+    Item {
+        id: String,
+        label: String,
+    },
     /// 出口開關，勾選＝設定裡的 enabled
-    Check { id: String, label: String, checked: bool },
+    Check {
+        id: String,
+        label: String,
+        checked: bool,
+    },
     /// 一個源一個子選單
-    Submenu { label: String, items: Vec<Node> },
+    Submenu {
+        label: String,
+        items: Vec<Node>,
+    },
 }
 
 fn item(id: impl Into<String>, label: impl Into<String>) -> Node {

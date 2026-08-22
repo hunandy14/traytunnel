@@ -563,6 +563,14 @@ body {
   color: var(--red);
 }
 
+/* pointer-events: none 順便關掉 :hover，不用另外覆寫 .iconbtn:hover／.btn:hover */
+.iconbtn:disabled,
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  pointer-events: none;
+}
+
 .btn {
   height: 28px;
   padding: 0 12px;

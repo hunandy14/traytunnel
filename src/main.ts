@@ -26,15 +26,18 @@ import {
   openTunnelSheet,
   syncSettingsPage,
 } from "./sheet";
+import {
+  defaultDetail,
+  isBad,
+  isRunning,
+  sourceTone,
+  splitTest,
+  statusTone,
+  testLine,
+  type Tone,
+} from "./status";
 import { showErrorToast, showUndoToast, type UndoToast } from "./toast";
-import type {
-  ExitInfo,
-  ExitStatus,
-  ExitStatusEvent,
-  ExitTestEvent,
-  Snapshot,
-  SourceInfo,
-} from "./types";
+import type { ExitInfo, ExitStatusEvent, ExitTestEvent, Snapshot, SourceInfo } from "./types";
 
 const EMPTY: Snapshot = { closeToTray: true, autostart: false, sources: [], logs: [] };
 
@@ -79,39 +82,6 @@ interface CardRefs {
 const cardRefs = new Map<number, CardRefs>();
 /** 側欄每個源 icon 的狀態小點，讓 exit-status 事件不用整列重建就能更新 */
 const railStatusRefs = new Map<string, HTMLElement>();
-
-// ---------------------------------------------------------------- 狀態工具
-
-const RUNNING: ExitStatus[] = ["connecting", "connected", "reconnecting", "port_busy", "error"];
-
-const isRunning = (e: ExitInfo) => RUNNING.includes(e.status);
-const isBad = (e: ExitInfo) => e.status === "port_busy" || e.status === "error";
-
-type Tone = "grey" | "amber" | "green" | "red";
-
-function statusTone(status: ExitStatus): Tone {
-  switch (status) {
-    case "connected":
-      return "green";
-    case "connecting":
-    case "reconnecting":
-      return "amber";
-    case "port_busy":
-    case "error":
-      return "red";
-    default:
-      return "grey";
-  }
-}
-
-/** 源的彙總狀態：全連綠／部分琥珀／全停灰，任一出口出錯就直接紅 */
-function sourceTone(src: SourceInfo): Tone {
-  const exits = src.exits.filter((e) => !pendingDelete.has(e.local));
-  if (exits.length === 0) return "grey";
-  if (exits.some(isBad)) return "red";
-  if (!exits.some(isRunning)) return "grey";
-  return exits.every((e) => e.status === "connected") ? "green" : "amber";
-}
 
 const sources = () => snap.sources;
 
@@ -159,7 +129,7 @@ function initial(name: string): string {
 function paintRailStatus(name: string) {
   const node = railStatusRefs.get(name);
   const src = snap.sources.find((s) => s.name === name);
-  if (node && src) node.className = `src-status tone-${sourceTone(src)}`;
+  if (node && src) node.className = `src-status tone-${sourceTone(visibleExits(src))}`;
 }
 
 function renderRail() {
@@ -174,7 +144,7 @@ function renderRail() {
     btn.style.setProperty("--src-ink", `hsl(${hue} 70% 86%)`);
     btn.title = `${src.name} — ssh ${src.user}@${src.host}`;
     btn.classList.toggle("active", view === "source" && src.name === selected);
-    const status = h("span", { class: `src-status tone-${sourceTone(src)}` });
+    const status = h("span", { class: `src-status tone-${sourceTone(visibleExits(src))}` });
     railStatusRefs.set(src.name, status);
     btn.appendChild(status);
     btn.addEventListener("click", () => selectSource(src.name));
@@ -365,38 +335,12 @@ function initSummaryMenu() {
 
 // ---------------------------------------------------------------- 出口卡片
 
-function testLine(exit: ExitInfo): { text: string; tone: string } {
-  const t = exit.lastTest;
-  if (!t) return { text: "", tone: "muted" };
-  if (t.state === "testing") return { text: t.text || "testing…", tone: "muted" };
-  if (t.state === "fail") return { text: t.text || "no response", tone: "red" };
-  return { text: t.text, tone: "text" };
-}
-
-/**
- * 自測成功的字串是後端組好的「ip␠␠city, country」，拆成兩行顯示。
- * 拆不開（格式不如預期）就退回單行，不要硬猜。
- */
-function splitTest(text: string): { ip: string; place: string } | null {
-  const i = text.indexOf("  ");
-  if (i <= 0) return null;
-  const ip = text.slice(0, i).trim();
-  const place = text.slice(i + 2).trim();
-  return ip && place ? { ip, place } : null;
-}
-
-/** 後端沒帶 detail 時至少讓紅點有句話可看 */
-function defaultDetail(status: ExitStatus): string {
-  return status === "port_busy" ? "local port is already in use" : "connection failed";
-}
-
 function paintCard(exit: ExitInfo) {
   const refs = cardRefs.get(exit.local);
   if (!refs) return;
 
   refs.dot.className = `dot tone-${statusTone(exit.status)}`;
   refs.dot.title = exit.status;
-  refs.root.dataset.status = exit.status;
 
   const t = testLine(exit);
   const two = t.tone === "text" ? splitTest(t.text) : null;
@@ -531,6 +475,15 @@ function requestDelete(local: number) {
 }
 
 /**
+ * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
+ * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
+ * 是 Rust 端直接處理，前端這裡攔不到，是已知限制。
+ */
+function flushPendingDeletes() {
+  for (const { toast } of [...undoToasts.values()]) toast.flush();
+}
+
+/**
  * 整個源被刪掉時，底下出口還掛著的 undo 倒數就沒有意義了：
  * 讓它到期去 deleteForward 一個已經不存在的埠只會噴錯，
  * pendingDelete 裡的殘留旗標也會一直卡著。這裡一次收乾淨。
@@ -640,7 +593,11 @@ async function loadSnapshot() {
       applySnapshot(await getState(), true);
       return;
     } catch (e) {
-      if (attempt === 19) appendLog(`ui error: ${String(e)}`);
+      if (attempt === 19) {
+        // 最後一輪已經不會再重試，寫錯誤就直接結束，不用再空等 250ms
+        appendLog(`ui error: ${String(e)}`);
+        break;
+      }
       await new Promise((r) => setTimeout(r, 250));
     }
   }
@@ -666,9 +623,11 @@ hydrateIcons();
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
 );
-el<HTMLButtonElement>("btn-close").addEventListener("click", () =>
-  void run(windowClose, "close the window"),
-);
+el<HTMLButtonElement>("btn-close").addEventListener("click", () => {
+  // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失
+  flushPendingDeletes();
+  void run(windowClose, "close the window");
+});
 
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
 el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("settings"));
@@ -699,7 +658,18 @@ initSourceSheet({
 });
 initTunnelSheet({ onDelete: requestDelete });
 render();
-// initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
-// 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，
-// 這個順序不影響任何行為（invoke 一開始就能用）。
-void bootstrap(init).then(() => initSettingsPage());
+/**
+ * initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
+ * 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，
+ * invoke 一開始就能用，不用等。
+ *
+ * 但 bootstrap／init 這條鏈可能慢（loadSnapshot 最多重試 5 秒）也可能失敗
+ * （bootstrap 動態 import dev-mock 出錯就是 rejected promise）：慢啟動時
+ * 設定頁的 toggle／開資料夾按鈕在這條鏈跑完前都還沒接上事件，點了沒反應；
+ * 若整條鏈 reject，沒有 catch 就是沒人接的 unhandled rejection，
+ * initSettingsPage() 也永遠不會被呼叫、設定頁從此死掉。用 finally 保證
+ * initSettingsPage 一定會跑到，用 catch 把失敗寫進活動區。
+ */
+void bootstrap(init)
+  .catch((e) => appendLog(`ui error: ${String(e)}`))
+  .finally(() => initSettingsPage());
