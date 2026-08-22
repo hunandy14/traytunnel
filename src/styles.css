@@ -1049,26 +1049,6 @@ body {
   color: var(--muted);
 }
 
-/* 可點的設定列（例如 About 的 Config file）：外觀與一般列一致，
-   只是底層換成 button，所以得把瀏覽器預設的按鈕樣式全部收掉 */
-.setting-row.action {
-  width: 100%;
-  color: var(--text);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.setting-row.action .action-glyph {
-  opacity: 0;
-  transition: opacity 130ms var(--ease);
-}
-
-.setting-row.action:hover .action-glyph,
-.setting-row.action:focus-visible .action-glyph {
-  opacity: 1;
-}
-
 /* 路徑可能很長，整列不會被撐開（.setting-text 已經有 min-width: 0，
    省略號才生效）。這裡要省略的是**開頭**：路徑尾端的檔名才是使用者要認的東西
    （.traytunnel.toml 還是 traytunnel.toml，決定現在是哪一種模式），

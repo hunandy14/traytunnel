@@ -698,6 +698,8 @@ initSourceSheet({
   },
 });
 initTunnelSheet({ onDelete: requestDelete });
-initSettingsPage();
 render();
-bootstrap(init);
+// initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
+// 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，
+// 這個順序不影響任何行為（invoke 一開始就能用）。
+void bootstrap(init).then(() => initSettingsPage());

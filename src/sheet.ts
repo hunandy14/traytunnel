@@ -410,23 +410,27 @@ function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>)
 }
 
 /**
- * About 的「Config file」一列：副標顯示實際生效的完整路徑，整列點下去
- * 就開檔案總管並選中它。路徑問不到時（後端還沒起來之類）留一個破折號，
- * 不讓這一列開天窗。dev-mock 模式的假路徑與 no-op 由 mockIPC 那邊給。
+ * About 的「Config file」一列：本身是非互動列，只顯示實際生效的完整路徑；
+ * 開檔案總管的動作收進右側獨立的圖示按鈕，路徑問不到之前先停用它。
+ * 路徑問不到時（後端還沒起來之類）留一個破折號，不讓這一列開天窗。
+ * dev-mock 模式的假路徑與 no-op 由 mockIPC 那邊給。
  */
 function initConfigPathRow() {
   const label = el<HTMLDivElement>("config-path");
+  const openBtn = el<HTMLButtonElement>("btn-open-config-dir");
+
   void getConfigPath()
     .then((p) => {
       label.textContent = p;
       // 省略號會吃掉路徑尾巴，滑過去至少看得到全文
       label.title = p;
+      openBtn.disabled = false;
     })
     .catch(() => {
       label.textContent = "—";
     });
 
-  el<HTMLButtonElement>("row-config-path").addEventListener("click", () => {
+  openBtn.addEventListener("click", () => {
     void openConfigDir().catch((e) => settingsError(String(e)));
   });
 }
