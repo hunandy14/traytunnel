@@ -948,6 +948,18 @@ body {
   color: var(--muted);
 }
 
+.about-icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+}
+
+.setting-version {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .toggle {
   position: relative;
   flex: none;

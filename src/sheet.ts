@@ -10,6 +10,7 @@
 import { el } from "./dom";
 import { deleteSource, setAutostart, setCloseToTray, upsertSource } from "./ipc";
 import type { Snapshot, SourceInfo } from "./types";
+import { loadAppVersion } from "./version";
 
 // ---------------------------------------------------------------- 源 sheet
 
@@ -252,4 +253,7 @@ function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>)
 export function initSettingsPage() {
   wireToggle(tgClose(), setCloseToTray);
   wireToggle(tgAutostart(), setAutostart);
+  void loadAppVersion().then((v) => {
+    el<HTMLSpanElement>("app-version").textContent = v;
+  });
 }
