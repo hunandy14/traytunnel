@@ -7,18 +7,28 @@
 直接等比縮小光柵化的產物，幾何邊界落在非整數像素上，每一條直邊都被抗鋸齒抹成
 兩排半透明像素，在 175% DPI（系統匣取 28px 層）看起來就是「軟」。
 
+再來，這幾層原本還墊了一塊深色圓角底板。底板在淺色工作列上會變成一顆突兀的黑
+方塊，而且吃掉一圈邊距讓盾牌只剩畫布的七成。現在底板拿掉了：小尺寸層的背景是
+全透明，只留盾牌 glyph（盾內的深色通道環是圖形本體，保留），釋放出來的邊距全
+數換成盾牌尺寸——盾高直接吃滿畫布，只留 1px 安全邊。
+
 作法
 ----
 本腳本不縮放 SVG，而是「為每個目標尺寸重算一次幾何」，把關鍵邊界四捨五入到整數
 像素格線上：
 
-- 底板圓角矩形的四條直邊
 - 盾形的左右垂直側邊（xL／xR）、肩線、直邊結束線、頂點與底尖
 - 同心圓的圓心（落在整數格點，左右對稱）與內外半徑（整數，直徑正好占滿整數像素）
 
-只有無法避免的曲線（圓角、圓弧、盾底貝茲）才保留抗鋸齒；直邊一律實心整像素。
+只有無法避免的曲線（斜肩線、盾底貝茲、圓弧）才留抗鋸齒；垂直邊一律實心整像素。
 光柵化用「x 方向解析、y 方向超取樣」的面積覆蓋率，再對覆蓋率做一次輕微的斜率
-銳化（EDGE_GAIN），把 AA 過渡帶壓窄，避免小尺寸出現一圈暈影。
+銳化（EDGE_GAIN）。EDGE_GAIN 是這份檔案裡最敏感的旋鈕：
+
+- 1.6（舊值）＝過渡帶壓到不足半像素，28px 全圖只剩 16 個半透明像素，斜肩線與盾底
+  冒出生硬的階梯
+- 1.0＝不銳化的純面積平均，過渡帶滿一像素寬，28px 有 60 個半透明像素，邊緣發虛
+- 1.15（現值）＝28px 42 個過渡像素，落在上面兩者中間；垂直邊仍是硬邊（幾何本來就
+  對齊格線，覆蓋率非 0 即 1），斜邊與圓弧各留一排面積覆蓋率，鋸齒消失但邊不虛
 
 輸出
 ----
@@ -41,28 +51,26 @@ SIZES = (16, 20, 24, 28, 32)
 ICO_TARGETS = ("src-tauri/icons/icon.ico", "traytunnel.ico")
 
 # 定稿簡化變體的色票（assets/icon-final-16-simplified.svg）
-C_PLATE = (0x14, 0x16, 0x1A)  # 底板
 C_SHIELD = (0x2D, 0xD4, 0xA7)  # 盾身
 C_HOLE = (0x0E, 0x10, 0x13)  # 通道負空間
 C_NODE = (0x4B, 0xF0, 0xC7)  # 中心節點
 
-# 原始 256 視框的幾何比例（除以 256）
-F_INSET = 8 / 256
-F_RADIUS = 56 / 256
-F_SHIELD_X = 56 / 256  # 盾形左側邊
-F_APEX_Y = 30 / 256  # 盾形頂點
-F_SHOULDER_Y = 58 / 256  # 肩線（左右側邊起點）
-F_STRAIGHT_Y = 158 / 256  # 側邊直線段結束
-F_BOTTOM_Y = 226 / 256  # 底尖
-F_CTRL1_Y = 190 / 256  # 盾底貝茲控制點
-F_CTRL2_X = 168 / 256
-F_CTRL2_Y = 210 / 256
-F_RING_CY = 120 / 256
-F_RING_R = 54 / 256
-F_NODE_R = 26 / 256
+# 原始 256 視框裡盾形的外框：x 56..200、y 30..226。以下比例一律換算成
+# 「盾形自身的外接框」——寬 W0=144、高 H0=196——好讓盾牌能獨立縮放去吃滿畫布。
+W0, H0 = 144.0, 196.0
+F_ASPECT = W0 / H0  # 盾寬／盾高
+F_SHOULDER = 28 / H0  # 肩線（左右垂直側邊起點），距頂點
+F_STRAIGHT = 128 / H0  # 垂直側邊結束，距頂點
+F_C1Y = 160 / H0  # 盾底貝茲第一控制點，距頂點
+F_C2X = 112 / W0  # 盾底貝茲第二控制點，距左側邊
+F_C2Y = 180 / H0
+F_RING_CY = 90 / H0  # 同心圓圓心，距頂點
+F_RING_R = 54 / W0  # 外圈（通道）半徑，對盾寬
+F_NODE_R = 26 / W0  # 中心節點半徑，對盾寬
 
+MARGIN = 1  # 四邊安全邊（像素）
 SSY = 16  # y 方向每像素的超取樣列數
-EDGE_GAIN = 1.6  # 覆蓋率斜率銳化：把 AA 過渡帶壓到約 1/1.6 像素寬
+EDGE_GAIN = 1.15  # 覆蓋率斜率銳化：把 AA 過渡帶壓到約 1/1.15 像素寬
 
 
 # ---------------------------------------------------------------- 幾何
@@ -70,38 +78,40 @@ EDGE_GAIN = 1.6  # 覆蓋率斜率銳化：把 AA 過渡帶壓到約 1/1.6 像�
 
 def geometry(n: int) -> dict:
     """算出尺寸 n 的像素對齊幾何。整數欄位代表「必須落在像素格線上」的邊界。"""
-    # 16px 太小，底板留邊會吃掉一整圈可用面積，改成滿版
-    inset = 0 if n <= 16 else round(n * F_INSET)
-    radius = max(1, round(n * F_RADIUS))
+    apex = MARGIN
+    bottom = n - MARGIN
+    h = bottom - apex  # 盾高吃滿畫布（扣掉安全邊）
 
-    x_l = round(n * F_SHIELD_X)
-    x_r = n - x_l  # 靠鏡射保證左右完全對稱
+    # 盾寬照原比例推，再把左右側邊各自吸到整數格線；n 皆為偶數，鏡射即左右對稱
+    w_ideal = h * F_ASPECT
+    x_l = round((n - w_ideal) / 2)
+    x_r = n - x_l
+    w = x_r - x_l
     cx = n / 2
 
-    # 半徑取整＝直徑為偶數，配上落在格點的圓心，圓的外接框剛好占滿整數像素
-    ring_r = max(1, round(n * F_RING_R))
-    node_r = max(1, round(n * F_NODE_R))
-    # 16px 的環厚只剩 1px，抗鋸齒會把它咬斷成一圈碎點，節點收到 2px 讓環穩定成 2px
-    if n <= 16:
-        node_r = 1
+    # 半徑取整＝直徑為偶數，配上落在格點的圓心，圓的外接框剛好占滿整數像素。
+    # 半徑照「理想盾寬」而非取整後的盾寬推算，免得 x_l 的捨入誤差被放大到環上。
+    ring_r = max(1, round(w_ideal * F_RING_R))
+    node_r = max(1, round(w_ideal * F_NODE_R))
+    ring_cy = apex + round(h * F_RING_CY)
     return {
         "n": n,
-        "plate": (inset, inset, n - inset, n - inset, radius),
         "shield": {
             "x_l": x_l,
             "x_r": x_r,
+            "w": w,
             "cx": cx,
-            "apex": round(n * F_APEX_Y),
-            "shoulder": round(n * F_SHOULDER_Y),
-            "straight": round(n * F_STRAIGHT_Y),
-            "bottom": round(n * F_BOTTOM_Y),
+            "apex": apex,
+            "shoulder": apex + round(h * F_SHOULDER),
+            "straight": apex + round(h * F_STRAIGHT),
+            "bottom": bottom,
             # 曲線控制點不需對齊，照比例縮放即可
-            "c1y": n * F_CTRL1_Y,
-            "c2x": n * F_CTRL2_X,
-            "c2y": n * F_CTRL2_Y,
+            "c1y": apex + h * F_C1Y,
+            "c2x": x_l + w * F_C2X,
+            "c2y": apex + h * F_C2Y,
         },
-        "ring": (cx, round(n * F_RING_CY), ring_r),
-        "node": (cx, round(n * F_RING_CY), node_r),
+        "ring": (cx, ring_cy, ring_r),
+        "node": (cx, ring_cy, node_r),
     }
 
 
@@ -125,8 +135,8 @@ def shield_polygon(g: dict, steps: int = 64) -> list[tuple[float, float]]:
                 u**3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t**3 * p3[1],
             )
 
-    c2x_r = n * F_CTRL2_X
-    c2x_l = n - c2x_r
+    c2x_r = s["c2x"]
+    c2x_l = n - c2x_r  # 盾牌以 cx = n/2 為軸，鏡射即得左側控制點
     pts += list(
         cubic(
             (x_r, s["straight"]),
@@ -148,20 +158,6 @@ def shield_polygon(g: dict, steps: int = 64) -> list[tuple[float, float]]:
 
 
 # ---------------------------------------------------------------- 光柵化
-
-
-def spans_round_rect(rect, y):
-    x0, y0, x1, y1, r = rect
-    if y <= y0 or y >= y1:
-        return ()
-    if y < y0 + r:
-        dy = (y0 + r) - y
-    elif y > y1 - r:
-        dy = y - (y1 - r)
-    else:
-        dy = 0.0
-    dx = r - math.sqrt(max(0.0, r * r - dy * dy)) if dy else 0.0
-    return ((x0 + dx, x1 - dx),)
 
 
 def spans_circle(circle, y):
@@ -238,11 +234,10 @@ def coverage(n: int, span_fn) -> list[list[float]]:
 
 
 def render(n: int) -> bytearray:
-    """回傳 top-down 的 RGBA 位元組。"""
+    """回傳 top-down 的 RGBA 位元組（背景全透明）。"""
     g = geometry(n)
     poly = shield_polygon(g)
     layers = [
-        (C_PLATE, coverage(n, lambda y, r=g["plate"]: spans_round_rect(r, y))),
         (C_SHIELD, coverage(n, lambda y, p=poly: spans_polygon(p, y))),
         (C_HOLE, coverage(n, lambda y, c=g["ring"]: spans_circle(c, y))),
         (C_NODE, coverage(n, lambda y, c=g["node"]: spans_circle(c, y))),
@@ -294,7 +289,6 @@ def disc_shape(circle, fill: str) -> str:
 
 def to_svg(n: int) -> str:
     g = geometry(n)
-    x0, y0, x1, y1, r = g["plate"]
     s = g["shield"]
     fmt = lambda v: f"{v:g}"
     path = (
@@ -307,8 +301,7 @@ def to_svg(n: int) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n} {n}" width="{n}" height="{n}">\n'
         f"  <!-- {n}px 系統匣圖層：assets/icon-final-16-simplified.svg 的像素對齊版，\n"
-        f"       由 assets/gen-tray-icons.py 產生，直邊皆落在整數像素格線上，請勿手改。 -->\n"
-        f'  <rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="{r}" fill="#14161a"/>\n'
+        f"       由 assets/gen-tray-icons.py 產生。背景透明、垂直邊落在整數像素格線上，請勿手改。 -->\n"
         f'  <path d="{path}" fill="#2dd4a7"/>\n'
         f"  {disc_shape(g['ring'], '#0e1013')}\n"
         f"  {disc_shape(g['node'], '#4bf0c7')}\n"
@@ -375,14 +368,19 @@ def main() -> None:
 
     rasters = {}
     for n in SIZES:
-        rasters[n] = bytes(render(n))
+        raster = bytes(render(n))
+        rasters[n] = raster
         (REPO / "assets" / f"icon-tray-{n}.svg").write_text(to_svg(n), encoding="utf-8")
         if args.png_out:
             args.png_out.mkdir(parents=True, exist_ok=True)
-            write_png(args.png_out / f"hinted-{n}.png", n, rasters[n])
-        print(f"  {n}px 幾何：{geometry(n)['plate']} 盾 x {geometry(n)['shield']['x_l']}"
-              f"..{geometry(n)['shield']['x_r']} 環 r={geometry(n)['ring'][2]}"
-              f" 節點 r={geometry(n)['node'][2]}")
+            write_png(args.png_out / f"hinted-{n}.png", n, raster)
+        g = geometry(n)
+        s = g["shield"]
+        aa = sum(1 for i in range(n * n) if 0 < raster[i * 4 + 3] < 255)
+        print(
+            f"  {n}px 盾 x {s['x_l']}..{s['x_r']} y {s['apex']}..{s['bottom']}"
+            f" 環 r={g['ring'][2]} 節點 r={g['node'][2]} AA 過渡像素 {aa}"
+        )
 
     if not args.no_ico:
         for rel in ICO_TARGETS:
