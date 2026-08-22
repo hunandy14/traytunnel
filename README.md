@@ -72,16 +72,15 @@ npm run dev
 
 ## 建置
 
-```
-npm run tauri build
-```
+三個指令，差別只在要不要順便打包安裝檔：
 
-產物：
+| 指令 | 做什麼 | 產物 |
+| --- | --- | --- |
+| `npm run build:exe` | 只編免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 | `src-tauri/target/release/traytunnel.exe` |
+| `npm run build:setup` | 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） | 上面那個 exe，加上 `src-tauri/target/release/bundle/nsis/traytunnel_<版本>_x64-setup.exe` |
+| `npm run build:all` | 走設定檔裡列的全部 bundle 目標（`tauri build`），要發佈時用 | 同上，未來若加了別的 bundle 目標也會一起產出 |
 
-- 免安裝執行檔：`src-tauri/target/release/traytunnel.exe`
-- NSIS 安裝檔：`src-tauri/target/release/bundle/nsis/`
-
-注意：一定要走 `npm run tauri build`。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
+注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
 免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成 `p` 結尾（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見下方「設定檔」）。
 
