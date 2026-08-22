@@ -9,7 +9,8 @@
 //! 2. 開始選單缺捷徑（或捷徑指到別的執行檔）時，用 IShellLinkW + IPropertyStore
 //!    建立／更新一份帶 AUMID 的捷徑
 //! 3. 寫 `HKCU\Software\Classes\AppUserModelId\{aumid}`，補上 DisplayName 與 IconUri，
-//!    通知中心才會顯示程式名稱與圖示
+//!    通知中心才會顯示程式名稱與圖示——IconUri 一定要指到圖片檔（ico/png），指到 exe
+//!    不會渲染，因此這裡把內嵌的 PNG 落地到 `%LOCALAPPDATA%\{aumid}\icon.png`
 //!
 //! 三步都要在建立 UI 之前跑完。
 
@@ -36,6 +37,28 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
 };
 
 const AUMID_CLASS_ROOT: &str = "Software\\Classes\\AppUserModelId";
+
+/// 通知圖示：內嵌方形 PNG，AUMID 的 IconUri 與 toast 的 appLogoOverride 都吃這一份，
+/// 只嵌這一次，不再另外複製一份到別的模組。
+const APP_ICON_PNG: &[u8] = include_bytes!("../icons/128x128.png");
+
+/// 圖示落地的路徑：可攜版沒有安裝目錄，只能寫進使用者自己的 LOCALAPPDATA。
+pub fn icon_file_path(aumid: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(local).join(aumid).join("icon.png"))
+}
+
+/// 把圖示 bytes 寫到磁碟：內容跟現有檔案一樣就不重寫，回傳這次是不是真的寫了檔。
+fn write_icon_file(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    if std::fs::read(path).map(|existing| existing == bytes).unwrap_or(false) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(true)
+}
 
 /// 開始選單裡「使用者自己的」程式資料夾，捷徑就放這一層
 fn start_menu_dir() -> Option<PathBuf> {
@@ -181,11 +204,22 @@ pub fn ensure_shortcut(lnk: &Path, exe: &Path, aumid: &str, description: &str) -
     Ok(true)
 }
 
-/// 註冊 AUMID 的顯示名稱與圖示，通知中心的分組才會顯示成程式本身
+/// 註冊 AUMID 的顯示名稱與圖示，通知中心的分組才會顯示成程式本身。
+///
+/// IconUri 必須指到圖片檔：先把內嵌 PNG 落地（冪等，內容沒變就不重寫），再讓
+/// IconUri 指過去。找不到 LOCALAPPDATA 這種邊緣情況就退回 exe 路徑，至少不會讓
+/// 整段註冊失敗。
 pub fn register_aumid(aumid: &str, display_name: &str, exe: &Path) -> io::Result<()> {
     let subkey = format!("{AUMID_CLASS_ROOT}\\{aumid}");
     crate::winsys::write_hkcu_string(&subkey, "DisplayName", display_name)?;
-    crate::winsys::write_hkcu_string(&subkey, "IconUri", &exe.to_string_lossy())?;
+    let icon_uri = match icon_file_path(aumid) {
+        Some(path) => {
+            write_icon_file(&path, APP_ICON_PNG)?;
+            path.to_string_lossy().into_owned()
+        }
+        None => exe.to_string_lossy().into_owned(),
+    };
+    crate::winsys::write_hkcu_string(&subkey, "IconUri", &icon_uri)?;
     Ok(())
 }
 
@@ -259,11 +293,15 @@ mod tests {
         }
     }
 
-    /// 真的寫一次 HKCU\Software\Classes\AppUserModelId\{id} 再讀回來，最後清掉
+    /// 真的寫一次 HKCU\Software\Classes\AppUserModelId\{id} 再讀回來，最後清掉。
+    /// IconUri 現在要指到落地的 PNG 檔，不是 exe——toast 只吃圖片檔。
     #[test]
     fn aumid_registry_entry_round_trips() {
         let id = format!("com.traytunnel.desktop.test{}", std::process::id());
         let exe = std::env::current_exe().unwrap();
+        let icon_path = icon_file_path(&id).expect("測試環境要有 LOCALAPPDATA");
+        let _ = std::fs::remove_dir_all(icon_path.parent().unwrap());
+
         register_aumid(&id, "Traytunnel Test", &exe).expect("寫登錄檔應該要成功");
 
         let sub = format!("{AUMID_CLASS_ROOT}\\{id}");
@@ -273,10 +311,36 @@ mod tests {
         );
         assert_eq!(
             crate::winsys::read_hkcu_string(&sub, "IconUri").as_deref(),
-            Some(exe.to_string_lossy().as_ref())
+            Some(icon_path.to_string_lossy().as_ref())
         );
+        assert!(icon_path.exists(), "IconUri 指到的圖示檔要真的寫出來");
+        assert_eq!(
+            std::fs::read(&icon_path).unwrap(),
+            APP_ICON_PNG,
+            "落地的圖示內容要跟內嵌的 PNG 一致"
+        );
+
         crate::winsys::delete_hkcu_key(&sub).expect("測試收尾要刪得掉");
         assert!(crate::winsys::read_hkcu_string(&sub, "DisplayName").is_none());
+        let _ = std::fs::remove_dir_all(icon_path.parent().unwrap());
+    }
+
+    /// 圖示檔冪等：內容沒變就不該重寫；內容真的不同（模擬版本升級）才要重寫。
+    #[test]
+    fn icon_file_write_is_idempotent() {
+        let id = format!("com.traytunnel.desktop.icon.test{}", std::process::id());
+        let path = icon_file_path(&id).expect("測試環境要有 LOCALAPPDATA");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert!(write_icon_file(&path, APP_ICON_PNG).unwrap(), "第一次要真的寫檔");
+        assert_eq!(std::fs::read(&path).unwrap(), APP_ICON_PNG);
+
+        assert!(!write_icon_file(&path, APP_ICON_PNG).unwrap(), "內容沒變就不該重寫");
+
+        assert!(write_icon_file(&path, b"different bytes").unwrap(), "內容變了要重寫");
+        assert_eq!(std::fs::read(&path).unwrap(), b"different bytes");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// 真的建一份捷徑再讀回來：目標與 AUMID 屬性都要對得上，

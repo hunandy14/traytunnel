@@ -14,7 +14,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tauri_plugin_notification::NotificationExt;
+use tauri_winrt_notification::{IconCrop, Toast};
 
 use config::{Config, Forward, LoadOutcome, Source};
 use state::{AppState, Snapshot, MAIN_WINDOW, TRAY_ID};
@@ -45,8 +45,18 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// 系統匣氣泡通知：直接組 Toast 而不是走 tauri-plugin-notification 的 builder，
+/// 因為那個 builder 在 Windows 分支沒接圖示（icon()/attachment() 都到不了 notify-rust
+/// 底層），要讓 toast 內文左側出現大 logo（appLogoOverride）只有 Toast::icon() 這條路。
 fn balloon(app: &AppHandle, body: &str) {
-    let _ = app.notification().builder().title("Traytunnel").body(body).show();
+    let aumid = app.config().identifier.clone();
+    let mut toast = Toast::new(&aumid).title("Traytunnel").text1(body);
+    if let Some(icon) = aumid::icon_file_path(&aumid) {
+        toast = toast.icon(&icon, IconCrop::Square, "Traytunnel");
+    }
+    if let Err(e) = toast.show() {
+        log::warn!("failed to show toast notification: {e}");
+    }
 }
 
 fn hide_to_tray(state: &Shared) {

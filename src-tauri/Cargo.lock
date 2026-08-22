@@ -4279,6 +4279,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tauri-winrt-notification",
  "tokio",
  "toml_edit 0.22.27",
  "ureq",

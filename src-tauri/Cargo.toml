@@ -50,3 +50,7 @@ windows = { version = "0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_Shell_PropertiesSystem",
 ] }
+# toast 大圖（appLogoOverride）只有 Toast::icon() 這條路能到，tauri-plugin-notification
+# 的 builder 沒接、notify-rust 的 image_path() 在 Windows 對應的是文字下方的小圖，都不是
+# 要的東西，因此直接用 tauri-plugin-notification 底下已經在用的這顆 crate，版本對齊鎖檔
+tauri-winrt-notification = "0.7.3"
