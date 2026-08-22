@@ -284,10 +284,16 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
         return; // 同一個埠已經在測了
     }
     state.set_exit_test(local, test_state::TESTING, "testing...");
+    // 自測是飛在半空的：探測期間使用者可能已經中斷或重接了這個出口，
+    // 那時 halt 早就把 last_test 清乾淨，晚到的結果不可以再寫回去
+    let generation = state.generation(local);
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
         st.end_test(local);
+        if !st.generation_alive(local, generation) {
+            return;
+        }
         let (state_name, text) = match result {
             Ok(ExitTest::Ok(text)) => (test_state::OK, text),
             Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
