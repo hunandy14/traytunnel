@@ -106,13 +106,19 @@ function assignError(msg: string) {
   setFieldError(backdrop(), key, m[2].trim());
 }
 
-/** 送出前先做一輪本地檢查，訊息與後端用同一套欄位前綴 */
+/**
+ * 送出前先做一輪本地檢查，訊息與後端用同一套欄位前綴。
+ * name 的規則照 Rust 端 valid_source_name：不可空白、不可含中括號
+ * （日誌行前綴是 `[源名]`，名字裡再冒出一個 `]` 會讓前端切不出正確的源名）。
+ */
 function localValidate(): Partial<Record<SourceField, string>> {
   const errors: Partial<Record<SourceField, string>> = {};
   const name = input("name").value.trim();
   const host = input("host").value.trim();
   const user = input("user").value.trim();
   if (!name) errors.name = "name is required";
+  else if (/\s/.test(name)) errors.name = "must not contain spaces";
+  else if (/[[\]]/.test(name)) errors.name = "must not contain brackets";
   if (!host) errors.host = "host is required";
   else if (/\s/.test(host)) errors.host = "must not contain spaces";
   if (!user) errors.user = "user is required";

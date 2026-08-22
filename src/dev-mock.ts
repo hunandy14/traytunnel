@@ -246,6 +246,8 @@ function validateSource(input: {
 }): string | null {
   if (!input.name) return "name: name is required";
   if (/\s/.test(input.name)) return "name: must not contain spaces";
+  // 照 Rust 端 valid_source_name：不可含中括號，日誌行前綴 `[源名]` 才切得出來
+  if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
   const dup = state.sources.find((s) => s.name === input.name && s.name !== input.originalName);
   if (dup) return "name: another source already uses this name";
   if (!input.host) return "host: host is required";
