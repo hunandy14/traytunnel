@@ -14,6 +14,7 @@ import { afterTransition, el } from "./dom";
 import {
   deleteSource,
   getConfigPath,
+  installUpdate,
   openConfigDir,
   setAutostart,
   setCloseToTray,
@@ -470,10 +471,26 @@ function settingsError(msg: string) {
   setGeneralError(el<HTMLDivElement>("settings-error"), msg);
 }
 
+/**
+ * About 區的更新列：沒有新版就整列藏起來，有的話顯示版本與可以做的動作。
+ *
+ * 安裝版（installed）才給得起「就地更新」——按下去是下載新版安裝檔並交棒給它，
+ * 這支程式會自己退出、安裝完由安裝程式重新啟動。
+ */
+function syncUpdateRow(update: Snapshot["update"]) {
+  const row = el<HTMLDivElement>("row-update");
+  row.hidden = !update;
+  if (!update) return;
+  el<HTMLDivElement>("update-name").textContent = `v${update.version} available`;
+  el<HTMLDivElement>("update-hint").textContent =
+    "Downloads and installs the update, then restarts Traytunnel";
+}
+
 /** 後端推了新設定就把 toggle 對齊回去 */
 export function syncSettingsPage(snap: Snapshot) {
   setToggle(tgClose(), snap.closeToTray);
   setToggle(tgAutostart(), snap.autostart);
+  syncUpdateRow(snap.update ?? null);
 }
 
 function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>) {
@@ -516,9 +533,28 @@ function initConfigPathRow() {
   });
 }
 
+/**
+ * 更新按鈕：按下去就沒有回頭路了，所以先把按鈕停用避免連按兩次。
+ *
+ * 成功的話這個 promise 根本不會 resolve（安裝程式接手、程式退出），
+ * 因此只有失敗要處理：把按鈕放回去並把原因寫在設定頁的錯誤列。
+ */
+function initUpdateRow() {
+  const btn = el<HTMLButtonElement>("btn-update");
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    settingsError("");
+    void installUpdate().catch((e) => {
+      btn.disabled = false;
+      settingsError(String(e));
+    });
+  });
+}
+
 export function initSettingsPage() {
   wireToggle(tgClose(), setCloseToTray);
   wireToggle(tgAutostart(), setAutostart);
+  initUpdateRow();
   initConfigPathRow();
   void loadAppVersion().then((v) => {
     el<HTMLSpanElement>("app-version").textContent = v;

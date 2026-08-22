@@ -27,6 +27,9 @@ ureq = { version = "3", features = ["socks-proxy", "json"] }
 log = "0.4"
 # 系統匣圖示要照 SM_CXSMICON 從多層 ICO 挑層，得自己解 ICO
 ico = "0.5"
+# 應用內更新（安裝版車道）。zip 特性只有 macOS／Linux 的 .tar.gz／.zip 更新包用得到，
+# Windows 的 NSIS 更新是直接下載並執行簽好章的 setup.exe，關掉可以少拖 zip／tar／flate2
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

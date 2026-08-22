@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, Source};
 use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
-use crate::{close_main, do_exit, tunnel, winsys, Shared};
+use crate::{close_main, do_exit, tunnel, update, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
 const SAVE_FAILED: &str = "Failed to save settings";
@@ -421,6 +421,16 @@ pub fn open_config_dir(state: State<'_, Shared>) {
     if let Err(e) = winsys::reveal_in_explorer(&st.path) {
         st.log(format!("could not open the config folder: {e}"));
     }
+}
+
+/// 安裝版的「Restart to update」：下載並交棒給 NSIS 安裝程式。
+///
+/// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，
+/// 所以前端不必為成功的情況做任何收尾。回 Err 才代表這次更新沒能開始。
+#[tauri::command]
+pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
+    let st = state.inner().clone();
+    update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
 }
 
 #[tauri::command]

@@ -54,6 +54,8 @@ const DEFAULT_SNAPSHOT: Snapshot = {
     },
   ],
   logs: [],
+  // 預設沒有新版，更新列不出現；三種更新情境由 __mock 那邊演（見 installScenarioHooks）
+  update: null,
 };
 
 /** 假的出口自測結果，照原版「ip  city, country」格式；沒列到的埠就當作測不到 */

@@ -132,6 +132,16 @@
                  JS 跑起來後 version.ts 的 loadAppVersion() 還會再覆寫一次成真正生效的版本 -->
             <span class="setting-version" id="app-version">v__APP_VERSION_PLACEHOLDER__</span>
           </div>
+          <!-- 更新列：只有背景檢查真的發現新版時才出現，其餘時候整列不存在，
+               About 區維持原本「版本＋設定檔」兩列的樣子 -->
+          <div class="setting-row" id="row-update" hidden>
+            <span class="setting-icon" data-icon="download" data-icon-size="17"></span>
+            <div class="setting-text">
+              <div class="setting-name" id="update-name">Update available</div>
+              <div class="setting-hint" id="update-hint"></div>
+            </div>
+            <button class="btn primary sm" id="btn-update" type="button">Restart to update</button>
+          </div>
           <!-- 整列不可互動，開資料夾的動作收進右側獨立的圖示按鈕 -->
           <div class="setting-row" id="row-config-path">
             <span class="setting-icon" data-icon="file-text" data-icon-size="17"></span>

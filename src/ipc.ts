@@ -18,6 +18,7 @@ import type {
   SourceInput,
   TestConnectionInput,
   TestConnectionResult,
+  UpdateInfo,
 } from "./types";
 
 export const getState = () => invoke<Snapshot>("get_state");
@@ -62,6 +63,16 @@ export const getConfigPath = () => invoke<string>("get_config_path");
 /** 在檔案總管開啟設定檔所在資料夾並選中它 */
 export const openConfigDir = () => invoke<void>("open_config_dir");
 
+// ------------------------------------------------------------ 更新
+
+/**
+ * 安裝版的就地更新：下載新版安裝檔並交棒給它。
+ *
+ * 正常情況下這個 promise **不會 resolve**——安裝程式一起來，程式本身就退出了。
+ * 會 reject 才代表更新沒能開始（沒網路、簽章驗不過之類）。
+ */
+export const installUpdate = () => invoke<void>("install_update");
+
 /** 自繪標題列用的視窗指令，close 的行為（縮到匣或結束）由 Rust 端決定 */
 export const windowMinimize = () => invoke<void>("window_minimize");
 export const windowClose = () => invoke<void>("window_close");
@@ -79,3 +90,7 @@ export const onLog = (fn: (line: string) => void) =>
 
 export const onConfigChanged = (fn: (snap: Snapshot) => void) =>
   listen<Snapshot>("config-changed", (e) => fn(e.payload));
+
+/** 背景檢查發現新版時推一次；payload 為 null 代表回到「沒有新版」 */
+export const onUpdateAvailable = (fn: (info: UpdateInfo | null) => void) =>
+  listen<UpdateInfo | null>("update-available", (e) => fn(e.payload));

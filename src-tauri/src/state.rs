@@ -80,6 +80,17 @@ pub struct SourceView {
     pub exits: Vec<ExitView>,
 }
 
+/// 有新版可用時的資訊：同時是 Snapshot 的 `update` 欄位與 `update-available`
+/// 事件的內容。沒有新版（或還沒查過、檢查失敗）時一律是 None，介面就不顯示那一列。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    /// 遠端公告的新版本號，不帶 v
+    pub version: String,
+    /// true＝安裝版，可以就地下載安裝；false＝可攜／單檔版，只能開瀏覽器讓使用者自己換
+    pub installed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -88,6 +99,8 @@ pub struct Snapshot {
     pub sources: Vec<SourceView>,
     /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
     pub logs: Vec<String>,
+    /// 背景檢查發現的新版，沒有就是 null（介面靠它決定要不要顯示更新列）
+    pub update: Option<UpdateInfo>,
 }
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
@@ -177,6 +190,8 @@ pub struct AppState {
     exiting: AtomicBool,
     /// 設定檔壞掉又備份不出來時會被拉起來，之後一律拒絕回寫
     read_only: AtomicBool,
+    /// 背景更新檢查的結果，None 代表目前沒有新版可用
+    update: Mutex<Option<UpdateInfo>>,
 }
 
 impl AppState {
@@ -193,6 +208,7 @@ impl AppState {
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
+            update: Mutex::new(None),
         }
     }
 
@@ -454,6 +470,25 @@ impl AppState {
         crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
+    /// 記下背景檢查的結果並推事件；跟上次一樣就不重推。
+    ///
+    /// 每 24 小時會再查一次，同一個新版本重複推的話，設定頁那一列會無謂重畫，
+    /// 也讓事件流看起來像真的又發生了什麼事。
+    pub fn set_update(&self, info: Option<UpdateInfo>) {
+        {
+            let mut slot = self.update.lock().unwrap();
+            if *slot == info {
+                return;
+            }
+            *slot = info.clone();
+        }
+        let _ = self.app.emit("update-available", info);
+    }
+
+    pub fn update_info(&self) -> Option<UpdateInfo> {
+        self.update.lock().unwrap().clone()
+    }
+
     /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
     ///
     /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
@@ -500,6 +535,7 @@ impl AppState {
             autostart: self.autostart(),
             sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
+            update: self.update_info(),
         }
     }
 
