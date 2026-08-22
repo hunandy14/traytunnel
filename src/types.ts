@@ -1,4 +1,17 @@
-/** IPC 契約 v3 的型別定義，欄位名稱與 Rust 端逐字對齊（參數平鋪 camelCase）。 */
+/**
+ * IPC 契約 v3 的型別定義，欄位名稱與 Rust 端逐字對齊（參數平鋪 camelCase）。
+ *
+ * ExitStatus／TestState 這兩組狀態值是跟 Rust 端手動同步的字面量聯集，
+ * 沒有共用的單一來源。新增、改名或刪除狀態值時，以下幾處都要一起改，
+ * 漏改不會在編譯期報錯，只會在執行期悄悄壞掉（畫面卡在某個 tone、
+ * dev-mock 模擬不出新狀態之類）：
+ *
+ *   - src-tauri/src/state.rs 的 status 模組常數（STOPPED／CONNECTING／…）
+ *   - src/status.ts 的 RUNNING 陣列與 statusTone()（isBad／isRunning
+ *     這些衍生判斷也在同一支檔案）
+ *   - src/dev-mock.ts 假後端裡任何列舉狀態值的地方（模擬情境、setStatus
+ *     的呼叫點）
+ */
 
 /** 出口的連線狀態（六態） */
 export type ExitStatus =

@@ -142,6 +142,14 @@ function ownerOf(local: number): string {
   return find(local)?.source.name ?? "";
 }
 
+/**
+ * 已知與真後端的落差：Rust 端的 state.set_exit_status 在狀態與 detail 都
+ * 沒變時會直接 return、不重推 exit-status 事件（見 src-tauri/src/state.rs），
+ * 這裡為了讓假後端的邏輯簡單直接，一律無條件 emit。實際差異只在「同狀態
+ * 又被設一次」這種邊界情況會多送一次事件，UI 收到重複事件本來就是冪等的
+ * （paintCard／paintRailStatus 都是整格重畫），不影響畫面表現，故不修行為，
+ * 僅在此註記。
+ */
 function setStatus(exit: ExitInfo, status: ExitStatus, detail?: string) {
   exit.status = status;
   if (status === "stopped") exit.lastTest = null;
@@ -253,6 +261,8 @@ function validateSource(input: {
 }): string | null {
   if (!input.name) return "name: name is required";
   if (/\s/.test(input.name)) return "name: must not contain spaces";
+  // 照 Rust 端 valid_source_name：不可含中括號，日誌行前綴 `[源名]` 才切得出來
+  if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
   const dup = state.sources.find((s) => s.name === input.name && s.name !== input.originalName);
   if (dup) return "name: another source already uses this name";
   if (!input.host) return "host: host is required";
