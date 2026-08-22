@@ -12,9 +12,32 @@ use crate::config::{self, Config, Source};
 use crate::state::{Snapshot, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, winsys, Shared};
 
+/// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
+const SAVE_FAILED: &str = "Failed to save settings";
+
 /// 設定檔寫入失敗一律讓使用者看得到，且記憶體狀態不會被改掉
-fn report_save_error(state: &Shared, e: std::io::Error) {
+fn report_save_error(state: &Shared, e: &std::io::Error) {
     state.log(format!("failed to save settings: {e}"));
+}
+
+/// 存檔失敗且要把原因交回前端時走這裡：記一行到活動日誌，並組出對話框要顯示的訊息
+fn save_error_message(st: &Shared, e: std::io::Error) -> String {
+    report_save_error(st, &e);
+    format!("{SAVE_FAILED}:\n{e}")
+}
+
+/// 存檔，失敗時記一行並回 false。
+///
+/// 指令層的通則：設定沒存成功就什麼都不要做——隧道不停、事件不推，因為
+/// `update_config` 回 Err 時記憶體裡的設定也沒被改動，這次操作等於沒發生。
+fn save(st: &Shared, edit: impl FnOnce(&mut Config)) -> bool {
+    match st.update_config(edit) {
+        Ok(()) => true,
+        Err(e) => {
+            report_save_error(st, &e);
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 前端指令
@@ -48,12 +71,11 @@ pub fn enable_exit(st: &Shared, local: u16) {
     if !require_exit(st, local) {
         return;
     }
-    if let Err(e) = st.update_config(|c| {
+    if !save(st, |c| {
         if let Some(f) = c.forward_mut(local) {
             f.enabled = true;
         }
     }) {
-        report_save_error(st, e);
         // 存檔失敗代表 enabled 沒改成，但系統匣的勾選已經被原生選單自己翻掉了，
         // 重建一次把它拉回設定裡的真值
         st.refresh_tray();
@@ -68,12 +90,11 @@ pub fn disable_exit(st: &Shared, local: u16) {
     if !require_exit(st, local) {
         return;
     }
-    if let Err(e) = st.update_config(|c| {
+    if !save(st, |c| {
         if let Some(f) = c.forward_mut(local) {
             f.enabled = false;
         }
     }) {
-        report_save_error(st, e);
         // 同上：勾選已被原生選單翻掉，設定卻沒改成，重建把它拉回真值
         st.refresh_tray();
         return;
@@ -102,12 +123,11 @@ pub fn restart_exit(state: State<'_, Shared>, local: u16) {
     }
     let enabled = st.with_config(|c| c.forward(local).is_some_and(|f| f.enabled));
     if !enabled {
-        if let Err(e) = st.update_config(|c| {
+        if !save(st, |c| {
             if let Some(f) = c.forward_mut(local) {
                 f.enabled = true;
             }
         }) {
-            report_save_error(st, e);
             return;
         }
         st.emit_config_changed();
@@ -123,14 +143,13 @@ pub fn start_source(state: State<'_, Shared>, name: String) {
     if !require_source(st, &name) {
         return;
     }
-    if let Err(e) = st.update_config(|c| {
+    if !save(st, |c| {
         if let Some(s) = c.source_mut(&name) {
             for f in s.forwards.iter_mut() {
                 f.enabled = true;
             }
         }
     }) {
-        report_save_error(st, e);
         return;
     }
     st.emit_config_changed();
@@ -144,14 +163,13 @@ pub fn stop_source(state: State<'_, Shared>, name: String) {
     if !require_source(st, &name) {
         return;
     }
-    if let Err(e) = st.update_config(|c| {
+    if !save(st, |c| {
         if let Some(s) = c.source_mut(&name) {
             for f in s.forwards.iter_mut() {
                 f.enabled = false;
             }
         }
     }) {
-        report_save_error(st, e);
         return;
     }
     tunnel::halt_source(st, &name);
@@ -160,8 +178,7 @@ pub fn stop_source(state: State<'_, Shared>, name: String) {
 
 /// 全部連接：跨源把 enabled 全開再拉線
 pub fn enable_all(st: &Shared) {
-    if let Err(e) = st.update_config(set_all_enabled(true)) {
-        report_save_error(st, e);
+    if !save(st, set_all_enabled(true)) {
         return;
     }
     st.emit_config_changed();
@@ -170,8 +187,7 @@ pub fn enable_all(st: &Shared) {
 
 /// 全部中斷
 pub fn disable_all(st: &Shared) {
-    if let Err(e) = st.update_config(set_all_enabled(false)) {
-        report_save_error(st, e);
+    if !save(st, set_all_enabled(false)) {
         return;
     }
     tunnel::halt_all(st);
@@ -248,9 +264,7 @@ pub fn upsert_source(
             forwards: Vec::new(),
         }),
     }) {
-        let msg = format!("Failed to save settings:\n{e}");
-        report_save_error(st, e);
-        return Some(msg);
+        return Some(save_error_message(st, e));
     }
 
     st.emit_config_changed();
@@ -280,8 +294,7 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
     let ports: Vec<u16> = st.with_config(|c| {
         c.source(&name).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
     });
-    if let Err(e) = st.update_config(|c| c.sources.retain(|s| s.name != name)) {
-        report_save_error(st, e);
+    if !save(st, |c| c.sources.retain(|s| s.name != name)) {
         return;
     }
     for p in ports {
@@ -334,9 +347,7 @@ pub fn upsert_forward(
             s.forwards.push(forward.clone());
         }
     }) {
-        let msg = format!("Failed to save settings:\n{e}");
-        report_save_error(st, e);
-        return Some(msg);
+        return Some(save_error_message(st, e));
     }
 
     // 存檔成功之後才停掉舊的那條線（換埠或換源時舊埠也才會放掉）。存檔失敗時
@@ -369,12 +380,11 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
         return;
     };
     // 同 delete_source：先存檔成功才停線，存檔失敗時隧道維持原狀
-    if let Err(e) = st.update_config(|c| {
+    if !save(st, |c| {
         for s in c.sources.iter_mut() {
             s.forwards.retain(|f| f.local != local);
         }
     }) {
-        report_save_error(st, e);
         return;
     }
     tunnel::halt(st, local);
@@ -390,8 +400,7 @@ pub fn test_exit(state: State<'_, Shared>, local: u16) {
 #[tauri::command]
 pub fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
     let st = state.inner();
-    st.update_config(|c| c.close_to_tray = on)
-        .map_err(|e| format!("Failed to save settings:\n{e}"))?;
+    st.update_config(|c| c.close_to_tray = on).map_err(|e| save_error_message(st, e))?;
     st.emit_config_changed();
     st.log(if on { "close hides to tray" } else { "close exits app" });
     Ok(())
