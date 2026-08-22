@@ -237,7 +237,13 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                 loop {
                     tokio::time::sleep(POLL).await;
                     if !state.generation_alive(local, generation) {
-                        return; // 已被 halt/restart 作廢，job 也已關閉
+                        // 已被 halt/restart 作廢。halt 的 kill_job 有可能跑在
+                        // store_job 之前（先清到空的，才輪到我們把 job 放進去），
+                        // 那一手就會讓這條 ssh 連同 ProxyCommand 的孫程序留著沒人收，
+                        // 所以離開前自己再收一次；世代不符時 kill_job_of 是 no-op，
+                        // 不會誤殺已經接手的新一輪連線
+                        state.kill_job_of(local, generation);
+                        return;
                     }
                     match child.try_wait() {
                         Ok(Some(_)) | Err(_) => break,
