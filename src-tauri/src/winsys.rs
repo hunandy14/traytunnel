@@ -15,6 +15,11 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -24,11 +29,6 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
-};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
 /// 以 isize 保存 handle，讓型別自然是 Send + Sync。
@@ -235,9 +235,8 @@ pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
 pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()> {
     let payload = wide(data);
     // UTF-16 的位元組數，含結尾的 NUL
-    let bytes = unsafe {
-        std::slice::from_raw_parts(payload.as_ptr() as *const u8, payload.len() * 2)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(payload.as_ptr() as *const u8, payload.len() * 2) };
     write_hkcu_value(subkey, name, REG_SZ, bytes)
 }
 

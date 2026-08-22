@@ -167,7 +167,8 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             return;
         }
         // 只複製這個出口與它所屬的源，不為了兩筆資料深拷貝整份設定
-        let Some((src, f)) = state.with_config(|c| c.locate(local).map(|(s, f)| (s.clone(), f.clone())))
+        let Some((src, f)) =
+            state.with_config(|c| c.locate(local).map(|(s, f)| (s.clone(), f.clone())))
         else {
             return; // 出口已經被刪掉
         };
@@ -203,7 +204,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             Err(e) => {
                 spawn_failed = true;
                 state.set_exit_status(local, status::ERROR, Some(e.to_string()));
-                state.log_from(sname, format!("{} : failed to start ssh: {e}, retrying in 5s", f.name));
+                state.log_from(
+                    sname,
+                    format!("{} : failed to start ssh: {e}, retrying in 5s", f.name),
+                );
             }
             Ok((mut child, job, pid)) => {
                 state.store_job(local, generation, job);

@@ -100,9 +100,7 @@ fn exe_parts() -> (PathBuf, String) {
 
 /// 使用者家目錄；空字串視同沒有
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
 /// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
@@ -184,9 +182,7 @@ impl Config {
     }
 
     pub fn forward_mut(&mut self, local: u16) -> Option<&mut Forward> {
-        self.sources
-            .iter_mut()
-            .find_map(|s| s.forwards.iter_mut().find(|f| f.local == local))
+        self.sources.iter_mut().find_map(|s| s.forwards.iter_mut().find(|f| f.local == local))
     }
 
     /// 出口所屬的源
@@ -227,7 +223,9 @@ impl Config {
 
     /// 單一源底下所有出口的本地埠；沒有這個源就是空的
     pub fn locals_of(&self, source: &str) -> Vec<u16> {
-        self.source(source).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
+        self.source(source)
+            .map(|s| s.forwards.iter().map(|f| f.local).collect())
+            .unwrap_or_default()
     }
 
     /// 單一源底下 enabled 出口的本地埠
@@ -422,11 +420,8 @@ fn is_legacy(doc: &DocumentMut) -> bool {
 /// （`[::1]` 這種字面 IPv6 位址就同時踩到），因此剝掉再用；
 /// 剝完是空的就退回一個固定名字，總之要生得出合法的源名。
 fn source_name_from_host(host: &str) -> String {
-    let cleaned: String = host
-        .trim()
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']')
-        .collect();
+    let cleaned: String =
+        host.trim().chars().filter(|c| !c.is_whitespace() && *c != '[' && *c != ']').collect();
     if cleaned.is_empty() {
         "default".to_string()
     } else {
@@ -455,8 +450,7 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     let doc: DocumentMut = strip_bom(raw).parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let legacy = is_legacy(&doc);
     let mut cfg: Config = if legacy {
-        let old: LegacyConfig =
-            toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
+        let old: LegacyConfig = toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
         old.into_config()
     } else {
         toml_edit::de::from_document(doc).map_err(|e| e.to_string())?
@@ -745,12 +739,8 @@ pub fn prepare_forward(
     remote: &str,
     enabled: bool,
 ) -> Result<Forward, String> {
-    let f = Forward {
-        name: name.trim().to_string(),
-        local,
-        remote: normalize_remote(remote),
-        enabled,
-    };
+    let f =
+        Forward { name: name.trim().to_string(), local, remote: normalize_remote(remote), enabled };
     match validate_forward(sources, original_local, &f.name, f.local, &f.remote) {
         Some(err) => Err(err),
         None => Ok(f),

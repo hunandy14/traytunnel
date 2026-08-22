@@ -31,10 +31,8 @@ pub fn probe(port: u16) -> ExitTest {
             return ExitTest::Fail("no response");
         }
     };
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .proxy(proxy)
-        .build();
+    let agent =
+        ureq::AgentBuilder::new().timeout(Duration::from_secs(TIMEOUT_SECS)).proxy(proxy).build();
 
     let resp = match agent.get(URL).call() {
         Ok(r) => r,

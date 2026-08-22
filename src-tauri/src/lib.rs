@@ -97,11 +97,8 @@ fn heal_autostart(app: &AppHandle, state: &Shared) {
 /// 通知外掛在正式部署路徑下用的也是它。
 fn prepare_notifications(app: &AppHandle) -> Vec<String> {
     let aumid = app.config().identifier.clone();
-    let product = app
-        .config()
-        .product_name
-        .clone()
-        .unwrap_or_else(|| app.package_info().name.clone());
+    let product =
+        app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone());
     let Ok(exe) = std::env::current_exe() else {
         return vec!["could not resolve the executable path for notifications".into()];
     };
@@ -262,7 +259,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
 
 /// 系統匣選單的事件路由：id 前綴決定要做什麼，一律呼叫內部函式，不繞 invoke
 fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {

@@ -324,10 +324,9 @@ impl AppState {
         if self.with_exit_mut(local, |rt| rt.last_test = Some(view)).is_none() {
             return;
         }
-        let _ = self.app.emit(
-            "exit-test",
-            ExitTestPayload { local, state: state.into(), text: text.into() },
-        );
+        let _ = self
+            .app
+            .emit("exit-test", ExitTestPayload { local, state: state.into(), text: text.into() });
     }
 
     /// 出口斷線或停掉時把舊的自測結果清乾淨
@@ -439,33 +438,33 @@ impl AppState {
     /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
     pub fn source_views(&self) -> Vec<SourceView> {
         self.with_config(|cfg| {
-        let exits = self.exits.lock().unwrap();
-        cfg.sources
-            .iter()
-            .map(|s| SourceView {
-                name: s.name.clone(),
-                host: s.host.clone(),
-                user: s.user.clone(),
-                proxy_command: s.proxy_command.clone(),
-                exits: s
-                    .forwards
-                    .iter()
-                    .map(|f| {
-                        let rt = exits.get(&f.local);
-                        ExitView {
-                            name: f.name.clone(),
-                            local: f.local,
-                            remote: f.remote.clone(),
-                            enabled: f.enabled,
-                            status: rt
-                                .map(|r| r.status.clone())
-                                .unwrap_or_else(|| status::STOPPED.to_string()),
-                            last_test: rt.and_then(|r| r.last_test.clone()),
-                        }
-                    })
-                    .collect(),
-            })
-            .collect()
+            let exits = self.exits.lock().unwrap();
+            cfg.sources
+                .iter()
+                .map(|s| SourceView {
+                    name: s.name.clone(),
+                    host: s.host.clone(),
+                    user: s.user.clone(),
+                    proxy_command: s.proxy_command.clone(),
+                    exits: s
+                        .forwards
+                        .iter()
+                        .map(|f| {
+                            let rt = exits.get(&f.local);
+                            ExitView {
+                                name: f.name.clone(),
+                                local: f.local,
+                                remote: f.remote.clone(),
+                                enabled: f.enabled,
+                                status: rt
+                                    .map(|r| r.status.clone())
+                                    .unwrap_or_else(|| status::STOPPED.to_string()),
+                                last_test: rt.and_then(|r| r.last_test.clone()),
+                            }
+                        })
+                        .collect(),
+                })
+                .collect()
         })
     }
 

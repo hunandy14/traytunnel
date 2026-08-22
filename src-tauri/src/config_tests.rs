@@ -10,7 +10,8 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let p = std::env::temp_dir().join(format!("traytunnel-test-{}-{}-{}", std::process::id(), tag, n));
+    let p =
+        std::env::temp_dir().join(format!("traytunnel-test-{}-{}-{}", std::process::id(), tag, n));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -461,11 +462,8 @@ fn broken_file_is_backed_up_and_never_overwritten() {
 /// 任何回寫都會把它輾成預設值。其餘結果一律照常可寫。
 #[test]
 fn only_a_broken_file_without_a_backup_turns_read_only() {
-    let broken_no_backup = LoadOutcome::Broken {
-        config: Config::default(),
-        backup: None,
-        error: "boom".into(),
-    };
+    let broken_no_backup =
+        LoadOutcome::Broken { config: Config::default(), backup: None, error: "boom".into() };
     assert!(broken_no_backup.read_only());
 
     let broken_with_backup = LoadOutcome::Broken {
@@ -741,8 +739,10 @@ fn write_goes_through_a_temp_file_and_leaves_none_behind() {
     let cfg = Config::default();
     write_config(&dir, &cfg).unwrap();
     assert!(!tmp_path(&path).exists(), "暫存檔要被 rename 掉");
-    let names: Vec<String> =
-        std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
     assert_eq!(names, vec![TOML_NAME.to_string()]);
     // 換名之後的內容是完整的一份，不是半截檔
     assert_eq!(parse_config(&std::fs::read_to_string(&path).unwrap()).unwrap(), cfg);
@@ -879,12 +879,7 @@ fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
     // 產出：名字順手 trim，remote 是完整形式
     assert_eq!(
         made,
-        Forward {
-            name: "web".into(),
-            local: 1090,
-            remote: "127.0.0.1:8080".into(),
-            enabled: true,
-        }
+        Forward { name: "web".into(), local: 1090, remote: "127.0.0.1:8080".into(), enabled: true }
     );
 
     // 落檔：command 端就是把這一筆原樣塞進設定再存，這裡照做一次
@@ -905,8 +900,7 @@ fn prepare_forward_hands_back_the_error_instead_of_a_forward() {
     let list = vec![src("hk", vec![fwd("a", 1080)])];
     // 撞埠、壞名字、壞 remote 都走同一個回傳
     let bad = |name: &str, local: u16, remote: &str| {
-        prepare_forward(&list, None, name, local, remote, true)
-            .expect_err("這組輸入應該要被擋下來")
+        prepare_forward(&list, None, name, local, remote, true).expect_err("這組輸入應該要被擋下來")
     };
     assert!(bad("b", 1080, "8080").starts_with("local: "));
     assert!(bad("", 1090, "8080").starts_with("name: "));
@@ -956,10 +950,8 @@ fn err(list: &[Source], orig: Option<u16>, name: &str, local: u16, remote: &str)
 
 #[test]
 fn upsert_rejects_duplicate_local_port() {
-    let list = vec![src(
-        "hk",
-        vec![fwd("exit-tw", 1080), Forward { enabled: false, ..fwd("b", 1083) }],
-    )];
+    let list =
+        vec![src("hk", vec![fwd("exit-tw", 1080), Forward { enabled: false, ..fwd("b", 1083) }])];
     // 新增撞到既有的，訊息要點名是誰佔走的
     assert_eq!(
         err(&list, None, "c", 1080, "127.0.0.1:1"),

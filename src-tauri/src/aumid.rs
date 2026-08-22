@@ -31,10 +31,8 @@ use windows::Win32::UI::Shell::{IShellLinkW, SetCurrentProcessExplicitAppUserMod
 use crate::winsys::wide;
 
 /// PKEY_AppUserModel_ID，propkey.h 裡的固定值，windows crate 的 metadata 沒有生出來
-const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
-    fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
-    pid: 5,
-};
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY =
+    PROPERTYKEY { fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
 
 const AUMID_CLASS_ROOT: &str = "Software\\Classes\\AppUserModelId";
 
@@ -190,8 +188,8 @@ pub fn ensure_shortcut(lnk: &Path, exe: &Path, aumid: &str, description: &str) -
 
         // 捷徑要帶 System.AppUserModel.ID，Windows 才會認這個 AUMID
         let store: IPropertyStore = link.cast().map_err(to_io)?;
-        let mut pv = propvariant_string(aumid)
-            .ok_or_else(|| io::Error::other("CoTaskMemAlloc 失敗"))?;
+        let mut pv =
+            propvariant_string(aumid).ok_or_else(|| io::Error::other("CoTaskMemAlloc 失敗"))?;
         let set = store.SetValue(&PKEY_APP_USER_MODEL_ID, &pv);
         let commit = set.and_then(|_| store.Commit());
         let _ = PropVariantClear(&mut pv);
@@ -347,8 +345,8 @@ mod tests {
     /// 而且第二次呼叫不該重寫檔案。寫在暫存資料夾，不碰真的開始選單。
     #[test]
     fn shortcut_round_trips_target_and_aumid() {
-        let dir = std::env::temp_dir()
-            .join(format!("traytunnel-lnk-{}-{}", std::process::id(), line!()));
+        let dir =
+            std::env::temp_dir().join(format!("traytunnel-lnk-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lnk = dir.join("Traytunnel Test.lnk");

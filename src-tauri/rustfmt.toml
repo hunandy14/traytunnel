@@ -1,0 +1,7 @@
+# 這份設定是把既有程式碼的排版寫成規則，不是改風格：
+# 全庫本來就是 100 欄、短的呼叫與結構實字盡量留在同一行（例如
+# `ConfigLocation { path: portable, portable: true }`），預設的
+# fn_call_width=60 會把這些全部拆開，跟現況差 82 個 hunk。
+# CI 的 `cargo fmt --check` 讀的就是這份，維持一致。
+max_width = 100
+use_small_heuristics = "Max"
