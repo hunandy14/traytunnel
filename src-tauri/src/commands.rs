@@ -90,9 +90,11 @@ pub fn set_exit_enabled(st: &Shared, local: u16, on: bool) {
             f.enabled = on;
         }
     }) {
-        // 存檔失敗代表 enabled 沒改成，但系統匣的勾選已經被原生選單自己翻掉了，
-        // 重建一次把它拉回設定裡的真值
-        st.refresh_tray();
+        // 存檔失敗代表 enabled 沒改成，但兩邊的開關都已經被樂觀翻過去了：
+        // 系統匣的勾選是原生選單自己翻的，主視窗的開關是前端先翻的。
+        // 全量推一次（emit_config_changed 連同系統匣一起重建）把兩邊都拉回設定裡的
+        // 真值——唯讀模式下這條路每次都會走到，只重建系統匣的話介面會一直停在假狀態。
+        st.emit_config_changed();
         return;
     }
     apply_enabled(st, on, || tunnel::start(st, local), || tunnel::halt(st, local));
