@@ -5,7 +5,7 @@
  * 期間按下 Undo 就整個取消。倒數條是純 CSS 動畫，時間與 timer 用同一個常數。
  */
 
-import { el, h } from "./dom";
+import { afterTransition, el, h } from "./dom";
 
 const UNDO_MS = 5000;
 
@@ -59,8 +59,7 @@ export function showUndoToast(
     done = true;
     window.clearTimeout(timer);
     toast.classList.remove("in");
-    toast.addEventListener("transitionend", () => toast.remove(), { once: true });
-    window.setTimeout(() => toast.remove(), 400);
+    afterTransition(toast, () => toast.remove());
     void fn();
   };
 

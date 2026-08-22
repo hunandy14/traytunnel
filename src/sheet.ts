@@ -10,7 +10,7 @@
  * 3. 主區的全域設定頁 —— 兩個 toggle 即時生效，失敗就把畫面翻回去。
  */
 
-import { el } from "./dom";
+import { afterTransition, el } from "./dom";
 import {
   deleteSource,
   getConfigPath,
@@ -53,11 +53,9 @@ function showSheet(node: HTMLElement, focus: HTMLInputElement) {
 /** stillClosed 是為了防「關到一半又被打開」時把新開的那次藏掉 */
 function hideSheet(node: HTMLElement, stillClosed: () => boolean) {
   node.classList.remove("open");
-  const finish = () => {
+  afterTransition(node, () => {
     if (stillClosed()) node.hidden = true;
-  };
-  node.addEventListener("transitionend", finish, { once: true });
-  window.setTimeout(finish, 400);
+  });
 }
 
 // ---------------------------------------------------------------- 連線 sheet
