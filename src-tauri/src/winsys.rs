@@ -269,11 +269,17 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
 }
 
 /// 組 explorer 的命令列。`exists` 拆成參數，路徑組法才測得到。
+///
+/// 相對路徑的 parent 是空字串（不是 None），直接丟給 explorer 會變成空引號，
+/// 因此空的也要收斂成目前目錄。
 fn explorer_arg(path: &std::path::Path, exists: bool) -> String {
     if exists {
         return format!("/select,\"{}\"", path.display());
     }
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
     format!("\"{}\"", dir.display())
 }
 
@@ -327,6 +333,7 @@ pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// 圖示工廠產出的層序，測試照著它走
     const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
@@ -382,5 +389,25 @@ mod tests {
     fn wide_is_nul_terminated() {
         assert_eq!(wide("ab"), vec![0x61, 0x62, 0]);
         assert_eq!(wide(""), vec![0]);
+    }
+
+    /// explorer 的命令列很挑：`/select,` 後面不可以有空白，路徑要自己加引號
+    /// （使用者名稱含空白、或裝在 Program Files 底下都會踩到），
+    /// 而且引號只能包路徑、不能把 `/select,` 一起包進去。
+    #[test]
+    fn explorer_selects_the_file_with_a_quoted_path() {
+        let path = Path::new("C:\\Users\\Bob Smith\\.traytunnel.toml");
+        let arg = explorer_arg(path, true);
+        assert_eq!(arg, "/select,\"C:\\Users\\Bob Smith\\.traytunnel.toml\"");
+        assert!(arg.starts_with("/select,\""), "逗號後面不可以有空白：{arg}");
+    }
+
+    /// 檔案不在了就退而開啟它所在的資料夾，一樣要帶引號
+    #[test]
+    fn explorer_falls_back_to_the_folder() {
+        let path = Path::new("C:\\Program Files\\app\\traytunnel.toml");
+        assert_eq!(explorer_arg(path, false), "\"C:\\Program Files\\app\"");
+        // 連上層資料夾都沒有時不該組出空引號
+        assert_eq!(explorer_arg(Path::new("traytunnel.toml"), false), "\".\"");
     }
 }
