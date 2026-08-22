@@ -787,17 +787,6 @@ function dropPendingDeletesOf(sourceName: string) {
 
 // ---------------------------------------------------------------- 日誌
 
-/**
- * 後端在每行日誌前面就放好了 [源名]，前端只負責過濾：
- * 認得出前綴的行只在對應的源顯示，沒有前綴的 app 級訊息則永遠顯示。
- */
-const PREFIX_RE = /^(?:\s*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\s+)?\[([^\]]+)\]/;
-
-function logSourceOf(line: string): string | null {
-  const m = PREFIX_RE.exec(line);
-  return m ? m[1].trim() : null;
-}
-
 function fill(box: HTMLElement, lines: string[], emptyText: string) {
   // 比照 appendLine：使用者自己往上捲去看舊訊息時就不要硬把他拉回底部
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
@@ -810,23 +799,9 @@ function fill(box: HTMLElement, lines: string[], emptyText: string) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
+/** 日誌只剩下獨立的活動頁一個出口，主區不再掛即時的小視窗 */
 function renderLogs() {
-  if (view === "log") {
-    fill(el<HTMLDivElement>("full-log"), logLines, "No activity yet");
-    return;
-  }
-  if (view !== "source") return;
-
-  const scope = el<HTMLSpanElement>("mini-log-scope");
-  scope.textContent = selected ? selected : "";
-  fill(
-    el<HTMLDivElement>("mini-log"),
-    logLines.filter((l) => {
-      const s = logSourceOf(l);
-      return s === null || s === selected;
-    }),
-    "No activity yet",
-  );
+  if (view === "log") fill(el<HTMLDivElement>("full-log"), logLines, "No activity yet");
 }
 
 function appendLine(box: HTMLElement, line: string) {
@@ -840,14 +815,7 @@ function appendLine(box: HTMLElement, line: string) {
 function appendLog(line: string) {
   logLines.push(line);
   if (logLines.length > LOG_CAP) logLines.shift();
-
-  if (view === "log") {
-    appendLine(el<HTMLDivElement>("full-log"), line);
-    return;
-  }
-  if (view !== "source") return;
-  const s = logSourceOf(line);
-  if (s === null || s === selected) appendLine(el<HTMLDivElement>("mini-log"), line);
+  if (view === "log") appendLine(el<HTMLDivElement>("full-log"), line);
 }
 
 // ---------------------------------------------------------------- 事件套用

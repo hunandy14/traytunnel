@@ -994,43 +994,6 @@ body {
   -webkit-user-select: text;
 }
 
-/* 主區底部的縮小即時日誌：只顯示目前這個源（與沒有前綴的 app 級訊息） */
-.mini-log {
-  flex: none;
-  margin-top: 8px;
-  padding: 8px 4px 8px 12px;
-}
-
-.mini-log-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 4px;
-  padding-right: 8px;
-}
-
-.mini-log-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.8px;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.mini-log-scope {
-  flex: 1;
-  font-size: 10px;
-  color: #61656e;
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.log-box.mini {
-  height: 96px;
-}
-
 .log-full-panel {
   flex: 1;
   min-height: 0;
@@ -1371,11 +1334,5 @@ body {
 
   .summary-title {
     font-size: 17px;
-  }
-}
-
-@media (max-height: 460px) {
-  .log-box.mini {
-    height: 64px;
   }
 }
