@@ -10,7 +10,6 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::Config;
 use crate::winsys::Job;
@@ -109,9 +108,15 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     }
 }
 
+/// 開機自啟登錄值的名稱。沿用 productName（沒有就退回套件名），與先前
+/// tauri-plugin-autostart 寫進去的那一份同名，升級的使用者不必重設。
+pub fn autostart_name(app: &AppHandle) -> String {
+    app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone())
+}
+
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
 fn format_log(source: Option<&str>, msg: &str) -> String {
-    let ts = chrono::Local::now().format("%H:%M:%S");
+    let ts = crate::winsys::local_time_hms();
     match source {
         Some(s) => format!("{ts}  [{s}] {msg}"),
         None => format!("{ts}  {msg}"),
@@ -127,7 +132,7 @@ fn push_log_line(logs: &mut VecDeque<String>, line: String) {
 }
 
 /// 單一出口的執行期狀態
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ExitRuntime {
     status: String,
     detail: Option<String>,
@@ -140,9 +145,19 @@ struct ExitRuntime {
     job: Option<(u64, Job)>,
 }
 
-impl ExitRuntime {
-    fn new() -> Self {
-        ExitRuntime { status: status::STOPPED.into(), ..Default::default() }
+/// 手寫而不是 derive：新項目的 status 一定要是 stopped。
+/// derive 出來的空字串不是任何一個合法狀態，而 `is_running` 的判斷是
+/// 「不是 stopped 就算在跑」，空字串一旦外流就會讓沒起來的出口顯示成運行中。
+impl Default for ExitRuntime {
+    fn default() -> Self {
+        ExitRuntime {
+            status: status::STOPPED.into(),
+            detail: None,
+            last_test: None,
+            generation: 0,
+            supervisor: None,
+            job: None,
+        }
     }
 }
 
@@ -160,11 +175,13 @@ pub struct AppState {
     generation: AtomicU64,
     tray_hint_shown: AtomicBool,
     exiting: AtomicBool,
+    /// 設定檔壞掉又備份不出來時會被拉起來，之後一律拒絕回寫
+    read_only: AtomicBool,
 }
 
 impl AppState {
     pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
-        let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::new())).collect();
+        let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         AppState {
             app,
             path,
@@ -175,18 +192,45 @@ impl AppState {
             generation: AtomicU64::new(0),
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
         }
     }
 
-    pub fn config(&self) -> Config {
-        self.cfg.lock().unwrap().clone()
+    /// 把設定切成唯讀，之後每一次 `update_config` 都會直接回 Err。
+    /// 只有「設定檔壞掉且備份不出來」時會走到這裡，見 `LoadOutcome::read_only`。
+    pub fn mark_read_only(&self) {
+        self.read_only.store(true, Ordering::SeqCst);
     }
 
-    /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
+    }
+
+    /// 唯讀地看一眼設定：閉包帶進鎖裡跑，整份 Config 不必複製。
+    ///
+    /// 絕大多數呼叫點只是問一個布林或抄幾個埠號，卻要為此深拷貝整份設定
+    /// （源、出口、字串全部），而狀態一變就會連推好幾次事件，複製量相當可觀。
+    ///
+    /// 閉包裡不可以再碰任何會鎖 cfg 的方法（`update_config`、`with_config`
+    /// 自己），否則當場自我死鎖。要跨鎖持有的話，在閉包裡複製需要的那幾筆
+    /// 出來就好——目前全程式沒有任何一處真的需要整份 owned 設定。
+    pub fn with_config<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&self.cfg.lock().unwrap())
+    }
+
+    /// 就地改設定並落地存檔，回傳 Err 代表寫檔失敗（此時記憶體也不會被改動）。
+    /// 唯讀模式下一律回 Err，絕不拿預設值去輾使用者那份救不回來的原檔。
     pub fn update_config<F, T>(&self, edit: F) -> std::io::Result<T>
     where
         F: FnOnce(&mut Config) -> T,
     {
+        if self.is_read_only() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the config file is unreadable and could not be backed up, \
+                 settings are read-only until it is fixed",
+            ));
+        }
         let mut guard = self.cfg.lock().unwrap();
         let mut next = guard.clone();
         let out = edit(&mut next);
@@ -197,13 +241,17 @@ impl AppState {
         Ok(out)
     }
 
-    /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態
+    /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態。
+    ///
+    /// 丟掉的那些 `ExitRuntime` 會連同它持有的 Job handle 一起 drop，被刪掉的
+    /// 出口那條 ssh 程序樹當場就收掉了；刪除流程因此可以先存檔再停線，
+    /// 不必為了收程序而搶在存檔之前 halt。
     fn sync_exits(&self) {
-        let ports = self.config().locals();
+        let ports = self.with_config(|c| c.locals());
         let mut exits = self.exits.lock().unwrap();
         exits.retain(|p, _| ports.contains(p));
         for p in ports {
-            exits.entry(p).or_insert_with(ExitRuntime::new);
+            exits.entry(p).or_default();
         }
     }
 
@@ -219,29 +267,45 @@ impl AppState {
 
     /// 依本地埠自動補上所屬源的名字；出口已經被刪掉時退回 app 級格式
     pub fn log_exit(&self, local: u16, msg: impl AsRef<str>) {
-        let cfg = self.config();
-        match cfg.source_name_of(local) {
-            Some(src) => self.log_from(src, msg),
+        match self.with_config(|c| c.source_name_of(local).map(str::to_string)) {
+            Some(src) => self.log_from(&src, msg),
             None => self.log(msg),
         }
     }
 
     fn push_log(&self, line: String) {
         log::info!("{line}");
-        push_log_line(&mut self.logs.lock().unwrap(), line.clone());
-        let _ = self.app.emit("log", line);
+        // emit 只要 Serialize + Clone，&str 就夠：先借出去推事件，再把整個
+        // String 讓給環形緩衝，一行日誌從頭到尾只配置一次
+        let _ = self.app.emit("log", line.as_str());
+        push_log_line(&mut self.logs.lock().unwrap(), line);
+    }
+
+    /// 對既存出口的執行期狀態就地改一筆，回傳 None 代表這個出口已經不在了。
+    ///
+    /// 執行期狀態的項目只由 `AppState::new` 與 `sync_exits` 依設定建立，
+    /// 其餘地方一律只改既存項：晚到的狀態更新若順手把項目補回來，就會生出
+    /// 設定裡根本不存在的幽靈出口。
+    fn with_exit_mut<T>(&self, local: u16, f: impl FnOnce(&mut ExitRuntime) -> T) -> Option<T> {
+        self.exits.lock().unwrap().get_mut(&local).map(f)
     }
 
     /// 更新某個出口的連線狀態並推事件；狀態沒變就不重複推。
+    ///
+    /// 只更新既存的出口：出口一旦被刪掉，執行期狀態也跟著被 `sync_exits` 清掉，
+    /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
+    /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
-        {
-            let mut exits = self.exits.lock().unwrap();
-            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
+        let changed = self.with_exit_mut(local, |rt| {
             if rt.status == status && rt.detail == detail {
-                return;
+                return false;
             }
             rt.status = status.into();
             rt.detail = detail.clone();
+            true
+        });
+        if changed != Some(true) {
+            return;
         }
         let _ = self
             .app
@@ -263,25 +327,21 @@ impl AppState {
         !matches!(self.exit_status(local).as_deref(), None | Some(status::STOPPED))
     }
 
-    /// 更新某個出口的自測狀態並推事件
+    /// 更新某個出口的自測狀態並推事件。與 `set_exit_status` 同理，
+    /// 只更新既存的出口，不讓已刪掉的埠靠一次晚到的自測結果復活
     pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
-        {
-            let mut exits = self.exits.lock().unwrap();
-            let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-            rt.last_test = Some(TestView { state: state.into(), text: text.into() });
+        let view = TestView { state: state.into(), text: text.into() };
+        if self.with_exit_mut(local, |rt| rt.last_test = Some(view)).is_none() {
+            return;
         }
-        let _ = self.app.emit(
-            "exit-test",
-            ExitTestPayload { local, state: state.into(), text: text.into() },
-        );
+        let _ = self
+            .app
+            .emit("exit-test", ExitTestPayload { local, state: state.into(), text: text.into() });
     }
 
     /// 出口斷線或停掉時把舊的自測結果清乾淨
     pub fn clear_exit_test(&self, local: u16) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            rt.last_test = None;
-        }
+        self.with_exit_mut(local, |rt| rt.last_test = None);
     }
 
     /// 標記某個埠開始測試，回傳 false 代表已經在測了
@@ -295,35 +355,31 @@ impl AppState {
 
     /// 讓該出口進入新世代並騰出位子，舊的監看迴圈看到世代不符就會自行退出。
     /// 位子當場清掉，緊接著的 start 不必等舊迴圈醒來就能接手。
-    pub fn next_generation(&self, local: u16) -> u64 {
-        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        rt.generation = next;
-        rt.supervisor = None;
-        next
+    pub fn next_generation(&self, local: u16) {
+        let counter = &self.generation;
+        self.with_exit_mut(local, |rt| {
+            rt.generation = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.supervisor = None;
+        });
     }
 
     /// 搶下這個出口的監看位子，回傳 None 代表已經有一條線在跑，不要再起第二條
     pub fn claim_supervisor(&self, local: u16) -> Option<u64> {
         let counter = &self.generation;
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        let claimed = claim_slot(&mut rt.supervisor, || {
-            counter.fetch_add(1, Ordering::SeqCst) + 1
-        });
-        if let Some(generation) = claimed {
-            rt.generation = generation;
-        }
-        claimed
+        self.with_exit_mut(local, |rt| {
+            let claimed =
+                claim_slot(&mut rt.supervisor, || counter.fetch_add(1, Ordering::SeqCst) + 1);
+            if let Some(generation) = claimed {
+                rt.generation = generation;
+            }
+            claimed
+        })
+        .flatten()
     }
 
     /// 監看迴圈結束時歸還位子
     pub fn release_supervisor(&self, local: u16, generation: u64) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            release_slot(&mut rt.supervisor, generation);
-        }
+        self.with_exit_mut(local, |rt| release_slot(&mut rt.supervisor, generation));
     }
 
     pub fn generation(&self, local: u16) -> u64 {
@@ -335,28 +391,35 @@ impl AppState {
         self.generation(local) == generation
     }
 
+    /// 記下這一輪連線的 job handle，**只在世代還是自己那一代時**才收下。
+    ///
+    /// spawn 與 store_job 之間有一段窄窗口：halt／restart 可能剛好插進來遞增世代，
+    /// 新的監看迴圈也已經 spawn 完並存好自己的 job。這時舊迴圈晚到的這一手若照存，
+    /// 會把新世代的 job 蓋掉——被蓋掉的那個 handle 一 drop，剛接起來的連線當場被殺，
+    /// 留下的反而是舊世代那條沒人管的 ssh。
+    ///
+    /// 世代不符（或出口已經被刪掉）時 job 就在這裡 drop：handle 關閉，
+    /// 那條剛 spawn 出來、已經沒有人要的 ssh 連同 ProxyCommand 的孫程序一起收乾淨。
     pub fn store_job(&self, local: u16, generation: u64, job: Job) {
-        let mut exits = self.exits.lock().unwrap();
-        let rt = exits.entry(local).or_insert_with(ExitRuntime::new);
-        rt.job = Some((generation, job));
+        self.with_exit_mut(local, |rt| {
+            if rt.generation == generation {
+                rt.job = Some((generation, job));
+            }
+        });
     }
 
     /// 關掉 job handle，該出口的 ssh 程序樹一起結束
     pub fn kill_job(&self, local: u16) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
-            let _ = rt.job.take();
-        }
+        self.with_exit_mut(local, |rt| rt.job.take());
     }
 
     /// 只在世代相符時清掉 job，避免誤殺新的一輪連線
     pub fn kill_job_of(&self, local: u16, generation: u64) {
-        let mut exits = self.exits.lock().unwrap();
-        if let Some(rt) = exits.get_mut(&local) {
+        self.with_exit_mut(local, |rt| {
             if rt.job.as_ref().map(|(g, _)| *g) == Some(generation) {
-                let _ = rt.job.take();
+                rt.job.take();
             }
-        }
+        });
     }
 
     /// 收掉所有出口的 ssh 程序，離開程式時用
@@ -369,12 +432,14 @@ impl AppState {
         }
     }
 
-    pub fn tray_hint_shown(&self) -> bool {
-        self.tray_hint_shown.swap(true, Ordering::SeqCst)
-    }
-
-    pub fn mark_tray_hint_shown(&self) {
-        self.tray_hint_shown.store(true, Ordering::SeqCst);
+    /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，
+    /// 之後一律回 false。
+    ///
+    /// 名字用 take_ 是因為它會改狀態——原本叫 tray_hint_shown，讀起來像個
+    /// getter，實際上是 swap(true)，呼叫端很容易以為只是問一下。已經自己彈過
+    /// 通知的路徑（例如 --tray 啟動）直接呼叫它把提示領掉即可。
+    pub fn take_tray_hint(&self) -> bool {
+        !self.tray_hint_shown.swap(true, Ordering::SeqCst)
     }
 
     pub fn is_exiting(&self) -> bool {
@@ -386,54 +451,67 @@ impl AppState {
     }
 
     pub fn autostart(&self) -> bool {
-        self.app.autolaunch().is_enabled().unwrap_or(false)
+        crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
-    /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法
+    /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
+    ///
+    /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
     pub fn source_views(&self) -> Vec<SourceView> {
-        let cfg = self.config();
-        let exits = self.exits.lock().unwrap();
-        cfg.sources
-            .iter()
-            .map(|s| SourceView {
-                name: s.name.clone(),
-                host: s.host.clone(),
-                user: s.user.clone(),
-                proxy_command: s.proxy_command.clone(),
-                exits: s
-                    .forwards
-                    .iter()
-                    .map(|f| {
-                        let rt = exits.get(&f.local);
-                        ExitView {
-                            name: f.name.clone(),
-                            local: f.local,
-                            remote: f.remote.clone(),
-                            enabled: f.enabled,
-                            status: rt
-                                .map(|r| r.status.clone())
-                                .unwrap_or_else(|| status::STOPPED.to_string()),
-                            last_test: rt.and_then(|r| r.last_test.clone()),
-                        }
-                    })
-                    .collect(),
-            })
-            .collect()
+        self.with_config(|cfg| {
+            let exits = self.exits.lock().unwrap();
+            cfg.sources
+                .iter()
+                .map(|s| SourceView {
+                    name: s.name.clone(),
+                    host: s.host.clone(),
+                    user: s.user.clone(),
+                    proxy_command: s.proxy_command.clone(),
+                    exits: s
+                        .forwards
+                        .iter()
+                        .map(|f| {
+                            let rt = exits.get(&f.local);
+                            ExitView {
+                                name: f.name.clone(),
+                                local: f.local,
+                                remote: f.remote.clone(),
+                                enabled: f.enabled,
+                                status: rt
+                                    .map(|r| r.status.clone())
+                                    .unwrap_or_else(|| status::STOPPED.to_string()),
+                                last_test: rt.and_then(|r| r.last_test.clone()),
+                            }
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        self.snapshot_with(self.source_views())
+    }
+
+    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
+    fn snapshot_with(&self, sources: Vec<SourceView>) -> Snapshot {
         Snapshot {
-            close_to_tray: self.config().close_to_tray,
+            close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
-            sources: self.source_views(),
+            sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
         }
     }
 
-    /// 任何設定變更後全量推一次
+    /// 任何設定變更後全量推一次。
+    ///
+    /// 前端的 Snapshot 與系統匣選單吃的是同一份 `source_views`，算一次就好：
+    /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
+    /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let _ = self.app.emit("config-changed", self.snapshot());
-        self.refresh_tray();
+        let sources = self.source_views();
+        self.refresh_tray_with(&sources);
+        let _ = self.app.emit("config-changed", self.snapshot_with(sources));
     }
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
@@ -442,9 +520,13 @@ impl AppState {
     /// 真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     /// 號碼牌緊貼快照配出，中間不插任何事，才不會有「號碼新、快照舊」的交錯。
     pub fn refresh_tray(&self) {
-        let sources = self.source_views();
+        self.refresh_tray_with(&self.source_views());
+    }
+
+    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
+    fn refresh_tray_with(&self, sources: &[SourceView]) {
         let seq = crate::traymenu::next_seq();
-        crate::traymenu::refresh(&self.app, &sources, seq);
+        crate::traymenu::refresh(&self.app, sources, seq);
     }
 }
 

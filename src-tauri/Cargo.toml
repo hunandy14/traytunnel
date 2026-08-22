@@ -17,15 +17,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
-tauri-plugin-autostart = "2"
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = { version = "0.25", features = ["serde"] }
-tokio = { version = "1", features = ["process", "time", "sync", "io-util", "rt", "macros"] }
+tokio = { version = "1", features = ["process", "time", "io-util", "rt"] }
 ureq = { version = "3", features = ["socks-proxy", "json"] }
-chrono = "0.4"
 log = "0.4"
 # 系統匣圖示要照 SM_CXSMICON 從多層 ICO 挑層，得自己解 ICO
 ico = "0.5"
@@ -36,6 +34,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Registry",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",

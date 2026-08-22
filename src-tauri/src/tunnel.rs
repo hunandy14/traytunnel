@@ -194,7 +194,7 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
 /// 還佔著的埠，白白誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
-    if state.config().forward(local).is_none() {
+    if state.with_config(|c| c.forward(local).is_none()) {
         return;
     }
     let Some(generation) = state.claim_supervisor(local) else {
@@ -225,53 +225,37 @@ pub fn restart(state: &Arc<AppState>, local: u16) {
 
 /// 啟動所有源的所有 enabled 出口（程式啟動與 start_all 都走這裡）
 pub fn start_enabled(state: &Arc<AppState>) {
-    for local in state.config().enabled_locals() {
+    for local in state.with_config(|c| c.enabled_locals()) {
         start(state, local);
     }
 }
 
 /// 停掉所有源的所有出口
 pub fn halt_all(state: &Arc<AppState>) {
-    for local in state.config().locals() {
+    for local in state.with_config(|c| c.locals()) {
         halt(state, local);
     }
 }
 
 /// 啟動單一源底下所有 enabled 的出口
 pub fn start_source(state: &Arc<AppState>, source: &str) {
-    for local in enabled_locals_of(state, source) {
+    for local in state.with_config(|c| c.enabled_locals_of(source)) {
         start(state, local);
     }
 }
 
 /// 停掉單一源底下所有出口
 pub fn halt_source(state: &Arc<AppState>, source: &str) {
-    for local in locals_of(state, source) {
+    for local in state.with_config(|c| c.locals_of(source)) {
         halt(state, local);
     }
 }
 
 /// 重接單一源底下運行中（enabled）的出口，該源的連線欄位改變時用
 pub fn restart_running_in_source(state: &Arc<AppState>, source: &str) {
-    for local in enabled_locals_of(state, source) {
+    for local in state.with_config(|c| c.enabled_locals_of(source)) {
         restart(state, local);
     }
-}
-
-fn locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state
-        .config()
-        .source(source)
-        .map(|s| s.forwards.iter().map(|f| f.local).collect())
-        .unwrap_or_default()
-}
-
-fn enabled_locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state
-        .config()
-        .source(source)
-        .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
-        .unwrap_or_default()
 }
 
 /// 分段等待，中途世代作廢就立刻回 false
@@ -293,8 +277,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         if !state.generation_alive(local, generation) {
             return;
         }
-        let cfg = state.config();
-        let Some((src, f)) = cfg.locate(local).map(|(s, f)| (s.clone(), f.clone())) else {
+        // 只複製這個出口與它所屬的源，不為了兩筆資料深拷貝整份設定
+        let Some((src, f)) =
+            state.with_config(|c| c.locate(local).map(|(s, f)| (s.clone(), f.clone())))
+        else {
             return; // 出口已經被刪掉
         };
         let sname = src.name.as_str();
@@ -329,7 +315,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             Err(e) => {
                 spawn_failed = true;
                 state.set_exit_status(local, status::ERROR, Some(e.to_string()));
-                state.log_from(sname, format!("{} : failed to start ssh: {e}, retrying in 5s", f.name));
+                state.log_from(
+                    sname,
+                    format!("{} : failed to start ssh: {e}, retrying in 5s", f.name),
+                );
             }
             Ok((mut child, job, pid)) => {
                 state.store_job(local, generation, job);
@@ -348,7 +337,13 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                 loop {
                     tokio::time::sleep(POLL).await;
                     if !state.generation_alive(local, generation) {
-                        return; // 已被 halt/restart 作廢，job 也已關閉
+                        // 已被 halt/restart 作廢。halt 的 kill_job 有可能跑在
+                        // store_job 之前（先清到空的，才輪到我們把 job 放進去），
+                        // 那一手就會讓這條 ssh 連同 ProxyCommand 的孫程序留著沒人收，
+                        // 所以離開前自己再收一次；世代不符時 kill_job_of 是 no-op，
+                        // 不會誤殺已經接手的新一輪連線
+                        state.kill_job_of(local, generation);
+                        return;
                     }
                     match child.try_wait() {
                         Ok(Some(_)) | Err(_) => break,
@@ -373,7 +368,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             state.log_from(sname, format!("{} : disconnected, retrying in 5s", f.name));
             state.set_exit_status(local, status::RECONNECTING, None);
         }
-        if !wait_alive(&state, local, generation, RETRY).await {
+        if !wait_alive(state, local, generation, RETRY).await {
             return;
         }
     }
@@ -389,10 +384,16 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
         return; // 同一個埠已經在測了
     }
     state.set_exit_test(local, test_state::TESTING, "testing...");
+    // 自測是飛在半空的：探測期間使用者可能已經中斷或重接了這個出口，
+    // 那時 halt 早就把 last_test 清乾淨，晚到的結果不可以再寫回去
+    let generation = state.generation(local);
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
         st.end_test(local);
+        if !st.generation_alive(local, generation) {
+            return;
+        }
         let (state_name, text) = match result {
             Ok(ExitTest::Ok(text)) => (test_state::OK, text),
             Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
@@ -407,7 +408,7 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
 /// 維持停用，不會被這個動作拉起來。對應托盤根層的「Reconnect all」。
 pub fn reconnect_all(state: &Arc<AppState>) {
     let ports: Vec<u16> =
-        state.config().locals().into_iter().filter(|p| state.is_running(*p)).collect();
+        state.with_config(|c| c.locals()).into_iter().filter(|p| state.is_running(*p)).collect();
     if ports.is_empty() {
         state.log("no running exit to reconnect");
         return;
@@ -422,8 +423,11 @@ pub fn reconnect_all(state: &Arc<AppState>) {
 /// 對應托盤子選單的「Reconnect」；主視窗 ⋯ 選單的同名動作是前端逐條呼叫
 /// restart_exit，不會走到這裡。
 pub fn reconnect_source(state: &Arc<AppState>, source: &str) {
-    let ports: Vec<u16> =
-        locals_of(state, source).into_iter().filter(|p| state.is_running(*p)).collect();
+    let ports: Vec<u16> = state
+        .with_config(|c| c.locals_of(source))
+        .into_iter()
+        .filter(|p| state.is_running(*p))
+        .collect();
     if ports.is_empty() {
         state.log_from(source, "no running exit to reconnect");
         return;
