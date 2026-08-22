@@ -108,6 +108,22 @@ npm run bump <x.y.z>
 
 會驗參數是嚴格 semver、確認兩處現值一致後才動手改，改完不會自動 commit、不會自動 tag，只印一行建議指令供複製。下次建置時 `Cargo.lock` 裡的版號會跟著更新，記得跟兩個檔案一併提交。
 
+### Release 流程
+
+發版走 `.github/workflows/release.yml`，在 `windows-latest` runner 上跑 `npm run build:all` 並把 `out/*.exe` 上傳成 GitHub Release：
+
+```
+npm run bump <x.y.z>
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json
+git commit -m "版本升級至 <x.y.z>"
+git tag v<x.y.z>
+git push --tags
+```
+
+push tag（`v*`）會自動觸發，比對 tag 版號與 `src-tauri/Cargo.toml` 的 `version` 一致後才建置發佈，不一致直接 fail。
+
+手動補發（例如發佈失敗要重跑）改走 Actions 頁面的 *Run workflow*（`workflow_dispatch`）：不用帶參數，直接以目前 `src-tauri/Cargo.toml` 的版號去掛對應的既有 tag（例如版號是 `0.4.1` 就掛 `v0.4.1`）；tag 還沒建立會直接 fail 並在 log 裡註明要先 tag、push --tags。
+
 ## 設定檔
 
 設定檔的位置在啟動時解析一次，優先序如下：
