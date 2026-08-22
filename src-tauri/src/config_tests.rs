@@ -736,6 +736,10 @@ fn write_goes_through_a_temp_file_and_leaves_none_behind() {
         PathBuf::from("C:\\Users\\bob\\.traytunnel.toml.tmp")
     );
 
+    // 建檔走的是同一條路，一樣不留暫存檔
+    assert!(matches!(load_from_path(&path), LoadOutcome::Created(_)));
+    assert!(!tmp_path(&path).exists(), "建檔的暫存檔要被 rename 掉");
+
     let cfg = Config::default();
     write_config(&dir, &cfg).unwrap();
     assert!(!tmp_path(&path).exists(), "暫存檔要被 rename 掉");

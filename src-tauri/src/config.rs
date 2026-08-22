@@ -384,7 +384,9 @@ pub fn load_from_path(toml_path: &Path) -> LoadOutcome {
     }
 
     let cfg = Config::default();
-    match std::fs::write(toml_path, default_document()) {
+    // 建檔也走與存檔同一條路：暫存檔寫完再 rename。使用者第一次啟動就遇到
+    // 磁碟滿或程式被砍時，資料夾裡不會多出一個半截的設定檔
+    match write_atomic(toml_path, &default_document()) {
         Ok(()) => LoadOutcome::Created(cfg),
         Err(e) => {
             log::warn!("could not create the config file at {}: {e}", toml_path.display());
