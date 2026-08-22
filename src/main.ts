@@ -19,10 +19,8 @@ import {
   windowMinimize,
 } from "./ipc";
 import {
-  closeSourceSheet,
   initSettingsPage,
   initSourceSheet,
-  isSourceSheetOpen,
   openSourceSheet,
   syncSettingsPage,
 } from "./sheet";
@@ -219,6 +217,7 @@ function renderRail() {
 
 function setView(next: View) {
   if (view !== next && draft) cancelEditNow();
+  closeMenu();
   // 使用者自己動了畫面，等快照的旗標就作廢，免得等不到時永遠卡著
   pendingSelect = null;
   view = next;
@@ -227,6 +226,7 @@ function setView(next: View) {
 
 function selectSource(name: string) {
   if (selected !== name && draft) cancelEditNow();
+  closeMenu();
   pendingSelect = null;
   selected = name;
   view = "source";
@@ -274,33 +274,105 @@ function renderSummary() {
   const bad = exits.filter(isBad).length;
   const running = exits.some(isRunning);
 
-  let text: string;
-  let tone: Tone;
-  if (!src) {
-    text = "No source";
-    tone = "grey";
-  } else if (total === 0) {
-    text = "No exits";
-    tone = "grey";
-  } else if (!running) {
-    text = "Stopped";
-    tone = "grey";
-  } else {
-    text = `${connected}/${total} Connected`;
-    tone = bad > 0 ? "red" : busy > 0 ? "amber" : connected > 0 ? "green" : "grey";
-  }
-
-  el<HTMLDivElement>("summary-title").textContent = text;
-  el<HTMLSpanElement>("summary-dot").className = `dot tone-${tone}`;
+  // 左段：連線名稱當主標，ssh 目標當副標
+  const title = el<HTMLDivElement>("summary-title");
+  title.textContent = src ? src.name : "No connection";
+  title.title = src ? src.name : "";
   el<HTMLDivElement>("summary-sub").textContent = src
     ? `ssh ${src.user}@${src.host}`
     : "no host configured";
 
-  const toggle = el<HTMLButtonElement>("btn-toggle-source");
-  toggle.innerHTML = running ? GLYPH_STOP : GLYPH_START;
-  toggle.title = running ? "Stop this source" : "Start this source";
-  toggle.classList.toggle("danger", running);
-  toggle.classList.toggle("go", !running);
+  // 中段：大分數＋小字狀態，顏色代表整條連線的健康度
+  let score: string;
+  let label: string;
+  let tone: Tone;
+  if (!src || total === 0) {
+    score = "—";
+    label = "no tunnels";
+    tone = "grey";
+  } else if (!running) {
+    score = `0/${total}`;
+    label = "stopped";
+    tone = "grey";
+  } else {
+    score = `${connected}/${total}`;
+    label = "connected";
+    tone = bad > 0 ? "red" : busy > 0 ? "amber" : connected > 0 ? "green" : "grey";
+  }
+  const num = el<HTMLDivElement>("summary-score");
+  num.textContent = score;
+  num.className = `summary-score-num tone-${tone}`;
+  el<HTMLDivElement>("summary-score-label").textContent = label;
+
+  // 右段：⋯ 選單裡的連／斷那一項跟著整條連線的狀態換字
+  el<HTMLSpanElement>("menu-toggle-ico").innerHTML = running ? GLYPH_STOP : GLYPH_START;
+  el<HTMLSpanElement>("menu-toggle-text").textContent = running ? "Disconnect" : "Connect";
+  const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
+  toggleItem.classList.toggle("danger", running);
+  toggleItem.classList.toggle("go", !running);
+}
+
+// ---------------------------------------------------------------- ⋯ 選單
+
+let menuOpen = false;
+
+function setMenuOpen(on: boolean) {
+  // 沒有選中的連線時整組動作都沒有對象，乾脆不讓它開
+  if (on && !currentSource()) return;
+  menuOpen = on;
+  el<HTMLDivElement>("summary-menu").hidden = !on;
+  el<HTMLButtonElement>("btn-more").setAttribute("aria-expanded", String(on));
+}
+
+function closeMenu() {
+  if (menuOpen) setMenuOpen(false);
+}
+
+/** 選單項一律「先收選單、再執行動作」，免得動作換頁後選單還飄在上面 */
+function menuItem(id: string, action: () => void) {
+  el<HTMLButtonElement>(id).addEventListener("click", () => {
+    closeMenu();
+    action();
+  });
+}
+
+function initSummaryMenu() {
+  el<HTMLButtonElement>("btn-more").addEventListener("click", (e) => {
+    e.stopPropagation();
+    setMenuOpen(!menuOpen);
+  });
+
+  // 點到選單以外的任何地方就關；用 mousedown 才不會被按鈕自己的 click 蓋掉
+  document.addEventListener("mousedown", (e) => {
+    if (!menuOpen) return;
+    const target = e.target;
+    if (target instanceof Element && target.closest(".summary-more-wrap")) return;
+    closeMenu();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && menuOpen) {
+      e.stopPropagation();
+      closeMenu();
+    }
+  });
+
+  menuItem("menu-add-exit", beginCreate);
+  menuItem("menu-toggle-source", () => {
+    const src = currentSource();
+    if (!src) return;
+    if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
+    else void run(() => startSource(src.name), `start ${src.name}`);
+  });
+  menuItem("menu-test-source", () => {
+    const src = currentSource();
+    if (src) void run(() => testSource(src.name), `test ${src.name}`);
+  });
+  menuItem("menu-activity", () => setView("log"));
+  menuItem("menu-edit-source", () => {
+    const src = currentSource();
+    if (src) openSourceSheet(src);
+  });
 }
 
 // ---------------------------------------------------------------- 出口卡片
@@ -840,23 +912,7 @@ el<HTMLButtonElement>("btn-close").addEventListener("click", () =>
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
 el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("settings"));
 
-el<HTMLButtonElement>("btn-add-exit").addEventListener("click", beginCreate);
-el<HTMLButtonElement>("btn-test-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (src) void run(() => testSource(src.name), `test ${src.name}`);
-});
-el<HTMLButtonElement>("btn-toggle-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (!src) return;
-  if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
-  else void run(() => startSource(src.name), `start ${src.name}`);
-});
-el<HTMLButtonElement>("btn-edit-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (!src) return;
-  if (isSourceSheetOpen()) closeSourceSheet();
-  else openSourceSheet(src);
-});
+initSummaryMenu();
 el<HTMLButtonElement>("btn-first-source").addEventListener("click", () => openSourceSheet(null));
 
 initSourceSheet({

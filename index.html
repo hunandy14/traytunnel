@@ -31,16 +31,44 @@
         <!-- ---------------------------------------------- 選中的源 -->
         <section class="view" id="view-source">
           <div class="panel summary">
-            <span class="dot tone-grey" id="summary-dot"></span>
             <div class="summary-text">
               <div class="summary-title" id="summary-title">Starting…</div>
               <div class="summary-sub" id="summary-sub">ssh tunnel</div>
             </div>
+            <div class="summary-score">
+              <div class="summary-score-num tone-grey" id="summary-score">&mdash;</div>
+              <div class="summary-score-label" id="summary-score-label">connected</div>
+            </div>
             <div class="summary-actions">
-              <button class="iconbtn" id="btn-add-exit" title="Add exit">&#xE710;</button>
-              <button class="iconbtn go" id="btn-toggle-source" title="Start source">&#xE768;</button>
-              <button class="iconbtn" id="btn-test-source" title="Test this source">&#xE72C;</button>
-              <button class="iconbtn" id="btn-edit-source" title="Edit source">&#xE70F;</button>
+              <!-- 動作全部收進 ⋯ 選單（自繪，不是原生右鍵選單） -->
+              <div class="summary-more-wrap">
+                <button
+                  class="iconbtn"
+                  id="btn-more"
+                  title="More"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                >&#xE712;</button>
+                <div class="summary-menu" id="summary-menu" role="menu" hidden>
+                  <button class="summary-menu-item" id="menu-add-exit" role="menuitem">
+                    <span class="ico">&#xE710;</span>Add tunnel
+                  </button>
+                  <button class="summary-menu-item" id="menu-toggle-source" role="menuitem">
+                    <span class="ico" id="menu-toggle-ico">&#xE71A;</span>
+                    <span id="menu-toggle-text">Disconnect</span>
+                  </button>
+                  <button class="summary-menu-item" id="menu-test-source" role="menuitem">
+                    <span class="ico">&#xE72C;</span>Test connectivity
+                  </button>
+                  <button class="summary-menu-item" id="menu-activity" role="menuitem">
+                    <span class="ico">&#xE81C;</span>Activity
+                  </button>
+                  <hr />
+                  <button class="summary-menu-item" id="menu-edit-source" role="menuitem">
+                    <span class="ico">&#xE70F;</span>Edit connection
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 

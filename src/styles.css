@@ -366,7 +366,8 @@ body {
   background: var(--red);
 }
 
-/* ------------------------------------------------------------ 頂部彙總列 */
+/* ------------------------------------------------------------ 頂部彙總卡
+   三段式：左邊連線名稱＋ssh 副標、中間用豎分隔線隔出的大分數、右邊只留 ⋯ */
 
 .summary {
   flex: none;
@@ -374,11 +375,6 @@ body {
   align-items: center;
   gap: 12px;
   padding: 12px 12px 12px 16px;
-}
-
-.summary .dot {
-  width: 10px;
-  height: 10px;
 }
 
 .summary-text {
@@ -404,10 +400,122 @@ body {
   text-overflow: ellipsis;
 }
 
+/* 中段的分數：左右兩條細線把它從名稱與按鈕之間隔開 */
+.summary-score {
+  flex: none;
+  min-width: 60px;
+  padding: 0 16px;
+  text-align: center;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+}
+
+.summary-score-num {
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text);
+  transition: color 150ms var(--ease);
+}
+
+.summary-score-num.tone-grey {
+  color: var(--muted);
+}
+
+.summary-score-num.tone-green {
+  color: var(--green);
+}
+
+.summary-score-num.tone-amber {
+  color: var(--amber);
+}
+
+.summary-score-num.tone-red {
+  color: var(--red);
+}
+
+.summary-score-label {
+  margin-top: 1px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .summary-actions {
   flex: none;
   display: flex;
   gap: 6px;
+}
+
+/* ------------------------------------------------------------ ⋯ 下拉選單
+   自繪的浮層（WebView2 的原生選單整個被關掉了），錨在 ⋯ 鈕下方、右對齊 */
+
+.summary-more-wrap {
+  position: relative;
+  flex: none;
+}
+
+.summary-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 180px;
+  padding: 4px;
+  background: var(--overlay);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+}
+
+.summary-menu[hidden] {
+  display: none;
+}
+
+.summary-menu hr {
+  margin: 4px 6px;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+
+.summary-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+
+.summary-menu-item:hover,
+.summary-menu-item:focus-visible {
+  background: var(--hover-strong);
+}
+
+.summary-menu-item .ico {
+  flex: none;
+  width: 14px;
+  font-family: "Segoe MDL2 Assets";
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.summary-menu-item.go .ico {
+  color: var(--accent);
+}
+
+.summary-menu-item.danger .ico {
+  color: var(--red);
 }
 
 /* ------------------------------------------------------------ 按鈕 */
