@@ -1,13 +1,14 @@
 /**
- * 同步版本號到三個檔案：
+ * 同步版本號到 package.json：
  *
- *   src-tauri/tauri.conf.json 的 "version"（單一權威）
- *   src-tauri/Cargo.toml      [package] 區塊的 version（不動 dependencies 裡的 version）
- *   package.json              的 "version"
+ *   src-tauri/Cargo.toml [package] 區塊的 version（單一權威——Tauri v2 官方 fallback
+ *                                    機制：tauri.conf.json 省略 "version" 時，
+ *                                    getVersion / NSIS / tauri-action 都會自動讀這裡）
+ *   package.json         的 "version"（純門面，不影響建置行為）
  *
  * 用法：npm run bump <x.y.z>
  *
- * 動手改之前會先確認三處現值一致，不一致就列出來中止，要求先手動對齊。
+ * 動手改之前會先確認兩處現值一致，不一致就列出來中止，要求先手動對齊。
  * 只換版本號那個 token，其餘格式（縮排、換行）原樣保留。
  *
  * 不會自動 commit、不會自動 tag——成功後印一行建議指令供複製貼上。
@@ -32,14 +33,13 @@ if (!newVersion || !SEMVER_RE.test(newVersion)) {
 }
 
 const files = {
-  tauriConf: join(root, "src-tauri", "tauri.conf.json"),
   cargoToml: join(root, "src-tauri", "Cargo.toml"),
   packageJson: join(root, "package.json"),
 };
 
 const VERSION_FIELD_RE = /"version"\s*:\s*"([^"]+)"/;
 
-/** package.json / tauri.conf.json 都只在頂層有一個 "version" 欄位，直接抓第一個 match */
+/** package.json 只在頂層有一個 "version" 欄位，直接抓第一個 match */
 function readJsonVersion(path, text) {
   const m = text.match(VERSION_FIELD_RE);
   if (!m) {
@@ -71,34 +71,28 @@ function readCargoVersion(path, text) {
   return m[1];
 }
 
-const tauriConfText = readFileSync(files.tauriConf, "utf8");
 const cargoTomlText = readFileSync(files.cargoToml, "utf8");
 const packageJsonText = readFileSync(files.packageJson, "utf8");
 
 const current = {
-  tauriConf: readJsonVersion(files.tauriConf, tauriConfText),
   cargoToml: readCargoVersion(files.cargoToml, cargoTomlText),
   packageJson: readJsonVersion(files.packageJson, packageJsonText),
 };
 
 const distinct = new Set(Object.values(current));
 if (distinct.size > 1) {
-  console.error("三處版本號現值不一致，先手動對齊再重跑：");
-  console.error(`  src-tauri/tauri.conf.json : ${current.tauriConf}`);
-  console.error(`  src-tauri/Cargo.toml      : ${current.cargoToml}`);
-  console.error(`  package.json              : ${current.packageJson}`);
+  console.error("兩處版本號現值不一致，先手動對齊再重跑：");
+  console.error(`  src-tauri/Cargo.toml : ${current.cargoToml}`);
+  console.error(`  package.json         : ${current.packageJson}`);
   process.exit(1);
 }
 
-const oldVersion = current.tauriConf;
+const oldVersion = current.cargoToml;
 
 if (oldVersion === newVersion) {
   console.error(`目前版本已經是 ${newVersion}，沒有需要改的`);
   process.exit(1);
 }
-
-const newTauriConfText = tauriConfText.replace(VERSION_FIELD_RE, `"version": "${newVersion}"`);
-const newPackageJsonText = packageJsonText.replace(VERSION_FIELD_RE, `"version": "${newVersion}"`);
 
 const { sectionStart, sectionEnd } = packageSectionRange(files.cargoToml, cargoTomlText);
 const newSection = cargoTomlText
@@ -107,13 +101,14 @@ const newSection = cargoTomlText
 const newCargoTomlText =
   cargoTomlText.slice(0, sectionStart) + newSection + cargoTomlText.slice(sectionEnd);
 
-writeFileSync(files.tauriConf, newTauriConfText);
+const newPackageJsonText = packageJsonText.replace(VERSION_FIELD_RE, `"version": "${newVersion}"`);
+
 writeFileSync(files.cargoToml, newCargoTomlText);
 writeFileSync(files.packageJson, newPackageJsonText);
 
-console.log(`${oldVersion} → ${newVersion}，3 檔已同步`);
+console.log(`${oldVersion} → ${newVersion}，2 檔已同步`);
 console.log("");
 console.log("建議指令（不會自動執行，複製貼上）：");
 console.log(
-  `  git add src-tauri/tauri.conf.json src-tauri/Cargo.toml package.json && git commit -m "版本升級至 ${newVersion}" && git tag v${newVersion}`,
+  `  git add src-tauri/Cargo.toml package.json && git commit -m "版本升級至 ${newVersion}" && git tag v${newVersion}`,
 );

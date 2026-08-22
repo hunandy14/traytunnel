@@ -1,8 +1,9 @@
 /**
  * 把建置產物複製成「發佈用檔名」放進根目錄的 out/。
  *
- * 版本號的單一來源是 src-tauri/tauri.conf.json 的 version，跟 exe 內嵌的版本、
- * NSIS 安裝檔名用的是同一個值，這裡不另外維護一份。
+ * 版本號的單一來源是 src-tauri/Cargo.toml 的 [package] version——這也是
+ * tauri.conf.json 省略 "version" 時 Tauri v2 的官方 fallback 來源，跟
+ * exe 內嵌的版本、NSIS 安裝檔名用的是同一個值，這裡不另外維護一份。
  *
  * 產出三個檔案（來源不存在的那項會跳過並印一行提示，所以只編 exe 不打包 NSIS
  * 的 build:exe 也能照跑）：
@@ -22,14 +23,23 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(root, "out");
 
-/** 版本號的單一來源 */
+/** 版本號的單一來源：只在 [package] 區塊裡找第一個 version=，避免誤傷 dependencies 裡同名的 version */
 function readVersion() {
-  const conf = join(root, "src-tauri", "tauri.conf.json");
-  const { version } = JSON.parse(readFileSync(conf, "utf8"));
-  if (!version) {
-    throw new Error(`${conf} 裡沒有 version 欄位`);
+  const cargoToml = join(root, "src-tauri", "Cargo.toml");
+  const text = readFileSync(cargoToml, "utf8");
+  const startMatch = text.match(/^\[package\]\s*$/m);
+  if (!startMatch) {
+    throw new Error(`${cargoToml} 找不到 [package] 區塊`);
   }
-  return version;
+  const sectionStart = startMatch.index + startMatch[0].length;
+  const rest = text.slice(sectionStart);
+  const nextSection = rest.match(/^\[.*\]\s*$/m);
+  const section = nextSection ? rest.slice(0, nextSection.index) : rest;
+  const m = section.match(/^version\s*=\s*"([^"]+)"/m);
+  if (!m) {
+    throw new Error(`${cargoToml} 的 [package] 區塊找不到 version`);
+  }
+  return m[1];
 }
 
 /** 位元組數字加上千分位，只是印出來好讀 */

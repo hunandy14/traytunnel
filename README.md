@@ -92,7 +92,7 @@ npm run dev
 | `out/traytunnel-<版本>p.exe` | 可攜版。**與上面同一顆二進位**，差別只在檔名結尾的 `p`——那個 p 就是可攜模式的記號，設定檔改放 exe 旁邊 |
 | `out/traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
-版本號取自 `src-tauri/tauri.conf.json` 的 `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
+版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
 
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
@@ -100,13 +100,13 @@ npm run dev
 
 ### 版本管理
 
-單一權威是 `src-tauri/tauri.conf.json` 的 `version`，`src-tauri/Cargo.toml`（`[package]`）與 `package.json` 是惰性副本，三處平常要保持一致。升版一律用：
+單一權威是 `src-tauri/Cargo.toml` 的 `[package]` `version`；`package.json` 是惰性副本。`src-tauri/tauri.conf.json` 沒有 `version` 欄位——這是刻意的：Tauri v2 官方規定省略該欄位時會 fallback 讀 `src-tauri/Cargo.toml` 的 `package.version`，`getVersion()`、NSIS 安裝檔名、`tauri-action` 全部自動跟著這顆版號走，不用再另外同步一份。升版一律用：
 
 ```
 npm run bump <x.y.z>
 ```
 
-會驗參數是嚴格 semver、確認三處現值一致後才動手改，改完不會自動 commit、不會自動 tag，只印一行建議指令供複製。下次建置時 `Cargo.lock` 裡的版號會跟著更新，記得跟三個檔案一併提交。
+會驗參數是嚴格 semver、確認兩處現值一致後才動手改，改完不會自動 commit、不會自動 tag，只印一行建議指令供複製。下次建置時 `Cargo.lock` 裡的版號會跟著更新，記得跟兩個檔案一併提交。
 
 ## 設定檔
 
