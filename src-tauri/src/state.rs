@@ -132,7 +132,7 @@ fn push_log_line(logs: &mut VecDeque<String>, line: String) {
 }
 
 /// 單一出口的執行期狀態
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ExitRuntime {
     status: String,
     detail: Option<String>,
@@ -145,9 +145,19 @@ struct ExitRuntime {
     job: Option<(u64, Job)>,
 }
 
-impl ExitRuntime {
-    fn new() -> Self {
-        ExitRuntime { status: status::STOPPED.into(), ..Default::default() }
+/// 手寫而不是 derive：新項目的 status 一定要是 stopped。
+/// derive 出來的空字串不是任何一個合法狀態，而 `is_running` 的判斷是
+/// 「不是 stopped 就算在跑」，空字串一旦外流就會讓沒起來的出口顯示成運行中。
+impl Default for ExitRuntime {
+    fn default() -> Self {
+        ExitRuntime {
+            status: status::STOPPED.into(),
+            detail: None,
+            last_test: None,
+            generation: 0,
+            supervisor: None,
+            job: None,
+        }
     }
 }
 
@@ -171,7 +181,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
-        let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::new())).collect();
+        let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         AppState {
             app,
             path,
@@ -241,7 +251,7 @@ impl AppState {
         let mut exits = self.exits.lock().unwrap();
         exits.retain(|p, _| ports.contains(p));
         for p in ports {
-            exits.entry(p).or_insert_with(ExitRuntime::new);
+            exits.entry(p).or_default();
         }
     }
 
