@@ -128,7 +128,9 @@
             <div class="setting-text">
               <div class="setting-name">Traytunnel</div>
             </div>
-            <span class="setting-version" id="app-version">v0.2.0</span>
+            <!-- 佔位字串在建置期被 vite.config.ts 的 htmlVersionPlugin 換成 package.json 的版號，
+                 JS 跑起來後 version.ts 的 loadAppVersion() 還會再覆寫一次成真正生效的版本 -->
+            <span class="setting-version" id="app-version">v__APP_VERSION_PLACEHOLDER__</span>
           </div>
           <!-- 整列不可互動，開資料夾的動作收進右側獨立的圖示按鈕 -->
           <div class="setting-row" id="row-config-path">
