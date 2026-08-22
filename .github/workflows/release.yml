@@ -90,8 +90,51 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      # tauri.conf.json 開了 createUpdaterArtifacts，打包時會用這把私鑰替
+      # setup.exe 簽出 .sig；缺了它 bundler 會直接失敗（本地不帶私鑰要建置的話
+      # 用 npm run build:exe，--no-bundle 不會走到簽章那一步）。
+      # 產私鑰時沒有設密碼，但環境變數仍要給空字串，否則 tauri 會停下來問。
       - name: Build all targets
         run: npm run build:all
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      # 應用內更新查的就是這一份：endpoint 是 releases/latest/download/latest.json，
+      # 也就是「最新一版的 release 上叫 latest.json 的那個資產」。
+      - name: Compose latest.json
+        shell: pwsh
+        run: |
+          $version = "${{ steps.resolve.outputs.version }}"
+          $tag = "${{ steps.resolve.outputs.release_tag }}"
+
+          # createUpdaterArtifacts 產出的簽章檔就落在 NSIS 安裝檔旁邊，
+          # 檔名是安裝檔全名再接 .sig；latest.json 要的是它的「內容」
+          $sig = "src-tauri/target/release/bundle/nsis/traytunnel_${version}_x64-setup.exe.sig"
+          if (-not (Test-Path $sig)) {
+            Write-Error "找不到更新簽章檔 $sig——請確認 TAURI_SIGNING_PRIVATE_KEY 有設，且 tauri.conf.json 的 bundle.createUpdaterArtifacts 是 true"
+            exit 1
+          }
+
+          # 下載網址指向 release 上的資產名，也就是 scripts/package.mjs 改好名的那一顆
+          $setup = "traytunnel-$version-setup.exe"
+          if (-not (Test-Path "out/$setup")) {
+            Write-Error "找不到 out/$setup，latest.json 的下載網址會指向不存在的資產"
+            exit 1
+          }
+
+          $latest = [ordered]@{
+            version   = $version
+            pub_date  = [System.DateTime]::UtcNow.ToString("o")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $sig -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$setup"
+              }
+            }
+          }
+          $latest | ConvertTo-Json -Depth 5 | Set-Content -Path out/latest.json -Encoding utf8
+          Get-Content out/latest.json
 
       - name: Generate SHA256SUMS
         shell: pwsh
@@ -111,6 +154,7 @@ jobs:
           files: |
             out/*.exe
             out/SHA256SUMS.txt
+            out/latest.json
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
