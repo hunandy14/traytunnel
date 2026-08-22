@@ -7,7 +7,7 @@
 use std::io;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, NO_ERROR,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -15,8 +15,9 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -218,9 +219,23 @@ pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
 
 /// 在 HKCU 底下寫一個字串值，subkey 不存在就建出來。
 pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()> {
+    let payload = wide(data);
+    // UTF-16 的位元組數，含結尾的 NUL
+    let bytes = unsafe {
+        std::slice::from_raw_parts(payload.as_ptr() as *const u8, payload.len() * 2)
+    };
+    write_hkcu_value(subkey, name, REG_SZ, bytes)
+}
+
+/// 在 HKCU 底下寫一個位元組值（REG_BINARY），subkey 不存在就建出來。
+fn write_hkcu_binary(subkey: &str, name: &str, data: &[u8]) -> io::Result<()> {
+    write_hkcu_value(subkey, name, REG_BINARY, data)
+}
+
+/// 寫值的共同骨架：開（或建）subkey、寫一個值、關 handle。
+fn write_hkcu_value(subkey: &str, name: &str, kind: u32, data: &[u8]) -> io::Result<()> {
     let sub = wide(subkey);
     let value = wide(name);
-    let payload = wide(data);
     unsafe {
         let mut key: HKEY = std::ptr::null_mut();
         let rc = RegCreateKeyExW(
@@ -237,16 +252,22 @@ pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()>
         if rc != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
-        let rc = RegSetValueExW(
-            key,
-            value.as_ptr(),
-            0,
-            REG_SZ,
-            payload.as_ptr() as *const u8,
-            (payload.len() * 2) as u32,
-        );
+        let rc = RegSetValueExW(key, value.as_ptr(), 0, kind, data.as_ptr(), data.len() as u32);
         RegCloseKey(key);
         if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+    }
+    Ok(())
+}
+
+/// 刪掉 HKCU 底下的一個值；值本來就不存在時視同成功（刪除是冪等的）。
+pub fn delete_hkcu_value(subkey: &str, name: &str) -> io::Result<()> {
+    let sub = wide(subkey);
+    let value = wide(name);
+    unsafe {
+        let rc = RegDeleteKeyValueW(HKEY_CURRENT_USER, sub.as_ptr(), value.as_ptr());
+        if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
     }
@@ -304,10 +325,69 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+// ------------------------------------------------------------------ 開機自啟
+//
+// 直接操作 HKCU 的 Run 登錄項，不再依賴 tauri-plugin-autostart。
+// 值的名稱與內容格式都沿用它原本寫的那一份，升級的使用者不必重設。
+
+/// 開機自啟的登錄項所在
+const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+/// 工作管理員的「啟動」分頁把使用者的停用寫在這裡，Run 值仍在但不會被執行。
+/// 判斷「開機自啟是不是真的開著」必須連它一起看，否則設定頁會顯示 ON 卻沒作用。
+const APPROVED_SUBKEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+
+/// 工作管理員記「啟用」用的那 12 個位元組；判斷只看後 8 個是不是全 0
+/// （後 8 位元組是停用時間的 FILETIME，啟用時為 0）
+const APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// 開機自啟要寫進登錄的那一行命令。
+///
+/// 路徑一定要加引號（使用者名稱或安裝路徑含空白時，沒引號的那一版會被 Windows
+/// 從空白處截斷），`--tray` 則是讓開機啟動直接縮在系統匣、不彈主視窗。
+pub fn autostart_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" --tray", exe.display())
+}
+
+/// 開機自啟目前是不是真的會生效：Run 值在，而且沒有被工作管理員停用
+pub fn autostart_enabled(name: &str) -> bool {
+    if read_run_value(name).is_none() {
+        return false;
+    }
+    approved_enabled(name)
+}
+
+/// 工作管理員那邊沒有紀錄就當成啟用（大多數情況），有紀錄才看後 8 個位元組
+fn approved_enabled(name: &str) -> bool {
+    let Some(bytes) = read_hkcu_binary(APPROVED_SUBKEY, name) else {
+        return true;
+    };
+    if bytes.len() < 8 {
+        return true;
+    }
+    bytes.iter().rev().take(8).all(|b| *b == 0)
+}
+
+/// 打開開機自啟；順手把工作管理員那邊的停用紀錄也翻回啟用，
+/// 否則使用者在設定頁按了 ON 卻依舊不會自啟（工作管理員的停用優先）。
+pub fn enable_autostart(name: &str, exe: &std::path::Path) -> io::Result<()> {
+    write_hkcu_string(RUN_SUBKEY, name, &autostart_command(exe))?;
+    // 這個 subkey 在乾淨的系統上可能還不存在，寫不進去也不影響自啟本身
+    if let Err(e) = write_hkcu_binary(APPROVED_SUBKEY, name, &APPROVED_ENABLED) {
+        log::warn!("could not update the startup approval entry: {e}");
+    }
+    Ok(())
+}
+
+/// 關掉開機自啟：拿掉 Run 值即可，工作管理員那邊的紀錄留著不動
+pub fn disable_autostart(name: &str) -> io::Result<()> {
+    delete_hkcu_value(RUN_SUBKEY, name)
+}
+
 /// 讀 HKCU 的 Run 登錄值，用來判斷開機自啟項是不是還指向這支執行檔。
 pub fn read_run_value(name: &str) -> Option<String> {
-    const SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    read_hkcu_string(SUBKEY, name)
+    read_hkcu_string(RUN_SUBKEY, name)
 }
 
 /// 讀 HKCU 底下的字串值
@@ -343,6 +423,42 @@ pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+/// 讀 HKCU 底下的位元組值（REG_BINARY）
+fn read_hkcu_binary(subkey: &str, name: &str) -> Option<Vec<u8>> {
+    let subkey = wide(subkey);
+    let value = wide(name);
+    unsafe {
+        let mut size: u32 = 0;
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        );
+        if rc != ERROR_SUCCESS || size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        );
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        buf.truncate(size as usize);
+        Some(buf)
     }
 }
 
@@ -408,6 +524,51 @@ mod tests {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("綁得起來");
         let port = l.local_addr().unwrap().port();
         assert!(is_listening(port), "剛綁上的 {port} 應該查得到");
+    }
+
+    /// 自啟登錄值的內容格式是與舊版（tauri-plugin-autostart）相容的關鍵：
+    /// 一定要有 --tray，路徑一定要有引號（安裝路徑含空白時沒引號會被截斷）
+    #[test]
+    fn autostart_command_quotes_the_path_and_keeps_the_tray_flag() {
+        let cmd = autostart_command(Path::new("C:\\Program Files\\app\\traytunnel.exe"));
+        assert_eq!(cmd, "\"C:\\Program Files\\app\\traytunnel.exe\" --tray");
+        assert!(cmd.ends_with(" --tray"), "少了 --tray 就會開機彈主視窗：{cmd}");
+        assert_eq!(cmd.matches('"').count(), 2);
+    }
+
+    /// 寫入、讀回、刪掉一個值走完一輪；刪除是冪等的，重刪不算錯
+    #[test]
+    fn hkcu_value_round_trip() {
+        let subkey = format!("Software\\traytunnel-test\\{}", std::process::id());
+        write_hkcu_string(&subkey, "cmd", "\"C:\\app\\traytunnel.exe\" --tray").unwrap();
+        assert_eq!(
+            read_hkcu_string(&subkey, "cmd").as_deref(),
+            Some("\"C:\\app\\traytunnel.exe\" --tray")
+        );
+
+        write_hkcu_binary(&subkey, "approved", &APPROVED_ENABLED).unwrap();
+        assert_eq!(read_hkcu_binary(&subkey, "approved").as_deref(), Some(&APPROVED_ENABLED[..]));
+
+        delete_hkcu_value(&subkey, "cmd").unwrap();
+        assert_eq!(read_hkcu_string(&subkey, "cmd"), None);
+        // 值已經不在了，再刪一次仍算成功
+        delete_hkcu_value(&subkey, "cmd").unwrap();
+
+        delete_hkcu_value(&subkey, "approved").unwrap();
+        let _ = delete_hkcu_key(&subkey);
+        let _ = delete_hkcu_key("Software\\traytunnel-test");
+    }
+
+    /// 工作管理員的停用紀錄：後 8 個位元組是停用時間，全 0 才算啟用
+    #[test]
+    fn task_manager_disable_is_respected() {
+        let subkey = format!("Software\\traytunnel-test-approved\\{}", std::process::id());
+        // 直接驗判斷規則本身：啟用的那 12 個位元組後 8 個全是 0
+        assert!(APPROVED_ENABLED.iter().rev().take(8).all(|b| *b == 0));
+        // 停用時後 8 個位元組是 FILETIME，不會全 0
+        let disabled: [u8; 12] = [0x03, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0];
+        assert!(!disabled.iter().rev().take(8).all(|b| *b == 0));
+        let _ = delete_hkcu_key(&subkey);
     }
 
     #[test]

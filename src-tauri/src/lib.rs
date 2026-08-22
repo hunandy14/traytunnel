@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_winrt_notification::{IconCrop, Toast};
 
 use config::{Config, LoadOutcome};
@@ -77,23 +76,18 @@ fn close_main(state: &Shared) {
 /// 開機自啟自癒：舊版 PowerShell 留下的 Run 登錄項會讓 toggle 顯示 ON 卻其實
 /// 啟動不到這支程式，啟動時發現登錄值沒指向目前的執行檔就重寫一次。
 fn heal_autostart(app: &AppHandle, state: &Shared) {
-    if !app.autolaunch().is_enabled().unwrap_or(false) {
+    let name = state::autostart_name(app);
+    if !winsys::autostart_enabled(&name) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let exe = exe.to_string_lossy().to_lowercase();
-    let name = app
-        .config()
-        .product_name
-        .clone()
-        .unwrap_or_else(|| app.package_info().name.clone());
     let current = winsys::read_run_value(&name).unwrap_or_default().to_lowercase();
-    if current.contains(&exe) {
+    if current.contains(exe.to_string_lossy().to_lowercase().as_str()) {
         return;
     }
-    match app.autolaunch().enable() {
+    match winsys::enable_autostart(&name, &exe) {
         Ok(()) => state.log("autostart entry refreshed"),
         Err(e) => state.log(format!("autostart entry refresh failed: {e}")),
     }
@@ -123,10 +117,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
         }))
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--tray"]),
-        ))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)

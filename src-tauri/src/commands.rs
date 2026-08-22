@@ -6,10 +6,9 @@
 //! 這裡不重複判斷，也不自己拼要存進設定的值。
 
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::{self, Config, Source};
-use crate::state::{Snapshot, MAIN_WINDOW};
+use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
@@ -378,7 +377,12 @@ pub fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), Strin
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Result<(), String> {
     let st = state.inner();
-    let result = if on { app.autolaunch().enable() } else { app.autolaunch().disable() };
+    let name = autostart_name(&app);
+    let result = if on {
+        std::env::current_exe().and_then(|exe| winsys::enable_autostart(&name, &exe))
+    } else {
+        winsys::disable_autostart(&name)
+    };
     result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
     st.log(if on { "autostart enabled" } else { "autostart disabled" });
     st.emit_config_changed();

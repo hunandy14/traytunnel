@@ -10,7 +10,6 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::Config;
 use crate::winsys::Job;
@@ -107,6 +106,12 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     if *slot == Some(generation) {
         *slot = None;
     }
+}
+
+/// 開機自啟登錄值的名稱。沿用 productName（沒有就退回套件名），與先前
+/// tauri-plugin-autostart 寫進去的那一份同名，升級的使用者不必重設。
+pub fn autostart_name(app: &AppHandle) -> String {
+    app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone())
 }
 
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
@@ -426,7 +431,7 @@ impl AppState {
     }
 
     pub fn autostart(&self) -> bool {
-        self.app.autolaunch().is_enabled().unwrap_or(false)
+        crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
     /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
