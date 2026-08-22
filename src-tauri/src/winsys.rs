@@ -572,27 +572,53 @@ mod tests {
         let _ = delete_hkcu_key("Software\\traytunnel-test");
     }
 
+    /// StartupApproved\Run 是使用者機器上真的那個機碼，測試值一旦留下就是垃圾。
+    /// 清理交給 Drop：斷言在哪一行 panic 都照樣會跑，`--nocapture` 或提早 return
+    /// 也一樣。名字帶 pid，碰不到真正的 traytunnel 那一筆。
+    struct ApprovedValue(String);
+
+    impl ApprovedValue {
+        fn new(name: &str) -> Self {
+            ApprovedValue(name.to_string())
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            write_hkcu_binary(APPROVED_SUBKEY, &self.0, bytes).unwrap();
+        }
+
+        /// 提早刪掉以驗「沒有紀錄」那一格；刪除是冪等的，Drop 再刪一次也沒事
+        fn remove(&self) {
+            delete_hkcu_value(APPROVED_SUBKEY, &self.0).unwrap();
+        }
+    }
+
+    impl Drop for ApprovedValue {
+        fn drop(&mut self) {
+            let _ = delete_hkcu_value(APPROVED_SUBKEY, &self.0);
+        }
+    }
+
     /// 工作管理員的「啟動」分頁把使用者的停用記在 StartupApproved\Run：Run 值還在，
     /// 但開機不會被執行。這裡實際寫進那個 subkey，走真的 approved_enabled 判定，
     /// 三種情形都釘住：啟用（時間戳全 0）、停用（時間戳非 0）、沒有紀錄。
     #[test]
     fn task_manager_disable_is_respected() {
-        // 值名帶 pid，碰不到真正的 traytunnel 那一筆
         let name = format!("traytunnel-test-{}", std::process::id());
+        let value = ApprovedValue::new(&name);
 
         // 啟用：後 8 個位元組（停用時間的 FILETIME）全是 0
-        write_hkcu_binary(APPROVED_SUBKEY, &name, &APPROVED_ENABLED).unwrap();
+        value.write(&APPROVED_ENABLED);
         assert!(approved_enabled(&name), "全零時間戳代表使用者沒有停用");
 
         // 停用：工作管理員把停用當下的 FILETIME 寫進後 8 個位元組
         let disabled: [u8; 12] = [0x03, 0, 0, 0, 0x2b, 0x7c, 0x1d, 0xa9, 0x5f, 0xd4, 0xdb, 0x01];
-        write_hkcu_binary(APPROVED_SUBKEY, &name, &disabled).unwrap();
+        value.write(&disabled);
         assert!(!approved_enabled(&name), "非零時間戳代表使用者在工作管理員按了停用");
         // 這個測試名稱沒有對應的 Run 值，整體判定當然也是關的
         assert!(!autostart_enabled(&name));
 
         // 收尾：測試值刪掉，沒有紀錄時一律當成啟用（乾淨系統的常態）
-        delete_hkcu_value(APPROVED_SUBKEY, &name).unwrap();
+        value.remove();
         assert!(read_hkcu_binary(APPROVED_SUBKEY, &name).is_none(), "測試值要清乾淨");
         assert!(approved_enabled(&name), "沒有紀錄就當成啟用");
     }
