@@ -1,8 +1,28 @@
-# traytunnel
+<p align="center"><img src="src-tauri/icons/128x128.png" width="96" alt="traytunnel icon"></p>
+
+<h1 align="center">traytunnel</h1>
+
+<p align="center">Windows 系統匣 SSH 隧道管理工具</p>
+<p align="center"><i>Windows tray SSH tunnel manager built with Tauri</i></p>
+
+<p align="center">
+  <a href="https://github.com/hunandy14/traytunnel/releases"><img src="https://img.shields.io/github/v/release/hunandy14/traytunnel" alt="GitHub release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/hunandy14/traytunnel" alt="License"></a>
+</p>
 
 Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri.app/) 撰寫，前端是 vanilla TypeScript + Vite，隧道管理、設定檔讀寫與連通檢測全部在 Rust 側完成。
 
 程式讀取一份 TOML 設定檔（預設是 `%USERPROFILE%\.traytunnel.toml`），支援**多組連線（connection）**（各自的 host／user／ProxyCommand），**每條隧道（tunnel）各自維持一條獨立的 SSH 連線**並在斷線時各自重連，同時對每條隧道做連通自我檢測，狀態即時顯示在系統匣圖示與主視窗中。
+
+## 截圖
+
+<p align="center">
+  <img src="docs/screenshots/main-window.png" width="700" alt="主視窗">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/tray-menu.png" width="700" alt="托盤選單">
+</p>
 
 ## 功能
 
@@ -19,6 +39,16 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 系統匣圖示依 `SM_CXSMICON` 從多層 ICO 挑原生尺寸的那一層（含 16／20／24／28／32px），高 DPI 下不會被 GDI 拉伸糊掉
 - 通知掛在自己的 AppUserModelID 底下：啟動時自註冊開始選單捷徑與 `HKCU\Software\Classes\AppUserModelId`，toast 顯示的是 Traytunnel 而不是 Windows PowerShell
 - 每條 ssh 子程序各自放在一個 Windows Job Object 內，隧道停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
+
+## 下載
+
+到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面抓最新版，依需求挑一種：
+
+| 檔名 | 說明 |
+| --- | --- |
+| `traytunnel-<版本>.exe` | 一般單檔，免安裝，設定檔在家目錄（`%USERPROFILE%\.traytunnel.toml`） |
+| `traytunnel-<版本>p.exe` | 可攜版，與上面**同一顆二進位**，檔名以 `p` 結尾＝設定檔跟著 exe 走 |
+| `traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
 ## 介面
 
@@ -130,10 +160,21 @@ push tag（`v*`）會自動觸發，比對 tag 版號與 `src-tauri/Cargo.toml` 
 
 | 順序 | 位置 | 何時生效 |
 | --- | --- | --- |
-| 1 | `<執行檔同目錄>\traytunnel.toml` | **可攜模式**。兩個觸發條件任一成立即可（見下），整支程式的讀寫都留在執行檔旁邊 |
+| 1 | `<執行檔同目錄>\traytunnel.toml` | **可攜模式**。兩個觸發條件任一成立即可（見下方摺疊區塊），整支程式的讀寫都留在執行檔旁邊 |
 | 2 | `%USERPROFILE%\.traytunnel.toml` | 預設位置。沒進可攜模式時一律用它 |
 
-### 可攜模式
+可攜模式概述：執行檔主檔名以 `p` 結尾，或執行檔旁放一個 `traytunnel.toml`，任一成立即進可攜模式，設定檔就在執行檔旁邊。完整判定規則、誤判排除見下方摺疊區塊。
+
+第一次啟動若檔案不存在會自動在生效位置產生一份預設值，也可以直接複製範本：
+
+```
+copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
+```
+
+實際生效的完整路徑一律以程式為準：設定頁的 About 分節有「Config file」一列，副標就是那個路徑，點整列會開檔案總管並選中該檔；啟動時的活動日誌也會記一行 `config: <路徑>`。
+
+<details>
+<summary>可攜模式完整判定規則</summary>
 
 兩種觸發方式，任一成立就進可攜模式，設定檔都是執行檔旁邊的 `traytunnel.toml`：
 
@@ -143,13 +184,10 @@ push tag（`v*`）會自動觸發，比對 tag 版號與 `src-tauri/Cargo.toml` 
 
 放在隨身碟上、或想讓同一台機器的多份執行檔各自帶設定時用得到。要注意檔名記號一旦成立就沒得退回：`traytunnel-p.exe` 不會再去讀家目錄那份設定。
 
-第一次啟動若檔案不存在會自動在生效位置產生一份預設值，也可以直接複製範本：
+</details>
 
-```
-copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
-```
-
-實際生效的完整路徑一律以程式為準：設定頁的 About 分節有「Config file」一列，副標就是那個路徑，點整列會開檔案總管並選中該檔；啟動時的活動日誌也會記一行 `config: <路徑>`。
+<details>
+<summary>術語對照與欄位詳表</summary>
 
 **術語對照**：介面上稱 **Connection**（一組 SSH 連線）與 **Tunnel**（一條轉發），設定檔的鍵名維持原樣不動——`[[sources]]` 就是 Connection、`[[sources.forwards]]` 就是 Tunnel。手改檔案的人不必跟著改名，舊檔案也照吃。
 
@@ -182,13 +220,18 @@ copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
 
 也可以在程式裡編輯，存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單一 `[[sources]]` 或單筆 `[[sources.forwards]]` 上方的註解）。
 
-其他行為：
+</details>
+
+<details>
+<summary>`.broken` 與遷移相關</summary>
 
 - **舊制設定檔自動遷移**：偵測到頂層還有 `host` 欄位（只有單一連線的舊格式）時，會把它整包成一個 `[[sources]]`（連線名稱預設用 `host` 的值，其中的空白與中括號會被剝掉，例如 `[::1]` 會變成名稱 `::1`）、把原本的 `[[forwards]]` 搬成 `[[sources.forwards]]`，並就地寫回新格式；檔頭與逐筆隧道上方的註解都會保留
 - **不會自動搬家**：舊版把設定檔固定放在執行檔同目錄，升級後那份檔案會直接被當成可攜模式繼續使用；想改用家目錄的預設位置，請自行把 `traytunnel.toml` 移到 `%USERPROFILE%\.traytunnel.toml`（執行檔旁邊那份要刪掉或改名，否則它優先）
 - 升級注意：舊設定檔如果含有**重複的 `local` 埠**（舊版沒擋下來的話），升級時會被判為無法解析，另存一份 `.broken` 並改用預設值啟動，請手動把重複的埠改掉再放回去
 - 設定檔解析失敗時**不會被覆寫**，程式會在同一個資料夾另存一份「生效檔名 + `.broken`」（家目錄模式是 `.traytunnel.toml.broken`，可攜模式是 `traytunnel.toml.broken`）並改用預設值繼續執行；內容自相矛盾（連線名稱重複、跨連線撞埠、`host`／`user` 空白）也算解析失敗
 - 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
+
+</details>
 
 設定檔為個人本機設定，`traytunnel.toml` 已加入 `.gitignore`，不會被提交。
 
