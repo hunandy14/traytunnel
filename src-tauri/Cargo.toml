@@ -38,6 +38,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Threading",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
+  "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
 ] }
 # 開始選單捷徑要走 COM（IShellLinkW + IPropertyStore），用高階綁定省掉手刻 vtable

@@ -579,8 +579,19 @@ pub fn run() {
 
             build_tray(&handle, &shared)?;
 
-            // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+                // 工作列的視窗按鈕吃的是 SM_CXICON（175% 下 56px），codegen 給的是
+                // ICO 第一層 16px，得自己挑層再設一次才不會被 GDI 放大成一團糊
+                match window_icon() {
+                    Some(icon) => {
+                        if let Err(e) = win.set_icon(icon) {
+                            log::warn!("could not set the window icon: {e}");
+                        }
+                    }
+                    None => log::warn!("no window icon layer available, keeping the default"),
+                }
+
+                // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
                 let st = shared.clone();
                 win.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
@@ -651,48 +662,72 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// 多層 ICO 直接內嵌，才不必依賴磁碟上有沒有圖示檔
-const TRAY_ICO: &[u8] = include_bytes!("../icons/icon.ico");
+/// 多層 ICO 直接內嵌，才不必依賴磁碟上有沒有圖示檔。
+/// 系統匣與視窗圖示都從這一顆挑層，assets/gen-tray-icons.py 產生。
+const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 
-/// 依這台機器實際要的系統匣圖示尺寸，從多層 ICO 裡挑一層原生尺寸的出來。
+/// 從內嵌的多層 ICO 裡挑最接近 `want` 的一層，解成 RGBA。
 ///
-/// Tauri codegen 的 `default_window_icon()` 只取 ICO 的第一層固定尺寸，
-/// 高 DPI（例如 175% 要 28px）時交給 GDI 拉伸就會糊掉（tauri#14596、#9335）。
-fn tray_icon() -> Option<Image<'static>> {
-    let (want, _) = winsys::small_icon_size();
-    let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).ok()?;
+/// Tauri codegen 的 `default_window_icon()` 只取 ICO 的第一層固定尺寸（我們的第一層
+/// 是 16px），高 DPI 時交給 GDI 拉伸就會糊掉（tauri#14596、#9335），所以系統匣與主
+/// 視窗都自己挑層再明確設定。
+fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
+    let dir = ico::IconDir::read(Cursor::new(APP_ICO)).ok()?;
     let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
     let idx = winsys::pick_icon_layer(&sizes, want)?;
     let img = dir.entries()[idx].decode().ok()?;
-    log::info!("tray icon: system wants {want}px, using the {}px layer", img.width());
+    log::info!("{purpose} icon: system wants {want}px, using the {}px layer", img.width());
     Some(Image::new_owned(img.rgba_data().to_vec(), img.width(), img.height()))
 }
 
+/// 系統匣圖示：照 SM_CXSMICON（100% 是 16、175% 是 28）挑層
+fn tray_icon() -> Option<Image<'static>> {
+    ico_layer(winsys::small_icon_size().0, "tray")
+}
+
+/// 主視窗圖示：照 SM_CXICON（100% 是 32、175% 是 56）挑層。
+/// 這是工作列的視窗按鈕與 Alt+Tab 取的尺寸。
+fn window_icon() -> Option<Image<'static>> {
+    ico_layer(winsys::large_icon_size().0, "window")
+}
+
 #[cfg(test)]
-mod tray_icon_tests {
+mod app_icon_tests {
     use super::*;
 
-    /// 內嵌的 ICO 必須含系統匣常用的整數縮放尺寸，尤其 175% DPI 的 28px，
-    /// 少了哪一層就會退回讓 GDI 拉伸而糊掉
+    /// 內嵌的 ICO 必須含系統匣（SM_CXSMICON）與視窗（SM_CXICON）常用的整數縮放
+    /// 尺寸，少了哪一層就會退回讓 GDI 拉伸而糊掉。125%／150%／175% 的 40／48／56
+    /// 沒有專用層，靠 pick_icon_layer 往上取一層再由系統縮小。
     #[test]
-    fn embedded_ico_has_the_tray_layers() {
-        let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).expect("內嵌的 ICO 要解得開");
+    fn embedded_ico_has_the_icon_layers() {
+        let dir = ico::IconDir::read(Cursor::new(APP_ICO)).expect("內嵌的 ICO 要解得開");
         let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
-        for want in [16u32, 20, 24, 28, 32] {
+        for want in [16u32, 20, 24, 28, 32, 48, 64, 128, 256] {
             assert!(sizes.contains(&want), "缺 {want}px 層，現有 {sizes:?}");
         }
     }
 
-    /// 這台機器實際要的尺寸要挑得到層，而且解得出對應大小的點陣圖
+    /// 每一層都要解得開，而且解出來的點陣圖尺寸與目錄項相符
     #[test]
-    fn picks_a_layer_for_this_machine() {
-        let (want, _) = winsys::small_icon_size();
-        assert!(want >= 16, "SM_CXSMICON = {want}");
-        let dir = ico::IconDir::read(Cursor::new(TRAY_ICO)).unwrap();
-        let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
-        let idx = winsys::pick_icon_layer(&sizes, want).expect("一定挑得到一層");
-        let img = dir.entries()[idx].decode().expect("該層要解得開");
-        assert_eq!(img.rgba_data().len(), (img.width() * img.height() * 4) as usize);
+    fn every_layer_decodes_to_its_declared_size() {
+        let dir = ico::IconDir::read(Cursor::new(APP_ICO)).unwrap();
+        for entry in dir.entries() {
+            let img = entry.decode().expect("每一層都要解得開");
+            assert_eq!(img.width(), entry.width());
+            assert_eq!(img.height(), entry.height());
+            assert_eq!(img.rgba_data().len(), (img.width() * img.height() * 4) as usize);
+        }
+    }
+
+    /// 這台機器實際要的兩個尺寸都要挑得到層
+    #[test]
+    fn picks_layers_for_this_machine() {
+        let (small, _) = winsys::small_icon_size();
+        let (large, _) = winsys::large_icon_size();
+        assert!(small >= 16, "SM_CXSMICON = {small}");
+        assert!(large >= small, "SM_CXICON {large} 不該小於 SM_CXSMICON {small}");
+        assert!(tray_icon().is_some(), "系統匣挑不到層");
+        assert!(window_icon().is_some(), "視窗挑不到層");
     }
 }
 

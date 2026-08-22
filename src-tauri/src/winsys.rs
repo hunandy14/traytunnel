@@ -18,7 +18,10 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -139,11 +142,37 @@ fn listening_v6(port: u16) -> bool {
 /// 100% DPI 是 16，175% 就是 28——Windows 會照這個尺寸向 tray-icon 要圖，
 /// 給錯尺寸就由 GDI 拉伸，高 DPI 下糊掉的根源。
 pub fn small_icon_size() -> (u32, u32) {
+    metrics(SM_CXSMICON, SM_CYSMICON, (16, 16))
+}
+
+/// 視窗「大圖示」這台機器實際要的像素尺寸。
+///
+/// 工作列的視窗按鈕、Alt+Tab 與 ICON_BIG 取的都是這個尺寸：100% DPI 是 32，
+/// 175% 就是 56。Tauri codegen 的 `default_window_icon()` 只給 ICO 的第一層
+/// （我們的第一層是 16px），交給 GDI 從 16 拉到 56 就是工作列圖示糊掉的原因。
+pub fn large_icon_size() -> (u32, u32) {
+    metrics(SM_CXICON, SM_CYICON, (32, 32))
+}
+
+/// 取一組系統度量，優先走 DPI 版本。
+///
+/// `GetSystemMetrics` 回的是行程 DPI awareness 脈絡下的值，混合 DPI 的機器上不一定
+/// 是目前螢幕要的；`GetSystemMetricsForDpi` 配上 `GetDpiForSystem` 至少能拿到系統
+/// DPI 下的正確值。兩者都失敗（回 0 或負數）才退回硬編碼的 100% DPI 尺寸。
+fn metrics(cx: i32, cy: i32, fallback: (u32, u32)) -> (u32, u32) {
     unsafe {
-        let w = GetSystemMetrics(SM_CXSMICON);
-        let h = GetSystemMetrics(SM_CYSMICON);
+        let dpi = GetDpiForSystem();
+        let (mut w, mut h) = if dpi > 0 {
+            (GetSystemMetricsForDpi(cx, dpi), GetSystemMetricsForDpi(cy, dpi))
+        } else {
+            (0, 0)
+        };
         if w <= 0 || h <= 0 {
-            (16, 16)
+            w = GetSystemMetrics(cx);
+            h = GetSystemMetrics(cy);
+        }
+        if w <= 0 || h <= 0 {
+            fallback
         } else {
             (w as u32, h as u32)
         }
@@ -273,14 +302,39 @@ pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 圖示工廠產出的層序，測試照著它走
+    const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
+
     /// 完全相符的層優先，這樣 GDI 完全不用縮放
     #[test]
     fn exact_layer_wins() {
-        let sizes = [16, 20, 24, 28, 32, 48, 64, 256];
-        assert_eq!(pick_icon_layer(&sizes, 16), Some(0));
+        assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
         // 175% DPI 的 28px 現在有專用層
-        assert_eq!(pick_icon_layer(&sizes, 28), Some(3));
-        assert_eq!(pick_icon_layer(&sizes, 32), Some(4));
+        assert_eq!(pick_icon_layer(&LAYERS, 28), Some(3));
+        assert_eq!(pick_icon_layer(&LAYERS, 32), Some(4));
+    }
+
+    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層，
+    /// 放大才會糊，縮小不會
+    #[test]
+    fn large_icon_sizes_never_upscale() {
+        // 100%／125%／150%／175%／200%／250%／300% 的 SM_CXICON
+        let ladder = [(32, 32), (40, 48), (48, 48), (56, 64), (64, 64), (80, 128), (96, 128)];
+        for (want, expect) in ladder {
+            let idx = pick_icon_layer(&LAYERS, want).expect("一定挑得到一層");
+            assert_eq!(LAYERS[idx], expect, "{want}px 挑錯層");
+        }
+    }
+
+    /// 這台機器兩種圖示尺寸的合理性：大圖示不會比小圖示小，也不會是 0
+    #[test]
+    fn metrics_are_sane_on_this_machine() {
+        let (sw, sh) = small_icon_size();
+        let (lw, lh) = large_icon_size();
+        assert_eq!(sw, sh, "小圖示應為正方");
+        assert_eq!(lw, lh, "大圖示應為正方");
+        assert!(sw >= 16 && lw >= 32, "SM_CXSMICON={sw} SM_CXICON={lw}");
+        assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
     }
 
     /// 沒有專用層時寧可讓系統縮小，也不要放大
