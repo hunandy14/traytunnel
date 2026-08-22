@@ -633,18 +633,21 @@ body {
   color: var(--muted);
 }
 
+/* 外層只負責量出可用高度，捲動交給裡面的群組容器自己做，
+   這樣清單再長，外框與圓角都還留在畫面上 */
 .cards-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 2px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .cards {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
 }
 
 .card {
@@ -665,7 +668,8 @@ body {
   background: transparent;
   border: 1px solid var(--line);
   border-radius: 8px;
-  overflow: hidden;
+  /* 橫向永遠裁掉（圓角才收得住），縱向超出可視高度就在框內捲 */
+  overflow: hidden auto;
 }
 
 .cards.grouped .card {
