@@ -341,7 +341,6 @@ function paintCard(exit: ExitInfo) {
 
   refs.dot.className = `dot tone-${statusTone(exit.status)}`;
   refs.dot.title = exit.status;
-  refs.root.dataset.status = exit.status;
 
   const t = testLine(exit);
   const two = t.tone === "text" ? splitTest(t.text) : null;
