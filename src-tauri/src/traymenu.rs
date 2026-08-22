@@ -1,7 +1,7 @@
 //! 系統匣右鍵選單：先把「狀態快照 → 選單模型」算成純資料（`menu_model`），
 //! 再把模型轉成 Tauri 的原生選單物件貼到系統匣上。
 //!
-//! 分成兩段是為了讓版面規則（攤平與否、狀態行文字、Start／Stop all 的字）
+//! 分成兩段是為了讓版面規則（攤平與否、狀態行文字、Connect／Disconnect all 的字）
 //! 可以單獨測試，不必生出一個真的 app。
 //!
 //! 更新策略：選單很小，任何影響它的狀態一變就整個重建再換上去，
@@ -82,12 +82,12 @@ fn tooltip_text(sources: &[SourceView]) -> String {
     }
 }
 
-/// 有任何出口 enabled 就給 Stop all，全停時給 Start all
+/// 有任何出口 enabled 就給 Disconnect all，全停時給 Connect all
 fn toggle_label(sources: &[SourceView]) -> &'static str {
     if all_exits(sources).any(|e| e.enabled) {
-        "Stop all"
+        "Disconnect all"
     } else {
-        "Start all"
+        "Connect all"
     }
 }
 
@@ -99,14 +99,14 @@ fn exit_node(exit: &ExitView) -> Node {
     }
 }
 
-/// 一個源一個子選單：出口 + 分隔線 + Retest source。
+/// 一個源一個子選單：出口 + 分隔線 + Test connectivity。
 /// 源底下沒出口時不放那條分隔線，免得子選單開頭空一格。
 fn source_node(src: &SourceView) -> Node {
     let mut items: Vec<Node> = src.exits.iter().map(exit_node).collect();
     if !items.is_empty() {
         items.push(Node::Separator);
     }
-    items.push(item(format!("{SRC_TEST_PREFIX}{}", src.name), "Retest source"));
+    items.push(item(format!("{SRC_TEST_PREFIX}{}", src.name), "Test connectivity"));
     Node::Submenu { label: src.name.clone(), items }
 }
 
@@ -138,7 +138,7 @@ pub fn menu_model(sources: &[SourceView]) -> Vec<Node> {
         });
         sections.push(vec![
             item(ID_ALL_TOGGLE, toggle_label(sources)),
-            item(ID_TEST_ALL, "Retest all"),
+            item(ID_TEST_ALL, "Test all"),
         ]);
     }
     sections.push(vec![item(ID_OPEN, "Open window"), item(ID_EXIT, "Exit")]);
@@ -297,7 +297,7 @@ mod tests {
                         check("exit:1080", "a (1080)", true),
                         check("exit:1083", "b (1083)", false),
                         Node::Separator,
-                        item("src-test:hk", "Retest source"),
+                        item("src-test:hk", "Test connectivity"),
                     ],
                 },
                 Node::Submenu {
@@ -305,12 +305,12 @@ mod tests {
                     items: vec![
                         check("exit:1090", "c (1090)", true),
                         Node::Separator,
-                        item("src-test:tw", "Retest source"),
+                        item("src-test:tw", "Test connectivity"),
                     ],
                 },
                 Node::Separator,
-                item("all-toggle", "Stop all"),
-                item("test-all", "Retest all"),
+                item("all-toggle", "Disconnect all"),
+                item("test-all", "Test all"),
                 Node::Separator,
                 item("open", "Open window"),
                 item("exit", "Exit"),
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(view.menu, menu_model(&sources));
     }
 
-    /// 單源且出口不多：出口直接放根層，沒有子選單也沒有 Retest source
+    /// 單源且出口不多：出口直接放根層，沒有子選單也沒有 Test connectivity
     #[test]
     fn single_source_flattens_its_exits_to_the_root() {
         let sources = vec![source(
@@ -385,8 +385,8 @@ mod tests {
                 check("exit:1080", "a (1080)", true),
                 check("exit:1083", "b (1083)", true),
                 Node::Separator,
-                item("all-toggle", "Stop all"),
-                item("test-all", "Retest all"),
+                item("all-toggle", "Disconnect all"),
+                item("test-all", "Test all"),
                 Node::Separator,
                 item("open", "Open window"),
                 item("exit", "Exit"),
@@ -405,8 +405,8 @@ mod tests {
             panic!("第三項應該是子選單，實際是 {:?}", model.get(2));
         };
         assert_eq!(label, "hk");
-        assert_eq!(items.len(), FLATTEN_LIMIT + 2); // 出口 + 分隔線 + Retest source
-        assert_eq!(items.last(), Some(&item("src-test:hk", "Retest source")));
+        assert_eq!(items.len(), FLATTEN_LIMIT + 2); // 出口 + 分隔線 + Test connectivity
+        assert_eq!(items.last(), Some(&item("src-test:hk", "Test connectivity")));
         // 根層不該直接出現出口
         assert!(!model.iter().any(|n| matches!(n, Node::Check { .. })));
     }
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(model.iter().filter(|n| matches!(n, Node::Check { .. })).count(), 4);
     }
 
-    /// 零源：只有狀態行與視窗動作，連 Start all／Retest all 都不給
+    /// 零源：只有狀態行與視窗動作，連 Connect all／Test all 都不給
     #[test]
     fn no_sources_shows_only_the_status_line_and_window_actions() {
         assert_eq!(
@@ -436,26 +436,26 @@ mod tests {
         );
     }
 
-    /// 有源沒出口：狀態行講 No exits，全域動作仍在（Start all 會是無事發生但不必藏）
+    /// 有源沒出口：狀態行講 No exits，全域動作仍在（Connect all 會是無事發生但不必藏）
     #[test]
     fn a_source_without_exits_says_no_exits() {
         let model = menu_model(&[source("hk", vec![])]);
         assert_eq!(model[0], Node::Status("No exits".into()));
         // 不會冒出兩條連在一起的分隔線
         assert_eq!(model[1], Node::Separator);
-        assert_eq!(model[2], item("all-toggle", "Start all"));
+        assert_eq!(model[2], item("all-toggle", "Connect all"));
     }
 
-    /// 全部停用時要顯示 Start all，只要還有一個 enabled 就是 Stop all
+    /// 全部停用時要顯示 Connect all，只要還有一個 enabled 就是 Disconnect all
     #[test]
     fn toggle_reads_start_all_only_when_everything_is_disabled() {
         let mut sources = two_sources();
-        assert_eq!(toggle_label(&sources), "Stop all");
+        assert_eq!(toggle_label(&sources), "Disconnect all");
         sources[1].exits[0].enabled = false;
-        assert_eq!(toggle_label(&sources), "Stop all"); // hk 的 a 還開著
+        assert_eq!(toggle_label(&sources), "Disconnect all"); // hk 的 a 還開著
         sources[0].exits[0].enabled = false;
-        assert_eq!(toggle_label(&sources), "Start all");
-        assert_eq!(menu_model(&sources)[5], item("all-toggle", "Start all"));
+        assert_eq!(toggle_label(&sources), "Connect all");
+        assert_eq!(menu_model(&sources)[5], item("all-toggle", "Connect all"));
     }
 
     /// 勾選狀態看的是設定裡的 enabled，不是連線狀態
