@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" width="28" height="28">
+  <!-- 28px 系統匣圖層：assets/icon-final-16-simplified.svg 的像素對齊版，
+       由 assets/gen-tray-icons.py 產生，直邊皆落在整數像素格線上，請勿手改。 -->
+  <rect x="1" y="1" width="26" height="26" rx="6" fill="#14161a"/>
+  <path d="M14,3 L22,6 V17 C22,20.781 18.375,22.969 14,25 C9.625,22.969 6,20.781 6,17 V6 Z" fill="#2dd4a7"/>
+  <circle cx="14" cy="13" r="6" fill="#0e1013"/>
+  <path d="M12,10 h4 v1 h-4 z M11,11 h6 v4 h-6 z M12,15 h4 v1 h-4 z" fill="#4bf0c7"/>
+</svg>
