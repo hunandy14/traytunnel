@@ -30,7 +30,6 @@ export const restartExit = (local: number) => invoke<void>("restart_exit", { loc
 
 export const startSource = (name: string) => invoke<void>("start_source", { name });
 export const stopSource = (name: string) => invoke<void>("stop_source", { name });
-export const testSource = (name: string) => invoke<void>("test_source", { name });
 
 /** 回傳錯誤字串代表驗證失敗，null 代表成功 */
 export const upsertSource = (input: SourceInput) =>

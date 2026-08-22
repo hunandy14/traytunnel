@@ -257,6 +257,12 @@ impl AppState {
         self.exit_status(local).as_deref() == Some(status::CONNECTED)
     }
 
+    /// 目前連線中：只要不是 stopped（含尚未有紀錄）就算，涵蓋 connecting／
+    /// reconnecting／port_busy／error 這幾個過渡狀態，讓重接掃得到它們。
+    pub fn is_running(&self, local: u16) -> bool {
+        !matches!(self.exit_status(local).as_deref(), None | Some(status::STOPPED))
+    }
+
     /// 更新某個出口的自測狀態並推事件
     pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
         {

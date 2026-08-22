@@ -292,32 +292,35 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
     });
 }
 
-/// 對所有連上的出口平行自測（跨源）
-pub fn test_connected(state: &Arc<AppState>) {
+/// 對所有目前連線中的出口逐一重接（跨源）。停用中的出口不在名單裡，
+/// 維持停用，不會被這個動作拉起來。對應托盤根層的「Reconnect all」。
+pub fn reconnect_all(state: &Arc<AppState>) {
     let ports: Vec<u16> =
-        state.config().locals().into_iter().filter(|p| state.is_connected(*p)).collect();
+        state.config().locals().into_iter().filter(|p| state.is_running(*p)).collect();
     if ports.is_empty() {
-        state.log("no connected exit to test");
+        state.log("no running exit to reconnect");
         return;
     }
     for p in ports {
-        test_exit(state, p);
+        restart(state, p);
     }
-    state.log("testing exits...");
+    state.log("reconnecting exits...");
 }
 
-/// 對單一源底下所有連上的出口平行自測
-pub fn test_source(state: &Arc<AppState>, source: &str) {
+/// 對單一源底下所有目前連線中的出口逐一重接，停用中的維持停用。
+/// 對應托盤子選單的「Reconnect」；主視窗 ⋯ 選單的同名動作是前端逐條呼叫
+/// restart_exit，不會走到這裡。
+pub fn reconnect_source(state: &Arc<AppState>, source: &str) {
     let ports: Vec<u16> =
-        locals_of(state, source).into_iter().filter(|p| state.is_connected(*p)).collect();
+        locals_of(state, source).into_iter().filter(|p| state.is_running(*p)).collect();
     if ports.is_empty() {
-        state.log_from(source, "no connected exit to test");
+        state.log_from(source, "no running exit to reconnect");
         return;
     }
     for p in ports {
-        test_exit(state, p);
+        restart(state, p);
     }
-    state.log_from(source, "testing exits...");
+    state.log_from(source, "reconnecting exits...");
 }
 
 #[cfg(test)]

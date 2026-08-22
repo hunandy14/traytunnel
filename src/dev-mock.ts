@@ -322,14 +322,6 @@ function handle(cmd: string, args: Args): unknown {
       return null;
     }
 
-    case "test_source": {
-      const src = findSource(args.name as string);
-      if (!src) return null;
-      log(src.name, "testing all exits...");
-      for (const e of src.exits) runTest(e, src.name);
-      return null;
-    }
-
     case "upsert_source": {
       const input = {
         originalName: args.originalName ?? null,

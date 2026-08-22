@@ -30,7 +30,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 ## 功能
 
 - 系統匣常駐，可設定開機自動啟動（啟動時帶 `--tray` 直接隱藏到系統匣）
-- 多組連線：每個 `[[sources]]` 是一組獨立的 ssh 連線參數，底下各自掛自己的隧道，可整組 Connect／Disconnect／Test connectivity
+- 多組連線：每個 `[[sources]]` 是一組獨立的 ssh 連線參數，底下各自掛自己的隧道，可整組 Connect／Disconnect／Reconnect
 - 每個 `[[sources.forwards]]` 隧道一條獨立的 `ssh.exe -N -L`，可個別 Connect／Disconnect／Reconnect，一條隧道斷線或重連不會影響其他隧道
 - 隧道的 Connect／Disconnect 選擇會寫回設定檔的 `enabled`，下次啟動只自動連線 `enabled` 的隧道（所有連線一起）
 - 斷線後固定 5 秒重連，無退避、無次數上限，每條隧道自己數自己的
@@ -38,7 +38,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地（此功能會經隧道向第三方服務 ipinfo.io 發出請求）
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
 - 單一實例：重複啟動只會把既有的主視窗叫出來
-- 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Test all`，多組連線時每組收成一個子選單（底下有 `Test connectivity`）
+- 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Reconnect all`，多組連線時每組收成一個子選單（底下有 `Reconnect`）
 - 系統匣圖示依 `SM_CXSMICON` 從多層 ICO 挑原生尺寸的那一層（含 16／20／24／28／32px），高 DPI 下不會被 GDI 拉伸糊掉
 - 通知掛在自己的 AppUserModelID 底下：啟動時自註冊開始選單捷徑與 `HKCU\Software\Classes\AppUserModelId`，toast 顯示的是 Traytunnel 而不是 Windows PowerShell
 - 每條 ssh 子程序各自放在一個 Windows Job Object 內，隧道停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
@@ -60,7 +60,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 視窗分成左側的連線軌道與右側的主區，兩者都可隨視窗縮放（最小 480×420）：
 
 - **左側連線軌道**：每條連線一個圓角方塊，圖案是連線名首字，底色由名稱 hash 決定，右下角的小點是該連線的彙總狀態（全連綠／部分琥珀／全停灰／有隧道出錯紅）。清單底部的虛線「＋」新增連線；左下角固定放活動日誌與設定兩個鈕。
-- **主區（選中的連線）**：頂部彙總卡分三段——左邊是連線名稱與 `ssh user@host`，中間用豎分隔線隔出大分數 `n/m` 與 `CONNECTED` 小字（顏色跟著整條連線的健康度走），右邊只有一顆「⋯」。⋯ 點開的選單收了 Add tunnel、Disconnect／Connect（整條連線一起）、Test connectivity、Activity，分隔線下再放 Edit connection。
+- **主區（選中的連線）**：頂部彙總卡分三段——左邊是連線名稱與 `ssh user@host`，中間用豎分隔線隔出大分數 `n/m` 與 `CONNECTED` 小字（顏色跟著整條連線的健康度走），右邊只有一顆「⋯」。⋯ 點開的選單收了 Add tunnel、Disconnect／Connect（整條連線一起）、Reconnect、Activity，分隔線下再放 Edit connection。
 - **隧道清單**：彙總卡下方是標題 `TUNNELS` 的隧道清單，整份包在單一外框裡，列與列之間用內縮的細分隔線分開，滑過去整列微亮。每列左側是狀態點、名稱與 `:local → remote`，右側兩行是最近一次自測結果（上行地點、下行對外 IP），最右邊是連接／中斷、重新連接、編輯三個鈕。外框高度跟著列數長，長到超過主區可用高度時就固定在那裡、改由框內捲動，外框與圓角一直留在畫面上。
 - **活動日誌頁**：左下的時鐘鈕（或 ⋯ 選單的 Activity）把主區換成所有連線的完整日誌，點任一連線 icon 即返回。
 - **設定頁**：左下的齒輪把主區換成設定頁，目前有「關閉時縮到系統匣」與「開機自動啟動」兩個即時生效的開關；下方的 About 分節顯示版本號，以及「Config file」一列（副標是實際生效的設定檔完整路徑，點整列會開檔案總管並選中它）。
@@ -101,7 +101,7 @@ npm run dev
 
 - 用官方的 `@tauri-apps/api/mocks` 的 `mockIPC`（開啟 `shouldMockEvents`）攔截所有 `invoke`，並讓 `listen`／`emit` 走記憶體，所以前端程式碼完全不用為了 mock 改寫
 - 偵測方式是 Tauri v2 官方提供的 `isTauri()`，偵測不到才啟用
-- 假資料有三條連線（`tokyo` 兩條隧道、`taipei` 兩條隧道、`lab` 零隧道示範空狀態），涵蓋每條隧道獨立的 `connecting → connected`、自測 `testing → ok`／`fail`、固定會撞埠的 `port_busy`，以及跨連線的本地埠衝突；隧道的連接／中斷／重新連接、整條連線的啟停與重測、隧道的新增／編輯／刪除（含 undo）、連線的新增／編輯／刪除都能實際操作
+- 假資料有三條連線（`tokyo` 兩條隧道、`taipei` 兩條隧道、`lab` 零隧道示範空狀態），涵蓋每條隧道獨立的 `connecting → connected`、自測 `testing → ok`／`fail`、固定會撞埠的 `port_busy`，以及跨連線的本地埠衝突；隧道的連接／中斷／重新連接、整條連線的啟停與重接、隧道的新增／編輯／刪除（含 undo）、連線的新增／編輯／刪除都能實際操作
 - 設定存檔只寫進 `sessionStorage`，不會碰到真的設定檔
 - 另外掛了 `window.__mock` 供演練特定狀態：`__mock.drop(1080)` 模擬斷線重連、`__mock.status(1080, "error", "…")` 直接指定狀態、`__mock.wipe()` 清掉所有連線看零連線空狀態、`__mock.configDelay(1500)` 讓 `config-changed` 晚於 invoke 的 resolve 送達（真後端就是這個順序，用來驗證改名後的選中不會被回退吃掉）、`__mock.reset()` 清掉暫存重來
 
