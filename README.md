@@ -83,7 +83,7 @@ npm run tauri build
 
 注意：一定要走 `npm run tauri build`。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
-免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，就在執行檔旁邊放一個 `traytunnel.toml`（見下方「設定檔」）。
+免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成含 `p` 的檔名（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見下方「設定檔」）。
 
 ## 設定檔
 
@@ -91,12 +91,19 @@ npm run tauri build
 
 | 順序 | 位置 | 何時生效 |
 | --- | --- | --- |
-| 1 | `<執行檔同目錄>\traytunnel.toml` | 這個檔案存在就是**可攜模式**，整支程式的讀寫都留在執行檔旁邊 |
-| 2 | `%USERPROFILE%\.traytunnel.toml` | 預設位置。可攜模式的檔案不存在時一律用它 |
+| 1 | `<執行檔同目錄>\traytunnel.toml` | **可攜模式**。兩個觸發條件任一成立即可（見下），整支程式的讀寫都留在執行檔旁邊 |
+| 2 | `%USERPROFILE%\.traytunnel.toml` | 預設位置。沒進可攜模式時一律用它 |
 
-可攜模式採 KeePass／Rufus 那套**同名檔偵測**：只要在執行檔旁邊放一個 `traytunnel.toml`（空檔也算，程式會補齊內容），就改用它；把它刪掉或改名就回到家目錄那份。放在隨身碟上、或想讓同一台機器的多份執行檔各自帶設定時用得到。
+### 可攜模式
 
-第一次啟動若檔案不存在會自動在預設位置產生一份預設值，也可以直接複製範本：
+兩種觸發方式，任一成立就進可攜模式，設定檔都是執行檔旁邊的 `traytunnel.toml`：
+
+- **執行檔名含 `p`**（Rufus 那套命名記號）：產品名 `traytunnel` 本身一個 p 都沒有，所以主檔名（副檔名以外的部分）裡只要出現任何一個 p，就是刻意加上去的可攜記號。位置不限、大小寫不敏感，例如 `traytunnel-0.2.0p.exe`、`traytunnel-p.exe`、`traytunnel-portable.exe` 都算。這種情況下設定檔還不存在時會**自動在執行檔旁邊建一份預設值**，就像 Rufus 建自己的 ini。
+- **執行檔旁放一個 `traytunnel.toml`**（KeePass／Rufus 那套同名檔偵測）：檔案存在就改用它，空檔也算（程式會補齊內容）；把它刪掉或改名就回到家目錄那份。
+
+放在隨身碟上、或想讓同一台機器的多份執行檔各自帶設定時用得到。要注意檔名記號一旦成立就沒得退回：`traytunnel-p.exe` 不會再去讀家目錄那份設定。
+
+第一次啟動若檔案不存在會自動在生效位置產生一份預設值，也可以直接複製範本：
 
 ```
 copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml

@@ -50,27 +50,48 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-/// 路徑優先序的純邏輯，實機與測試共用：
+/// 執行檔主檔名裡的可攜記號：Rufus 的 `rufus-4.5p.exe` 那套。
 ///
-/// 1. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
-/// 2. 否則用家目錄的 `.traytunnel.toml`；
-/// 3. 連家目錄都問不出來時退回執行檔目錄，檔名仍維持點檔，
+/// `traytunnel` 這個名字本身一個 p 都沒有，所以主檔名（去掉副檔名）裡只要出現
+/// 任何一個 p，就是使用者刻意加上去的記號，例如 `traytunnel-p.exe`、
+/// `traytunnel-0.2.0p.exe`。大小寫不敏感。
+pub fn stem_marks_portable(exe_stem: &str) -> bool {
+    exe_stem.chars().any(|c| c.eq_ignore_ascii_case(&'p'))
+}
+
+/// 路徑優先序的純邏輯，實機與測試共用。可攜模式兩個觸發條件**任一成立**即可，
+/// 兩者都指向執行檔旁邊的 `traytunnel.toml`：
+///
+/// 1. 執行檔主檔名含 p（[`stem_marks_portable`]）→ 可攜模式；檔案還不存在也算，
+///    後面 `load_from_path` 會就地建一份預設檔（Rufus 建 ini 的行為）；
+/// 2. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
+/// 3. 都不成立就用家目錄的 `.traytunnel.toml`；
+/// 4. 連家目錄都問不出來時退回執行檔目錄，檔名仍維持點檔，
 ///    才不會反過來把自己變成可攜模式。
-pub fn resolve_location(exe_dir: &Path, home: Option<&Path>) -> ConfigLocation {
+pub fn resolve_location(exe_dir: &Path, exe_stem: &str, home: Option<&Path>) -> ConfigLocation {
     let portable = exe_dir.join(TOML_NAME);
-    if portable.is_file() {
+    if stem_marks_portable(exe_stem) || portable.is_file() {
         return ConfigLocation { path: portable, portable: true };
     }
     let base = home.unwrap_or(exe_dir);
     ConfigLocation { path: base.join(HOME_TOML_NAME), portable: false }
 }
 
-/// 執行檔所在資料夾，取不到就退回工作目錄
-fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
+/// 執行檔的所在資料夾與主檔名，取自同一次 `current_exe()`；
+/// 問不出來時分別退回工作目錄與空字串（空字串不含 p，不會誤觸可攜模式）
+fn exe_parts() -> (PathBuf, String) {
+    let exe = std::env::current_exe().ok();
+    let dir = exe
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = exe
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (dir, stem)
 }
 
 /// 使用者家目錄；空字串視同沒有
@@ -83,7 +104,8 @@ fn home_dir() -> Option<PathBuf> {
 /// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
 /// 全程式只有這一個入口，讀寫與備份都從回傳值派生。
 pub fn config_location() -> ConfigLocation {
-    let loc = resolve_location(&exe_dir(), home_dir().as_deref());
+    let (dir, stem) = exe_parts();
+    let loc = resolve_location(&dir, &stem, home_dir().as_deref());
     let _ = std::fs::create_dir_all(loc.dir());
     loc
 }
@@ -655,13 +677,16 @@ mod tests {
 
     // ------------------------------------------------------------ 路徑優先序
 
+    /// 一般的執行檔名，測試裡除非要測 p 記號否則都用它
+    const PLAIN: &str = "traytunnel";
+
     /// 四象限之一：exe 旁有同名檔、家目錄問得出來 → 可攜模式優先
     #[test]
     fn portable_file_beside_the_exe_wins() {
         let exe = tmp_dir("loc-portable");
         let home = tmp_dir("loc-home");
         std::fs::write(exe.join(TOML_NAME), "closeToTray = true\n").unwrap();
-        let loc = resolve_location(&exe, Some(&home));
+        let loc = resolve_location(&exe, PLAIN, Some(&home));
         assert!(loc.portable);
         assert_eq!(loc.path, exe.join(TOML_NAME));
         assert_eq!(loc.dir(), exe);
@@ -673,7 +698,7 @@ mod tests {
     fn falls_back_to_the_home_dotfile() {
         let exe = tmp_dir("loc-noportable");
         let home = tmp_dir("loc-home2");
-        let loc = resolve_location(&exe, Some(&home));
+        let loc = resolve_location(&exe, PLAIN, Some(&home));
         assert!(!loc.portable);
         assert_eq!(loc.path, home.join(HOME_TOML_NAME));
         assert_eq!(loc.dir(), home);
@@ -685,7 +710,7 @@ mod tests {
     fn portable_wins_even_without_a_home_dir() {
         let exe = tmp_dir("loc-portable-nohome");
         std::fs::write(exe.join(TOML_NAME), "closeToTray = true\n").unwrap();
-        let loc = resolve_location(&exe, None);
+        let loc = resolve_location(&exe, PLAIN, None);
         assert!(loc.portable);
         assert_eq!(loc.path, exe.join(TOML_NAME));
     }
@@ -695,10 +720,85 @@ mod tests {
     #[test]
     fn without_a_home_dir_it_uses_the_exe_dir_dotfile() {
         let exe = tmp_dir("loc-nohome");
-        let loc = resolve_location(&exe, None);
+        let loc = resolve_location(&exe, PLAIN, None);
         assert!(!loc.portable);
         assert_eq!(loc.path, exe.join(HOME_TOML_NAME));
         assert_ne!(loc.path, exe.join(TOML_NAME));
+    }
+
+    // ------------------------------ 檔名含 p 的可攜記號（Rufus 那套）
+
+    /// 產品名 traytunnel 本身一個 p 都沒有，這是整個記號成立的前提
+    #[test]
+    fn the_product_name_itself_has_no_p() {
+        assert!(!stem_marks_portable("traytunnel"));
+        assert!(!stem_marks_portable("traytunnel-0.2.0"));
+        assert!(!stem_marks_portable(""));
+    }
+
+    /// p 在哪裡都算：結尾、中間、開頭，大小寫都不敏感
+    #[test]
+    fn any_p_in_the_stem_marks_portable() {
+        // Rufus 式的版本號後綴
+        assert!(stem_marks_portable("traytunnel-0.2.0p"));
+        assert!(stem_marks_portable("traytunnel-p"));
+        assert!(stem_marks_portable("traytunnelp"));
+        // p 在中間
+        assert!(stem_marks_portable("traytunnel-portable"));
+        assert!(stem_marks_portable("tray-p-tunnel"));
+        // 大寫
+        assert!(stem_marks_portable("traytunnel-0.2.0P"));
+        assert!(stem_marks_portable("TRAYTUNNEL-P"));
+        // 開頭
+        assert!(stem_marks_portable("portable-traytunnel"));
+    }
+
+    /// 檔名含 p 時，設定檔就在 exe 旁邊，即使檔案還不存在、家目錄也問得出來
+    #[test]
+    fn p_in_the_stem_wins_over_the_home_dotfile() {
+        let exe = tmp_dir("loc-pstem");
+        let home = tmp_dir("loc-home-pstem");
+        let loc = resolve_location(&exe, "traytunnel-0.2.0p", Some(&home));
+        assert!(loc.portable);
+        assert_eq!(loc.path, exe.join(TOML_NAME));
+        // 家目錄那份完全不碰
+        assert!(!home.join(HOME_TOML_NAME).exists());
+    }
+
+    /// 檔名含 p 但檔案還不存在時，load 要就地建一份預設檔（Rufus 建 ini 的行為）
+    #[test]
+    fn p_in_the_stem_creates_the_file_next_to_the_exe() {
+        let exe = tmp_dir("loc-pstem-create");
+        let home = tmp_dir("loc-home-pstem-create");
+        let loc = resolve_location(&exe, "traytunnel-p", Some(&home));
+        assert!(!loc.path.exists(), "解析階段不該自己先建檔");
+
+        let out = load_from_path(&loc.path);
+        assert!(matches!(out, LoadOutcome::Created(_)));
+        assert!(exe.join(TOML_NAME).is_file());
+        assert_eq!(out.config(), &Config::default());
+        // 家目錄依舊乾乾淨淨
+        assert!(!home.join(HOME_TOML_NAME).exists());
+    }
+
+    /// 兩個觸發條件同時成立（檔名含 p ＋ exe 旁已有檔案）時是同一個結果，
+    /// 而且既有檔案要被讀進來，不可以被預設值蓋掉
+    #[test]
+    fn both_portable_triggers_agree_on_the_same_file() {
+        let exe = tmp_dir("loc-both");
+        let home = tmp_dir("loc-home-both");
+        let raw = "closeToTray = false\n\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\n";
+        std::fs::write(exe.join(TOML_NAME), raw).unwrap();
+
+        let by_stem = resolve_location(&exe, "traytunnel-p", Some(&home));
+        let by_file = resolve_location(&exe, PLAIN, Some(&home));
+        assert_eq!(by_stem, by_file);
+        assert!(by_stem.portable);
+
+        let out = load_from_path(&by_stem.path);
+        assert!(matches!(out, LoadOutcome::Loaded(_)));
+        assert!(!out.config().close_to_tray);
+        assert_eq!(std::fs::read_to_string(exe.join(TOML_NAME)).unwrap(), raw);
     }
 
     /// 資料夾不算數，同名的資料夾不該讓程式誤判成可攜模式
@@ -707,7 +807,7 @@ mod tests {
         let exe = tmp_dir("loc-dir");
         let home = tmp_dir("loc-home3");
         std::fs::create_dir_all(exe.join(TOML_NAME)).unwrap();
-        assert!(!resolve_location(&exe, Some(&home)).portable);
+        assert!(!resolve_location(&exe, PLAIN, Some(&home)).portable);
     }
 
     /// 壞檔備份跟著生效檔名走，兩種模式各自不同名
