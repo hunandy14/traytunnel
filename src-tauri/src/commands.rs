@@ -157,6 +157,9 @@ fn set_source_enabled(st: &Shared, name: &str, on: bool) {
             }
         }
     }) {
+        // 同 set_exit_enabled：設定沒改成，但介面的開關已經被樂觀翻過去了，
+        // 全量推一次把它們拉回設定裡的真值
+        st.emit_config_changed();
         return;
     }
     apply_enabled(st, on, || tunnel::start_source(st, name), || tunnel::halt_source(st, name));
@@ -171,6 +174,9 @@ pub fn set_all_enabled(st: &Shared, on: bool) {
             }
         }
     }) {
+        // 同上。系統匣的 Start／Stop all 還會連帶讓那一列的標籤與整份勾選跟著錯，
+        // emit_config_changed 一次把介面與系統匣都重建回真值
+        st.emit_config_changed();
         return;
     }
     apply_enabled(st, on, || tunnel::start_enabled(st), || tunnel::halt_all(st));
