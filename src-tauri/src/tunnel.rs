@@ -128,37 +128,23 @@ pub fn halt_all(state: &Arc<AppState>) {
 
 /// 啟動單一源底下所有 enabled 的出口
 pub fn start_source(state: &Arc<AppState>, source: &str) {
-    for local in enabled_locals_of(state, source) {
+    for local in state.with_config(|c| c.enabled_locals_of(source)) {
         start(state, local);
     }
 }
 
 /// 停掉單一源底下所有出口
 pub fn halt_source(state: &Arc<AppState>, source: &str) {
-    for local in locals_of(state, source) {
+    for local in state.with_config(|c| c.locals_of(source)) {
         halt(state, local);
     }
 }
 
 /// 重接單一源底下運行中（enabled）的出口，該源的連線欄位改變時用
 pub fn restart_running_in_source(state: &Arc<AppState>, source: &str) {
-    for local in enabled_locals_of(state, source) {
+    for local in state.with_config(|c| c.enabled_locals_of(source)) {
         restart(state, local);
     }
-}
-
-fn locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state.with_config(|c| {
-        c.source(source).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
-    })
-}
-
-fn enabled_locals_of(state: &Arc<AppState>, source: &str) -> Vec<u16> {
-    state.with_config(|c| {
-        c.source(source)
-            .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
-            .unwrap_or_default()
-    })
 }
 
 /// 分段等待，中途世代作廢就立刻回 false
@@ -322,8 +308,11 @@ pub fn reconnect_all(state: &Arc<AppState>) {
 /// 對應托盤子選單的「Reconnect」；主視窗 ⋯ 選單的同名動作是前端逐條呼叫
 /// restart_exit，不會走到這裡。
 pub fn reconnect_source(state: &Arc<AppState>, source: &str) {
-    let ports: Vec<u16> =
-        locals_of(state, source).into_iter().filter(|p| state.is_running(*p)).collect();
+    let ports: Vec<u16> = state
+        .with_config(|c| c.locals_of(source))
+        .into_iter()
+        .filter(|p| state.is_running(*p))
+        .collect();
     if ports.is_empty() {
         state.log_from(source, "no running exit to reconnect");
         return;

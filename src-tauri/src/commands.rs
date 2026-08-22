@@ -262,9 +262,7 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
     }
     // 先存檔成功才停線。反過來做的話，存檔失敗就會留下「隧道已經停了、設定裡卻還
     // 在而且是 enabled」的錯位狀態。要停的埠得在刪掉之前先抄下來，刪完就查不到了。
-    let ports: Vec<u16> = st.with_config(|c| {
-        c.source(&name).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
-    });
+    let ports = st.with_config(|c| c.locals_of(&name));
     if !save(st, |c| c.sources.retain(|s| s.name != name)) {
         return;
     }

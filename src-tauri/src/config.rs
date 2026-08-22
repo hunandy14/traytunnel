@@ -224,6 +224,18 @@ impl Config {
             .flat_map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local))
             .collect()
     }
+
+    /// 單一源底下所有出口的本地埠；沒有這個源就是空的
+    pub fn locals_of(&self, source: &str) -> Vec<u16> {
+        self.source(source).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
+    }
+
+    /// 單一源底下 enabled 出口的本地埠
+    pub fn enabled_locals_of(&self, source: &str) -> Vec<u16> {
+        self.source(source)
+            .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for Config {

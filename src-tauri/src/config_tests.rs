@@ -332,6 +332,23 @@ enabled = false
     assert_eq!(cfg.locate(1080).unwrap().0.user, "bob");
 }
 
+/// 單一源的埠清單：跨源不會混到，問一個不存在的源就是空的
+#[test]
+fn locals_of_only_covers_that_source() {
+    let cfg = Config {
+        close_to_tray: true,
+        sources: vec![
+            src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
+            src("tw", vec![fwd("c", 1090)]),
+        ],
+    };
+    assert_eq!(cfg.locals_of("hk"), vec![1080, 1083]);
+    assert_eq!(cfg.enabled_locals_of("hk"), vec![1080]);
+    assert_eq!(cfg.locals_of("tw"), vec![1090]);
+    assert!(cfg.locals_of("nope").is_empty());
+    assert!(cfg.enabled_locals_of("nope").is_empty());
+}
+
 /// 沒有 enabled 欄位時一律當成啟用
 #[test]
 fn forward_enabled_defaults_to_true() {
