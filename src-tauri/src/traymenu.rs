@@ -63,11 +63,11 @@ fn totals(sources: &[SourceView]) -> (usize, usize) {
 /// 狀態行：連線數／出口總數，跟主視窗的彙總列同一套算法
 fn status_line(sources: &[SourceView]) -> String {
     if sources.is_empty() {
-        return "No sources".into();
+        return "No connections".into();
     }
     let (connected, total) = totals(sources);
     if total == 0 {
-        return "No exits".into();
+        return "No tunnels".into();
     }
     format!("{connected}/{total} Connected")
 }
@@ -76,7 +76,7 @@ fn status_line(sources: &[SourceView]) -> String {
 fn tooltip_text(sources: &[SourceView]) -> String {
     let (connected, total) = totals(sources);
     if total == 0 {
-        "Traytunnel - no exits".to_string()
+        "Traytunnel - no tunnels".to_string()
     } else {
         format!("Traytunnel - {connected}/{total} connected")
     }
@@ -354,11 +354,11 @@ mod tests {
         assert_eq!(status_line(&sources), "0/3 Connected");
     }
 
-    /// 一個出口都沒有時不報 0/0
+    /// 一條隧道都沒有時不報 0/0
     #[test]
-    fn tooltip_says_no_exits_when_there_are_none() {
-        assert_eq!(tooltip_text(&[]), "Traytunnel - no exits");
-        assert_eq!(tooltip_text(&[source("hk", vec![])]), "Traytunnel - no exits");
+    fn tooltip_says_no_tunnels_when_there_are_none() {
+        assert_eq!(tooltip_text(&[]), "Traytunnel - no tunnels");
+        assert_eq!(tooltip_text(&[source("hk", vec![])]), "Traytunnel - no tunnels");
     }
 
     /// 提示與選單出自同一份快照，才能一起套用
@@ -422,13 +422,13 @@ mod tests {
         assert_eq!(model.iter().filter(|n| matches!(n, Node::Check { .. })).count(), 4);
     }
 
-    /// 零源：只有狀態行與視窗動作，連 Connect all／Test all 都不給
+    /// 零連線：只有狀態行與視窗動作，連 Connect all／Test all 都不給
     #[test]
-    fn no_sources_shows_only_the_status_line_and_window_actions() {
+    fn no_connections_shows_only_the_status_line_and_window_actions() {
         assert_eq!(
             menu_model(&[]),
             vec![
-                Node::Status("No sources".into()),
+                Node::Status("No connections".into()),
                 Node::Separator,
                 item("open", "Open window"),
                 item("exit", "Exit"),
@@ -436,11 +436,11 @@ mod tests {
         );
     }
 
-    /// 有源沒出口：狀態行講 No exits，全域動作仍在（Connect all 會是無事發生但不必藏）
+    /// 有連線沒隧道：狀態行講 No tunnels，全域動作仍在（Connect all 會是無事發生但不必藏）
     #[test]
-    fn a_source_without_exits_says_no_exits() {
+    fn a_connection_without_tunnels_says_no_tunnels() {
         let model = menu_model(&[source("hk", vec![])]);
-        assert_eq!(model[0], Node::Status("No exits".into()));
+        assert_eq!(model[0], Node::Status("No tunnels".into()));
         // 不會冒出兩條連在一起的分隔線
         assert_eq!(model[1], Node::Separator);
         assert_eq!(model[2], item("all-toggle", "Connect all"));
