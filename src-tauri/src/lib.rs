@@ -2,6 +2,7 @@ mod aumid;
 mod config;
 mod exits;
 mod state;
+mod traymenu;
 mod tunnel;
 mod winsys;
 
@@ -10,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -153,11 +153,10 @@ fn require_source(st: &Shared, name: &str) -> bool {
     true
 }
 
-/// 連接單一出口：記住使用者的選擇（enabled=true）後再拉線
-#[tauri::command]
-fn start_exit(state: State<'_, Shared>, local: u16) {
-    let st = state.inner().clone();
-    if !require_exit(&st, local) {
+/// 連接單一出口：記住使用者的選擇（enabled=true）後再拉線。
+/// 前端指令與系統匣選單共用這裡，不繞 invoke。
+fn enable_exit(st: &Shared, local: u16) {
+    if !require_exit(st, local) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -165,18 +164,16 @@ fn start_exit(state: State<'_, Shared>, local: u16) {
             f.enabled = true;
         }
     }) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
     st.emit_config_changed();
-    tunnel::start(&st, local);
+    tunnel::start(st, local);
 }
 
 /// 中斷單一出口：enabled=false 並持久化，重開程式也不會自己連回來
-#[tauri::command]
-fn stop_exit(state: State<'_, Shared>, local: u16) {
-    let st = state.inner().clone();
-    if !require_exit(&st, local) {
+fn disable_exit(st: &Shared, local: u16) {
+    if !require_exit(st, local) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -184,11 +181,21 @@ fn stop_exit(state: State<'_, Shared>, local: u16) {
             f.enabled = false;
         }
     }) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
-    tunnel::halt(&st, local);
+    tunnel::halt(st, local);
     st.emit_config_changed();
+}
+
+#[tauri::command]
+fn start_exit(state: State<'_, Shared>, local: u16) {
+    enable_exit(&state.inner().clone(), local);
+}
+
+#[tauri::command]
+fn stop_exit(state: State<'_, Shared>, local: u16) {
+    disable_exit(&state.inner().clone(), local);
 }
 
 /// 重接單一出口：halt 後立刻 start，套用最新設定。
@@ -257,26 +264,34 @@ fn stop_source(state: State<'_, Shared>, name: String) {
     st.emit_config_changed();
 }
 
-#[tauri::command]
-fn start_all(state: State<'_, Shared>) {
-    let st = state.inner().clone();
+/// 全部連接：跨源把 enabled 全開再拉線
+fn enable_all(st: &Shared) {
     if let Err(e) = st.update_config(set_all_enabled(true)) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
     st.emit_config_changed();
-    tunnel::start_enabled(&st);
+    tunnel::start_enabled(st);
+}
+
+/// 全部中斷
+fn disable_all(st: &Shared) {
+    if let Err(e) = st.update_config(set_all_enabled(false)) {
+        report_save_error(st, e);
+        return;
+    }
+    tunnel::halt_all(st);
+    st.emit_config_changed();
+}
+
+#[tauri::command]
+fn start_all(state: State<'_, Shared>) {
+    enable_all(&state.inner().clone());
 }
 
 #[tauri::command]
 fn stop_all(state: State<'_, Shared>) {
-    let st = state.inner().clone();
-    if let Err(e) = st.update_config(set_all_enabled(false)) {
-        report_save_error(&st, e);
-        return;
-    }
-    tunnel::halt_all(&st);
-    st.emit_config_changed();
+    disable_all(&state.inner().clone());
 }
 
 fn set_all_enabled(on: bool) -> impl FnOnce(&mut Config) {
@@ -603,7 +618,7 @@ pub fn run() {
                 });
             }
 
-            shared.refresh_tooltip();
+            shared.refresh_tray();
             shared.log("Traytunnel started");
             for note in aumid_notes {
                 shared.log(note);
@@ -731,10 +746,47 @@ mod app_icon_tests {
     }
 }
 
+/// 系統匣選單的事件路由：id 前綴決定要做什麼，一律呼叫內部函式，不繞 invoke
+fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
+    match id {
+        traymenu::ID_OPEN => show_main(app),
+        // 系統匣的 Exit 一律真的退出
+        traymenu::ID_EXIT => do_exit(st),
+        traymenu::ID_ALL_TOGGLE => toggle_all(st),
+        traymenu::ID_TEST_ALL => tunnel::test_connected(st),
+        _ => {
+            if let Some(local) = id.strip_prefix(traymenu::EXIT_PREFIX).and_then(|p| p.parse().ok())
+            {
+                toggle_exit(st, local);
+            } else if let Some(name) = id.strip_prefix(traymenu::SRC_TEST_PREFIX) {
+                if require_source(st, name) {
+                    tunnel::test_source(st, name);
+                }
+            }
+        }
+    }
+}
+
+/// 勾選＝設定裡的 enabled，所以點一下就是反過來
+fn toggle_exit(st: &Shared, local: u16) {
+    match st.config().forward(local) {
+        Some(f) if f.enabled => disable_exit(st, local),
+        Some(_) => enable_exit(st, local),
+        None => st.log(format!("port {local} : no such exit")),
+    }
+}
+
+/// 有任何出口 enabled 就是 Stop all，全停時就是 Start all
+fn toggle_all(st: &Shared) {
+    if st.config().enabled_locals().is_empty() {
+        enable_all(st);
+    } else {
+        disable_all(st);
+    }
+}
+
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open window", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let menu = traymenu::build(app, &traymenu::menu_model(&shared.source_views()))?;
 
     // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可讓系統匣先長出來
     // 也不要 panic 掉整支程式，圖示之後照樣可以補
@@ -751,12 +803,7 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
         .tooltip("Traytunnel")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(move |app, event| match event.id().as_ref() {
-            "open" => show_main(app),
-            // 系統匣的 Exit 一律真的退出
-            "exit" => do_exit(&st),
-            _ => {}
-        })
+        .on_menu_event(move |app, event| on_tray_menu(app, &st, event.id().as_ref()))
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = event {
                 show_main(tray.app_handle());

@@ -254,7 +254,7 @@ impl AppState {
         let _ = self
             .app
             .emit("exit-status", ExitStatusPayload { local, status: status.into(), detail });
-        self.refresh_tooltip();
+        self.refresh_tray();
     }
 
     pub fn exit_status(&self, local: u16) -> Option<String> {
@@ -391,11 +391,11 @@ impl AppState {
         self.app.autolaunch().is_enabled().unwrap_or(false)
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法
+    pub fn source_views(&self) -> Vec<SourceView> {
         let cfg = self.config();
         let exits = self.exits.lock().unwrap();
-        let sources = cfg
-            .sources
+        cfg.sources
             .iter()
             .map(|s| SourceView {
                 name: s.name.clone(),
@@ -420,11 +420,14 @@ impl AppState {
                     })
                     .collect(),
             })
-            .collect();
+            .collect()
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            close_to_tray: cfg.close_to_tray,
+            close_to_tray: self.config().close_to_tray,
             autostart: self.autostart(),
-            sources,
+            sources: self.source_views(),
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
         }
     }
@@ -432,22 +435,23 @@ impl AppState {
     /// 任何設定變更後全量推一次
     pub fn emit_config_changed(&self) {
         let _ = self.app.emit("config-changed", self.snapshot());
-        self.refresh_tooltip();
+        self.refresh_tray();
     }
 
-    /// 系統匣提示彙總所有源的出口，例如「Traytunnel - 3/4 connected」
-    pub fn refresh_tooltip(&self) {
-        let enabled = self.config().enabled_locals();
-        let exits = self.exits.lock().unwrap();
-        let connected = enabled
-            .iter()
-            .filter(|p| exits.get(p).map(|r| r.status.as_str()) == Some(status::CONNECTED))
-            .count();
+    /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
+    ///
+    /// 鎖紀律：先取快照（鎖在 `source_views` 裡取完就放掉），之後只碰快照與
+    /// tray API，絕不持鎖呼叫系統匣。
+    pub fn refresh_tray(&self) {
+        let sources = self.source_views();
+        let enabled: Vec<&ExitView> =
+            sources.iter().flat_map(|s| s.exits.iter()).filter(|e| e.enabled).collect();
+        let connected = enabled.iter().filter(|e| e.status == status::CONNECTED).count();
         let text = tooltip_text(connected, enabled.len());
-        drop(exits);
         if let Some(tray) = self.app.tray_by_id(TRAY_ID) {
             let _ = tray.set_tooltip(Some(text));
         }
+        crate::traymenu::refresh(&self.app, &sources);
     }
 }
 
