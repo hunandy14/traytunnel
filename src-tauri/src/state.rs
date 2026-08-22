@@ -260,8 +260,10 @@ impl AppState {
 
     fn push_log(&self, line: String) {
         log::info!("{line}");
-        push_log_line(&mut self.logs.lock().unwrap(), line.clone());
-        let _ = self.app.emit("log", line);
+        // emit 只要 Serialize + Clone，&str 就夠：先借出去推事件，再把整個
+        // String 讓給環形緩衝，一行日誌從頭到尾只配置一次
+        let _ = self.app.emit("log", line.as_str());
+        push_log_line(&mut self.logs.lock().unwrap(), line);
     }
 
     /// 更新某個出口的連線狀態並推事件；狀態沒變就不重複推。
