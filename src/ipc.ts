@@ -16,6 +16,8 @@ import type {
   ForwardInput,
   Snapshot,
   SourceInput,
+  TestConnectionInput,
+  TestConnectionResult,
 } from "./types";
 
 export const getState = () => invoke<Snapshot>("get_state");
@@ -36,6 +38,10 @@ export const upsertSource = (input: SourceInput) =>
   invoke<string | null>("upsert_source", { ...input });
 
 export const deleteSource = (name: string) => invoke<void>("delete_source", { name });
+
+/** 存檔前的手動連線測試，拿表單當下的值 spawn 一次性 ssh，不必先存檔 */
+export const testConnection = (input: TestConnectionInput) =>
+  invoke<TestConnectionResult>("test_connection", { ...input });
 
 // ------------------------------------------------------------ 轉發設定
 

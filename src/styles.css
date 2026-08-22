@@ -876,8 +876,56 @@ body {
   margin-top: 4px;
 }
 
+/* 存檔前連線測試的結果，就地顯示在頁腳正上方那一行 */
+.test-result {
+  display: none;
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 600;
+}
+
+.test-result.show {
+  display: block;
+}
+
+.test-result.ok {
+  color: var(--green);
+}
+
+.test-result.fail {
+  color: var(--red);
+}
+
 .sheet-foot .spacer {
   flex: 1;
+}
+
+/* Test 按鈕測試中：文字讓位給一顆置中的小轉圈 */
+.btn.loading {
+  position: relative;
+  color: transparent !important;
+  pointer-events: none;
+}
+
+.btn.loading::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  color: var(--text);
+  animation: btn-spin 700ms linear infinite;
+}
+
+@keyframes btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ------------------------------------------------------------ 空狀態 */

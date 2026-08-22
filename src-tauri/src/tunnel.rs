@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -22,6 +23,9 @@ const RETRY: Duration = Duration::from_secs(5);
 /// 自己的舊連線剛被收掉時，本地埠可能還殘留幾百毫秒才真的放掉，
 /// 判定 port_busy 前先給這段緩衝再看一次，免得重接時誤報佔用
 const PORT_GRACE: Duration = Duration::from_millis(500);
+/// 連線測試的總上限，涵蓋 spawn 到程序退出的整段等待；
+/// ssh 自己的 ConnectTimeout 管不到 ProxyCommand 卡住的情況，這裡兜底。
+const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 組單一出口的 ssh 參數，每個 token 獨立傳遞，不做字串拼接。
 /// 連線參數一律取自這個出口所屬的源。
@@ -44,6 +48,26 @@ pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
     args.push("-L".into());
     args.push(format!("{}:{}", f.local, f.remote));
     args.push(format!("{}@{}", src.user, src.host));
+    args
+}
+
+/// 組連線測試用的 ssh 參數：一次性登入即退出，不建立任何轉發。
+/// token 一樣逐個獨立傳遞，ProxyCommand 的處理與 build_exit_args 一致，
+/// 只是不帶 -N -L，改用 BatchMode 避免卡在互動提示、ConnectTimeout 讓 ssh
+/// 自己先設一道逾時。
+pub fn build_test_args(user: &str, host: &str, proxy_command: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+    ];
+    if !proxy_command.trim().is_empty() {
+        args.push("-o".into());
+        args.push(format!("ProxyCommand={proxy_command}"));
+    }
+    args.push(format!("{user}@{host}"));
+    args.push("exit".into());
     args
 }
 
@@ -74,6 +98,93 @@ fn spawn_ssh(src: &Source, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
         }
     }
     Ok((child, job, pid))
+}
+
+/// 存檔前的連線測試結果：ok 為 false 時 message 是給使用者看的失敗原因。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestConnectionResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+impl TestConnectionResult {
+    fn ok() -> Self {
+        TestConnectionResult { ok: true, message: "Connected".into() }
+    }
+
+    fn fail(message: impl Into<String>) -> Self {
+        TestConnectionResult { ok: false, message: message.into() }
+    }
+}
+
+/// stderr 逐行讀完，回傳最後一行非空白內容；ssh 的失敗原因（DNS 解析失敗、
+/// 逾時、金鑰被拒……）都在這一行，原樣顯示給使用者就分辨得出來，不必自己再分類。
+async fn last_meaningful_line(stderr: tokio::process::ChildStderr) -> String {
+    let mut last = String::new();
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if !line.trim().is_empty() {
+            last = line;
+        }
+    }
+    last
+}
+
+/// 存檔前的手動連線測試：拿表單當下的值 spawn 一次性 ssh（不建立任何轉發），
+/// 用來讓使用者在存檔前就知道 host／user／ProxyCommand 對不對。
+/// 探測程序一樣掛進 Job Object，函式結束（含逾時）時隨著 Job 一起收掉，不留孤兒。
+pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> TestConnectionResult {
+    let job = match Job::new() {
+        Ok(j) => j,
+        Err(e) => return TestConnectionResult::fail(format!("failed to prepare job object: {e}")),
+    };
+
+    let mut cmd = Command::new("ssh");
+    cmd.args(build_test_args(user, host, proxy_command))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return TestConnectionResult::fail(format!("failed to start ssh: {e}")),
+    };
+    if let Some(handle) = child.raw_handle() {
+        if let Err(e) = job.assign(handle as isize) {
+            log::warn!("test_connection: assign ssh to job object failed: {e}");
+        }
+    }
+
+    let stderr_task =
+        child.stderr.take().map(|s| tauri::async_runtime::spawn(last_meaningful_line(s)));
+
+    let result = match tokio::time::timeout(TEST_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
+            let last_line = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            if status.success() {
+                TestConnectionResult::ok()
+            } else if last_line.is_empty() {
+                TestConnectionResult::fail(format!("ssh exited with {status}"))
+            } else {
+                TestConnectionResult::fail(last_line)
+            }
+        }
+        Ok(Err(e)) => TestConnectionResult::fail(format!("failed to wait for ssh: {e}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            TestConnectionResult::fail("connection test timed out after 15s")
+        }
+    };
+    // job 在這裡被丟掉：無論成功、失敗還是逾時，整棵程序樹（含 ProxyCommand
+    // 生出來的子程序，例如 cloudflared）都會跟著關閉的 handle 一起收掉。
+    drop(job);
+    result
 }
 
 /// 啟動單一出口的監看迴圈；出口不在設定裡就什麼都不做。
@@ -436,5 +547,44 @@ mod tests {
         assert!(port_busy_detail(1080, false).is_none());
         let detail = port_busy_detail(1080, true).expect("佔用時要給 detail");
         assert!(detail.contains("1080"));
+    }
+
+    /// 連線測試不帶 -N -L，只做一次性登入即退出，且要有 BatchMode／ConnectTimeout
+    #[test]
+    fn test_args_are_a_one_shot_login_without_any_forward() {
+        let args = build_test_args("bob", "h.example.com", "");
+        assert_eq!(
+            args,
+            vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "bob@h.example.com", "exit"]
+        );
+        assert!(!args.contains(&"-N".to_string()));
+        assert!(!args.iter().any(|a| a == "-L"));
+    }
+
+    /// 表單有填 ProxyCommand 就照 build_exit_args 的作法帶一個 -o ProxyCommand=
+    #[test]
+    fn test_args_carry_proxy_command_when_present() {
+        let args = build_test_args("alice", "t.example.com", "cloudflared access ssh --hostname %h");
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ProxyCommand=cloudflared access ssh --hostname %h",
+                "alice@t.example.com",
+                "exit",
+            ]
+        );
+    }
+
+    /// 空白（或只有空白）的 ProxyCommand 一樣要省略，跟 build_exit_args 一致
+    #[test]
+    fn test_args_omit_blank_proxy_command() {
+        let args = build_test_args("bob", "h.example.com", "   ");
+        assert!(!args.iter().any(|a| a.starts_with("ProxyCommand=")));
+        assert_eq!(args, vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "bob@h.example.com", "exit"]);
     }
 }

@@ -17,6 +17,7 @@ import {
   openConfigDir,
   setAutostart,
   setCloseToTray,
+  testConnection,
   upsertForward,
   upsertSource,
 } from "./ipc";
@@ -41,6 +42,14 @@ function setFieldError(root: HTMLElement, key: string, msg: string) {
 function setGeneralError(node: HTMLElement, msg: string) {
   node.textContent = msg;
   node.classList.toggle("show", Boolean(msg));
+}
+
+/** Test 按鈕的就地結果：成功綠字、失敗紅字，空字串就整行藏起來 */
+function setTestResult(node: HTMLElement, msg: string, ok: boolean) {
+  node.textContent = msg;
+  node.classList.toggle("show", Boolean(msg));
+  node.classList.toggle("ok", ok);
+  node.classList.toggle("fail", !ok);
 }
 
 function showSheet(node: HTMLElement, focus: HTMLInputElement) {
@@ -88,9 +97,27 @@ let busy = false;
 /** null 代表這是「新增」 */
 let originalName: string | null = null;
 
+let testBusy = false;
+/**
+ * 每次開關 sheet 都遞增，測試中途關掉 sheet 就讓當初送出的那次結果作廢，
+ * 不必真的取消後端探測——反正它自己有 15 秒兜底逾時，函式結束就收乾淨。
+ */
+let testGeneration = 0;
+
 function clearErrors() {
   for (const f of FIELDS) setFieldError(backdrop(), f, "");
   setGeneralError(el<HTMLDivElement>("src-error"), "");
+}
+
+function clearTestResult() {
+  setTestResult(el<HTMLDivElement>("src-test-result"), "", true);
+}
+
+function setTestBusy(next: boolean) {
+  const btn = el<HTMLButtonElement>("src-test");
+  testBusy = next;
+  btn.disabled = next;
+  btn.classList.toggle("loading", next);
 }
 
 /** 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤 */
@@ -141,6 +168,9 @@ export function openSourceSheet(src: SourceInfo | null) {
     : "Delete this connection?";
 
   clearErrors();
+  clearTestResult();
+  setTestBusy(false);
+  testGeneration++;
   showFoot("edit");
   open = true;
   showSheet(backdrop(), input("name"));
@@ -149,6 +179,8 @@ export function openSourceSheet(src: SourceInfo | null) {
 function closeSourceSheet() {
   if (!open) return;
   open = false;
+  // 讓還在飛的測試結果作廢，reopen 之後 gen 對不上就不會被顯示出來
+  testGeneration++;
   hideSheet(backdrop(), () => !open);
 }
 
@@ -186,6 +218,46 @@ async function save() {
   }
 }
 
+/**
+ * 存檔前的連線測試：拿表單「當下」填的值探測，不必先存檔。
+ * 前置驗證只看 host／user（跟 localValidate 用同一套訊息），空白就地顯示
+ * 錯誤、不 spawn；name 是否合法與這裡無關。
+ */
+async function testConnectionNow() {
+  if (testBusy) return;
+  clearTestResult();
+
+  const errors = localValidate();
+  const relevant: Partial<Record<SourceField, string>> = {};
+  if (errors.host) relevant.host = errors.host;
+  if (errors.user) relevant.user = errors.user;
+  const keys = Object.keys(relevant) as SourceField[];
+  if (keys.length > 0) {
+    for (const k of keys) setFieldError(backdrop(), k, relevant[k] as string);
+    return;
+  }
+
+  // gen 對不上就代表 sheet 中途被關掉或重開過（testGeneration 已經前進），
+  // 這時連按鈕狀態都不去動——它早被 open/close 那一刻重置過，不能讓晚到的
+  // 這次回應蓋掉正在跑的下一輪測試。
+  const gen = testGeneration;
+  setTestBusy(true);
+  try {
+    const result = await testConnection({
+      host: input("host").value.trim(),
+      user: input("user").value.trim(),
+      proxyCommand: input("proxyCommand").value.trim(),
+    });
+    if (gen !== testGeneration) return;
+    setTestBusy(false);
+    setTestResult(el<HTMLDivElement>("src-test-result"), result.message, result.ok);
+  } catch (e) {
+    if (gen !== testGeneration) return;
+    setTestBusy(false);
+    setTestResult(el<HTMLDivElement>("src-test-result"), String(e), false);
+  }
+}
+
 async function commitDelete() {
   const target = originalName;
   if (!target || busy) return;
@@ -211,6 +283,7 @@ export function initSourceSheet(h: Handlers) {
   el<HTMLButtonElement>("src-close").addEventListener("click", closeSourceSheet);
   el<HTMLButtonElement>("src-cancel").addEventListener("click", closeSourceSheet);
   el<HTMLButtonElement>("src-save").addEventListener("click", () => void save());
+  el<HTMLButtonElement>("src-test").addEventListener("click", () => void testConnectionNow());
 
   el<HTMLButtonElement>("src-delete").addEventListener("click", () => showFoot("confirm"));
   el<HTMLButtonElement>("src-confirm-no").addEventListener("click", () => showFoot("edit"));
@@ -222,7 +295,11 @@ export function initSourceSheet(h: Handlers) {
 
   for (const f of FIELDS) {
     const node = input(f);
-    node.addEventListener("input", () => setFieldError(backdrop(), f, ""));
+    node.addEventListener("input", () => {
+      setFieldError(backdrop(), f, "");
+      // 欄位改過了，舊的測試結果已經不對這一份表單負責，藏起來避免誤導
+      clearTestResult();
+    });
     node.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void save();
     });

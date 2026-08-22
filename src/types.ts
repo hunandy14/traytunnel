@@ -82,3 +82,16 @@ export interface ForwardInput {
   local: number;
   remote: string;
 }
+
+/** test_connection 的輸入：拿表單當下的值測，不必先存檔 */
+export interface TestConnectionInput {
+  host: string;
+  user: string;
+  proxyCommand: string;
+}
+
+/** test_connection 的回傳：ok 為 false 時 message 是 ssh 失敗原因的最後一行 */
+export interface TestConnectionResult {
+  ok: boolean;
+  message: string;
+}
