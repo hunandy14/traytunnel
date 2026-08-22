@@ -320,4 +320,35 @@ mod tests {
             "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\traytunnel"
         );
     }
+
+    /// tauri.conf.json 的 plugins.updater 一旦寫壞（少了 pubkey、endpoint 不是
+    /// 合法網址），外掛會在 setup 階段回 Err，`run()` 當場 panic——使用者連視窗
+    /// 都看不到。那是執行期才會爆的東西，這裡拿我們真的會發佈的那份設定解析一次，
+    /// 把它擋在 CI。
+    #[test]
+    fn the_shipped_updater_config_parses() {
+        let raw = include_str!("../tauri.conf.json");
+        let conf: serde_json::Value =
+            serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
+
+        let updater = conf.pointer("/plugins/updater").expect("plugins.updater 不可以消失");
+        let parsed: tauri_plugin_updater::Config =
+            serde_json::from_value(updater.clone()).expect("updater 設定要解析得出來");
+
+        assert!(!parsed.pubkey.is_empty(), "沒有公鑰就驗不了簽章");
+        assert_eq!(parsed.endpoints.len(), 1);
+        let endpoint = &parsed.endpoints[0];
+        assert_eq!(endpoint.scheme(), "https", "非 https 的 endpoint 在 release 建置會被拒絕");
+        assert!(endpoint.as_str().ends_with("/latest.json"), "{endpoint}");
+
+        // 安裝走 passive（NSIS 的 /P /R）：使用者只看到進度條，裝完自動重啟
+        let windows = parsed.windows.expect("windows 區塊要在");
+        assert_eq!(windows.install_mode.to_string(), "passive");
+
+        // 沒有這一項就簽不出 .sig，release workflow 組 latest.json 那步會直接失敗
+        assert_eq!(
+            conf.pointer("/bundle/createUpdaterArtifacts"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
 }
