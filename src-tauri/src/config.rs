@@ -616,9 +616,13 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
 /// `MoveFileEx` 帶 REPLACE_EXISTING），使用者手上永遠只會看到完整的舊版或新版。
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, contents)?;
+    // 寫到一半失敗（最典型的就是磁碟寫滿）時，暫存檔已經開出來而且是半截的，
+    // 一樣要清掉——「不留半成品」的承諾得涵蓋兩種失敗，不是只有換名那一種
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
-        // 換名失敗就別把半成品留在使用者的設定資料夾裡
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
