@@ -1,4 +1,5 @@
 import { bootstrap } from "./bootstrap";
+import { installContextMenuGuard } from "./context-menu";
 import { el, h } from "./dom";
 import {
   deleteForward,
@@ -826,6 +827,8 @@ async function init() {
   }
   await loadSnapshot();
 }
+
+installContextMenuGuard();
 
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
