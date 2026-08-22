@@ -43,7 +43,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 # 開始選單捷徑要走 COM（IShellLinkW + IPropertyStore），用高階綁定省掉手刻 vtable
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
