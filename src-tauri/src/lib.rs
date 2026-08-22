@@ -477,6 +477,13 @@ fn test_exit(state: State<'_, Shared>, local: u16) {
     tunnel::test_exit(&state.inner().clone(), local);
 }
 
+/// 存檔前的連線測試：拿表單當下（不一定已存檔）的值 spawn 一次性 ssh，
+/// async 執行不擋住 UI 執行緒，成功與否＋訊息直接回傳，不走事件。
+#[tauri::command]
+async fn test_connection(host: String, user: String, proxy_command: String) -> tunnel::TestConnectionResult {
+    tunnel::test_connection(user.trim(), host.trim(), proxy_command.trim()).await
+}
+
 #[tauri::command]
 fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
     let st = state.inner().clone();
@@ -568,6 +575,7 @@ pub fn run() {
             upsert_forward,
             delete_forward,
             test_exit,
+            test_connection,
             set_close_to_tray,
             set_autostart,
             get_config_path,

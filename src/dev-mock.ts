@@ -10,7 +10,14 @@
 
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { ExitInfo, ExitStatus, Snapshot, SourceInfo, TestState } from "./types";
+import type {
+  ExitInfo,
+  ExitStatus,
+  Snapshot,
+  SourceInfo,
+  TestConnectionResult,
+  TestState,
+} from "./types";
 
 const STORE_KEY = "traytunnel-dev-mock-v3";
 
@@ -254,6 +261,24 @@ function validateSource(input: {
   return null;
 }
 
+// ---------------------------------------------------------------- 連線測試
+
+/** 演一下真後端的延遲感：spawn ssh、等它跑完，總要花一點時間 */
+const TEST_CONNECTION_DELAY_MS = 1500;
+
+/**
+ * host 是假資料裡既有的主機名就演成功，其他一律演失敗，訊息照 ssh 真實會印的
+ * 那種「無法解析主機名」樣式，讓瀏覽器模式也能演示兩種結果。
+ */
+function fakeTestConnection(host: string): TestConnectionResult {
+  const known = state.sources.some((s) => s.host === host);
+  if (known) return { ok: true, message: "Connected" };
+  return {
+    ok: false,
+    message: `ssh: Could not resolve hostname ${host}: Name or service not known`,
+  };
+}
+
 // ---------------------------------------------------------------- 指令
 
 interface Args {
@@ -347,6 +372,13 @@ function handle(cmd: string, args: Args): unknown {
         log(input.name, `source added (${input.user}@${input.host})`);
       }
       return null;
+    }
+
+    case "test_connection": {
+      const host = (args.host ?? "").trim();
+      return new Promise<TestConnectionResult>((resolve) => {
+        window.setTimeout(() => resolve(fakeTestConnection(host)), TEST_CONNECTION_DELAY_MS);
+      });
     }
 
     case "delete_source": {
