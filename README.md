@@ -98,6 +98,16 @@ npm run dev
 
 免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成 `p` 結尾（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見下方「設定檔」）。
 
+### 版本管理
+
+單一權威是 `src-tauri/tauri.conf.json` 的 `version`，`src-tauri/Cargo.toml`（`[package]`）與 `package.json` 是惰性副本，三處平常要保持一致。升版一律用：
+
+```
+npm run bump <x.y.z>
+```
+
+會驗參數是嚴格 semver、確認三處現值一致後才動手改，改完不會自動 commit、不會自動 tag，只印一行建議指令供複製。下次建置時 `Cargo.lock` 裡的版號會跟著更新，記得跟三個檔案一併提交。
+
 ## 設定檔
 
 設定檔的位置在啟動時解析一次，優先序如下：

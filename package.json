@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "build:exe": "tauri build --no-bundle && node scripts/package.mjs",
     "build:setup": "tauri build --bundles nsis && node scripts/package.mjs",
-    "build:all": "tauri build && node scripts/package.mjs"
+    "build:all": "tauri build && node scripts/package.mjs",
+    "bump": "node scripts/bump.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"
