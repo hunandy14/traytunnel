@@ -14,36 +14,37 @@ pub enum ExitTest {
 
 /// 本地 SOCKS5 代理的 URL。
 ///
-/// 注意這裡只能寫 `socks5://`，不能寫 `socks5h://`：ureq 2.x 的 Proxy 只認得
-/// http／socks4／socks4a／socks／socks5，遇到 socks5h 會直接回 Err，探測會在
-/// 送出請求前就失敗。DNS 本來就已經走代理——ureq 對 SOCKS5 且目標不是 IP 字面值
-/// 時，會把主機名以 TargetAddr::Domain 交給代理解析，等同 curl --socks5-hostname。
+/// 這裡一定要寫 `socks5h://`，不能寫 `socks5://`：ureq 3.2 起把兩者分開了——
+/// `socks5://` 會先用本機 DNS 解出 IP 再交給代理，`socks5h://` 才是把主機名整個
+/// 丟給代理去解析（等同 curl --socks5-hostname）。ureq 2 的 `socks5://` 是後者的
+/// 行為，所以升到 3 之後要改寫成 `socks5h://` 才維持得住「DNS 也走代理」。
 fn proxy_url(port: u16) -> String {
-    format!("socks5://127.0.0.1:{port}")
+    format!("socks5h://127.0.0.1:{port}")
 }
 
 /// 阻塞式檢測，呼叫端請丟到 blocking 執行緒上跑。
 pub fn probe(port: u16) -> ExitTest {
-    let proxy = match ureq::Proxy::new(proxy_url(port)) {
+    let proxy = match ureq::Proxy::new(&proxy_url(port)) {
         Ok(p) => p,
         Err(e) => {
             log::warn!("exit test port {port}: bad proxy url: {e}");
             return ExitTest::Fail("no response");
         }
     };
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .proxy(proxy)
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(TIMEOUT_SECS)))
+        .proxy(Some(proxy))
         .build();
+    let agent = ureq::Agent::new_with_config(config);
 
-    let resp = match agent.get(URL).call() {
+    let mut resp = match agent.get(URL).call() {
         Ok(r) => r,
         Err(e) => {
             log::warn!("exit test port {port}: request failed: {e}");
             return ExitTest::Fail("no response");
         }
     };
-    let body: serde_json::Value = match resp.into_json() {
+    let body: serde_json::Value = match resp.body_mut().read_json() {
         Ok(v) => v,
         Err(e) => {
             log::warn!("exit test port {port}: response not json: {e}");
@@ -67,7 +68,16 @@ mod tests {
     /// 否則探測會在送出請求前就失敗，UI 上看起來像瞬間 no response。
     #[test]
     fn proxy_url_is_accepted_by_ureq() {
-        assert!(ureq::Proxy::new(proxy_url(1080)).is_ok());
+        assert!(ureq::Proxy::new(&proxy_url(1080)).is_ok());
+    }
+
+    /// DNS 一定要走代理：ureq 3 用 resolve_target 區分，socks5h 才是「不在本機解析」。
+    /// 這條釘住 scheme，避免哪天有人手滑改回 socks5://。
+    #[test]
+    fn proxy_does_not_resolve_target_locally() {
+        let proxy = ureq::Proxy::new(&proxy_url(1080)).unwrap();
+        assert_eq!(proxy.protocol(), ureq::ProxyProtocol::Socks5h);
+        assert!(!proxy.resolve_target(), "主機名要交給代理解析，不能在本機先解 DNS");
     }
 
     /// 實機驗證用，預設不跑：
