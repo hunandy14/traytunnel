@@ -466,18 +466,28 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        self.snapshot_with(self.source_views())
+    }
+
+    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
+    fn snapshot_with(&self, sources: Vec<SourceView>) -> Snapshot {
         Snapshot {
             close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
-            sources: self.source_views(),
+            sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
         }
     }
 
-    /// 任何設定變更後全量推一次
+    /// 任何設定變更後全量推一次。
+    ///
+    /// 前端的 Snapshot 與系統匣選單吃的是同一份 `source_views`，算一次就好：
+    /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
+    /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let _ = self.app.emit("config-changed", self.snapshot());
-        self.refresh_tray();
+        let sources = self.source_views();
+        self.refresh_tray_with(&sources);
+        let _ = self.app.emit("config-changed", self.snapshot_with(sources));
     }
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
@@ -486,9 +496,13 @@ impl AppState {
     /// 真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     /// 號碼牌緊貼快照配出，中間不插任何事，才不會有「號碼新、快照舊」的交錯。
     pub fn refresh_tray(&self) {
-        let sources = self.source_views();
+        self.refresh_tray_with(&self.source_views());
+    }
+
+    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
+    fn refresh_tray_with(&self, sources: &[SourceView]) {
         let seq = crate::traymenu::next_seq();
-        crate::traymenu::refresh(&self.app, &sources, seq);
+        crate::traymenu::refresh(&self.app, sources, seq);
     }
 }
 
