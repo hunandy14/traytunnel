@@ -74,11 +74,21 @@ npm run dev
 
 三個指令，差別只在要不要順便打包安裝檔：
 
-| 指令 | 做什麼 | 產物 |
-| --- | --- | --- |
-| `npm run build:exe` | 只編免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 | `src-tauri/target/release/traytunnel.exe` |
-| `npm run build:setup` | 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） | 上面那個 exe，加上 `src-tauri/target/release/bundle/nsis/traytunnel_<版本>_x64-setup.exe` |
-| `npm run build:all` | 走設定檔裡列的全部 bundle 目標（`tauri build`），要發佈時用 | 同上，未來若加了別的 bundle 目標也會一起產出 |
+| 指令 | 做什麼 |
+| --- | --- |
+| `npm run build:exe` | 只編免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
+| `npm run build:setup` | 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
+| `npm run build:all` | 走設定檔裡列的全部 bundle 目標（`tauri build`），要發佈時用 |
+
+三個指令都會在建置後跑 `node scripts/package.mjs`，把產物複製成發佈用的檔名放進根目錄的 `out/`（每次重跑會先清空）：
+
+| 發佈檔 | 說明 |
+| --- | --- |
+| `out/traytunnel-<版本>.exe` | 一般單檔，設定檔走 `%USERPROFILE%\.traytunnel.toml` |
+| `out/traytunnel-<版本>p.exe` | 可攜版。**與上面同一顆二進位**，差別只在檔名結尾的 `p`——那個 p 就是可攜模式的記號，設定檔改放 exe 旁邊 |
+| `out/traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
+
+版本號取自 `src-tauri/tauri.conf.json` 的 `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
 
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 

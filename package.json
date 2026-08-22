@@ -8,9 +8,9 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:exe": "tauri build --no-bundle",
-    "build:setup": "tauri build --bundles nsis",
-    "build:all": "tauri build"
+    "build:exe": "tauri build --no-bundle && node scripts/package.mjs",
+    "build:setup": "tauri build --bundles nsis && node scripts/package.mjs",
+    "build:all": "tauri build && node scripts/package.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"
