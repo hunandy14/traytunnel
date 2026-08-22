@@ -300,8 +300,7 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
 /// 勾選＝設定裡的 enabled，所以點一下就是反過來
 fn toggle_exit(st: &Shared, local: u16) {
     match st.with_config(|c| c.forward(local).map(|f| f.enabled)) {
-        Some(true) => commands::disable_exit(st, local),
-        Some(false) => commands::enable_exit(st, local),
+        Some(enabled) => commands::set_exit_enabled(st, local, !enabled),
         // 選單比設定舊了（出口已經被刪掉），重建一次讓它跟上
         None => {
             st.log(format!("port {local} : no such exit"));
@@ -312,11 +311,8 @@ fn toggle_exit(st: &Shared, local: u16) {
 
 /// 有任何出口 enabled 就是 Stop all，全停時就是 Start all
 fn toggle_all(st: &Shared) {
-    if st.with_config(|c| c.enabled_locals().is_empty()) {
-        commands::enable_all(st);
-    } else {
-        commands::disable_all(st);
-    }
+    let all_stopped = st.with_config(|c| c.enabled_locals().is_empty());
+    commands::set_all_enabled(st, all_stopped);
 }
 
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {

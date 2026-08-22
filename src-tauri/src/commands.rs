@@ -26,6 +26,21 @@ fn save_error_message(st: &Shared, e: std::io::Error) -> String {
     format!("{SAVE_FAILED}:\n{e}")
 }
 
+/// enable／disable 三對指令存檔成功之後的共同收尾。
+///
+/// 事件與隧道動作的先後**刻意不對稱**，不可以為了整齊而統一：
+/// 連接時先推事件再拉線，介面立刻看得到 connecting，隧道慢慢接上；
+/// 中斷時先停線再推事件，介面上不會出現「已停用但還連著」的那一瞬。
+fn apply_enabled(st: &Shared, on: bool, start: impl FnOnce(), halt: impl FnOnce()) {
+    if on {
+        st.emit_config_changed();
+        start();
+    } else {
+        halt();
+        st.emit_config_changed();
+    }
+}
+
 /// 存檔，失敗時記一行並回 false。
 ///
 /// 指令層的通則：設定沒存成功就什麼都不要做——隧道不停、事件不推，因為
@@ -65,15 +80,15 @@ pub fn require_source(st: &Shared, name: &str) -> bool {
     true
 }
 
-/// 連接單一出口：記住使用者的選擇（enabled=true）後再拉線。
+/// 連接／中斷單一出口：先把使用者的選擇（enabled）持久化，成功了才動隧道。
 /// 前端指令與系統匣選單共用這裡，不繞 invoke。
-pub fn enable_exit(st: &Shared, local: u16) {
+pub fn set_exit_enabled(st: &Shared, local: u16, on: bool) {
     if !require_exit(st, local) {
         return;
     }
     if !save(st, |c| {
         if let Some(f) = c.forward_mut(local) {
-            f.enabled = true;
+            f.enabled = on;
         }
     }) {
         // 存檔失敗代表 enabled 沒改成，但系統匣的勾選已經被原生選單自己翻掉了，
@@ -81,36 +96,17 @@ pub fn enable_exit(st: &Shared, local: u16) {
         st.refresh_tray();
         return;
     }
-    st.emit_config_changed();
-    tunnel::start(st, local);
-}
-
-/// 中斷單一出口：enabled=false 並持久化，重開程式也不會自己連回來
-pub fn disable_exit(st: &Shared, local: u16) {
-    if !require_exit(st, local) {
-        return;
-    }
-    if !save(st, |c| {
-        if let Some(f) = c.forward_mut(local) {
-            f.enabled = false;
-        }
-    }) {
-        // 同上：勾選已被原生選單翻掉，設定卻沒改成，重建把它拉回真值
-        st.refresh_tray();
-        return;
-    }
-    tunnel::halt(st, local);
-    st.emit_config_changed();
+    apply_enabled(st, on, || tunnel::start(st, local), || tunnel::halt(st, local));
 }
 
 #[tauri::command]
 pub fn start_exit(state: State<'_, Shared>, local: u16) {
-    enable_exit(state.inner(), local);
+    set_exit_enabled(state.inner(), local, true);
 }
 
 #[tauri::command]
 pub fn stop_exit(state: State<'_, Shared>, local: u16) {
-    disable_exit(state.inner(), local);
+    set_exit_enabled(state.inner(), local, false);
 }
 
 /// 重接單一出口：halt 後立刻 start，套用最新設定。
@@ -139,79 +135,54 @@ pub fn restart_exit(state: State<'_, Shared>, local: u16) {
 /// 連接一個源底下全部的出口
 #[tauri::command]
 pub fn start_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner();
-    if !require_source(st, &name) {
-        return;
-    }
-    if !save(st, |c| {
-        if let Some(s) = c.source_mut(&name) {
-            for f in s.forwards.iter_mut() {
-                f.enabled = true;
-            }
-        }
-    }) {
-        return;
-    }
-    st.emit_config_changed();
-    tunnel::start_source(st, &name);
+    set_source_enabled(state.inner(), &name, true);
 }
 
 /// 中斷一個源底下全部的出口
 #[tauri::command]
 pub fn stop_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner();
-    if !require_source(st, &name) {
+    set_source_enabled(state.inner(), &name, false);
+}
+
+/// 連接／中斷一個源底下全部的出口
+fn set_source_enabled(st: &Shared, name: &str, on: bool) {
+    if !require_source(st, name) {
         return;
     }
     if !save(st, |c| {
-        if let Some(s) = c.source_mut(&name) {
+        if let Some(s) = c.source_mut(name) {
             for f in s.forwards.iter_mut() {
-                f.enabled = false;
+                f.enabled = on;
             }
         }
     }) {
         return;
     }
-    tunnel::halt_source(st, &name);
-    st.emit_config_changed();
+    apply_enabled(st, on, || tunnel::start_source(st, name), || tunnel::halt_source(st, name));
 }
 
-/// 全部連接：跨源把 enabled 全開再拉線
-pub fn enable_all(st: &Shared) {
-    if !save(st, set_all_enabled(true)) {
-        return;
-    }
-    st.emit_config_changed();
-    tunnel::start_enabled(st);
-}
-
-/// 全部中斷
-pub fn disable_all(st: &Shared) {
-    if !save(st, set_all_enabled(false)) {
-        return;
-    }
-    tunnel::halt_all(st);
-    st.emit_config_changed();
-}
-
-#[tauri::command]
-pub fn start_all(state: State<'_, Shared>) {
-    enable_all(state.inner());
-}
-
-#[tauri::command]
-pub fn stop_all(state: State<'_, Shared>) {
-    disable_all(state.inner());
-}
-
-fn set_all_enabled(on: bool) -> impl FnOnce(&mut Config) {
-    move |c: &mut Config| {
+/// 全部連接／全部中斷：跨源把 enabled 一起翻過去
+pub fn set_all_enabled(st: &Shared, on: bool) {
+    if !save(st, |c| {
         for s in c.sources.iter_mut() {
             for f in s.forwards.iter_mut() {
                 f.enabled = on;
             }
         }
+    }) {
+        return;
     }
+    apply_enabled(st, on, || tunnel::start_enabled(st), || tunnel::halt_all(st));
+}
+
+#[tauri::command]
+pub fn start_all(state: State<'_, Shared>) {
+    set_all_enabled(state.inner(), true);
+}
+
+#[tauri::command]
+pub fn stop_all(state: State<'_, Shared>) {
+    set_all_enabled(state.inner(), false);
 }
 
 /// 新增或編輯連線源，originalName 為 None 代表新增；回傳 None 代表成功。
