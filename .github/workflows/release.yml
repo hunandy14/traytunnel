@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要完整歷史與所有 tag，workflow_dispatch 才驗得到既有 tag 是否存在
+          fetch-depth: 0
+
+      # 版本防呆：tag 觸發時比對 tag（去 v）與 Cargo.toml version，
+      # workflow_dispatch 則以 Cargo.toml 為準並確認對應 tag 已存在。
+      # windows-latest 預設 shell 是 pwsh，這裡明定 shell 並用 PowerShell 語法。
+      - name: Resolve release version and tag
+        id: resolve
+        shell: pwsh
+        run: |
+          $cargoTomlPath = "src-tauri/Cargo.toml"
+          $lines = Get-Content $cargoTomlPath
+          $inPackage = $false
+          $version = $null
+          foreach ($line in $lines) {
+            if ($line -match '^\[package\]\s*$') { $inPackage = $true; continue }
+            if ($line -match '^\[.*\]\s*$') { $inPackage = $false; continue }
+            if ($inPackage -and $line -match '^version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+              break
+            }
+          }
+          if (-not $version) {
+            Write-Error "$cargoTomlPath 的 [package] 區塊找不到 version"
+            exit 1
+          }
+          Write-Host "Cargo.toml 版本：$version"
+
+          if ("${{ github.event_name }}" -eq "push") {
+            $tagName = "${{ github.ref_name }}"
+            $tagVersion = $tagName -replace '^v', ''
+            if ($tagVersion -ne $version) {
+              Write-Error "Tag $tagName 與 src-tauri/Cargo.toml 的版本 $version 不一致，請確認後重新打 tag"
+              exit 1
+            }
+            $releaseTag = $tagName
+          } else {
+            $releaseTag = "v$version"
+            $exists = git tag -l $releaseTag
+            if ([string]::IsNullOrWhiteSpace($exists)) {
+              Write-Error "workflow_dispatch 手動觸發，但 tag $releaseTag 不存在——請先 npm run bump、commit、git tag $releaseTag 並 git push --tags，再重新執行本 workflow"
+              exit 1
+            }
+            Write-Host "workflow_dispatch：沿用既有 tag $releaseTag"
+          }
+
+          Write-Host "Release tag：$releaseTag"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Rust (stable-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build all targets
+        run: npm run build:all
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.release_tag }}
+          name: v${{ steps.resolve.outputs.version }}
+          files: out/*.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
