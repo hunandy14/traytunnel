@@ -84,20 +84,20 @@ pub fn disable_exit(st: &Shared, local: u16) {
 
 #[tauri::command]
 pub fn start_exit(state: State<'_, Shared>, local: u16) {
-    enable_exit(&state.inner().clone(), local);
+    enable_exit(state.inner(), local);
 }
 
 #[tauri::command]
 pub fn stop_exit(state: State<'_, Shared>, local: u16) {
-    disable_exit(&state.inner().clone(), local);
+    disable_exit(state.inner(), local);
 }
 
 /// 重接單一出口：halt 後立刻 start，套用最新設定。
 /// 停用中的出口按重接視同要它連起來，順手把 enabled 補成 true。
 #[tauri::command]
 pub fn restart_exit(state: State<'_, Shared>, local: u16) {
-    let st = state.inner().clone();
-    if !require_exit(&st, local) {
+    let st = state.inner();
+    if !require_exit(st, local) {
         return;
     }
     let enabled = st.with_config(|c| c.forward(local).is_some_and(|f| f.enabled));
@@ -107,20 +107,20 @@ pub fn restart_exit(state: State<'_, Shared>, local: u16) {
                 f.enabled = true;
             }
         }) {
-            report_save_error(&st, e);
+            report_save_error(st, e);
             return;
         }
         st.emit_config_changed();
     }
     st.log_exit(local, format!("port {local} : restarting"));
-    tunnel::restart(&st, local);
+    tunnel::restart(st, local);
 }
 
 /// 連接一個源底下全部的出口
 #[tauri::command]
 pub fn start_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner().clone();
-    if !require_source(&st, &name) {
+    let st = state.inner();
+    if !require_source(st, &name) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -130,18 +130,18 @@ pub fn start_source(state: State<'_, Shared>, name: String) {
             }
         }
     }) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
     st.emit_config_changed();
-    tunnel::start_source(&st, &name);
+    tunnel::start_source(st, &name);
 }
 
 /// 中斷一個源底下全部的出口
 #[tauri::command]
 pub fn stop_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner().clone();
-    if !require_source(&st, &name) {
+    let st = state.inner();
+    if !require_source(st, &name) {
         return;
     }
     if let Err(e) = st.update_config(|c| {
@@ -151,10 +151,10 @@ pub fn stop_source(state: State<'_, Shared>, name: String) {
             }
         }
     }) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
-    tunnel::halt_source(&st, &name);
+    tunnel::halt_source(st, &name);
     st.emit_config_changed();
 }
 
@@ -180,12 +180,12 @@ pub fn disable_all(st: &Shared) {
 
 #[tauri::command]
 pub fn start_all(state: State<'_, Shared>) {
-    enable_all(&state.inner().clone());
+    enable_all(state.inner());
 }
 
 #[tauri::command]
 pub fn stop_all(state: State<'_, Shared>) {
-    disable_all(&state.inner().clone());
+    disable_all(state.inner());
 }
 
 fn set_all_enabled(on: bool) -> impl FnOnce(&mut Config) {
@@ -209,7 +209,7 @@ pub fn upsert_source(
     user: String,
     proxy_command: String,
 ) -> Option<String> {
-    let st = state.inner().clone();
+    let st = state.inner();
     let name = name.trim().to_string();
     let host = host.trim().to_string();
     let user = user.trim().to_string();
@@ -249,7 +249,7 @@ pub fn upsert_source(
         }),
     }) {
         let msg = format!("Failed to save settings:\n{e}");
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return Some(msg);
     }
 
@@ -263,7 +263,7 @@ pub fn upsert_source(
     );
     if changed {
         st.log_from(&name, "connection settings changed, restarting running exits");
-        tunnel::restart_running_in_source(&st, &name);
+        tunnel::restart_running_in_source(st, &name);
     }
     None
 }
@@ -271,8 +271,8 @@ pub fn upsert_source(
 /// 刪源，底下的出口先全部停掉；刪到零源也是允許的
 #[tauri::command]
 pub fn delete_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner().clone();
-    if !require_source(&st, &name) {
+    let st = state.inner();
+    if !require_source(st, &name) {
         return;
     }
     // 先存檔成功才停線。反過來做的話，存檔失敗就會留下「隧道已經停了、設定裡卻還
@@ -281,11 +281,11 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
         c.source(&name).map(|s| s.forwards.iter().map(|f| f.local).collect()).unwrap_or_default()
     });
     if let Err(e) = st.update_config(|c| c.sources.retain(|s| s.name != name)) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
     for p in ports {
-        tunnel::halt(&st, p);
+        tunnel::halt(st, p);
     }
     st.emit_config_changed();
     st.log(format!("source {name} deleted"));
@@ -302,7 +302,7 @@ pub fn upsert_forward(
     local: u16,
     remote: String,
 ) -> Option<String> {
-    let st = state.inner().clone();
+    let st = state.inner();
     // 查源、抄原本的 enabled、正規化與驗證，全部看同一份設定
     let prepared = st.with_config(|c| {
         if c.source(&source).is_none() {
@@ -335,14 +335,14 @@ pub fn upsert_forward(
         }
     }) {
         let msg = format!("Failed to save settings:\n{e}");
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return Some(msg);
     }
 
     // 存檔成功之後才停掉舊的那條線（換埠或換源時舊埠也才會放掉）。存檔失敗時
     // 什麼都還沒動，隧道照舊跑著，不會出現「線停了、設定沒改成」的錯位。
     if let Some(orig) = original_local {
-        tunnel::halt(&st, orig);
+        tunnel::halt(st, orig);
     }
 
     st.emit_config_changed();
@@ -354,7 +354,7 @@ pub fn upsert_forward(
         },
     );
     if was_enabled {
-        tunnel::start(&st, local);
+        tunnel::start(st, local);
     }
     None
 }
@@ -362,7 +362,7 @@ pub fn upsert_forward(
 /// 刪出口，運行中的先停掉
 #[tauri::command]
 pub fn delete_forward(state: State<'_, Shared>, local: u16) {
-    let st = state.inner().clone();
+    let st = state.inner();
     let names = st.with_config(|c| c.locate(local).map(|(s, f)| (s.name.clone(), f.name.clone())));
     let Some((sname, fname)) = names else {
         st.log(format!("port {local} : no such exit"));
@@ -374,22 +374,22 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
             s.forwards.retain(|f| f.local != local);
         }
     }) {
-        report_save_error(&st, e);
+        report_save_error(st, e);
         return;
     }
-    tunnel::halt(&st, local);
+    tunnel::halt(st, local);
     st.emit_config_changed();
     st.log_from(&sname, format!("{fname} deleted"));
 }
 
 #[tauri::command]
 pub fn test_exit(state: State<'_, Shared>, local: u16) {
-    tunnel::test_exit(&state.inner().clone(), local);
+    tunnel::test_exit(state.inner(), local);
 }
 
 #[tauri::command]
 pub fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
-    let st = state.inner().clone();
+    let st = state.inner();
     st.update_config(|c| c.close_to_tray = on)
         .map_err(|e| format!("Failed to save settings:\n{e}"))?;
     st.emit_config_changed();
@@ -399,7 +399,7 @@ pub fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), Strin
 
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Result<(), String> {
-    let st = state.inner().clone();
+    let st = state.inner();
     let result = if on { app.autolaunch().enable() } else { app.autolaunch().disable() };
     result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
     st.log(if on { "autostart enabled" } else { "autostart disabled" });
@@ -416,7 +416,7 @@ pub fn get_config_path(state: State<'_, Shared>) -> String {
 /// 在檔案總管裡開啟設定檔所在資料夾，並選中設定檔本身
 #[tauri::command]
 pub fn open_config_dir(state: State<'_, Shared>) {
-    let st = state.inner().clone();
+    let st = state.inner();
     if let Err(e) = winsys::reveal_in_explorer(&st.path) {
         st.log(format!("could not open the config folder: {e}"));
     }
@@ -424,7 +424,7 @@ pub fn open_config_dir(state: State<'_, Shared>) {
 
 #[tauri::command]
 pub fn window_close(state: State<'_, Shared>) {
-    close_main(&state.inner().clone());
+    close_main(state.inner());
 }
 
 #[tauri::command]
@@ -436,5 +436,5 @@ pub fn window_minimize(app: AppHandle) {
 
 #[tauri::command]
 pub fn exit_app(state: State<'_, Shared>) {
-    do_exit(&state.inner().clone());
+    do_exit(state.inner());
 }
