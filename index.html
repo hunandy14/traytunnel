@@ -192,6 +192,43 @@
       </div>
     </div>
 
+    <!-- 隧道的新增／編輯 sheet（與源編輯共用同一套 .sheet 元件） -->
+    <div class="sheet-backdrop" id="fwd-backdrop" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="Tunnel">
+        <header class="sheet-head">
+          <span class="sheet-title" id="fwd-title">Edit tunnel</span>
+          <button class="tbtn" id="fwd-close" title="Close">&#xE8BB;</button>
+        </header>
+
+        <div class="sheet-body">
+          <label class="sheet-field field-name">
+            <span class="edit-label">Name</span>
+            <span class="input"><input id="fwd-name" spellcheck="false" placeholder="socks" /></span>
+            <span class="field-error"></span>
+          </label>
+          <label class="sheet-field field-local">
+            <span class="edit-label">Local port</span>
+            <span class="input"><input id="fwd-local" class="mono" spellcheck="false" placeholder="1080" /></span>
+            <span class="field-error"></span>
+          </label>
+          <label class="sheet-field field-remote">
+            <span class="edit-label">Remote</span>
+            <span class="input"><input id="fwd-remote" class="mono" spellcheck="false" placeholder="1080（伺服器本機）或 host:port" /></span>
+            <span class="field-error"></span>
+          </label>
+
+          <div class="field-error general" id="fwd-error"></div>
+        </div>
+
+        <footer class="sheet-foot">
+          <button class="btn danger-ghost" id="fwd-delete">Delete</button>
+          <div class="spacer"></div>
+          <button class="btn ghost" id="fwd-cancel">Cancel</button>
+          <button class="btn primary" id="fwd-save">Save</button>
+        </footer>
+      </div>
+    </div>
+
     <div class="toast-stack" id="toasts"></div>
   </body>
 </html>
