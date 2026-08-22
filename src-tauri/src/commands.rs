@@ -433,6 +433,13 @@ pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
     update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
 }
 
+/// 可攜／單檔版的「Download」：開系統瀏覽器到 Releases 頁，剩下的交給使用者。
+/// 這條路不下載任何東西，也不會動到執行中的這顆 exe。
+#[tauri::command]
+pub fn open_releases_page(state: State<'_, Shared>) {
+    update::open_releases_page(state.inner());
+}
+
 #[tauri::command]
 pub fn window_close(state: State<'_, Shared>) {
     close_main(state.inner());

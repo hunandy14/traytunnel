@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use semver::Version;
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -29,6 +30,20 @@ const FIRST_DELAY: Duration = Duration::from_secs(8);
 
 /// 常駐期間的檢查間隔
 const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 更新資訊清單。安裝版由 updater 外掛（tauri.conf.json 的 endpoints）去拿，
+/// 非安裝版由下面的 `fetch_latest_version` 自己拿，兩邊指向同一份檔案。
+const LATEST_JSON: &str =
+    "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
+
+/// 非安裝版按下 Download 時開的頁面
+const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
+
+/// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
+const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
 /// NSIS（currentUser 模式）寫解除安裝資訊的機碼位置。
 ///
@@ -98,10 +113,12 @@ pub fn spawn_checker(state: &Shared) {
 /// 查一次。任何失敗都只記一行就算了——更新檢查不成功不影響程式本身能不能用，
 /// 沒有理由為它彈通知或改變任何狀態。
 async fn check_once(st: &Shared) {
-    if !is_installed(&st.app) {
-        return;
-    }
-    match check_installed(&st.app).await {
+    let found = if is_installed(&st.app) {
+        check_installed(&st.app).await
+    } else {
+        check_unmanaged(&st.app).await
+    };
+    match found {
         Ok(found) => st.set_update(found),
         Err(e) => st.log(format!("update check failed: {e}")),
     }
@@ -112,6 +129,63 @@ async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> 
     let updater = app.updater().map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
     Ok(found.map(|u| UpdateInfo { version: u.version, installed: true }))
+}
+
+// ------------------------------------------------- 可攜／單檔車道（不就地更新）
+
+/// 非安裝版車道的檢查：自己拿同一份 latest.json 比版本。
+///
+/// 刻意**不**走 updater 外掛：它的 check 一路連著 download＋install，而那條路
+/// 對非安裝版是有害的——單檔 exe 沒有安裝程式可以交棒，可攜版更不能被搬到
+/// %LOCALAPPDATA% 去（設定檔就在 exe 旁邊，換了位置等於換了一份設定）。
+/// 這裡只讀一個版本號，其餘什麼都不做。
+async fn check_unmanaged(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let current = app.package_info().version.to_string();
+    // ureq 是阻塞式的，丟到 blocking 執行緒上跑，不擋住 async runtime
+    let latest = tauri::async_runtime::spawn_blocking(fetch_latest_version)
+        .await
+        .map_err(|e| e.to_string())??;
+    if !is_newer(&latest, &current) {
+        return Ok(None);
+    }
+    Ok(Some(UpdateInfo { version: latest, installed: false }))
+}
+
+/// 拿 latest.json 的 version 欄位。阻塞式，呼叫端負責丟到 blocking 執行緒。
+fn fetch_latest_version() -> Result<String, String> {
+    let config = ureq::Agent::config_builder().timeout_global(Some(HTTP_TIMEOUT)).build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut resp = agent
+        .get(LATEST_JSON)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.body_mut().read_json().map_err(|e| e.to_string())?;
+    body.get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "latest.json has no version field".to_string())
+}
+
+/// 遠端版本是不是嚴格大於目前這一版。
+///
+/// 用 semver 的比較規則（它已經在相依樹裡，是 updater 外掛自己在用的那一顆），
+/// 因此 0.10.0 > 0.9.0，而 pre-release 一律小於同號的正式版。兩邊任一個解析
+/// 不出來就當成「沒有新版」：更新提示寧可漏報，也不要因為一個怪字串誤報。
+pub fn is_newer(remote: &str, current: &str) -> bool {
+    let parse = |s: &str| Version::parse(s.trim().trim_start_matches(['v', 'V'])).ok();
+    match (parse(remote), parse(current)) {
+        (Some(r), Some(c)) => r > c,
+        _ => false,
+    }
+}
+
+/// 非安裝版的「Download」：開系統瀏覽器到 Releases 頁，讓使用者自己換檔案。
+/// 這條路不下載、不碰自己這顆 exe。
+pub fn open_releases_page(st: &Shared) {
+    if let Err(e) = crate::winsys::open_url(RELEASES_PAGE) {
+        st.log(format!("could not open the releases page: {e}"));
+    }
 }
 
 // ---------------------------------------------------------------- 就地更新
@@ -192,6 +266,40 @@ mod tests {
         assert!(!location_matches("", &exe_in("C:\\app")));
         assert!(!location_matches("\"\"", &exe_in("C:\\app")));
         assert!(!location_matches("   ", &exe_in("C:\\app")));
+    }
+
+    /// 只有嚴格大於才算新版：同版與舊版都不可以跳出更新提示
+    #[test]
+    fn only_a_strictly_greater_version_counts() {
+        assert!(is_newer("0.5.0", "0.4.3"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(!is_newer("0.4.3", "0.4.3"));
+        assert!(!is_newer("0.4.2", "0.4.3"));
+    }
+
+    /// 字串比大小的經典陷阱：字面上 "0.10.0" < "0.9.0"，semver 規則下才是大的
+    #[test]
+    fn ten_is_newer_than_nine() {
+        assert!(is_newer("0.10.0", "0.9.0"));
+        assert!(!is_newer("0.9.0", "0.10.0"));
+    }
+
+    /// latest.json 的 version 寫成 v0.5.0 也照樣認得；pre-release 小於同號正式版
+    #[test]
+    fn leading_v_is_tolerated_and_prerelease_is_older() {
+        assert!(is_newer("v0.5.0", "0.4.3"));
+        assert!(is_newer("0.5.0", "v0.4.3"));
+        assert!(!is_newer("0.5.0-rc.1", "0.5.0"));
+        assert!(is_newer("0.5.0", "0.5.0-rc.1"));
+    }
+
+    /// 解析不出來一律當成沒有新版：更新提示寧可漏報也不要誤報
+    #[test]
+    fn garbage_never_reports_an_update() {
+        assert!(!is_newer("", "0.4.3"));
+        assert!(!is_newer("latest", "0.4.3"));
+        assert!(!is_newer("0.5", "0.4.3"));
+        assert!(!is_newer("0.5.0", "not-a-version"));
     }
 
     /// 機碼名跟著 productName 走，不是 identifier（實機上是 `...\Uninstall\traytunnel`）

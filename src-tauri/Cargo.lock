@@ -4485,6 +4485,7 @@ version = "0.4.3"
 dependencies = [
  "ico",
  "log",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

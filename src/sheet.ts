@@ -16,6 +16,7 @@ import {
   getConfigPath,
   installUpdate,
   openConfigDir,
+  openReleasesPage,
   setAutostart,
   setCloseToTray,
   testConnection,
@@ -472,18 +473,30 @@ function settingsError(msg: string) {
 }
 
 /**
+ * 目前顯示中的更新資訊。按鈕的行為分兩條車道，按下去的當下要知道自己是哪一條，
+ * 所以留一份在這裡，而不是每次都回頭去問快照。
+ */
+let updateInfo: Snapshot["update"] = null;
+
+/**
  * About 區的更新列：沒有新版就整列藏起來，有的話顯示版本與可以做的動作。
  *
- * 安裝版（installed）才給得起「就地更新」——按下去是下載新版安裝檔並交棒給它，
- * 這支程式會自己退出、安裝完由安裝程式重新啟動。
+ * 兩條車道的按鈕完全不同：安裝版是就地更新（下載安裝檔並交棒給它，程式自己
+ * 退出、裝完重啟）；可攜／單檔版沒有安裝程式可以交棒，也不該自己改寫自己，
+ * 因此只把使用者送到 Releases 頁，換檔案這件事交回給他自己決定。
  */
 function syncUpdateRow(update: Snapshot["update"]) {
+  updateInfo = update;
   const row = el<HTMLDivElement>("row-update");
   row.hidden = !update;
   if (!update) return;
+  const btn = el<HTMLButtonElement>("btn-update");
+  btn.disabled = false;
   el<HTMLDivElement>("update-name").textContent = `v${update.version} available`;
-  el<HTMLDivElement>("update-hint").textContent =
-    "Downloads and installs the update, then restarts Traytunnel";
+  btn.textContent = update.installed ? "Restart to update" : "Download";
+  el<HTMLDivElement>("update-hint").textContent = update.installed
+    ? "Downloads and installs the update, then restarts Traytunnel"
+    : "Opens the releases page so you can replace this executable yourself";
 }
 
 /** 後端推了新設定就把 toggle 對齊回去 */
@@ -534,16 +547,23 @@ function initConfigPathRow() {
 }
 
 /**
- * 更新按鈕：按下去就沒有回頭路了，所以先把按鈕停用避免連按兩次。
+ * 更新按鈕。兩條車道的收尾方式不一樣：
  *
- * 成功的話這個 promise 根本不會 resolve（安裝程式接手、程式退出），
- * 因此只有失敗要處理：把按鈕放回去並把原因寫在設定頁的錯誤列。
+ * 安裝版按下去就沒有回頭路了（安裝程式接手、程式退出），所以先停用按鈕避免
+ * 連按兩次，而且那個 promise 成功時根本不會 resolve——只有失敗要處理，
+ * 把按鈕放回去並把原因寫在設定頁的錯誤列。
+ *
+ * 可攜版只是開一個瀏覽器分頁，按幾次都無所謂，按鈕不必停用。
  */
 function initUpdateRow() {
   const btn = el<HTMLButtonElement>("btn-update");
   btn.addEventListener("click", () => {
-    btn.disabled = true;
     settingsError("");
+    if (!updateInfo?.installed) {
+      void openReleasesPage().catch((e) => settingsError(String(e)));
+      return;
+    }
+    btn.disabled = true;
     void installUpdate().catch((e) => {
       btn.disabled = false;
       settingsError(String(e));

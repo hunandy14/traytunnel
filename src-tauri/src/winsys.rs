@@ -318,6 +318,36 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// 用系統預設的瀏覽器開一個網址。
+///
+/// 走 ShellExecuteW 而不是 `explorer.exe <url>` 或 `cmd /c start`：那兩條都要
+/// 另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。ShellExecuteW 是
+/// Windows 開啟關聯程式的正規做法（tauri-plugin-updater 自己叫安裝程式用的
+/// 也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+pub fn open_url(url: &str) -> io::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = wide("open");
+    let file = wide(url);
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // 舊式 API：回傳值大於 32 才算成功，小於等於 32 的那個數字本身就是錯誤碼
+    let code = rc as isize;
+    if code <= 32 {
+        return Err(io::Error::other(format!("ShellExecuteW failed with code {code}")));
+    }
+    Ok(())
+}
+
 /// 組 explorer 的命令列。`exists` 拆成參數，路徑組法才測得到。
 ///
 /// 相對路徑的 parent 是空字串（不是 None），直接丟給 explorer 會變成空引號，

@@ -73,6 +73,9 @@ export const openConfigDir = () => invoke<void>("open_config_dir");
  */
 export const installUpdate = () => invoke<void>("install_update");
 
+/** 可攜／單檔版的更新：開系統瀏覽器到 Releases 頁，不下載也不改寫自己 */
+export const openReleasesPage = () => invoke<void>("open_releases_page");
+
 /** 自繪標題列用的視窗指令，close 的行為（縮到匣或結束）由 Rust 端決定 */
 export const windowMinimize = () => invoke<void>("window_minimize");
 export const windowClose = () => invoke<void>("window_close");

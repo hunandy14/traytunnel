@@ -150,6 +150,7 @@ pub fn run() {
             commands::get_config_path,
             commands::open_config_dir,
             commands::install_update,
+            commands::open_releases_page,
             commands::window_close,
             commands::window_minimize,
             commands::exit_app,
