@@ -14,16 +14,16 @@ import {
   stopExit,
   stopSource,
   testSource,
-  upsertForward,
   windowClose,
   windowMinimize,
 } from "./ipc";
 import {
-  closeSourceSheet,
+  closeTunnelSheet,
   initSettingsPage,
   initSourceSheet,
-  isSourceSheetOpen,
+  initTunnelSheet,
   openSourceSheet,
+  openTunnelSheet,
   syncSettingsPage,
 } from "./sheet";
 import { showErrorToast, showUndoToast, type UndoToast } from "./toast";
@@ -75,20 +75,6 @@ const pendingDelete = new Set<number>();
  */
 const undoToasts = new Map<number, { source: string; toast: UndoToast }>();
 
-interface Draft {
-  /** 這張草稿屬於哪個源 */
-  source: string;
-  /** null 代表這是「新增」中的草稿 */
-  originalLocal: number | null;
-  name: string;
-  local: string;
-  remote: string;
-  errors: Partial<Record<"name" | "local" | "remote" | "general", string>>;
-  busy: boolean;
-}
-
-let draft: Draft | null = null;
-
 interface CardRefs {
   root: HTMLElement;
   dot: HTMLElement;
@@ -100,11 +86,6 @@ interface CardRefs {
 const cardRefs = new Map<number, CardRefs>();
 /** 側欄每個源 icon 的狀態小點，讓 exit-status 事件不用整列重建就能更新 */
 const railStatusRefs = new Map<string, HTMLElement>();
-
-/** 這一輪 renderCards 裡要展開的那張卡 */
-let openNode: HTMLElement | null = null;
-/** 只有「剛按下編輯／新增」那次才播展開動畫，重繪（例如顯示驗證錯誤）不重播 */
-let animateOpen = false;
 
 // ---------------------------------------------------------------- 狀態工具
 
@@ -207,7 +188,7 @@ function renderRail() {
     list.appendChild(btn);
   }
 
-  const add = h("button", { class: "rail-btn add", text: "+", title: "Add source" });
+  const add = h("button", { class: "rail-btn add", text: "+", title: "Add connection" });
   add.addEventListener("click", () => openSourceSheet(null));
   list.appendChild(add);
 
@@ -218,7 +199,8 @@ function renderRail() {
 // ---------------------------------------------------------------- 視圖切換
 
 function setView(next: View) {
-  if (view !== next && draft) cancelEditNow();
+  if (view !== next) closeTunnelSheet();
+  closeMenu();
   // 使用者自己動了畫面，等快照的旗標就作廢，免得等不到時永遠卡著
   pendingSelect = null;
   view = next;
@@ -226,7 +208,9 @@ function setView(next: View) {
 }
 
 function selectSource(name: string) {
-  if (selected !== name && draft) cancelEditNow();
+  // 切到別條連線時，開著的隧道 sheet 就沒有對象了
+  if (selected !== name) closeTunnelSheet();
+  closeMenu();
   pendingSelect = null;
   selected = name;
   view = "source";
@@ -244,6 +228,8 @@ function applyViewVisibility() {
 
 /** 一次把整個畫面對齊到目前的 snap／selected／view */
 function render() {
+  const before = selected;
+
   // 存檔後的名字一旦出現在快照裡就切過去，切完才解除等待
   if (pendingSelect !== null && snap.sources.some((s) => s.name === pendingSelect)) {
     selected = pendingSelect;
@@ -253,6 +239,11 @@ function render() {
   // 選中的源被刪掉或還沒選過，就落回第一個；
   // 但還在等 config-changed 時不回退，否則改名會被打回舊的源
   if (pendingSelect === null && !currentSource()) selected = sources()[0]?.name ?? null;
+
+  // ⋯ 選單的每一項都以「選中的那條連線」為對象。外部變更（別的視窗改了設定檔、
+  // 連線被刪掉、整份清空）可能在選單開著時把它換掉或抽走，這時要收起來——
+  // 否則使用者按下去的動作會打在另一條連線上，或打在不存在的東西上。
+  if (menuOpen && (selected !== before || !currentSource())) closeMenu();
 
   applyViewVisibility();
   renderRail();
@@ -274,33 +265,105 @@ function renderSummary() {
   const bad = exits.filter(isBad).length;
   const running = exits.some(isRunning);
 
-  let text: string;
-  let tone: Tone;
-  if (!src) {
-    text = "No source";
-    tone = "grey";
-  } else if (total === 0) {
-    text = "No exits";
-    tone = "grey";
-  } else if (!running) {
-    text = "Stopped";
-    tone = "grey";
-  } else {
-    text = `${connected}/${total} Connected`;
-    tone = bad > 0 ? "red" : busy > 0 ? "amber" : connected > 0 ? "green" : "grey";
-  }
-
-  el<HTMLDivElement>("summary-title").textContent = text;
-  el<HTMLSpanElement>("summary-dot").className = `dot tone-${tone}`;
+  // 左段：連線名稱當主標，ssh 目標當副標
+  const title = el<HTMLDivElement>("summary-title");
+  title.textContent = src ? src.name : "No connection";
+  title.title = src ? src.name : "";
   el<HTMLDivElement>("summary-sub").textContent = src
     ? `ssh ${src.user}@${src.host}`
     : "no host configured";
 
-  const toggle = el<HTMLButtonElement>("btn-toggle-source");
-  toggle.innerHTML = running ? GLYPH_STOP : GLYPH_START;
-  toggle.title = running ? "Stop this source" : "Start this source";
-  toggle.classList.toggle("danger", running);
-  toggle.classList.toggle("go", !running);
+  // 中段：大分數＋小字狀態，顏色代表整條連線的健康度
+  let score: string;
+  let label: string;
+  let tone: Tone;
+  if (!src || total === 0) {
+    score = "—";
+    label = "no tunnels";
+    tone = "grey";
+  } else if (!running) {
+    score = `0/${total}`;
+    label = "stopped";
+    tone = "grey";
+  } else {
+    score = `${connected}/${total}`;
+    label = "connected";
+    tone = bad > 0 ? "red" : busy > 0 ? "amber" : connected > 0 ? "green" : "grey";
+  }
+  const num = el<HTMLDivElement>("summary-score");
+  num.textContent = score;
+  num.className = `summary-score-num tone-${tone}`;
+  el<HTMLDivElement>("summary-score-label").textContent = label;
+
+  // 右段：⋯ 選單裡的連／斷那一項跟著整條連線的狀態換字
+  el<HTMLSpanElement>("menu-toggle-ico").innerHTML = running ? GLYPH_STOP : GLYPH_START;
+  el<HTMLSpanElement>("menu-toggle-text").textContent = running ? "Disconnect" : "Connect";
+  const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
+  toggleItem.classList.toggle("danger", running);
+  toggleItem.classList.toggle("go", !running);
+}
+
+// ---------------------------------------------------------------- ⋯ 選單
+
+let menuOpen = false;
+
+function setMenuOpen(on: boolean) {
+  // 沒有選中的連線時整組動作都沒有對象，乾脆不讓它開
+  if (on && !currentSource()) return;
+  menuOpen = on;
+  el<HTMLDivElement>("summary-menu").hidden = !on;
+  el<HTMLButtonElement>("btn-more").setAttribute("aria-expanded", String(on));
+}
+
+function closeMenu() {
+  if (menuOpen) setMenuOpen(false);
+}
+
+/** 選單項一律「先收選單、再執行動作」，免得動作換頁後選單還飄在上面 */
+function menuItem(id: string, action: () => void) {
+  el<HTMLButtonElement>(id).addEventListener("click", () => {
+    closeMenu();
+    action();
+  });
+}
+
+function initSummaryMenu() {
+  el<HTMLButtonElement>("btn-more").addEventListener("click", (e) => {
+    e.stopPropagation();
+    setMenuOpen(!menuOpen);
+  });
+
+  // 點到選單以外的任何地方就關；用 mousedown 才不會被按鈕自己的 click 蓋掉
+  document.addEventListener("mousedown", (e) => {
+    if (!menuOpen) return;
+    const target = e.target;
+    if (target instanceof Element && target.closest(".summary-more-wrap")) return;
+    closeMenu();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && menuOpen) {
+      e.stopPropagation();
+      closeMenu();
+    }
+  });
+
+  menuItem("menu-add-exit", beginCreate);
+  menuItem("menu-toggle-source", () => {
+    const src = currentSource();
+    if (!src) return;
+    if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
+    else void run(() => startSource(src.name), `start ${src.name}`);
+  });
+  menuItem("menu-test-source", () => {
+    const src = currentSource();
+    if (src) void run(() => testSource(src.name), `test ${src.name}`);
+  });
+  menuItem("menu-activity", () => setView("log"));
+  menuItem("menu-edit-source", () => {
+    const src = currentSource();
+    if (src) openSourceSheet(src);
+  });
 }
 
 // ---------------------------------------------------------------- 出口卡片
@@ -311,6 +374,18 @@ function testLine(exit: ExitInfo): { text: string; tone: string } {
   if (t.state === "testing") return { text: t.text || "testing…", tone: "muted" };
   if (t.state === "fail") return { text: t.text || "no response", tone: "red" };
   return { text: t.text, tone: "text" };
+}
+
+/**
+ * 自測成功的字串是後端組好的「ip␠␠city, country」，拆成兩行顯示。
+ * 拆不開（格式不如預期）就退回單行，不要硬猜。
+ */
+function splitTest(text: string): { ip: string; place: string } | null {
+  const i = text.indexOf("  ");
+  if (i <= 0) return null;
+  const ip = text.slice(0, i).trim();
+  const place = text.slice(i + 2).trim();
+  return ip && place ? { ip, place } : null;
 }
 
 /** 後端沒帶 detail 時至少讓紅點有句話可看 */
@@ -327,8 +402,18 @@ function paintCard(exit: ExitInfo) {
   refs.root.dataset.status = exit.status;
 
   const t = testLine(exit);
-  refs.test.textContent = t.text;
-  refs.test.className = `card-test tone-text-${t.tone}`;
+  const two = t.tone === "text" ? splitTest(t.text) : null;
+  refs.test.textContent = "";
+  if (two) {
+    refs.test.className = "card-test two-line";
+    refs.test.title = t.text;
+    refs.test.appendChild(h("div", { class: "card-test-place", text: two.place }));
+    refs.test.appendChild(h("div", { class: "card-test-ip mono", text: two.ip }));
+  } else {
+    refs.test.className = `card-test tone-text-${t.tone}`;
+    refs.test.title = "";
+    refs.test.textContent = t.text;
+  }
 
   const detail = isBad(exit) ? (exit.detailText ?? defaultDetail(exit.status)) : "";
   refs.detail.textContent = detail;
@@ -361,7 +446,7 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
   );
 
   const edit = h("button", { class: "iconbtn sm", html: GLYPH_EDIT, title: "Edit" });
-  edit.addEventListener("click", () => beginEdit(exit, source));
+  edit.addEventListener("click", () => openTunnelSheet(source, exit));
 
   const main = h("div", { class: "card-main" }, [
     dot,
@@ -374,11 +459,6 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
   root.dataset.local = String(exit.local);
 
   cardRefs.set(exit.local, { root, dot, test, detail, toggle });
-
-  if (draft && draft.originalLocal === exit.local) {
-    root.appendChild(buildEditor());
-    openNode = root;
-  }
   return root;
 }
 
@@ -386,286 +466,71 @@ function renderCards() {
   const box = el<HTMLDivElement>("cards");
   box.textContent = "";
   cardRefs.clear();
-  openNode = null;
 
   const src = currentSource();
+  box.classList.remove("grouped");
   if (!src) return;
 
   const exits = visibleExits(src);
+  // 有隧道列才套群組外框，零隧道時留給虛線引導卡自己的樣子
+  box.classList.toggle("grouped", exits.length > 0);
   for (const exit of exits) {
     box.appendChild(buildCard(exit, src.name));
     paintCard(exit);
   }
 
-  if (draft && draft.originalLocal === null) {
-    const card = h("article", { class: "card new" }, [buildEditor()]);
-    box.appendChild(card);
-    openNode = card;
-  } else if (exits.length === 0) {
-    // 大虛線卡只在該源零出口時出現，其餘時候用彙總列的 ＋ 新增
+  if (exits.length === 0) {
+    // 大虛線卡只在這條連線零隧道時出現，其餘時候用 ⋯ 選單的 Add tunnel
     const ghost = h("button", { class: "ghost-card" }, [
       h("span", { class: "ghost-plus", text: "+" }),
-      h("span", { text: "Add exit" }),
+      h("span", { text: "Add tunnel" }),
     ]);
     ghost.addEventListener("click", beginCreate);
     box.appendChild(ghost);
   }
-
-  if (openNode) {
-    const node = openNode;
-    if (animateOpen) {
-      animateOpen = false;
-      // 節點剛進 DOM，要先讓瀏覽器把 0fr 的起始狀態畫出來，下一幀再切 1fr，
-      // 否則兩個值同一幀套上去，transition 不會有中間幀
-      requestAnimationFrame(() => requestAnimationFrame(() => node.classList.add("editing")));
-    } else {
-      node.classList.add("editing");
-    }
-  }
 }
 
-// ---------------------------------------------------------------- 就地編輯
-
-function beginEdit(exit: ExitInfo, source: string) {
-  draft = {
-    source,
-    originalLocal: exit.local,
-    name: exit.name,
-    local: String(exit.local),
-    remote: exit.remote,
-    errors: {},
-    busy: false,
-  };
-  animateOpen = true;
-  renderCards();
-}
+// ---------------------------------------------------------------- 新增隧道
 
 function beginCreate() {
   const src = currentSource();
-  if (!src) return;
-  draft = {
-    source: src.name,
-    originalLocal: null,
-    name: "",
-    local: "",
-    remote: "",
-    errors: {},
-    busy: false,
-  };
-  animateOpen = true;
-  renderCards();
-}
-
-/**
- * 收合要等動畫跑完才能把節點抽掉，否則 renderCards 一重繪就是瞬間消失。
- * transitionend 沒來（例如頁面在背景）就靠逾時保底。
- */
-function collapseEditor(after: () => void) {
-  const node = document.querySelector<HTMLElement>("#cards .card.editing");
-  if (!node) {
-    after();
-    return;
-  }
-  let done = false;
-  const finish = () => {
-    if (done) return;
-    done = true;
-    after();
-  };
-  node.classList.remove("editing");
-  node.querySelector(".card-edit")?.addEventListener("transitionend", finish, { once: true });
-  window.setTimeout(finish, 320);
-}
-
-function cancelEdit() {
-  collapseEditor(() => {
-    draft = null;
-    renderCards();
-  });
-}
-
-/** 切源／切頁時不播收合動畫，直接把草稿丟掉 */
-function cancelEditNow() {
-  draft = null;
-}
-
-function field(
-  key: "name" | "local" | "remote",
-  label: string,
-  placeholder: string,
-  mono = false,
-): HTMLElement {
-  const d = draft as Draft;
-  const input = h("input", { class: mono ? "mono" : "" }) as HTMLInputElement;
-  input.value = d[key];
-  input.placeholder = placeholder;
-  input.spellcheck = false;
-  input.addEventListener("input", () => {
-    d[key] = input.value;
-    delete d.errors[key];
-    err.textContent = "";
-    err.classList.remove("show");
-    wrap.classList.remove("invalid");
-  });
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") void commitEdit();
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      cancelEdit();
-    }
-  });
-
-  const wrap = h("div", { class: "input" }, [input]);
-  const err = h("div", { class: "field-error" });
-  if (d.errors[key]) {
-    err.textContent = d.errors[key] as string;
-    err.classList.add("show");
-    wrap.classList.add("invalid");
-  }
-  return h("label", { class: `edit-field field-${key}` }, [
-    h("span", { class: "edit-label", text: label }),
-    wrap,
-    err,
-  ]);
-}
-
-function buildEditor(): HTMLElement {
-  const d = draft as Draft;
-
-  const save = h("button", {
-    class: "btn primary",
-    text: d.originalLocal === null ? "Add" : "Save",
-  });
-  save.addEventListener("click", () => void commitEdit());
-
-  const cancel = h("button", { class: "btn ghost", text: "Cancel" });
-  cancel.addEventListener("click", cancelEdit);
-
-  const actions: HTMLElement[] = [];
-  if (d.originalLocal !== null) {
-    const del = h("button", { class: "btn danger-ghost", text: "Delete" });
-    del.addEventListener("click", () => requestDelete(d.originalLocal as number));
-    actions.push(del);
-  }
-
-  const general = h("div", { class: "field-error general" });
-  if (d.errors.general) {
-    general.textContent = d.errors.general;
-    general.classList.add("show");
-  }
-
-  // card-edit（grid 0fr→1fr）> inner（overflow hidden）> body（分隔線與內距，收合時一起被裁掉）
-  return h("div", { class: "card-edit" }, [
-    h("div", { class: "card-edit-inner" }, [
-      h("div", { class: "card-edit-body" }, [
-        h("div", { class: "edit-grid" }, [
-          field("name", "Name", "exit-a"),
-          field("local", "Local port", "1080", true),
-          field("remote", "Remote", "127.0.0.1:1080", true),
-        ]),
-        general,
-        h("div", { class: "edit-actions" }, [...actions, h("div", { class: "spacer" }), cancel, save]),
-      ]),
-    ]),
-  ]);
-}
-
-/** 送出前先做一輪本地檢查，錯誤訊息與後端用同一套欄位前綴 */
-function localValidate(d: Draft): Partial<Record<"name" | "local" | "remote", string>> {
-  const errors: Partial<Record<"name" | "local" | "remote", string>> = {};
-  if (!d.name.trim()) errors.name = "name is required";
-  const port = Number(d.local.trim());
-  if (!/^\d+$/.test(d.local.trim()) || port < 1 || port > 65535) {
-    errors.local = "must be 1-65535";
-  }
-  if (!/^[^\s:]+:\d+$/.test(d.remote.trim())) errors.remote = "expected host:port";
-  return errors;
-}
-
-/**
- * 後端回傳的錯誤字串約定用 `field: message` 開頭（name / local / remote），
- * 這樣才能逐欄顯示；認不出前綴就當成整體錯誤放在按鈕上方。
- */
-function assignError(d: Draft, msg: string) {
-  const m = /^\s*(name|local|remote)\s*:\s*([\s\S]+)$/i.exec(msg);
-  if (m) d.errors[m[1].toLowerCase() as "name" | "local" | "remote"] = m[2].trim();
-  else d.errors.general = msg;
-}
-
-async function commitEdit() {
-  const d = draft;
-  if (!d || d.busy) return;
-
-  d.errors = {};
-  const errors = localValidate(d);
-  if (Object.keys(errors).length > 0) {
-    d.errors = errors;
-    renderCards();
-    return;
-  }
-
-  d.busy = true;
-  try {
-    const err = await upsertForward({
-      source: d.source,
-      originalLocal: d.originalLocal,
-      name: d.name.trim(),
-      local: Number(d.local.trim()),
-      remote: d.remote.trim(),
-    });
-    d.busy = false;
-    if (err) {
-      assignError(d, err);
-      renderCards();
-      return;
-    }
-    collapseEditor(() => {
-      draft = null;
-      renderCards();
-    });
-  } catch (e) {
-    d.busy = false;
-    assignError(d, String(e));
-    renderCards();
-  }
+  if (src) openTunnelSheet(src.name, null);
 }
 
 // ---------------------------------------------------------------- 刪除／undo
 
+/** sheet 的 Delete 鍵按下後走到這裡：畫面先移除，5 秒內都還能收回 */
 function requestDelete(local: number) {
   const hit = locate(local);
   if (!hit) return;
   const name = hit.exit.name;
   const owner = hit.source.name;
 
-  collapseEditor(() => {
-    draft = null;
-    pendingDelete.add(local);
-    render();
+  pendingDelete.add(local);
+  render();
 
-    const toast = showUndoToast(
-      `Deleted ${name}`,
-      async () => {
-        undoToasts.delete(local);
-        try {
-          await deleteForward(local);
-          // 刪成功才收掉暫存旗標，之後靠 config-changed 把卡片真的移除
-          pendingDelete.delete(local);
-        } catch (e) {
-          // 後端拒絕就把卡片放回來，不要無聲復活
-          pendingDelete.delete(local);
-          render();
-          showErrorToast(`Could not delete ${name}: ${String(e)}`);
-        }
-      },
-      () => {
-        undoToasts.delete(local);
+  const toast = showUndoToast(
+    `Deleted tunnel ${name}`,
+    async () => {
+      undoToasts.delete(local);
+      try {
+        await deleteForward(local);
+        // 刪成功才收掉暫存旗標，之後靠 config-changed 把卡片真的移除
+        pendingDelete.delete(local);
+      } catch (e) {
+        // 後端拒絕就把卡片放回來，不要無聲復活
         pendingDelete.delete(local);
         render();
-      },
-    );
-    undoToasts.set(local, { source: owner, toast });
-  });
+        showErrorToast(`Could not delete ${name}: ${String(e)}`);
+      }
+    },
+    () => {
+      undoToasts.delete(local);
+      pendingDelete.delete(local);
+      render();
+    },
+  );
+  undoToasts.set(local, { source: owner, toast });
 }
 
 /**
@@ -690,17 +555,6 @@ function dropPendingDeletesOf(sourceName: string) {
 
 // ---------------------------------------------------------------- 日誌
 
-/**
- * 後端在每行日誌前面就放好了 [源名]，前端只負責過濾：
- * 認得出前綴的行只在對應的源顯示，沒有前綴的 app 級訊息則永遠顯示。
- */
-const PREFIX_RE = /^(?:\s*\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\s+)?\[([^\]]+)\]/;
-
-function logSourceOf(line: string): string | null {
-  const m = PREFIX_RE.exec(line);
-  return m ? m[1].trim() : null;
-}
-
 function fill(box: HTMLElement, lines: string[], emptyText: string) {
   // 比照 appendLine：使用者自己往上捲去看舊訊息時就不要硬把他拉回底部
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
@@ -713,23 +567,9 @@ function fill(box: HTMLElement, lines: string[], emptyText: string) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
+/** 日誌只剩下獨立的活動頁一個出口，主區不再掛即時的小視窗 */
 function renderLogs() {
-  if (view === "log") {
-    fill(el<HTMLDivElement>("full-log"), logLines, "No activity yet");
-    return;
-  }
-  if (view !== "source") return;
-
-  const scope = el<HTMLSpanElement>("mini-log-scope");
-  scope.textContent = selected ? selected : "";
-  fill(
-    el<HTMLDivElement>("mini-log"),
-    logLines.filter((l) => {
-      const s = logSourceOf(l);
-      return s === null || s === selected;
-    }),
-    "No activity yet",
-  );
+  if (view === "log") fill(el<HTMLDivElement>("full-log"), logLines, "No activity yet");
 }
 
 function appendLine(box: HTMLElement, line: string) {
@@ -743,14 +583,7 @@ function appendLine(box: HTMLElement, line: string) {
 function appendLog(line: string) {
   logLines.push(line);
   if (logLines.length > LOG_CAP) logLines.shift();
-
-  if (view === "log") {
-    appendLine(el<HTMLDivElement>("full-log"), line);
-    return;
-  }
-  if (view !== "source") return;
-  const s = logSourceOf(line);
-  if (s === null || s === selected) appendLine(el<HTMLDivElement>("mini-log"), line);
+  if (view === "log") appendLine(el<HTMLDivElement>("full-log"), line);
 }
 
 // ---------------------------------------------------------------- 事件套用
@@ -840,23 +673,7 @@ el<HTMLButtonElement>("btn-close").addEventListener("click", () =>
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
 el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("settings"));
 
-el<HTMLButtonElement>("btn-add-exit").addEventListener("click", beginCreate);
-el<HTMLButtonElement>("btn-test-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (src) void run(() => testSource(src.name), `test ${src.name}`);
-});
-el<HTMLButtonElement>("btn-toggle-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (!src) return;
-  if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
-  else void run(() => startSource(src.name), `start ${src.name}`);
-});
-el<HTMLButtonElement>("btn-edit-source").addEventListener("click", () => {
-  const src = currentSource();
-  if (!src) return;
-  if (isSourceSheetOpen()) closeSourceSheet();
-  else openSourceSheet(src);
-});
+initSummaryMenu();
 el<HTMLButtonElement>("btn-first-source").addEventListener("click", () => openSourceSheet(null));
 
 initSourceSheet({
@@ -868,6 +685,8 @@ initSourceSheet({
     render();
   },
   onDeleted: (name) => {
+    // 整條連線都沒了，底下那條隧道的 sheet 也不該留著
+    closeTunnelSheet();
     dropPendingDeletesOf(name);
     // 同樣不等 config-changed，先把它從本地快照拿掉，
     // 免得回退第一個源時又挑回這個剛被刪掉的
@@ -878,6 +697,7 @@ initSourceSheet({
     render();
   },
 });
+initTunnelSheet({ onDelete: requestDelete });
 initSettingsPage();
 render();
 bootstrap(init);

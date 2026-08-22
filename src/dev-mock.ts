@@ -224,8 +224,12 @@ function validateForward(input: {
     return `local: ${where}`;
   }
 
-  if (!/^[^\s:]+:\d+$/.test(input.remote)) {
-    return "remote: expected host:port, for example 127.0.0.1:1080";
+  // remote 只填埠號是合法的（代表伺服器本機的那個埠），正規化留到寫進狀態時才做
+  if (/^\d+$/.test(input.remote)) {
+    const port = Number(input.remote);
+    if (port < 1 || port > 65535) return "remote: must be 1-65535";
+  } else if (!/^[^\s:]+:\d+$/.test(input.remote)) {
+    return "remote: expected a port or host:port, for example 1080 or 127.0.0.1:1080";
   }
 
   const owner = findSource(input.source) as SourceInfo;
@@ -375,6 +379,9 @@ function handle(cmd: string, args: Args): unknown {
       };
       const err = validateForward(input);
       if (err) return err;
+
+      // 純埠號補成伺服器本機的 host:port，比照真後端會做的正規化
+      if (/^\d+$/.test(input.remote)) input.remote = `127.0.0.1:${input.remote}`;
 
       const owner = findSource(input.source) as SourceInfo;
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);

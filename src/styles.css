@@ -366,7 +366,8 @@ body {
   background: var(--red);
 }
 
-/* ------------------------------------------------------------ 頂部彙總列 */
+/* ------------------------------------------------------------ 頂部彙總卡
+   三段式：左邊連線名稱＋ssh 副標、中間用豎分隔線隔出的大分數、右邊只留 ⋯ */
 
 .summary {
   flex: none;
@@ -374,11 +375,6 @@ body {
   align-items: center;
   gap: 12px;
   padding: 12px 12px 12px 16px;
-}
-
-.summary .dot {
-  width: 10px;
-  height: 10px;
 }
 
 .summary-text {
@@ -404,10 +400,122 @@ body {
   text-overflow: ellipsis;
 }
 
+/* 中段的分數：左右兩條細線把它從名稱與按鈕之間隔開 */
+.summary-score {
+  flex: none;
+  min-width: 60px;
+  padding: 0 16px;
+  text-align: center;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+}
+
+.summary-score-num {
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text);
+  transition: color 150ms var(--ease);
+}
+
+.summary-score-num.tone-grey {
+  color: var(--muted);
+}
+
+.summary-score-num.tone-green {
+  color: var(--green);
+}
+
+.summary-score-num.tone-amber {
+  color: var(--amber);
+}
+
+.summary-score-num.tone-red {
+  color: var(--red);
+}
+
+.summary-score-label {
+  margin-top: 1px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .summary-actions {
   flex: none;
   display: flex;
   gap: 6px;
+}
+
+/* ------------------------------------------------------------ ⋯ 下拉選單
+   自繪的浮層（WebView2 的原生選單整個被關掉了），錨在 ⋯ 鈕下方、右對齊 */
+
+.summary-more-wrap {
+  position: relative;
+  flex: none;
+}
+
+.summary-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 180px;
+  padding: 4px;
+  background: var(--overlay);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+}
+
+.summary-menu[hidden] {
+  display: none;
+}
+
+.summary-menu hr {
+  margin: 4px 6px;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+
+.summary-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+
+.summary-menu-item:hover,
+.summary-menu-item:focus-visible {
+  background: var(--hover-strong);
+}
+
+.summary-menu-item .ico {
+  flex: none;
+  width: 14px;
+  font-family: "Segoe MDL2 Assets";
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.summary-menu-item.go .ico {
+  color: var(--accent);
+}
+
+.summary-menu-item.danger .ico {
+  color: var(--red);
 }
 
 /* ------------------------------------------------------------ 按鈕 */
@@ -506,21 +614,40 @@ body {
   border-color: rgba(240, 68, 56, 0.55);
 }
 
-/* ------------------------------------------------------------ 出口卡片 */
+/* ------------------------------------------------------------ 隧道清單
+   整份清單包在單一外框裡（Win11 設定頁的列表語言），列本身沒有底也沒有框，
+   靠內縮的 1px 分隔線斷行、hover 時整列微亮。 */
 
+.list-head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  margin: 12px 2px 6px;
+}
+
+.list-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* 外層只負責量出可用高度，捲動交給裡面的群組容器自己做，
+   這樣清單再長，外框與圓角都還留在畫面上 */
 .cards-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  margin-top: 8px;
-  padding-right: 2px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .cards {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
 }
 
 .card {
@@ -535,8 +662,36 @@ body {
   border-color: var(--line-strong);
 }
 
-.card.editing {
-  border-color: var(--line-strong);
+/* 群組容器：只有真的有隧道列時才掛上，零隧道的虛線卡不套這層外框 */
+.cards.grouped {
+  gap: 0;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  /* 橫向永遠裁掉（圓角才收得住），縱向超出可視高度就在框內捲 */
+  overflow: hidden auto;
+}
+
+.cards.grouped .card {
+  position: relative;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  transition: background 130ms var(--ease);
+}
+
+.cards.grouped .card:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.cards.grouped .card:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 0;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .card-main {
@@ -569,7 +724,8 @@ body {
   text-overflow: ellipsis;
 }
 
-/* 自測結果沿用原版「ip  city, country」的兩個空白，所以要 pre 不能塌掉 */
+/* 自測結果的異常單行態（testing…／no response）沿用原版「ip  city, country」
+   的兩個空白，所以要 pre 不能塌掉 */
 .card-test {
   flex: 0 1 auto;
   min-width: 0;
@@ -577,6 +733,30 @@ body {
   font-size: 11px;
   text-align: right;
   white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 成功態拆兩行，明暗次序跟左欄同構：地點行是主資訊（亮）、IP 行是輔助（灰等寬），
+   跟左欄的「名稱亮／路由灰」對齊。兩行行高加總 27px，列高與單行態一致。 */
+.card-test.two-line {
+  white-space: normal;
+}
+
+.card-test-place {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-test-ip {
+  font-size: 10.5px;
+  line-height: 13px;
+  color: var(--muted);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -612,43 +792,9 @@ body {
   display: block;
 }
 
-/* ------------------------------------------------------------ 就地編輯 */
+/* ------------------------------------------------------------ 表單欄位
+   連線 sheet 與隧道 sheet 共用這一套 */
 
-.card-edit {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 220ms var(--ease);
-}
-
-.card.editing .card-edit {
-  grid-template-rows: 1fr;
-}
-
-.card-edit-inner {
-  min-height: 0;
-  overflow: hidden;
-}
-
-/* 分隔線與內距放在 inner 裡面，收合時才會跟著被裁掉，不會在關閉的瞬間跳一下 */
-.card-edit-body {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
-}
-
-.card.new .card-edit-body {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
-}
-
-.edit-grid {
-  display: grid;
-  grid-template-columns: 1fr 104px 1.25fr;
-  gap: 8px;
-}
-
-.edit-field,
 .sheet-field {
   display: flex;
   flex-direction: column;
@@ -719,14 +865,6 @@ body {
   margin-top: 4px;
 }
 
-.edit-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.edit-actions .spacer,
 .sheet-foot .spacer {
   flex: 1;
 }
@@ -816,43 +954,6 @@ body {
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
-}
-
-/* 主區底部的縮小即時日誌：只顯示目前這個源（與沒有前綴的 app 級訊息） */
-.mini-log {
-  flex: none;
-  margin-top: 8px;
-  padding: 8px 4px 8px 12px;
-}
-
-.mini-log-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 4px;
-  padding-right: 8px;
-}
-
-.mini-log-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.8px;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.mini-log-scope {
-  flex: 1;
-  font-size: 10px;
-  color: #61656e;
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.log-box.mini {
-  height: 96px;
 }
 
 .log-full-panel {
@@ -1178,28 +1279,14 @@ body {
 }
 
 /* ------------------------------------------------------------ 窄視窗
-   縮到 480×420 時把就地編輯改成單欄堆疊，自測文字讓位給按鈕 */
+   縮到 480×420 時自測文字讓位給按鈕，彙總卡的名稱降一級 */
 
 @media (max-width: 560px) {
-  .edit-grid {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .edit-grid .field-remote {
-    grid-column: 1 / -1;
-  }
-
   .card-test {
     max-width: 96px;
   }
 
   .summary-title {
     font-size: 17px;
-  }
-}
-
-@media (max-height: 460px) {
-  .log-box.mini {
-    height: 64px;
   }
 }
