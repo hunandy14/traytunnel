@@ -16,7 +16,7 @@
         "label": "main",
         "title": "Traytunnel",
         "width": 540,
-        "height": 620,
+        "height": 446,
         "minWidth": 480,
         "minHeight": 420,
         "resizable": true,
