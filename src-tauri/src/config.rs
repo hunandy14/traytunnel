@@ -261,6 +261,9 @@ pub enum LoadOutcome {
     Loaded(Config),
     /// 檔案不存在，已寫入預設值
     Created(Config),
+    /// 檔案不存在，連預設值都寫不進去（資料夾唯讀、磁碟滿之類）。
+    /// 記憶體照樣用預設值跑，但不可以對外宣稱「已建檔」
+    CreateFailed { config: Config, error: String },
     /// 讀到舊制設定，已就地遷移成新制並寫回
     Migrated(Config),
     /// 解析或讀取失敗，改用預設值且未覆寫原檔；backup 只在確實備份成功時有值
@@ -282,6 +285,7 @@ impl LoadOutcome {
             LoadOutcome::Loaded(c)
             | LoadOutcome::Created(c)
             | LoadOutcome::Migrated(c)
+            | LoadOutcome::CreateFailed { config: c, .. }
             | LoadOutcome::Broken { config: c, .. } => c,
         }
     }
@@ -351,8 +355,15 @@ pub fn load_from_path(toml_path: &Path) -> LoadOutcome {
         return match parse_document(&raw) {
             Ok((cfg, migrated)) => {
                 if migrated {
-                    // 遷移只改結構，寫回時走同一套就地改寫，註解照樣留著
-                    let _ = write_config_at(toml_path, &cfg);
+                    // 遷移只改結構，寫回時走同一套就地改寫，註解照樣留著。
+                    // 寫不回去也還能用記憶體裡這份跑，但一定要留下痕跡，
+                    // 否則使用者只會看到「已遷移」而檔案其實原封不動
+                    if let Err(e) = write_config_at(toml_path, &cfg) {
+                        log::warn!(
+                            "could not write the migrated config back to {}: {e}",
+                            toml_path.display()
+                        );
+                    }
                     LoadOutcome::Migrated(cfg)
                 } else {
                     LoadOutcome::Loaded(cfg)
@@ -363,8 +374,13 @@ pub fn load_from_path(toml_path: &Path) -> LoadOutcome {
     }
 
     let cfg = Config::default();
-    let _ = std::fs::write(toml_path, default_document());
-    LoadOutcome::Created(cfg)
+    match std::fs::write(toml_path, default_document()) {
+        Ok(()) => LoadOutcome::Created(cfg),
+        Err(e) => {
+            log::warn!("could not create the config file at {}: {e}", toml_path.display());
+            LoadOutcome::CreateFailed { config: cfg, error: e.to_string() }
+        }
+    }
 }
 
 /// 資料夾版的薄包裝，只給測試用（實機一律走 [`config_location`] 解析出來的完整路徑）
@@ -1212,6 +1228,24 @@ enabled = false
         let out = load_from_dir(&dir);
         assert!(matches!(out, LoadOutcome::Broken { .. }));
         assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    }
+
+    /// 預設檔寫不出去時不可以回報 Created：記憶體照樣用預設值跑，
+    /// 但「已經幫你建好檔了」這句話是假的，上層要據此給不同的訊息
+    #[test]
+    fn a_failed_creation_is_not_reported_as_created() {
+        let dir = tmp_dir("create-fail");
+        // 上層資料夾不存在，fs::write 一定失敗
+        let path = dir.join("no-such-dir").join(TOML_NAME);
+        let out = load_from_path(&path);
+        match &out {
+            LoadOutcome::CreateFailed { error, .. } => assert!(!error.is_empty()),
+            other => panic!("預期 CreateFailed，拿到 {other:?}"),
+        }
+        assert_eq!(out.config(), &Config::default());
+        assert!(!path.exists());
+        // 沒有原檔要保護，不必切唯讀
+        assert!(!out.read_only());
     }
 
     #[test]

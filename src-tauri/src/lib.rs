@@ -644,6 +644,9 @@ pub fn run() {
                 LoadOutcome::Created(_) => {
                     shared.log("config created with defaults, open Settings to edit");
                 }
+                LoadOutcome::CreateFailed { error, .. } => {
+                    shared.log(format!("config file could not be created ({error}), using defaults"));
+                }
                 LoadOutcome::Migrated(cfg) => {
                     shared.log(format!(
                         "config migrated to the multi-source format ({} source(s))",
