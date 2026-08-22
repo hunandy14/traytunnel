@@ -20,9 +20,12 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
   <img src="docs/screenshots/main-window.png" width="700" alt="主視窗">
 </p>
 
+<!-- 待補：托盤選單截圖
 <p align="center">
   <img src="docs/screenshots/tray-menu.png" width="700" alt="托盤選單">
 </p>
+-->
+
 
 ## 功能
 
