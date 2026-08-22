@@ -54,7 +54,7 @@ fn hide_to_tray(state: &Shared) {
     if let Some(w) = state.app.get_webview_window(MAIN_WINDOW) {
         let _ = w.hide();
     }
-    if !state.tray_hint_shown() {
+    if state.take_tray_hint() {
         balloon(&state.app, "Closed to tray, still running. Double-click the tray icon to reopen.");
     }
 }
@@ -257,7 +257,9 @@ pub fn run() {
             heal_autostart(&handle, &shared);
 
             if is_tray_start() {
-                shared.mark_tray_hint_shown();
+                // 這裡自己就彈了一顆，順手把「關到系統匣」那顆提示領掉，
+                // 免得使用者第一次按 X 時又被通知一次
+                let _ = shared.take_tray_hint();
                 balloon(&handle, "Started in the system tray. Double-click the tray icon to open.");
             } else {
                 show_main(&handle);

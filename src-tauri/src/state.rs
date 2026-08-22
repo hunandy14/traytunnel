@@ -407,12 +407,14 @@ impl AppState {
         }
     }
 
-    pub fn tray_hint_shown(&self) -> bool {
-        self.tray_hint_shown.swap(true, Ordering::SeqCst)
-    }
-
-    pub fn mark_tray_hint_shown(&self) {
-        self.tray_hint_shown.store(true, Ordering::SeqCst);
+    /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，
+    /// 之後一律回 false。
+    ///
+    /// 名字用 take_ 是因為它會改狀態——原本叫 tray_hint_shown，讀起來像個
+    /// getter，實際上是 swap(true)，呼叫端很容易以為只是問一下。已經自己彈過
+    /// 通知的路徑（例如 --tray 啟動）直接呼叫它把提示領掉即可。
+    pub fn take_tray_hint(&self) -> bool {
+        !self.tray_hint_shown.swap(true, Ordering::SeqCst)
     }
 
     pub fn is_exiting(&self) -> bool {
