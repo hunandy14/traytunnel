@@ -531,6 +531,15 @@ function requestDelete(local: number) {
 }
 
 /**
+ * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
+ * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
+ * 是 Rust 端直接處理，前端這裡攔不到，是已知限制。
+ */
+function flushPendingDeletes() {
+  for (const { toast } of [...undoToasts.values()]) toast.flush();
+}
+
+/**
  * 整個源被刪掉時，底下出口還掛著的 undo 倒數就沒有意義了：
  * 讓它到期去 deleteForward 一個已經不存在的埠只會噴錯，
  * pendingDelete 裡的殘留旗標也會一直卡著。這裡一次收乾淨。
@@ -666,9 +675,11 @@ hydrateIcons();
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
 );
-el<HTMLButtonElement>("btn-close").addEventListener("click", () =>
-  void run(windowClose, "close the window"),
-);
+el<HTMLButtonElement>("btn-close").addEventListener("click", () => {
+  // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失
+  flushPendingDeletes();
+  void run(windowClose, "close the window");
+});
 
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
 el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("settings"));
