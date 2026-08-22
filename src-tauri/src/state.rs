@@ -391,10 +391,21 @@ impl AppState {
         self.generation(local) == generation
     }
 
-    /// 記下這一輪連線的 job handle。出口已經被刪掉時 job 當場 drop，
-    /// 那條剛 spawn 出來的 ssh 也就跟著收掉，正是我們要的結果。
+    /// 記下這一輪連線的 job handle，**只在世代還是自己那一代時**才收下。
+    ///
+    /// spawn 與 store_job 之間有一段窄窗口：halt／restart 可能剛好插進來遞增世代，
+    /// 新的監看迴圈也已經 spawn 完並存好自己的 job。這時舊迴圈晚到的這一手若照存，
+    /// 會把新世代的 job 蓋掉——被蓋掉的那個 handle 一 drop，剛接起來的連線當場被殺，
+    /// 留下的反而是舊世代那條沒人管的 ssh。
+    ///
+    /// 世代不符（或出口已經被刪掉）時 job 就在這裡 drop：handle 關閉，
+    /// 那條剛 spawn 出來、已經沒有人要的 ssh 連同 ProxyCommand 的孫程序一起收乾淨。
     pub fn store_job(&self, local: u16, generation: u64, job: Job) {
-        self.with_exit_mut(local, |rt| rt.job = Some((generation, job)));
+        self.with_exit_mut(local, |rt| {
+            if rt.generation == generation {
+                rt.job = Some((generation, job));
+            }
+        });
     }
 
     /// 關掉 job handle，該出口的 ssh 程序樹一起結束
