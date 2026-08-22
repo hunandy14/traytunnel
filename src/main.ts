@@ -385,6 +385,18 @@ function testLine(exit: ExitInfo): { text: string; tone: string } {
   return { text: t.text, tone: "text" };
 }
 
+/**
+ * 自測成功的字串是後端組好的「ip␠␠city, country」，拆成兩行顯示。
+ * 拆不開（格式不如預期）就退回單行，不要硬猜。
+ */
+function splitTest(text: string): { ip: string; place: string } | null {
+  const i = text.indexOf("  ");
+  if (i <= 0) return null;
+  const ip = text.slice(0, i).trim();
+  const place = text.slice(i + 2).trim();
+  return ip && place ? { ip, place } : null;
+}
+
 /** 後端沒帶 detail 時至少讓紅點有句話可看 */
 function defaultDetail(status: ExitStatus): string {
   return status === "port_busy" ? "local port is already in use" : "connection failed";
@@ -399,8 +411,18 @@ function paintCard(exit: ExitInfo) {
   refs.root.dataset.status = exit.status;
 
   const t = testLine(exit);
-  refs.test.textContent = t.text;
-  refs.test.className = `card-test tone-text-${t.tone}`;
+  const two = t.tone === "text" ? splitTest(t.text) : null;
+  refs.test.textContent = "";
+  if (two) {
+    refs.test.className = "card-test two-line";
+    refs.test.title = t.text;
+    refs.test.appendChild(h("div", { class: "card-test-place", text: two.place }));
+    refs.test.appendChild(h("div", { class: "card-test-ip mono", text: two.ip }));
+  } else {
+    refs.test.className = `card-test tone-text-${t.tone}`;
+    refs.test.title = "";
+    refs.test.textContent = t.text;
+  }
 
   const detail = isBad(exit) ? (exit.detailText ?? defaultDetail(exit.status)) : "";
   refs.detail.textContent = detail;
@@ -461,9 +483,12 @@ function renderCards() {
   openNode = null;
 
   const src = currentSource();
+  box.classList.remove("grouped");
   if (!src) return;
 
   const exits = visibleExits(src);
+  // 有隧道列才套群組外框，零隧道時留給虛線引導卡自己的樣子
+  box.classList.toggle("grouped", exits.length > 0);
   for (const exit of exits) {
     box.appendChild(buildCard(exit, src.name));
     paintCard(exit);

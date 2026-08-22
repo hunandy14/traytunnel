@@ -614,14 +614,30 @@ body {
   border-color: rgba(240, 68, 56, 0.55);
 }
 
-/* ------------------------------------------------------------ 出口卡片 */
+/* ------------------------------------------------------------ 隧道清單
+   整份清單包在單一外框裡（Win11 設定頁的列表語言），列本身沒有底也沒有框，
+   靠內縮的 1px 分隔線斷行、hover 時整列微亮。 */
+
+.list-head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  margin: 12px 2px 6px;
+}
+
+.list-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
 
 .cards-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  margin-top: 8px;
   padding-right: 2px;
 }
 
@@ -643,8 +659,35 @@ body {
   border-color: var(--line-strong);
 }
 
-.card.editing {
-  border-color: var(--line-strong);
+/* 群組容器：只有真的有隧道列時才掛上，零隧道的虛線卡不套這層外框 */
+.cards.grouped {
+  gap: 0;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.cards.grouped .card {
+  position: relative;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  transition: background 130ms var(--ease);
+}
+
+.cards.grouped .card:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.cards.grouped .card:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 0;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .card-main {
@@ -677,7 +720,8 @@ body {
   text-overflow: ellipsis;
 }
 
-/* 自測結果沿用原版「ip  city, country」的兩個空白，所以要 pre 不能塌掉 */
+/* 自測結果的異常單行態（testing…／no response）沿用原版「ip  city, country」
+   的兩個空白，所以要 pre 不能塌掉 */
 .card-test {
   flex: 0 1 auto;
   min-width: 0;
@@ -685,6 +729,30 @@ body {
   font-size: 11px;
   text-align: right;
   white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 成功態拆兩行，明暗次序跟左欄同構：地點行是主資訊（亮）、IP 行是輔助（灰等寬），
+   跟左欄的「名稱亮／路由灰」對齊。兩行行高加總 27px，列高與單行態一致。 */
+.card-test.two-line {
+  white-space: normal;
+}
+
+.card-test-place {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-test-ip {
+  font-size: 10.5px;
+  line-height: 13px;
+  color: var(--muted);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
