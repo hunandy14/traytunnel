@@ -26,15 +26,18 @@ import {
   openTunnelSheet,
   syncSettingsPage,
 } from "./sheet";
+import {
+  defaultDetail,
+  isBad,
+  isRunning,
+  sourceTone,
+  splitTest,
+  statusTone,
+  testLine,
+  type Tone,
+} from "./status";
 import { showErrorToast, showUndoToast, type UndoToast } from "./toast";
-import type {
-  ExitInfo,
-  ExitStatus,
-  ExitStatusEvent,
-  ExitTestEvent,
-  Snapshot,
-  SourceInfo,
-} from "./types";
+import type { ExitInfo, ExitStatusEvent, ExitTestEvent, Snapshot, SourceInfo } from "./types";
 
 const EMPTY: Snapshot = { closeToTray: true, autostart: false, sources: [], logs: [] };
 
@@ -79,39 +82,6 @@ interface CardRefs {
 const cardRefs = new Map<number, CardRefs>();
 /** 側欄每個源 icon 的狀態小點，讓 exit-status 事件不用整列重建就能更新 */
 const railStatusRefs = new Map<string, HTMLElement>();
-
-// ---------------------------------------------------------------- 狀態工具
-
-const RUNNING: ExitStatus[] = ["connecting", "connected", "reconnecting", "port_busy", "error"];
-
-const isRunning = (e: ExitInfo) => RUNNING.includes(e.status);
-const isBad = (e: ExitInfo) => e.status === "port_busy" || e.status === "error";
-
-type Tone = "grey" | "amber" | "green" | "red";
-
-function statusTone(status: ExitStatus): Tone {
-  switch (status) {
-    case "connected":
-      return "green";
-    case "connecting":
-    case "reconnecting":
-      return "amber";
-    case "port_busy":
-    case "error":
-      return "red";
-    default:
-      return "grey";
-  }
-}
-
-/** 源的彙總狀態：全連綠／部分琥珀／全停灰，任一出口出錯就直接紅 */
-function sourceTone(src: SourceInfo): Tone {
-  const exits = src.exits.filter((e) => !pendingDelete.has(e.local));
-  if (exits.length === 0) return "grey";
-  if (exits.some(isBad)) return "red";
-  if (!exits.some(isRunning)) return "grey";
-  return exits.every((e) => e.status === "connected") ? "green" : "amber";
-}
 
 const sources = () => snap.sources;
 
@@ -159,7 +129,7 @@ function initial(name: string): string {
 function paintRailStatus(name: string) {
   const node = railStatusRefs.get(name);
   const src = snap.sources.find((s) => s.name === name);
-  if (node && src) node.className = `src-status tone-${sourceTone(src)}`;
+  if (node && src) node.className = `src-status tone-${sourceTone(visibleExits(src))}`;
 }
 
 function renderRail() {
@@ -174,7 +144,7 @@ function renderRail() {
     btn.style.setProperty("--src-ink", `hsl(${hue} 70% 86%)`);
     btn.title = `${src.name} — ssh ${src.user}@${src.host}`;
     btn.classList.toggle("active", view === "source" && src.name === selected);
-    const status = h("span", { class: `src-status tone-${sourceTone(src)}` });
+    const status = h("span", { class: `src-status tone-${sourceTone(visibleExits(src))}` });
     railStatusRefs.set(src.name, status);
     btn.appendChild(status);
     btn.addEventListener("click", () => selectSource(src.name));
@@ -364,31 +334,6 @@ function initSummaryMenu() {
 }
 
 // ---------------------------------------------------------------- 出口卡片
-
-function testLine(exit: ExitInfo): { text: string; tone: string } {
-  const t = exit.lastTest;
-  if (!t) return { text: "", tone: "muted" };
-  if (t.state === "testing") return { text: t.text || "testing…", tone: "muted" };
-  if (t.state === "fail") return { text: t.text || "no response", tone: "red" };
-  return { text: t.text, tone: "text" };
-}
-
-/**
- * 自測成功的字串是後端組好的「ip␠␠city, country」，拆成兩行顯示。
- * 拆不開（格式不如預期）就退回單行，不要硬猜。
- */
-function splitTest(text: string): { ip: string; place: string } | null {
-  const i = text.indexOf("  ");
-  if (i <= 0) return null;
-  const ip = text.slice(0, i).trim();
-  const place = text.slice(i + 2).trim();
-  return ip && place ? { ip, place } : null;
-}
-
-/** 後端沒帶 detail 時至少讓紅點有句話可看 */
-function defaultDetail(status: ExitStatus): string {
-  return status === "port_busy" ? "local port is already in use" : "connection failed";
-}
 
 function paintCard(exit: ExitInfo) {
   const refs = cardRefs.get(exit.local);
