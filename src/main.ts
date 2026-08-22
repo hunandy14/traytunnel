@@ -14,7 +14,6 @@ import {
   startSource,
   stopExit,
   stopSource,
-  testSource,
   windowClose,
   windowMinimize,
 } from "./ipc";
@@ -349,9 +348,13 @@ function initSummaryMenu() {
     if (visibleExits(src).some(isRunning)) void run(() => stopSource(src.name), `stop ${src.name}`);
     else void run(() => startSource(src.name), `start ${src.name}`);
   });
-  menuItem("menu-test-source", () => {
+  menuItem("menu-reconnect-source", () => {
     const src = currentSource();
-    if (src) void run(() => testSource(src.name), `test ${src.name}`);
+    if (!src) return;
+    // 只重接目前連線中的隧道，停用中的維持停用，不拉起來
+    for (const exit of visibleExits(src).filter(isRunning)) {
+      void run(() => restartExit(exit.local), `reconnect ${exit.name}`);
+    }
   });
   menuItem("menu-activity", () => setView("log"));
   menuItem("menu-edit-source", () => {

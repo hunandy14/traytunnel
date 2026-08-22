@@ -478,20 +478,6 @@ fn test_exit(state: State<'_, Shared>, local: u16) {
 }
 
 #[tauri::command]
-fn test_source(state: State<'_, Shared>, name: String) {
-    let st = state.inner().clone();
-    if !require_source(&st, &name) {
-        return;
-    }
-    tunnel::test_source(&st, &name);
-}
-
-#[tauri::command]
-fn test_all(state: State<'_, Shared>) {
-    tunnel::test_connected(&state.inner().clone());
-}
-
-#[tauri::command]
 fn set_close_to_tray(state: State<'_, Shared>, on: bool) -> Result<(), String> {
     let st = state.inner().clone();
     st.update_config(|c| c.close_to_tray = on)
@@ -582,8 +568,6 @@ pub fn run() {
             upsert_forward,
             delete_forward,
             test_exit,
-            test_source,
-            test_all,
             set_close_to_tray,
             set_autostart,
             get_config_path,
@@ -769,16 +753,16 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
         // 系統匣的 Exit 一律真的退出
         traymenu::ID_EXIT => do_exit(st),
         traymenu::ID_ALL_TOGGLE => toggle_all(st),
-        traymenu::ID_TEST_ALL => tunnel::test_connected(st),
+        traymenu::ID_RECONNECT_ALL => tunnel::reconnect_all(st),
         // 狀態行是停用的，照理點不到，真收到也是什麼都不做
         traymenu::ID_STATUS => {}
         _ => {
             if let Some(local) = id.strip_prefix(traymenu::EXIT_PREFIX).and_then(|p| p.parse().ok())
             {
                 toggle_exit(st, local);
-            } else if let Some(name) = id.strip_prefix(traymenu::SRC_TEST_PREFIX) {
+            } else if let Some(name) = id.strip_prefix(traymenu::SRC_RECONNECT_PREFIX) {
                 if require_source(st, name) {
-                    tunnel::test_source(st, name);
+                    tunnel::reconnect_source(st, name);
                 }
             } else {
                 log::warn!("unhandled tray menu id: {id}");

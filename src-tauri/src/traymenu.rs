@@ -20,11 +20,11 @@ pub const ID_STATUS: &str = "status";
 pub const ID_OPEN: &str = "open";
 pub const ID_EXIT: &str = "exit";
 pub const ID_ALL_TOGGLE: &str = "all-toggle";
-pub const ID_TEST_ALL: &str = "test-all";
+pub const ID_RECONNECT_ALL: &str = "reconnect-all";
 /// 單一出口的開關，後面接本地埠
 pub const EXIT_PREFIX: &str = "exit:";
-/// 單一源的重測，後面接源名
-pub const SRC_TEST_PREFIX: &str = "src-test:";
+/// 單一源的重接，後面接源名
+pub const SRC_RECONNECT_PREFIX: &str = "src-reconnect:";
 
 /// 出口少於這個數量而且只有一個源時，出口直接攤在根層；
 /// 再多就巢狀進子選單，免得整份選單長到蓋住半個螢幕。
@@ -99,14 +99,14 @@ fn exit_node(exit: &ExitView) -> Node {
     }
 }
 
-/// 一個源一個子選單：出口 + 分隔線 + Test connectivity。
+/// 一個源一個子選單：出口 + 分隔線 + Reconnect。
 /// 源底下沒出口時不放那條分隔線，免得子選單開頭空一格。
 fn source_node(src: &SourceView) -> Node {
     let mut items: Vec<Node> = src.exits.iter().map(exit_node).collect();
     if !items.is_empty() {
         items.push(Node::Separator);
     }
-    items.push(item(format!("{SRC_TEST_PREFIX}{}", src.name), "Test connectivity"));
+    items.push(item(format!("{SRC_RECONNECT_PREFIX}{}", src.name), "Reconnect"));
     Node::Submenu { label: src.name.clone(), items }
 }
 
@@ -138,7 +138,7 @@ pub fn menu_model(sources: &[SourceView]) -> Vec<Node> {
         });
         sections.push(vec![
             item(ID_ALL_TOGGLE, toggle_label(sources)),
-            item(ID_TEST_ALL, "Test all"),
+            item(ID_RECONNECT_ALL, "Reconnect all"),
         ]);
     }
     sections.push(vec![item(ID_OPEN, "Open window"), item(ID_EXIT, "Exit")]);
@@ -297,7 +297,7 @@ mod tests {
                         check("exit:1080", "a (1080)", true),
                         check("exit:1083", "b (1083)", false),
                         Node::Separator,
-                        item("src-test:hk", "Test connectivity"),
+                        item("src-reconnect:hk", "Reconnect"),
                     ],
                 },
                 Node::Submenu {
@@ -305,12 +305,12 @@ mod tests {
                     items: vec![
                         check("exit:1090", "c (1090)", true),
                         Node::Separator,
-                        item("src-test:tw", "Test connectivity"),
+                        item("src-reconnect:tw", "Reconnect"),
                     ],
                 },
                 Node::Separator,
                 item("all-toggle", "Disconnect all"),
-                item("test-all", "Test all"),
+                item("reconnect-all", "Reconnect all"),
                 Node::Separator,
                 item("open", "Open window"),
                 item("exit", "Exit"),
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(view.menu, menu_model(&sources));
     }
 
-    /// 單源且出口不多：出口直接放根層，沒有子選單也沒有 Test connectivity
+    /// 單源且出口不多：出口直接放根層，沒有子選單也沒有 Reconnect
     #[test]
     fn single_source_flattens_its_exits_to_the_root() {
         let sources = vec![source(
@@ -386,7 +386,7 @@ mod tests {
                 check("exit:1083", "b (1083)", true),
                 Node::Separator,
                 item("all-toggle", "Disconnect all"),
-                item("test-all", "Test all"),
+                item("reconnect-all", "Reconnect all"),
                 Node::Separator,
                 item("open", "Open window"),
                 item("exit", "Exit"),
@@ -405,8 +405,8 @@ mod tests {
             panic!("第三項應該是子選單，實際是 {:?}", model.get(2));
         };
         assert_eq!(label, "hk");
-        assert_eq!(items.len(), FLATTEN_LIMIT + 2); // 出口 + 分隔線 + Test connectivity
-        assert_eq!(items.last(), Some(&item("src-test:hk", "Test connectivity")));
+        assert_eq!(items.len(), FLATTEN_LIMIT + 2); // 出口 + 分隔線 + Reconnect
+        assert_eq!(items.last(), Some(&item("src-reconnect:hk", "Reconnect")));
         // 根層不該直接出現出口
         assert!(!model.iter().any(|n| matches!(n, Node::Check { .. })));
     }
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(model.iter().filter(|n| matches!(n, Node::Check { .. })).count(), 4);
     }
 
-    /// 零連線：只有狀態行與視窗動作，連 Connect all／Test all 都不給
+    /// 零連線：只有狀態行與視窗動作，連 Connect all／Reconnect all 都不給
     #[test]
     fn no_connections_shows_only_the_status_line_and_window_actions() {
         assert_eq!(
