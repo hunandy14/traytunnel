@@ -145,19 +145,39 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走 `.github/workflows/release.yml`，在 `windows-latest` runner 上跑 `npm run build:all` 並把 `out/*.exe` 上傳成 GitHub Release：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all` 並把 `out/*.exe` 上傳成 GitHub Release。主流程只需要：
 
 ```
 npm run bump <x.y.z>
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json
 git commit -m "版本升級至 <x.y.z>"
+git push
+```
+
+開 PR、合併進 `main` 後，`autotag.yml` 偵測到 `src-tauri/Cargo.toml` 的版號變動，會自動建立 annotated tag `v<x.y.z>` 並推送，接著主動 dispatch `release.yml` 觸發建置發佈（GitHub 的防遞迴機制不會讓 `GITHUB_TOKEN` push 的 tag 自己觸發其他 workflow，所以由 `autotag.yml` 補這一腳）；`release.yml` 收到後照原本邏輯確認同名 tag 已存在再建置。
+
+以下是備援手段，主流程正常運作時不需要用到：
+
+<details>
+<summary>備援：手動貼 tag</summary>
+
+`autotag.yml` 若因故沒有跑（例如版號變動沒有進到 `main`、workflow 被停用），可以自己補 tag 觸發：
+
+```
 git tag -a v<x.y.z> -m "v<x.y.z>"
 git push --tags
 ```
 
-push tag（`v*`）會自動觸發，比對 tag 版號與 `src-tauri/Cargo.toml` 的 `version` 一致後才建置發佈，不一致直接 fail。
+push tag（`v*`）會自動觸發 `release.yml`，比對 tag 版號與 `src-tauri/Cargo.toml` 的 `version` 一致後才建置發佈，不一致直接 fail。
 
-手動補發（例如發佈失敗要重跑）改走 Actions 頁面的 *Run workflow*（`workflow_dispatch`）：不用帶參數，直接以目前 `src-tauri/Cargo.toml` 的版號去掛對應的既有 tag（例如版號是 `0.4.1` 就掛 `v0.4.1`）；tag 還沒建立會直接 fail 並在 log 裡註明要先 tag、push --tags。
+</details>
+
+<details>
+<summary>備援：Actions 頁手動補發</summary>
+
+發佈失敗要重跑時，改走 Actions 頁面的 *Run workflow*（`release.yml` 的 `workflow_dispatch`）：不用帶參數，直接以目前 `src-tauri/Cargo.toml` 的版號去掛對應的既有 tag（例如版號是 `0.4.1` 就掛 `v0.4.1`）；tag 還沒建立會直接 fail 並在 log 裡註明要先 tag、push --tags。
+
+</details>
 
 ## 設定檔
 

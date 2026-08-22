@@ -1,0 +1,98 @@
+name: Autotag
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src-tauri/Cargo.toml
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: autotag-main
+  cancel-in-progress: false
+
+jobs:
+  autotag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要完整歷史，push 既有 tag 與比對既有 tag 才可靠
+          fetch-depth: 0
+
+      # 解析 src-tauri/Cargo.toml 的 [package] version，邏輯對齊 release.yml，
+      # 這裡是 ubuntu-latest，shell 明定用 bash。
+      - name: Resolve version from Cargo.toml
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_toml_path="src-tauri/Cargo.toml"
+          in_package=false
+          version=""
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^\[package\][[:space:]]*$ ]]; then
+              in_package=true
+              continue
+            fi
+            if [[ "$line" =~ ^\[.*\][[:space:]]*$ ]]; then
+              in_package=false
+              continue
+            fi
+            if $in_package && [[ "$line" =~ ^version[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+              version="${BASH_REMATCH[1]}"
+              break
+            fi
+          done < "$cargo_toml_path"
+
+          if [ -z "$version" ]; then
+            echo "::error::$cargo_toml_path 的 [package] 區塊找不到 version"
+            exit 1
+          fi
+
+          echo "Cargo.toml 版本：$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      # 用 ls-remote 查遠端既有 tag，比本地 git tag -l 可靠（不吃 fetch 範圍影響）。
+      - name: Check if tag already exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q "refs/tags/$tag\$"; then
+            echo "Tag $tag 已存在，略過（no-op）"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # tag 不存在才動手：建 annotated tag、push，再主動 dispatch release.yml。
+      # GitHub 防遞迴機制——用 GITHUB_TOKEN push 的 tag 不會觸發其他 workflow 的
+      # on: push: tags，所以這裡必須自己 gh workflow run 補一腳。
+      - name: Create annotated tag and push
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"
+
+      - name: Trigger release workflow
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml
+          echo "tag 已建立並已觸發 release：${{ steps.resolve.outputs.tag }}"
