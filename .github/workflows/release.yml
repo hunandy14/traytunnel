@@ -93,12 +93,24 @@ jobs:
       - name: Build all targets
         run: npm run build:all
 
+      - name: Generate SHA256SUMS
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path out -Filter *.exe | Sort-Object Name
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($f.Name)"
+          }
+          Set-Content -Path out/SHA256SUMS.txt -Value $lines -Encoding utf8
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.resolve.outputs.release_tag }}
           name: v${{ steps.resolve.outputs.version }}
-          files: out/*.exe
+          files: |
+            out/*.exe
+            out/SHA256SUMS.txt
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
