@@ -146,7 +146,7 @@ export function openSourceSheet(src: SourceInfo | null) {
   showSheet(backdrop(), input("name"));
 }
 
-export function closeSourceSheet() {
+function closeSourceSheet() {
   if (!open) return;
   open = false;
   hideSheet(backdrop(), () => !open);

@@ -228,6 +228,8 @@ function applyViewVisibility() {
 
 /** 一次把整個畫面對齊到目前的 snap／selected／view */
 function render() {
+  const before = selected;
+
   // 存檔後的名字一旦出現在快照裡就切過去，切完才解除等待
   if (pendingSelect !== null && snap.sources.some((s) => s.name === pendingSelect)) {
     selected = pendingSelect;
@@ -237,6 +239,11 @@ function render() {
   // 選中的源被刪掉或還沒選過，就落回第一個；
   // 但還在等 config-changed 時不回退，否則改名會被打回舊的源
   if (pendingSelect === null && !currentSource()) selected = sources()[0]?.name ?? null;
+
+  // ⋯ 選單的每一項都以「選中的那條連線」為對象。外部變更（別的視窗改了設定檔、
+  // 連線被刪掉、整份清空）可能在選單開著時把它換掉或抽走，這時要收起來——
+  // 否則使用者按下去的動作會打在另一條連線上，或打在不存在的東西上。
+  if (menuOpen && (selected !== before || !currentSource())) closeMenu();
 
   applyViewVisibility();
   renderRail();
