@@ -490,6 +490,15 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
                 return Err(format!("本地埠重複：{}（跨連線也不可以重複）", f.local));
             }
             seen_locals.push(f.local);
+            // 與介面輸入同一條規則（remote 這時已經過 normalize_remotes，
+            // 手寫純埠號一樣算數）。壞值放行的話會一路餵進 ssh -L，
+            // 換來的是每 5 秒重連一次卻永遠接不起來
+            if !valid_remote(&f.remote) {
+                return Err(format!(
+                    "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
+                    f.name, f.remote
+                ));
+            }
         }
     }
     Ok(())
@@ -1157,6 +1166,25 @@ enabled = false
         let raw = "[[sources]]\nname=\"a\"\nhost=\"h\"\nuser=\"u\"\n\n[[sources.forwards]]\nname=\"x\"\nlocal=1080\nremote=\"127.0.0.1:1\"\n\n[[sources]]\nname=\"b\"\nhost=\"h2\"\nuser=\"u\"\n\n[[sources.forwards]]\nname=\"y\"\nlocal=1080\nremote=\"127.0.0.1:2\"\n";
         let err = parse_config(raw).unwrap_err();
         assert!(err.contains("1080"));
+    }
+
+    /// 手寫的 remote 走的是與介面輸入同一條規則，壞值不可以一路餵進 ssh -L
+    #[test]
+    fn rejects_hand_written_bad_remote() {
+        let with = |remote: &str| {
+            format!(
+                "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+                 [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"{remote}\"\n"
+            )
+        };
+        for bad in ["127.0.0.1", "nope", "has space:22", "127.0.0.1:abc", "0", "70000", ""] {
+            let err = parse_config(&with(bad)).unwrap_err();
+            assert!(err.contains("remote"), "{bad} 的訊息要點名 remote：{err}");
+        }
+        // 合法的兩種寫法照樣過（純埠號在驗證之前已經被補成完整形式）
+        assert!(parse_config(&with("127.0.0.1:1080")).is_ok());
+        assert!(parse_config(&with("8080")).is_ok());
+        assert!(parse_config(&with("example.com:22")).is_ok());
     }
 
     #[test]
