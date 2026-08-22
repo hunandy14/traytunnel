@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 需要完整歷史與所有 tag，workflow_dispatch 才驗得到既有 tag 是否存在
           fetch-depth: 0
@@ -72,7 +72,7 @@ jobs:
           "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
@@ -104,7 +104,7 @@ jobs:
           Set-Content -Path out/SHA256SUMS.txt -Value $lines -Encoding utf8
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.resolve.outputs.release_tag }}
           name: v${{ steps.resolve.outputs.version }}
