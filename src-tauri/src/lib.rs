@@ -375,10 +375,19 @@ fn delete_source(state: State<'_, Shared>, name: String) {
     if !require_source(&st, &name) {
         return;
     }
-    tunnel::halt_source(&st, &name);
+    // 先存檔成功才停線。反過來做的話，存檔失敗就會留下「隧道已經停了、設定裡卻還
+    // 在而且是 enabled」的錯位狀態。要停的埠得在刪掉之前先抄下來，刪完就查不到了。
+    let ports: Vec<u16> = st
+        .config()
+        .source(&name)
+        .map(|s| s.forwards.iter().map(|f| f.local).collect())
+        .unwrap_or_default();
     if let Err(e) = st.update_config(|c| c.sources.retain(|s| s.name != name)) {
         report_save_error(&st, e);
         return;
+    }
+    for p in ports {
+        tunnel::halt(&st, p);
     }
     st.emit_config_changed();
     st.log(format!("source {name} deleted"));
@@ -414,11 +423,6 @@ fn upsert_forward(
     };
     let name = forward.name.clone();
 
-    // 編輯運行中的出口要先停掉舊的那條線（換埠或換源時舊埠也才會放掉）
-    if let Some(orig) = original_local {
-        tunnel::halt(&st, orig);
-    }
-
     if let Err(e) = st.update_config(|c| {
         if let Some(orig) = original_local {
             // 先從原本的源拔掉，再掛進目標源，同源編輯也走同一條路
@@ -433,6 +437,12 @@ fn upsert_forward(
         let msg = format!("Failed to save settings:\n{e}");
         report_save_error(&st, e);
         return Some(msg);
+    }
+
+    // 存檔成功之後才停掉舊的那條線（換埠或換源時舊埠也才會放掉）。存檔失敗時
+    // 什麼都還沒動，隧道照舊跑著，不會出現「線停了、設定沒改成」的錯位。
+    if let Some(orig) = original_local {
+        tunnel::halt(&st, orig);
     }
 
     st.emit_config_changed();
@@ -459,7 +469,7 @@ fn delete_forward(state: State<'_, Shared>, local: u16) {
         return;
     };
     let (sname, fname) = (src.name.clone(), f.name.clone());
-    tunnel::halt(&st, local);
+    // 同 delete_source：先存檔成功才停線，存檔失敗時隧道維持原狀
     if let Err(e) = st.update_config(|c| {
         for s in c.sources.iter_mut() {
             s.forwards.retain(|f| f.local != local);
@@ -468,6 +478,7 @@ fn delete_forward(state: State<'_, Shared>, local: u16) {
         report_save_error(&st, e);
         return;
     }
+    tunnel::halt(&st, local);
     st.emit_config_changed();
     st.log_from(&sname, format!("{fname} deleted"));
 }

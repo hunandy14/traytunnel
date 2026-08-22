@@ -218,7 +218,11 @@ impl AppState {
         Ok(out)
     }
 
-    /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態
+    /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態。
+    ///
+    /// 丟掉的那些 `ExitRuntime` 會連同它持有的 Job handle 一起 drop，被刪掉的
+    /// 出口那條 ssh 程序樹當場就收掉了；刪除流程因此可以先存檔再停線，
+    /// 不必為了收程序而搶在存檔之前 halt。
     fn sync_exits(&self) {
         let ports = self.config().locals();
         let mut exits = self.exits.lock().unwrap();
