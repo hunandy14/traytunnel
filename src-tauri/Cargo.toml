@@ -54,5 +54,7 @@ windows = { version = "0.62", features = [
 ] }
 # toast 大圖（appLogoOverride）只有 Toast::icon() 這條路能到，tauri-plugin-notification
 # 的 builder 沒接、notify-rust 的 image_path() 在 Windows 對應的是文字下方的小圖，都不是
-# 要的東西，因此直接用 tauri-plugin-notification 底下已經在用的這顆 crate，版本對齊鎖檔
-tauri-winrt-notification = "0.7.3"
+# 要的東西，因此直接用 tauri-plugin-notification 底下已經在用的這顆 crate。
+# 註：這裡是 0.8（用 windows 0.62，跟本檔上面的 windows 對齊），而 notify-rust 4.18 還鎖在
+# 0.7.3，鎖檔會同時存在兩個版本；notify-rust 出新版鎖到 0.8 之後即可自然收斂
+tauri-winrt-notification = "0.8.1"
