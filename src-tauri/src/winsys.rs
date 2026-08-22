@@ -8,6 +8,7 @@ use std::io;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, NO_ERROR,
+    SYSTEMTIME,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -19,6 +20,7 @@ use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ,
     RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
 };
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
@@ -151,6 +153,18 @@ fn listening_v6(port: u16) -> bool {
         let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
         let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
         rows.iter().any(|r| local_port(r.dwLocalPort) == port)
+    }
+}
+
+/// 本地時間的 `HH:mm:ss`，活動日誌每一行的時間戳。
+///
+/// 只為了這一個格式扛一整包 chrono 不划算，時區換算交給 Windows 自己做：
+/// `GetLocalTime` 回的就是使用者當下時區的牆上時間。
+pub fn local_time_hms() -> String {
+    unsafe {
+        let mut t: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut t);
+        format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
     }
 }
 
@@ -569,6 +583,20 @@ mod tests {
         let disabled: [u8; 12] = [0x03, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0];
         assert!(!disabled.iter().rev().take(8).all(|b| *b == 0));
         let _ = delete_hkcu_key(&subkey);
+    }
+
+    /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss
+    #[test]
+    fn local_time_is_a_fixed_width_hms() {
+        let ts = local_time_hms();
+        assert_eq!(ts.len(), 8, "{ts}");
+        let parts: Vec<&str> = ts.split(':').collect();
+        assert_eq!(parts.len(), 3, "{ts}");
+        let bounds = [24, 60, 60];
+        for (p, max) in parts.iter().zip(bounds) {
+            assert_eq!(p.len(), 2, "每段都要補到兩位：{ts}");
+            assert!(p.parse::<u32>().unwrap() < max, "{ts}");
+        }
     }
 
     #[test]

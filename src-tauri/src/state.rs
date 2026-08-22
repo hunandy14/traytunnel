@@ -116,7 +116,7 @@ pub fn autostart_name(app: &AppHandle) -> String {
 
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
 fn format_log(source: Option<&str>, msg: &str) -> String {
-    let ts = chrono::Local::now().format("%H:%M:%S");
+    let ts = crate::winsys::local_time_hms();
     match source {
         Some(s) => format!("{ts}  [{s}] {msg}"),
         None => format!("{ts}  {msg}"),
