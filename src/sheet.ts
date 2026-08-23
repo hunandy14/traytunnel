@@ -344,6 +344,18 @@ let fwdSource = "";
 /** null 代表這是「新增」 */
 let fwdOriginalLocal: number | null = null;
 
+/**
+ * Save 送出期間鎖住 Save／Delete 兩顆鈕，比照連線 sheet 的 setTestBusy：
+ * 沒有這道鎖，Save 在途時按 Delete 會把 fwdOriginalLocal 指到的那條（可能剛
+ * 存檔改過名字／埠號的）隧道刪掉，而 Save 那個 pending 的 invoke 還在跑，
+ * 兩個請求疊在一起，畫面最後留下的東西完全看後端回應順序碰運氣。
+ */
+function setFwdBusy(next: boolean) {
+  fwdBusy = next;
+  el<HTMLButtonElement>("fwd-save").disabled = next;
+  el<HTMLButtonElement>("fwd-delete").disabled = next;
+}
+
 function fwdClearErrors() {
   for (const f of FWD_FIELDS) setFieldError(fwdBackdrop(), f, "");
   setGeneralError(el<HTMLDivElement>("fwd-error"), "");
@@ -379,7 +391,7 @@ function fwdLocalValidate(): Partial<Record<ForwardField, string>> {
 export function openTunnelSheet(source: string, exit: ExitInfo | null) {
   fwdSource = source;
   fwdOriginalLocal = exit ? exit.local : null;
-  fwdBusy = false;
+  setFwdBusy(false);
 
   fwdInput("name").value = exit?.name ?? "";
   fwdInput("local").value = exit ? String(exit.local) : "";
@@ -411,7 +423,7 @@ async function fwdSave() {
     return;
   }
 
-  fwdBusy = true;
+  setFwdBusy(true);
   try {
     const err = await upsertForward({
       source: fwdSource,
@@ -420,14 +432,14 @@ async function fwdSave() {
       local: Number(fwdInput("local").value.trim()),
       remote: fwdInput("remote").value.trim(),
     });
-    fwdBusy = false;
+    setFwdBusy(false);
     if (err) {
       fwdAssignError(err);
       return;
     }
     closeTunnelSheet();
   } catch (e) {
-    fwdBusy = false;
+    setFwdBusy(false);
     setGeneralError(el<HTMLDivElement>("fwd-error"), String(e));
   }
 }
@@ -443,6 +455,8 @@ export function initTunnelSheet(h: TunnelHandlers) {
   el<HTMLButtonElement>("fwd-save").addEventListener("click", () => void fwdSave());
 
   el<HTMLButtonElement>("fwd-delete").addEventListener("click", () => {
+    // Save 送出、還沒等到回應之前不能按刪除：見 setFwdBusy 的說明
+    if (fwdBusy) return;
     const local = fwdOriginalLocal;
     if (local === null) return;
     closeTunnelSheet();
