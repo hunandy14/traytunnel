@@ -3,7 +3,7 @@
 //! 每個出口（以本地埠為唯一鍵）各自帶一份執行期狀態：連線狀態、自測結果、
 //! 世代序號與 Job Object handle，彼此互不影響。
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -123,6 +123,43 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     }
 }
 
+/// 一次自測的憑證：這個出口的**連線世代**加上**自測期號**。
+///
+/// 只靠連線世代是不夠的。世代只在 halt／restart 時換號，而 ssh 自己掛掉時
+/// 監看迴圈是內圈 break 之後在同一代裡重跑一輪——連線換了、世代沒換，
+/// 上一條連線發出去、還在路上的那份探測（`probe` 最久要 12 秒）就會通過
+/// 世代檢查，把舊連線的出口 IP 寫成新連線的自測結果。
+///
+/// 自測期號補上這個落差：任何會讓既有自測結果失效的事件都會換號，
+/// 換號的唯一入口是 [`AppState::invalidate_tests`]。兩個號碼合起來當一張憑證，
+/// 呼叫端只要原樣帶著它走，不必自己記得該比哪幾個號。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestToken {
+    generation: u64,
+    epoch: u64,
+}
+
+/// 搶下自測佔位，回傳 false 代表「同一張憑證真的還在測」，這次不要再發一份探測。
+///
+/// 憑證不同時**搶佔**而不是拒絕：位子上那份是上一輪連線留下的在途探測，
+/// 它的結果已經被憑證判死，沒有理由讓一個註定被丟掉的探測把新的自測擋在門外
+/// ——擋掉的話這個出口就再也不會有自測結果，只能等使用者自己按。
+fn claim_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken) -> bool {
+    if slots.get(&local) == Some(&token) {
+        return false;
+    }
+    slots.insert(local, token);
+    true
+}
+
+/// 探測結束時歸還佔位，只還得掉自己那一張：被搶佔過的舊探測晚一步跑完，
+/// 不可以把接手者的佔位清掉，否則下一份探測會與接手者並存。
+fn release_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken) {
+    if slots.get(&local) == Some(&token) {
+        slots.remove(&local);
+    }
+}
+
 /// 就地寫一筆連線狀態，回傳「有沒有真的變」。有守門與無守門的兩條寫入路徑
 /// 共用這一份「相同就不推事件」的規則，兩邊不會各判各的。
 fn write_status(rt: &mut ExitRuntime, status: &str, detail: &Option<String>) -> bool {
@@ -166,9 +203,19 @@ struct ExitRuntime {
     /// 目前有效的世代序號，換號即代表舊的監看迴圈作廢；
     /// 號碼取自全域計數器，出口被刪掉又重建也不會撞號
     generation: u64,
+    /// 目前有效的自測期號，換號即代表在途的探測結果不算數了。
+    /// 與 generation 分開的理由見 [`TestToken`]
+    test_epoch: u64,
     /// 目前活著的監看迴圈是哪一代，None 代表這個出口沒人在跑
     supervisor: Option<u64>,
     job: Option<(u64, Job)>,
+}
+
+impl ExitRuntime {
+    /// 這個出口當下的自測憑證
+    fn token(&self) -> TestToken {
+        TestToken { generation: self.generation, epoch: self.test_epoch }
+    }
 }
 
 /// 手寫而不是 derive：新項目的 status 一定要是 stopped。
@@ -181,6 +228,7 @@ impl Default for ExitRuntime {
             detail: None,
             last_test: None,
             generation: 0,
+            test_epoch: 0,
             supervisor: None,
             job: None,
         }
@@ -199,7 +247,9 @@ pub struct AppState {
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
     exits: Mutex<BTreeMap<u16, ExitRuntime>>,
-    testing: Mutex<HashSet<u16>>,
+    /// 正在自測的埠，值是那份探測拿在手上的憑證。互斥比的是憑證而不只是埠，
+    /// 舊連線留下的在途探測才擋不住新一輪的自測
+    testing: Mutex<HashMap<u16, TestToken>>,
     /// 全域世代計數器，發出去的號碼永不重複
     generation: AtomicU64,
     tray_hint_shown: AtomicBool,
@@ -220,7 +270,7 @@ impl AppState {
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
-            testing: Mutex::new(HashSet::new()),
+            testing: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -394,11 +444,24 @@ impl AppState {
         !matches!(self.exit_status(local).as_deref(), None | Some(status::STOPPED))
     }
 
-    /// 更新某個出口的自測狀態並推事件。與 `set_exit_status` 同理，
-    /// 只更新既存的出口，不讓已刪掉的埠靠一次晚到的自測結果復活
-    pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
+    /// 更新某個出口的自測狀態並推事件，憑證不符就整筆丟掉。
+    ///
+    /// 與 `set_exit_status_of` 同一套規矩：比對與寫入在同一次 exits 鎖內完成，
+    /// 中途被 halt／restart／斷線重連換掉憑證的探測寫不進去。順帶保留原本
+    /// 「只更新既存的出口」的性質，已刪掉的埠不會靠一次晚到的自測結果復活。
+    pub fn set_exit_test_of(&self, local: u16, token: TestToken, state: &str, text: &str) {
         let view = TestView { state: state.into(), text: text.into() };
-        if self.with_exit_mut(local, |rt| rt.last_test = Some(view)).is_none() {
+        let written = {
+            let mut exits = self.exits.lock().unwrap();
+            match exits.get_mut(&local) {
+                Some(rt) if rt.token() == token => {
+                    rt.last_test = Some(view);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !written {
             return;
         }
         let _ = self
@@ -406,18 +469,43 @@ impl AppState {
             .emit("exit-test", ExitTestPayload { local, state: state.into(), text: text.into() });
     }
 
-    /// 出口斷線或停掉時把舊的自測結果清乾淨
+    /// 出口斷線或停掉時把舊的自測結果清乾淨，並讓在途的探測就地作廢。
+    ///
+    /// 換期號這一手對「ssh 自己掛掉、監看迴圈在同一代裡重跑一輪」特別要緊：
+    /// 那條路不換連線世代，沒有期號的話上一條連線發出去的探測會通過世代檢查，
+    /// 把舊連線的出口 IP 寫成新連線的自測結果。
     pub fn clear_exit_test(&self, local: u16) {
-        self.with_exit_mut(local, |rt| rt.last_test = None);
+        let counter = &self.generation;
+        self.with_exit_mut(local, |rt| {
+            rt.test_epoch = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.last_test = None;
+        });
     }
 
-    /// 標記某個埠開始測試，回傳 false 代表已經在測了
-    pub fn begin_test(&self, local: u16) -> bool {
-        self.testing.lock().unwrap().insert(local)
+    /// 取這個出口當下的自測憑證。一次鎖把兩個號碼一起讀出來，
+    /// 中間不會被插進一半（讀到舊世代配新期號那種不存在的組合）。
+    pub fn test_token(&self, local: u16) -> TestToken {
+        self.exits
+            .lock()
+            .unwrap()
+            .get(&local)
+            .map(ExitRuntime::token)
+            .unwrap_or(TestToken { generation: 0, epoch: 0 })
     }
 
-    pub fn end_test(&self, local: u16) {
-        self.testing.lock().unwrap().remove(&local);
+    /// 憑證還算不算數，用來決定要不要把探測結果寫回去
+    pub fn test_alive(&self, local: u16, token: TestToken) -> bool {
+        self.exits.lock().unwrap().get(&local).is_some_and(|rt| rt.token() == token)
+    }
+
+    /// 標記某個埠開始測試，回傳 false 代表同一張憑證真的還在測
+    pub fn begin_test(&self, local: u16, token: TestToken) -> bool {
+        claim_test(&mut self.testing.lock().unwrap(), local, token)
+    }
+
+    /// 探測跑完歸還佔位，只還得掉自己那一張
+    pub fn end_test(&self, local: u16, token: TestToken) {
+        release_test(&mut self.testing.lock().unwrap(), local, token);
     }
 
     /// 讓該出口進入新世代並騰出位子，舊的監看迴圈看到世代不符就會自行退出。
@@ -706,6 +794,59 @@ mod tests {
         assert!(!without.contains('['));
         // 時間戳仍是 HH:mm:ss，長度固定 8
         assert_eq!(with.split("  ").next().unwrap().len(), 8);
+    }
+
+    fn token(generation: u64, epoch: u64) -> TestToken {
+        TestToken { generation, epoch }
+    }
+
+    /// 同一輪連線裡重複按自測要擋下來，否則一個埠會同時飛出好幾份探測
+    #[test]
+    fn the_same_token_cannot_start_a_second_probe() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(!claim_test(&mut slots, 1080, token(1, 1)));
+    }
+
+    /// 重接之後憑證換了新的，這時位子上那份是註定被丟掉的舊探測——
+    /// 必須讓新的自測搶佔，不然這個出口在舊探測跑完之前都測不了
+    #[test]
+    fn a_newer_token_preempts_a_stale_probe() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(claim_test(&mut slots, 1080, token(2, 5)), "換了憑證要搶得到位子");
+        assert_eq!(slots.get(&1080), Some(&token(2, 5)));
+    }
+
+    /// ssh 自己掛掉、監看迴圈在同一代裡重跑一輪：世代沒變，只有自測期號變了，
+    /// 這一樣要算成新的一輪，舊探測不能擋著
+    #[test]
+    fn a_new_epoch_alone_is_enough_to_preempt() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(7, 1)));
+        assert!(claim_test(&mut slots, 1080, token(7, 2)));
+    }
+
+    /// 被搶佔的舊探測晚一步跑完，不可以把接手者的位子清掉
+    #[test]
+    fn a_preempted_probe_cannot_release_the_new_slot() {
+        let mut slots = HashMap::new();
+        claim_test(&mut slots, 1080, token(1, 1));
+        claim_test(&mut slots, 1080, token(2, 2));
+        release_test(&mut slots, 1080, token(1, 1));
+        assert_eq!(slots.get(&1080), Some(&token(2, 2)), "舊的還不掉新的位子");
+        release_test(&mut slots, 1080, token(2, 2));
+        assert!(!slots.contains_key(&1080), "自己那一張還得掉");
+    }
+
+    /// 位子是逐埠獨立的，一個出口在測不會擋到另一個
+    #[test]
+    fn test_slots_are_per_exit() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(claim_test(&mut slots, 1083, token(1, 1)));
+        release_test(&mut slots, 1080, token(1, 1));
+        assert_eq!(slots.get(&1083), Some(&token(1, 1)));
     }
 
     #[test]

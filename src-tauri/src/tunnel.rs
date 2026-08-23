@@ -381,25 +381,28 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
 
 /// 對單一出口做自測，只有連上的出口才測。
 pub fn test_exit(state: &Arc<AppState>, local: u16) {
-    // 世代要在任何其他檢查之前先取。自測在背景非同步進行，探測期間使用者可能
-    // 已經中斷或重接了這個出口，晚到的結果靠世代擋在門外——但號碼要是等到
+    // 憑證要在任何其他檢查之前先取。自測在背景非同步進行，探測期間使用者可能
+    // 已經中斷或重接了這個出口，晚到的結果靠憑證擋在門外——但號碼要是等到
     // is_connected／begin_test 之後才讀，halt 剛好插在中間時讀到的就是 halt
-    // 換過的**新**號碼，之後那道 generation_alive 一路都會成立，守門形同虛設，
+    // 換過的**新**號碼，之後那道檢查一路都會成立，守門形同虛設，
     // 一份對舊連線做的探測結果就這樣寫進了新連線。
-    let generation = state.generation(local);
+    let token = state.test_token(local);
     if !state.is_connected(local) {
         state.log_exit(local, format!("port {local} : not connected, cannot test"));
         return;
     }
-    if !state.begin_test(local) {
-        return; // 同一個埠已經在測了
+    if !state.begin_test(local, token) {
+        return; // 同一輪連線已經在測了
     }
-    state.set_exit_test(local, test_state::TESTING, "testing...");
+    // 連「testing...」這個佔位也走憑證版：從取憑證到寫下去之間一樣有窗口，
+    // 沒守門的話 halt 剛清乾淨的自測欄會被這一手寫回一個永遠不會有結果的
+    // testing（它的結果稍後會被憑證擋掉），介面就這樣一直轉下去
+    state.set_exit_test_of(local, token, test_state::TESTING, "testing...");
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
-        st.end_test(local);
-        if !st.generation_alive(local, generation) {
+        st.end_test(local, token);
+        if !st.test_alive(local, token) {
             return;
         }
         let (state_name, text) = match result {
@@ -407,7 +410,7 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
             Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
             Err(_) => (test_state::FAIL, "no response".to_string()),
         };
-        st.set_exit_test(local, state_name, &text);
+        st.set_exit_test_of(local, token, state_name, &text);
         st.log_exit(local, format!("port {local} : {text}"));
     });
 }
