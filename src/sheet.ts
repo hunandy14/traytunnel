@@ -652,14 +652,25 @@ function initConfigPathRow() {
   });
 }
 
-function closeUpdateMenu() {
-  updateMenu().hidden = true;
-  updateChevron().setAttribute("aria-expanded", "false");
+/**
+ * 選單現在是不是開著。
+ *
+ * 讀 `hidden` 一定要經過這裡轉成真正的布林值再用：DOM 的 `hidden` 型別是
+ * `string | boolean`，規格為了 `hidden="until-found"` 把它放寬成
+ * boolean／double／DOMString 的聯集了。寫入端不受影響（setter 照收布林），
+ * 只有讀出來當布林用的地方需要這一手，而 `!` 的結果一定是布林。
+ */
+function isUpdateMenuOpen(): boolean {
+  return !updateMenu().hidden;
 }
 
 function setUpdateMenuOpen(open: boolean) {
   updateMenu().hidden = !open;
   updateChevron().setAttribute("aria-expanded", String(open));
+}
+
+function closeUpdateMenu() {
+  setUpdateMenuOpen(false);
 }
 
 /**
@@ -719,19 +730,19 @@ function initUpdateControl() {
 
   updateChevron().addEventListener("click", (e) => {
     e.stopPropagation();
-    setUpdateMenuOpen(updateMenu().hidden);
+    setUpdateMenuOpen(!isUpdateMenuOpen());
   });
 
   // 點到 split 以外的任何地方就關；用 mousedown 才不會被按鈕自己的 click 蓋掉
   document.addEventListener("mousedown", (e) => {
-    if (updateMenu().hidden) return;
+    if (!isUpdateMenuOpen()) return;
     const target = e.target;
     if (target instanceof Element && target.closest("#update-split")) return;
     closeUpdateMenu();
   });
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !updateMenu().hidden) {
+    if (e.key === "Escape" && isUpdateMenuOpen()) {
       e.stopPropagation();
       closeUpdateMenu();
     }
