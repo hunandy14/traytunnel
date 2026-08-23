@@ -1,13 +1,19 @@
 /**
- * 兩個 sheet dialog 與一個設定頁：
+ * 四個 sheet dialog 與一個設定頁：
  *
- * 1. 連線的新增／編輯 sheet —— 置中覆蓋層。按下 Save 才送出，後端的錯誤字串用
- *    `field: message` 前綴逐欄顯示；刪除連線用一次確認（就地把頁腳換成確認列），
- *    不走 undo。
- * 2. 隧道的新增／編輯 sheet —— 同一套 .sheet 元件、同一套逐欄錯誤規則，操作手感
- *    與連線編輯一致。刪除走 undo toast（畫面先移除、5 秒內可收回），實際的倒數
- *    與復原由 main.ts 的 onDelete 接手。
- * 3. 主區的全域設定頁 —— 兩個 toggle 即時生效，失敗就把畫面翻回去。
+ * 1. 連線的新增／編輯 sheet —— 置中覆蓋層，SSH／WireGuard 共用同一張 sheet，
+ *    靠類型分頁（僅新增時可切換，wg-design.md U1：連線類型建立後不可變）分出
+ *    兩組欄位。按下 Save 才送出，後端的錯誤字串用 `field: message` 前綴逐欄
+ *    顯示；刪除連線用一次確認（就地把頁腳換成確認列），不走 undo。
+ * 2. 轉發（forward 列）的新增／編輯 sheet —— SSH 與 WG 共用同一套表單，
+ *    REMOTE 欄位下方多一顆「Destination is a proxy」switch（probeProxy，
+ *    wg-design.md §1.6），隨時可改。刪除走 undo toast（畫面先移除、5 秒內
+ *    可收回），實際的倒數與復原由 main.ts 的 onDelete 接手。
+ * 3. SOCKS5 代理列（kind=socks）的新增／編輯 sheet —— WG 專屬，只有名稱／
+ *    本地埠兩欄，跟轉發表單完全分開（沒有目的地、沒有 probeProxy 開關）。
+ *    刪除同樣走 undo toast，與轉發列共用同一個 onDelete 回呼（local 是
+ *    全域唯一鍵，main.ts 那邊不必知道是哪一種列）。
+ * 4. 主區的全域設定頁 —— 兩個 toggle 即時生效，失敗就把畫面翻回去。
  */
 
 import { afterTransition, el } from "./dom";
@@ -15,19 +21,24 @@ import { setIcon, type IconName } from "./icons";
 import {
   checkForUpdatesNow,
   deleteSource,
+  deleteWgProxy,
   getConfigPath,
   installUpdate,
   openConfigDir,
   openReleasePage,
   openReleasesPage,
+  pickWgConf,
   setAutostart,
   setCheckForUpdates,
   setCloseToTray,
   testConnection,
+  testWgConf,
   upsertForward,
   upsertSource,
+  upsertWgProxy,
+  upsertWgSocks,
 } from "./ipc";
-import type { ExitInfo, Snapshot, SourceInfo } from "./types";
+import type { ConnKind, ExitInfo, Snapshot, SourceInfo, WgProxyInfo } from "./types";
 import { loadAppVersion } from "./version";
 
 // ---------------------------------------------------------------- sheet 共用
@@ -73,21 +84,32 @@ function hideSheet(node: HTMLElement, stillClosed: () => boolean) {
   });
 }
 
-// ---------------------------------------------------------------- 連線 sheet
+// ---------------------------------------------------------------- 連線 sheet（SSH／WireGuard 共用）
 
-type SourceField = "name" | "host" | "user" | "proxyCommand";
+type SshField = "name" | "host" | "user" | "proxyCommand";
+type WgField = "wgName" | "conf";
 
-const FIELDS: SourceField[] = ["name", "host", "user", "proxyCommand"];
+const SSH_FIELDS: SshField[] = ["name", "host", "user", "proxyCommand"];
+const WG_FIELDS: WgField[] = ["wgName", "conf"];
 
-const INPUT_ID: Record<SourceField, string> = {
+const SSH_INPUT_ID: Record<SshField, string> = {
   name: "src-name",
   host: "src-host",
   user: "src-user",
   proxyCommand: "src-proxy",
 };
 
+const WG_INPUT_ID: Record<WgField, string> = {
+  wgName: "wg-name",
+  conf: "wg-conf",
+};
+
 const backdrop = () => el<HTMLDivElement>("src-backdrop");
-const input = (f: SourceField) => el<HTMLInputElement>(INPUT_ID[f]);
+const sshInput = (f: SshField) => el<HTMLInputElement>(SSH_INPUT_ID[f]);
+const wgInput = (f: WgField) => el<HTMLInputElement>(WG_INPUT_ID[f]);
+
+/** 目前 sheet 裡選的是哪個分頁；編輯模式下鎖定為對象的既有型別 */
+type Tab = "ssh" | "wg";
 
 interface Handlers {
   /** 存檔成功，帶回最終的連線名稱（改名後是新名字） */
@@ -100,6 +122,8 @@ let open = false;
 let busy = false;
 /** null 代表這是「新增」 */
 let originalName: string | null = null;
+let originalKind: ConnKind | null = null;
+let activeTab: Tab = "ssh";
 
 let testBusy = false;
 /**
@@ -111,7 +135,8 @@ let testBusy = false;
 let testGeneration = 0;
 
 function clearErrors() {
-  for (const f of FIELDS) setFieldError(backdrop(), f, "");
+  for (const f of SSH_FIELDS) setFieldError(backdrop(), f, "");
+  for (const f of WG_FIELDS) setFieldError(backdrop(), f, "");
   setGeneralError(el<HTMLDivElement>("src-error"), "");
 }
 
@@ -128,14 +153,20 @@ function setTestBusy(next: boolean) {
 
 /** 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤 */
 function assignError(msg: string) {
-  const m = /^\s*(name|host|user|proxycommand)\s*:\s*([\s\S]+)$/i.exec(msg);
+  const m = /^\s*(name|host|user|proxycommand|confpath)\s*:\s*([\s\S]+)$/i.exec(msg);
   if (!m) {
     setGeneralError(el<HTMLDivElement>("src-error"), msg);
     return;
   }
-  // 欄位鍵是 camelCase，比對過的前綴要轉回來
   const lower = m[1].toLowerCase();
-  const key: SourceField = lower === "proxycommand" ? "proxyCommand" : (lower as SourceField);
+  if (activeTab === "wg") {
+    // wg 分頁：name 對應 wgName 這個欄位鍵，confPath 直接對應
+    const key: WgField = lower === "confpath" ? "conf" : "wgName";
+    setFieldError(backdrop(), key, m[2].trim());
+    return;
+  }
+  // ssh 分頁：欄位鍵是 camelCase，比對過的前綴要轉回來
+  const key: SshField = lower === "proxycommand" ? "proxyCommand" : (lower as SshField);
   setFieldError(backdrop(), key, m[2].trim());
 }
 
@@ -144,11 +175,11 @@ function assignError(msg: string) {
  * name 的規則照 Rust 端 valid_source_name：不可空白、不可含中括號
  * （日誌行前綴是 `[源名]`，名字裡再冒出一個 `]` 會讓前端切不出正確的源名）。
  */
-function localValidate(): Partial<Record<SourceField, string>> {
-  const errors: Partial<Record<SourceField, string>> = {};
-  const name = input("name").value.trim();
-  const host = input("host").value.trim();
-  const user = input("user").value.trim();
+function localValidateSsh(): Partial<Record<SshField, string>> {
+  const errors: Partial<Record<SshField, string>> = {};
+  const name = sshInput("name").value.trim();
+  const host = sshInput("host").value.trim();
+  const user = sshInput("user").value.trim();
   if (!name) errors.name = "name is required";
   else if (/\s/.test(name)) errors.name = "must not contain spaces";
   else if (/[[\]]/.test(name)) errors.name = "must not contain brackets";
@@ -158,25 +189,74 @@ function localValidate(): Partial<Record<SourceField, string>> {
   return errors;
 }
 
+function localValidateWg(): Partial<Record<WgField, string>> {
+  const errors: Partial<Record<WgField, string>> = {};
+  const name = wgInput("wgName").value.trim();
+  const conf = wgInput("conf").value.trim();
+  if (!name) errors.wgName = "name is required";
+  else if (/\s/.test(name)) errors.wgName = "must not contain spaces";
+  else if (/[[\]]/.test(name)) errors.wgName = "must not contain brackets";
+  if (!conf) errors.conf = ".conf path is required";
+  return errors;
+}
+
 function showFoot(mode: "edit" | "confirm") {
   el<HTMLElement>("src-foot").hidden = mode !== "edit";
   el<HTMLElement>("src-confirm").hidden = mode !== "confirm";
 }
 
-export function openSourceSheet(src: SourceInfo | null) {
-  originalName = src ? src.name : null;
+function setTab(tab: Tab) {
+  activeTab = tab;
+  el<HTMLButtonElement>("src-tab-ssh").classList.toggle("active", tab === "ssh");
+  el<HTMLButtonElement>("src-tab-wg").classList.toggle("active", tab === "wg");
+  el<HTMLElement>("src-fields-ssh").hidden = tab !== "ssh";
+  el<HTMLElement>("src-fields-wg").hidden = tab !== "wg";
+}
+
+/** 傳給 openSourceSheet 的編輯對象：null 代表新增 */
+export type ConnTarget = { kind: "ssh"; data: SourceInfo } | { kind: "wg"; data: WgProxyInfo };
+
+export function openSourceSheet(target: ConnTarget | null) {
+  originalName = target ? target.data.name : null;
+  originalKind = target ? target.kind : null;
   busy = false;
 
-  input("name").value = src?.name ?? "";
-  input("host").value = src?.host ?? "";
-  input("user").value = src?.user ?? "";
-  input("proxyCommand").value = src?.proxyCommand ?? "";
+  const tabs = el<HTMLElement>("src-type-tabs");
+  const badge = el<HTMLSpanElement>("src-type-badge");
+  if (target) {
+    // U1：連線型別建立後不可變，編輯時不給切分頁，改用唯讀徽章
+    tabs.hidden = true;
+    badge.hidden = false;
+    badge.className = `type-badge ${target.kind}`;
+    badge.textContent = target.kind === "ssh" ? "SSH" : "WG";
+  } else {
+    tabs.hidden = false;
+    badge.hidden = true;
+  }
 
-  el<HTMLSpanElement>("src-title").textContent = src ? "Edit connection" : "Add connection";
-  el<HTMLButtonElement>("src-save").textContent = src ? "Save" : "Add";
-  el<HTMLButtonElement>("src-delete").hidden = !src;
-  el<HTMLSpanElement>("src-confirm-text").textContent = src
-    ? `Delete ${src.name} and its ${src.exits.length} tunnel${src.exits.length === 1 ? "" : "s"}?`
+  if (target && target.kind === "ssh") {
+    setTab("ssh");
+    sshInput("name").value = target.data.name;
+    sshInput("host").value = target.data.host;
+    sshInput("user").value = target.data.user;
+    sshInput("proxyCommand").value = target.data.proxyCommand;
+  } else if (target && target.kind === "wg") {
+    setTab("wg");
+    wgInput("wgName").value = target.data.name;
+    wgInput("conf").value = target.data.confPath;
+  } else {
+    setTab("ssh");
+    for (const f of SSH_FIELDS) sshInput(f).value = "";
+    for (const f of WG_FIELDS) wgInput(f).value = "";
+  }
+
+  el<HTMLSpanElement>("src-title").textContent = target ? "Edit connection" : "Add connection";
+  el<HTMLButtonElement>("src-save").textContent = target ? "Save" : "Add";
+  el<HTMLButtonElement>("src-delete").hidden = !target;
+  el<HTMLSpanElement>("src-confirm-text").textContent = target
+    ? target.kind === "ssh"
+      ? `Delete ${target.data.name} and its ${target.data.exits.length} tunnel${target.data.exits.length === 1 ? "" : "s"}?`
+      : `Delete ${target.data.name} and its ${target.data.exits.length} row${target.data.exits.length === 1 ? "" : "s"}?`
     : "Delete this connection?";
 
   clearErrors();
@@ -185,7 +265,7 @@ export function openSourceSheet(src: SourceInfo | null) {
   testGeneration++;
   showFoot("edit");
   open = true;
-  showSheet(backdrop(), input("name"));
+  showSheet(backdrop(), activeTab === "ssh" ? sshInput("name") : wgInput("wgName"));
 }
 
 function closeSourceSheet() {
@@ -196,26 +276,23 @@ function closeSourceSheet() {
   hideSheet(backdrop(), () => !open);
 }
 
-async function save() {
-  if (busy) return;
-  clearErrors();
-
-  const errors = localValidate();
-  const keys = Object.keys(errors) as SourceField[];
+async function saveSsh() {
+  const errors = localValidateSsh();
+  const keys = Object.keys(errors) as SshField[];
   if (keys.length > 0) {
     for (const k of keys) setFieldError(backdrop(), k, errors[k] as string);
     return;
   }
 
-  const name = input("name").value.trim();
+  const name = sshInput("name").value.trim();
   busy = true;
   try {
     const err = await upsertSource({
-      originalName,
+      originalName: originalKind === "ssh" ? originalName : null,
       name,
-      host: input("host").value.trim(),
-      user: input("user").value.trim(),
-      proxyCommand: input("proxyCommand").value.trim(),
+      host: sshInput("host").value.trim(),
+      user: sshInput("user").value.trim(),
+      proxyCommand: sshInput("proxyCommand").value.trim(),
     });
     busy = false;
     if (err) {
@@ -230,23 +307,68 @@ async function save() {
   }
 }
 
+async function saveWg() {
+  const errors = localValidateWg();
+  const keys = Object.keys(errors) as WgField[];
+  if (keys.length > 0) {
+    for (const k of keys) setFieldError(backdrop(), k, errors[k] as string);
+    return;
+  }
+
+  const name = wgInput("wgName").value.trim();
+  busy = true;
+  try {
+    const err = await upsertWgProxy({
+      originalName: originalKind === "wg" ? originalName : null,
+      name,
+      confPath: wgInput("conf").value.trim(),
+    });
+    busy = false;
+    if (err) {
+      assignError(err);
+      return;
+    }
+    closeSourceSheet();
+    handlers.onSaved(name);
+  } catch (e) {
+    busy = false;
+    setGeneralError(el<HTMLDivElement>("src-error"), String(e));
+  }
+}
+
+async function save() {
+  if (busy) return;
+  clearErrors();
+  if (activeTab === "ssh") await saveSsh();
+  else await saveWg();
+}
+
 /**
  * 存檔前的連線測試：拿表單「當下」填的值探測，不必先存檔。
- * 前置驗證只看 host／user（跟 localValidate 用同一套訊息），空白就地顯示
- * 錯誤、不 spawn；name 是否合法與這裡無關。
+ * SSH 分頁測 host／user（跟 localValidateSsh 用同一套訊息），WG 分頁測
+ * .conf 路徑（真握手，15 秒上限，回傳形狀與 ssh 那邊一致，見 ipc.ts 的
+ * testWgConf）。空白就地顯示錯誤、不送出。
  */
-async function testConnectionNow() {
+async function testNow() {
   if (testBusy) return;
   clearTestResult();
 
-  const errors = localValidate();
-  const relevant: Partial<Record<SourceField, string>> = {};
-  if (errors.host) relevant.host = errors.host;
-  if (errors.user) relevant.user = errors.user;
-  const keys = Object.keys(relevant) as SourceField[];
-  if (keys.length > 0) {
-    for (const k of keys) setFieldError(backdrop(), k, relevant[k] as string);
-    return;
+  if (activeTab === "ssh") {
+    const errors = localValidateSsh();
+    const relevant: Partial<Record<SshField, string>> = {};
+    if (errors.host) relevant.host = errors.host;
+    if (errors.user) relevant.user = errors.user;
+    const keys = Object.keys(relevant) as SshField[];
+    if (keys.length > 0) {
+      for (const k of keys) setFieldError(backdrop(), k, relevant[k] as string);
+      return;
+    }
+  } else {
+    const conf = wgInput("conf").value.trim();
+    if (!conf) {
+      setFieldError(backdrop(), "conf", ".conf path is required");
+      return;
+    }
   }
 
   // gen 對不上就代表 sheet 中途被關掉／重開過，或欄位在探測進行中被改掉了
@@ -254,13 +376,17 @@ async function testConnectionNow() {
   // 被重置過（reopen 或欄位 input handler），不能讓晚到的這次回應蓋掉
   // 正在跑的下一輪測試。
   const gen = testGeneration;
+  const tab = activeTab;
   setTestBusy(true);
   try {
-    const result = await testConnection({
-      host: input("host").value.trim(),
-      user: input("user").value.trim(),
-      proxyCommand: input("proxyCommand").value.trim(),
-    });
+    const result =
+      tab === "ssh"
+        ? await testConnection({
+            host: sshInput("host").value.trim(),
+            user: sshInput("user").value.trim(),
+            proxyCommand: sshInput("proxyCommand").value.trim(),
+          })
+        : await testWgConf(wgInput("conf").value.trim());
     if (gen !== testGeneration) return;
     setTestBusy(false);
     setTestResult(el<HTMLDivElement>("src-test-result"), result.message, result.ok);
@@ -271,12 +397,36 @@ async function testConnectionNow() {
   }
 }
 
+/** .conf 路徑輸入框內嵌的 folder icon 鈕：叫原生檔案選擇器，取消時 pickWgConf 回 null */
+async function pickConf() {
+  try {
+    const path = await pickWgConf();
+    if (path === null) return;
+    wgInput("conf").value = path;
+    setFieldError(backdrop(), "conf", "");
+    clearTestResult();
+    testGeneration++;
+    if (testBusy) setTestBusy(false);
+    // 選檔當下順手帶一個名字，使用者還沒自己填的話——跟 remote 的正規化一樣，
+    // 只是預填，使用者仍然可以自己改
+    const nameField = wgInput("wgName");
+    if (!nameField.value.trim()) {
+      const base = path.split(/[\\/]/).pop() ?? path;
+      nameField.value = base.replace(/\.conf$/i, "");
+    }
+  } catch (e) {
+    setFieldError(backdrop(), "conf", String(e));
+  }
+}
+
 async function commitDelete() {
   const target = originalName;
-  if (!target || busy) return;
+  const kind = originalKind;
+  if (!target || !kind || busy) return;
   busy = true;
   try {
-    await deleteSource(target);
+    if (kind === "ssh") await deleteSource(target);
+    else await deleteWgProxy(target);
     busy = false;
     closeSourceSheet();
     handlers.onDeleted(target);
@@ -296,7 +446,12 @@ export function initSourceSheet(h: Handlers) {
   el<HTMLButtonElement>("src-close").addEventListener("click", closeSourceSheet);
   el<HTMLButtonElement>("src-cancel").addEventListener("click", closeSourceSheet);
   el<HTMLButtonElement>("src-save").addEventListener("click", () => void save());
-  el<HTMLButtonElement>("src-test").addEventListener("click", () => void testConnectionNow());
+  el<HTMLButtonElement>("src-test").addEventListener("click", () => void testNow());
+
+  el<HTMLButtonElement>("src-tab-ssh").addEventListener("click", () => setTab("ssh"));
+  el<HTMLButtonElement>("src-tab-wg").addEventListener("click", () => setTab("wg"));
+
+  el<HTMLButtonElement>("wg-pick").addEventListener("click", () => void pickConf());
 
   el<HTMLButtonElement>("src-delete").addEventListener("click", () => showFoot("confirm"));
   el<HTMLButtonElement>("src-confirm-no").addEventListener("click", () => showFoot("edit"));
@@ -306,18 +461,24 @@ export function initSourceSheet(h: Handlers) {
     if (e.key === "Escape" && open) closeSourceSheet();
   });
 
-  for (const f of FIELDS) {
-    const node = input(f);
+  for (const f of SSH_FIELDS) {
+    const node = sshInput(f);
     node.addEventListener("input", () => {
       setFieldError(backdrop(), f, "");
-      // 欄位改過了，舊的測試結果已經不對這一份表單負責，藏起來避免誤導
       clearTestResult();
-      // 順便遞增世代：探測還在跑的話，等它回來時 gen 比對會作廢，
-      // 不會把針對舊欄位值跑出來的結果畫到已經改過的表單上。
       testGeneration++;
-      // 舊探測既然已經作廢，不必再讓 Test 鈕陪著它空等——立刻解鎖，
-      // 讓使用者能馬上針對新內容重新測；晚到的舊回應被上面的 gen 擋住，
-      // 不會回頭把鈕重新鎖上或蓋掉畫面。
+      if (testBusy) setTestBusy(false);
+    });
+    node.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void save();
+    });
+  }
+  for (const f of WG_FIELDS) {
+    const node = wgInput(f);
+    node.addEventListener("input", () => {
+      setFieldError(backdrop(), f, "");
+      clearTestResult();
+      testGeneration++;
       if (testBusy) setTestBusy(false);
     });
     node.addEventListener("keydown", (e) => {
@@ -326,7 +487,7 @@ export function initSourceSheet(h: Handlers) {
   }
 }
 
-// ---------------------------------------------------------------- 隧道 sheet
+// ---------------------------------------------------------------- 轉發（forward 列）sheet
 
 type ForwardField = "name" | "local" | "remote";
 
@@ -340,6 +501,7 @@ const FWD_INPUT_ID: Record<ForwardField, string> = {
 
 const fwdBackdrop = () => el<HTMLDivElement>("fwd-backdrop");
 const fwdInput = (f: ForwardField) => el<HTMLInputElement>(FWD_INPUT_ID[f]);
+const fwdProxyToggle = () => el<HTMLButtonElement>("fwd-is-proxy");
 
 interface TunnelHandlers {
   /** 刪除鍵：sheet 先關掉，undo toast 的倒數與復原交給 main.ts */
@@ -349,8 +511,9 @@ interface TunnelHandlers {
 let fwdHandlers: TunnelHandlers = { onDelete: () => {} };
 let fwdOpen = false;
 let fwdBusy = false;
-/** 這條隧道掛在哪條連線底下 */
-let fwdSource = "";
+/** 這條轉發掛在哪條連線底下，以及那條連線的型別（決定 upsertForward 的 connectionKind） */
+let fwdConnection = "";
+let fwdConnectionKind: ConnKind = "ssh";
 /** null 代表這是「新增」 */
 let fwdOriginalLocal: number | null = null;
 
@@ -402,16 +565,18 @@ function fwdLocalValidate(): Partial<Record<ForwardField, string>> {
   return errors;
 }
 
-export function openTunnelSheet(source: string, exit: ExitInfo | null) {
-  fwdSource = source;
+export function openTunnelSheet(connection: string, connectionKind: ConnKind, exit: ExitInfo | null) {
+  fwdConnection = connection;
+  fwdConnectionKind = connectionKind;
   fwdOriginalLocal = exit ? exit.local : null;
   setFwdBusy(false);
 
   fwdInput("name").value = exit?.name ?? "";
   fwdInput("local").value = exit ? String(exit.local) : "";
   fwdInput("remote").value = exit?.remote ?? "";
+  fwdProxyToggle().classList.toggle("on", Boolean(exit?.probeProxy));
 
-  el<HTMLSpanElement>("fwd-title").textContent = exit ? "Edit tunnel" : "Add tunnel";
+  el<HTMLSpanElement>("fwd-title").textContent = exit ? "Edit forward" : "Add forward";
   el<HTMLButtonElement>("fwd-save").textContent = exit ? "Save" : "Add";
   el<HTMLButtonElement>("fwd-delete").hidden = !exit;
 
@@ -440,11 +605,13 @@ async function fwdSave() {
   setFwdBusy(true);
   try {
     const err = await upsertForward({
-      source: fwdSource,
+      connection: fwdConnection,
+      connectionKind: fwdConnectionKind,
       originalLocal: fwdOriginalLocal,
       name: fwdInput("name").value.trim(),
       local: Number(fwdInput("local").value.trim()),
       remote: fwdInput("remote").value.trim(),
+      probeProxy: fwdProxyToggle().classList.contains("on"),
     });
     setFwdBusy(false);
     if (err) {
@@ -467,6 +634,9 @@ export function initTunnelSheet(h: TunnelHandlers) {
   el<HTMLButtonElement>("fwd-close").addEventListener("click", closeTunnelSheet);
   el<HTMLButtonElement>("fwd-cancel").addEventListener("click", closeTunnelSheet);
   el<HTMLButtonElement>("fwd-save").addEventListener("click", () => void fwdSave());
+  fwdProxyToggle().addEventListener("click", (e) => {
+    (e.currentTarget as HTMLElement).classList.toggle("on");
+  });
 
   el<HTMLButtonElement>("fwd-delete").addEventListener("click", () => {
     // Save 送出、還沒等到回應之前不能按刪除：見 setFwdBusy 的說明
@@ -486,6 +656,139 @@ export function initTunnelSheet(h: TunnelHandlers) {
     node.addEventListener("input", () => setFieldError(fwdBackdrop(), f, ""));
     node.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void fwdSave();
+    });
+  }
+}
+
+// ---------------------------------------------------------------- SOCKS5 代理列 sheet（WG 專屬）
+
+type SocksField = "name" | "local";
+
+const SOCKS_FIELDS: SocksField[] = ["name", "local"];
+
+const SOCKS_INPUT_ID: Record<SocksField, string> = {
+  name: "socks-name",
+  local: "socks-local",
+};
+
+const socksBackdrop = () => el<HTMLDivElement>("socks-backdrop");
+const socksInput = (f: SocksField) => el<HTMLInputElement>(SOCKS_INPUT_ID[f]);
+
+interface SocksHandlers {
+  onDelete: (local: number) => void;
+}
+
+let socksHandlers: SocksHandlers = { onDelete: () => {} };
+let socksOpen = false;
+let socksBusy = false;
+let socksConnection = "";
+let socksOriginalLocal: number | null = null;
+
+function setSocksBusy(next: boolean) {
+  socksBusy = next;
+  el<HTMLButtonElement>("socks-save").disabled = next;
+  el<HTMLButtonElement>("socks-delete").disabled = next;
+}
+
+function socksClearErrors() {
+  for (const f of SOCKS_FIELDS) setFieldError(socksBackdrop(), f, "");
+  setGeneralError(el<HTMLDivElement>("socks-error"), "");
+}
+
+function socksAssignError(msg: string) {
+  const m = /^\s*(name|local)\s*:\s*([\s\S]+)$/i.exec(msg);
+  if (m) setFieldError(socksBackdrop(), m[1].toLowerCase(), m[2].trim());
+  else setGeneralError(el<HTMLDivElement>("socks-error"), msg);
+}
+
+function socksLocalValidate(): Partial<Record<SocksField, string>> {
+  const errors: Partial<Record<SocksField, string>> = {};
+  if (!socksInput("name").value.trim()) errors.name = "name is required";
+  if (!isPort(socksInput("local").value.trim())) errors.local = "must be 1-65535";
+  return errors;
+}
+
+export function openSocksSheet(connection: string, exit: ExitInfo | null) {
+  socksConnection = connection;
+  socksOriginalLocal = exit ? exit.local : null;
+  setSocksBusy(false);
+
+  socksInput("name").value = exit?.name ?? "";
+  socksInput("local").value = exit ? String(exit.local) : "";
+
+  el<HTMLSpanElement>("socks-title").textContent = exit ? "Edit SOCKS5 proxy" : "Add SOCKS5 proxy";
+  el<HTMLButtonElement>("socks-save").textContent = exit ? "Save" : "Add";
+  el<HTMLButtonElement>("socks-delete").hidden = !exit;
+
+  socksClearErrors();
+  socksOpen = true;
+  showSheet(socksBackdrop(), socksInput("name"));
+}
+
+export function closeSocksSheet() {
+  if (!socksOpen) return;
+  socksOpen = false;
+  hideSheet(socksBackdrop(), () => !socksOpen);
+}
+
+async function socksSave() {
+  if (socksBusy) return;
+  socksClearErrors();
+
+  const errors = socksLocalValidate();
+  const keys = Object.keys(errors) as SocksField[];
+  if (keys.length > 0) {
+    for (const k of keys) setFieldError(socksBackdrop(), k, errors[k] as string);
+    return;
+  }
+
+  setSocksBusy(true);
+  try {
+    const err = await upsertWgSocks({
+      connection: socksConnection,
+      originalLocal: socksOriginalLocal,
+      name: socksInput("name").value.trim(),
+      local: Number(socksInput("local").value.trim()),
+    });
+    setSocksBusy(false);
+    if (err) {
+      socksAssignError(err);
+      return;
+    }
+    closeSocksSheet();
+  } catch (e) {
+    setSocksBusy(false);
+    setGeneralError(el<HTMLDivElement>("socks-error"), String(e));
+  }
+}
+
+export function initSocksSheet(h: SocksHandlers) {
+  socksHandlers = h;
+
+  socksBackdrop().addEventListener("mousedown", (e) => {
+    if (e.target === socksBackdrop()) closeSocksSheet();
+  });
+  el<HTMLButtonElement>("socks-close").addEventListener("click", closeSocksSheet);
+  el<HTMLButtonElement>("socks-cancel").addEventListener("click", closeSocksSheet);
+  el<HTMLButtonElement>("socks-save").addEventListener("click", () => void socksSave());
+
+  el<HTMLButtonElement>("socks-delete").addEventListener("click", () => {
+    if (socksBusy) return;
+    const local = socksOriginalLocal;
+    if (local === null) return;
+    closeSocksSheet();
+    socksHandlers.onDelete(local);
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && socksOpen) closeSocksSheet();
+  });
+
+  for (const f of SOCKS_FIELDS) {
+    const node = socksInput(f);
+    node.addEventListener("input", () => setFieldError(socksBackdrop(), f, ""));
+    node.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void socksSave();
     });
   }
 }
