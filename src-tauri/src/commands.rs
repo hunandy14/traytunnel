@@ -8,7 +8,7 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, Source};
-use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
+use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, update, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
@@ -452,8 +452,27 @@ pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
     update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
 }
 
-/// 可攜／單檔版的「Download」：開系統瀏覽器到 Releases 頁，剩下的交給使用者。
-/// 這條路不下載任何東西，也不會動到執行中的這顆 exe。
+/// 使用者主動按下的「Check now」。
+///
+/// **不受背景檢查開關管**：那個開關管的是自動連外，親手按下這顆鈕就是對這一次
+/// 連外的明示同意。結果直接回傳，讓按鈕演得出 Up to date 與 Check failed
+/// 那兩個瞬態——Err 就是失敗，Ok(None) 就是已經最新。
+#[tauri::command]
+pub async fn check_for_updates_now(state: State<'_, Shared>) -> Result<Option<UpdateInfo>, String> {
+    let st = state.inner().clone();
+    update::check_manually(&st).await
+}
+
+/// 某一版的 release 頁：發佈說明與該版的下載資產都在那一頁上。
+/// 可攜／單檔版的「Get vX.Y.Z」與下拉的「View release notes」共用這個指令，
+/// version 給 None 時退回 releases/latest。
+#[tauri::command]
+pub fn open_release_page(state: State<'_, Shared>, version: Option<String>) {
+    update::open_release_page(state.inner(), version.as_deref());
+}
+
+/// 下拉的「Download from Releases」：開系統瀏覽器到 Releases 列表頁，
+/// 剩下的交給使用者。這條路不下載任何東西，也不會動到執行中的這顆 exe。
 #[tauri::command]
 pub fn open_releases_page(state: State<'_, Shared>) {
     update::open_releases_page(state.inner());

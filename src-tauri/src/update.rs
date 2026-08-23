@@ -36,8 +36,16 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LATEST_JSON: &str =
     "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
 
-/// 非安裝版按下 Download 時開的頁面
-const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
+/// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
+/// 使用者可以自己挑要哪一版（含更早的版本）
+const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases";
+
+/// 單一版本的 release 頁前綴。發佈說明與該版的下載資產都在同一頁上，
+/// 所以「View release notes」與可攜版的「Get vX.Y.Z」開的是同一個網址。
+const RELEASE_TAG_PREFIX: &str = "https://github.com/hunandy14/traytunnel/releases/tag/v";
+
+/// 還不知道是哪一版（沒查過或查不到）時，release 頁退回這裡
+const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
 
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,22 +131,75 @@ async fn check_once(st: &Shared) {
     if !st.checks_for_updates() {
         return;
     }
-    let found = if is_installed(&st.app) {
-        check_installed(&st.app).await
-    } else {
-        check_unmanaged(&st.app).await
-    };
-    match found {
+    match check_lane(&st.app).await {
         Ok(found) => st.set_update(found),
         Err(e) => st.log(format!("update check failed: {e}")),
     }
 }
 
+/// 使用者主動按下的檢查。
+///
+/// 刻意**不**看 `checks_for_updates` 那道閘：它管的是「要不要自己在背景連外」，
+/// 而使用者親手按下這顆鈕，就是對這一次連外的明示同意。拿背景開關去擋一個
+/// 當面的請求，得到的只會是一顆按了沒反應的鈕。
+///
+/// 與背景車道的另一個差別是結果要回傳：按鈕得靠它演出 Up to date／Check
+/// failed 那兩個瞬態，而背景車道對這兩種結果都是靜默的。共用狀態照樣更新，
+/// 兩條車道與介面看到的始終是同一份事實。
+pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
+    let found = check_lane(&st.app).await;
+    match &found {
+        Ok(Some(u)) => {
+            st.set_update(Some(u.clone()));
+            st.log(format!("update check: v{} is available", u.version));
+        }
+        Ok(None) => {
+            st.set_update(None);
+            st.log("update check: already up to date");
+        }
+        Err(e) => st.log(format!("update check failed: {e}")),
+    }
+    found
+}
+
+/// 這次執行該走哪一條車道，背景與手動共用同一個判斷
+async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    if is_installed(app) {
+        check_installed(app).await
+    } else {
+        check_unmanaged(app).await
+    }
+}
+
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
+///
+/// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
 async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(found.map(|u| UpdateInfo { version: u.version, installed: true }))
+    let current = app.package_info().version.to_string();
+    Ok(found.and_then(|u| accept_installed(&u.version, &current)))
+}
+
+/// 外掛回報的那一版要不要真的當成新版，由自家的 [`is_newer`] 再判一次。
+///
+/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
+/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉
+/// 任何東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依手上：
+/// 換版本、有人塞了 version_comparator、或 latest.json 長出沒預期的形狀，
+/// 都可能讓那個 Option 變成 Some 而我們這層毫無反抗餘地。
+///
+/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
+/// 重裝一個他已經在用的版本。因此版本比對這件事自己做一次，任何比不出「嚴格
+/// 大於」的情形（含空字串、解析不出來的怪版本號）一律當成沒有新版。
+fn accept_installed(remote: &str, current: &str) -> Option<UpdateInfo> {
+    if !is_newer(remote, current) {
+        return None;
+    }
+    Some(UpdateInfo {
+        version: remote.trim().trim_start_matches(['v', 'V']).to_string(),
+        installed: true,
+    })
 }
 
 // ------------------------------------------------- 可攜／單檔車道（不就地更新）
@@ -190,11 +251,35 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
     }
 }
 
-/// 非安裝版的「Download」：開系統瀏覽器到 Releases 頁，讓使用者自己換檔案。
-/// 這條路不下載、不碰自己這顆 exe。
+/// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
+/// 使用者按下「View release notes」時至少看得到最新那一版的說明。
+///
+/// 純函式，網址組法有問題要在測試裡就看得出來，不必等到實機按下去開錯頁。
+pub fn release_url(version: Option<&str>) -> String {
+    let tag = version
+        .map(|v| v.trim().trim_start_matches(['v', 'V']))
+        .filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
+    match tag {
+        Some(v) => format!("{RELEASE_TAG_PREFIX}{v}"),
+        None => LATEST_RELEASE_PAGE.to_string(),
+    }
+}
+
+/// 單一版本的 release 頁：發佈說明與該版的下載資產都在上面。
+/// 可攜／單檔版的「Get vX.Y.Z」與下拉的「View release notes」都走這裡。
+pub fn open_release_page(st: &Shared, version: Option<&str>) {
+    open_page(st, &release_url(version));
+}
+
+/// Releases 列表頁：下拉的「Download from Releases」走這裡，
+/// 讓使用者自己挑版本換檔案。這條路不下載、不碰自己這顆 exe。
 pub fn open_releases_page(st: &Shared) {
-    if let Err(e) = crate::winsys::open_url(RELEASES_PAGE) {
-        st.log(format!("could not open the releases page: {e}"));
+    open_page(st, RELEASES_PAGE);
+}
+
+fn open_page(st: &Shared, url: &str) {
+    if let Err(e) = crate::winsys::open_url(url) {
+        st.log(format!("could not open {url}: {e}"));
     }
 }
 
@@ -312,6 +397,73 @@ mod tests {
         assert!(!is_newer("0.5.0", "not-a-version"));
     }
 
+    /// 安裝版車道的最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
+    ///
+    /// 0.5.0 那次誤報的教訓是「說有新版」這個判斷不可以整個外包出去，
+    /// 這裡釘住我們自己一定會再判一次。
+    #[test]
+    fn the_installed_lane_refuses_a_version_that_is_not_newer() {
+        assert_eq!(accept_installed("0.5.0", "0.5.0"), None);
+        assert_eq!(accept_installed("0.4.9", "0.5.0"), None);
+        // 版本號怪到解析不出來時同樣不報，寧可漏報也不要叫人去重裝已經在用的版本
+        assert_eq!(accept_installed("", "0.5.0"), None);
+        assert_eq!(accept_installed("latest", "0.5.0"), None);
+    }
+
+    /// 真的有新版時照樣要放行，而且版本號存進去是不帶 v 的（UpdateInfo 的契約，
+    /// 前端會自己補上 v 顯示成 `Update to v0.6.0`）
+    #[test]
+    fn the_installed_lane_still_passes_a_real_update_through() {
+        let found = accept_installed("0.6.0", "0.5.0").expect("0.6.0 比 0.5.0 新");
+        assert_eq!(found, UpdateInfo { version: "0.6.0".into(), installed: true });
+        let prefixed = accept_installed("v0.6.0", "0.5.0").expect("帶 v 的一樣認得");
+        assert_eq!(prefixed.version, "0.6.0");
+    }
+
+    /// release 頁的網址組法：帶不帶 v 都要組出同一個 tag 頁，
+    /// 不知道版本時退回 releases/latest 而不是組出一個 tag 是空的壞網址
+    #[test]
+    fn a_release_url_points_at_that_version_or_falls_back_to_latest() {
+        assert_eq!(
+            release_url(Some("0.6.0")),
+            "https://github.com/hunandy14/traytunnel/releases/tag/v0.6.0"
+        );
+        assert_eq!(release_url(Some("v0.6.0")), release_url(Some("0.6.0")));
+        assert_eq!(release_url(Some("  0.6.0  ")), release_url(Some("0.6.0")));
+        let latest = "https://github.com/hunandy14/traytunnel/releases/latest";
+        assert_eq!(release_url(None), latest);
+        assert_eq!(release_url(Some("")), latest);
+        assert_eq!(release_url(Some("   ")), latest);
+        // 版本號裡混進路徑分隔符就不是版本號了，不可以讓它把網址帶去別的地方
+        assert_eq!(release_url(Some("0.6.0/../../evil")), latest);
+    }
+
+    /// 「Download from Releases」開的是列表頁，不是 releases/latest 那一頁——
+    /// 整份列表才挑得到更早的版本
+    #[test]
+    fn the_downloads_menu_item_opens_the_release_list() {
+        assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
+    }
+
+    /// 0.5.0 更新提示誤亮的真正成因，釘在 CI。
+    ///
+    /// `hidden` 屬性的 `display: none` 只來自瀏覽器預設樣式表，層疊順序上輸給
+    /// 任何一條作者樣式，所以 `.setting-row { display: flex }` 之類的規則會讓
+    /// `node.hidden = true` 完全失效——當時設定頁的更新列從第一幀起就沒被藏過，
+    /// 畫面上顯示的是 index.html 裡寫死的靜態字串，跟後端查到什麼版本無關。
+    ///
+    /// 樣式表是我們真的會出貨的檔案，比照 `the_shipped_updater_config_parses`
+    /// 的做法直接讀它，把這條全域規則擋在 CI，不讓它哪天被順手刪掉。
+    #[test]
+    fn the_stylesheet_makes_the_hidden_attribute_actually_hide() {
+        let css = include_str!("../../src/styles.css");
+        let normalized: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            normalized.contains("[hidden]{display:none!important;}"),
+            "styles.css 必須有全域的 [hidden] 規則，否則 node.hidden 會被任何一條 display 規則蓋掉"
+        );
+    }
+
     /// 機碼名跟著 productName 走，不是 identifier（實機上是 `...\Uninstall\traytunnel`）
     #[test]
     fn uninstall_key_is_under_hkcu_uninstall() {
@@ -341,9 +493,11 @@ mod tests {
         assert_eq!(endpoint.scheme(), "https", "非 https 的 endpoint 在 release 建置會被拒絕");
         assert!(endpoint.as_str().ends_with("/latest.json"), "{endpoint}");
 
-        // 安裝走 passive（NSIS 的 /P /R）：使用者只看到進度條，裝完自動重啟
+        // 安裝走 quiet（NSIS 的 /S）：全靜默，連進度條都不出現，裝完自動重啟。
+        // 更新是使用者在設定頁按下按鈕才發生的，他已經知道自己在等什麼，
+        // 中途再彈一個進度視窗搶焦點只是打斷他手邊的事
         let windows = parsed.windows.expect("windows 區塊要在");
-        assert_eq!(windows.install_mode.to_string(), "passive");
+        assert_eq!(windows.install_mode.to_string(), "quiet");
 
         // 沒有這一項就簽不出 .sig，release workflow 組 latest.json 那步會直接失敗
         assert_eq!(

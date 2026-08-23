@@ -37,7 +37,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 本地埠衝突三層防護：設定階段擋重複埠（跨連線也擋，訊息會點名佔用者與它所屬的連線）、spawn 前偵測埠是否已被其他程序佔用（狀態顯示 `port_busy`，每 5 秒重查而不盲目 spawn），最後由 ssh 的 `ExitOnForwardFailure=yes` 兜底
 - 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地（此功能會經隧道向第三方服務 ipinfo.io 發出請求）
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
-- 應用內更新：啟動幾秒後與之後每 24 小時各查一次 Releases 上的 `latest.json`，有新版時設定頁的 About 分節會多出一列 `v<新版> available`。**安裝版**（NSIS 裝的那一份）可以就地更新，按 Restart to update 會下載經 minisign 簽章驗證的安裝檔並交棒給它，程式自己退出、裝完由安裝程式重啟；**一般單檔與可攜版**不會改寫自己，按鈕是 Download，只開系統瀏覽器到 Releases 頁讓你自己換檔案。是不是安裝版由登錄檔的解除安裝資訊判定（`InstallLocation` 要真的就是這支執行檔的所在資料夾）。檢查失敗完全靜默，只在活動日誌留一行；整個機制可以用 `checkForUpdates` 關掉，關掉後完全不發網路請求（可攜模式預設就是關的）
+- 應用內更新：啟動幾秒後與之後每 24 小時各查一次 Releases 上的 `latest.json`，更新的一切都收在設定頁 About 的**版本列**裡——標題平時是 Version、查到新版變成 Update available，右側常駐一顆會隨狀態變身的按鈕（見下面的〈介面〉）。**安裝版**（NSIS 裝的那一份）可以就地更新，按 `Update to v<新版>` 會下載經 minisign 簽章驗證的安裝檔並交棒給它，程式自己退出、安裝全靜默（NSIS 的 `/S`，連進度視窗都不出現）、裝完由安裝程式重啟；**一般單檔與可攜版**不會改寫自己，按鈕是 `Get v<新版>`，只開系統瀏覽器到那一版的 release 頁讓你自己換檔案。是不是安裝版由登錄檔的解除安裝資訊判定（`InstallLocation` 要真的就是這支執行檔的所在資料夾）。檢查失敗完全靜默，只在活動日誌留一行；**背景**檢查可以用 `checkForUpdates` 關掉，關掉後完全不發網路請求（可攜模式預設就是關的），但**手動按下檢查不受它管**——親手按鈕就是對那一次連外的明示同意
 - 單一實例：重複啟動只會把既有的主視窗叫出來
 - 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Reconnect all`，多組連線時每組收成一個子選單（底下有 `Reconnect`）
 - 系統匣圖示依 `SM_CXSMICON` 從多層 ICO 挑原生尺寸的那一層（含 16／20／24／28／32px），高 DPI 下不會被 GDI 拉伸糊掉
@@ -66,7 +66,9 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - **主區（選中的連線）**：頂部彙總卡分三段——左邊是連線名稱與 `ssh user@host`，中間用豎分隔線隔出大分數 `n/m` 與 `CONNECTED` 小字（顏色跟著整條連線的健康度走），右邊只有一顆「⋯」。⋯ 點開的選單收了 Add tunnel、Disconnect／Connect（整條連線一起）、Reconnect、Activity，分隔線下再放 Edit connection。
 - **隧道清單**：彙總卡下方是標題 `TUNNELS` 的隧道清單，整份包在單一外框裡，列與列之間用內縮的細分隔線分開，滑過去整列微亮。每列左側是狀態點、名稱與 `:local → remote`，右側兩行是最近一次自測結果（上行地點、下行對外 IP），最右邊是連接／中斷、重新連接、編輯三個鈕。外框高度跟著列數長，長到超過主區可用高度時就固定在那裡、改由框內捲動，外框與圓角一直留在畫面上。
 - **活動日誌頁**：左下的時鐘鈕（或 ⋯ 選單的 Activity）把主區換成所有連線的完整日誌，點任一連線 icon 即返回。
-- **設定頁**：左下的齒輪把主區換成設定頁，目前有「關閉時縮到系統匣」與「開機自動啟動」兩個即時生效的開關；下方的 About 分節顯示版本號，以及「Config file」一列（副標是實際生效的設定檔完整路徑，點整列會開檔案總管並選中它）。
+- **設定頁**：左下的齒輪把主區換成設定頁。General 分節有「關閉時縮到系統匣」、「開機自動啟動」、「背景檢查更新」三個即時生效的開關。下方的 About 分節有兩列：
+  - **版本列**——左邊是 app 的盾牌 logo，中間的標題平時是 `Version`、查到新版時變成 `Update available`，副標永遠只是純版號（`v0.5.0`）。右邊常駐一顆 split button，主鈕會隨狀態變身：`Check for updates` →（按下）`Checking…` → `Up to date` 或 `Check failed` 各停兩秒後退回 → 查到新版就升成綠色主要鈕，安裝版是 `Update to v<新版>`、可攜／單檔版是 `Get v<新版>`。右側的柄點開下拉，收三個次要動作：`Check now`、`View release notes`（開查到的那一版的 release 頁，沒查到就是 `releases/latest`）、`Download from Releases`（開 Releases 列表頁自己挑版本）。主鈕與圖示欄都是固定寬度、下拉走絕對定位，狀態文字再怎麼變版面都不會跳動。
+  - **Config file 一列**——副標是實際生效的設定檔完整路徑，右側的圖示鈕開檔案總管並選中它。
 - **連線編輯**：⋯ 選單的 Edit connection 或側欄的「＋」會開出置中的編輯 sheet（name／host／user／ProxyCommand），驗證錯誤逐欄顯示；刪除連線需要一次確認。頁腳左側的 Test 鈕可以在存檔前就拿表單當下填的值試連一次（spawn 一次性 `ssh ... exit`，不建立任何轉發），結果就地顯示成功的綠字「Connected」或失敗的紅字（帶 ssh 的錯誤原因，例如 DNS 解析失敗、逾時、金鑰被拒），逾時 15 秒兜底；host／user 空白時按 Test 直接顯示欄位驗證錯誤，不會真的去連。
 - **隧道編輯**：列上的鉛筆、⋯ 選單的 Add tunnel、以及零隧道時的虛線引導卡，都開同一個 sheet（name／local port／remote）。remote 欄的提示是 `1080 (server-side port) or host:port`——只填埠號就是伺服器本機的那個埠，補成 `host:port` 由後端做。刪除隧道不跳確認，先從畫面移除、5 秒內可以按 Undo 收回。
 
@@ -107,7 +109,10 @@ npm run dev
 - 假資料有三條連線（`tokyo` 兩條隧道、`taipei` 兩條隧道、`lab` 零隧道示範空狀態），涵蓋每條隧道獨立的 `connecting → connected`、自測 `testing → ok`／`fail`、固定會撞埠的 `port_busy`，以及跨連線的本地埠衝突；隧道的連接／中斷／重新連接、整條連線的啟停與重接、隧道的新增／編輯／刪除（含 undo）、連線的新增／編輯／刪除都能實際操作
 - 設定存檔只寫進 `sessionStorage`，不會碰到真的設定檔
 - 另外掛了 `window.__mock` 供演練特定狀態：`__mock.drop(1080)` 模擬斷線重連、`__mock.status(1080, "error", "…")` 直接指定狀態、`__mock.wipe()` 清掉所有連線看零連線空狀態、`__mock.configDelay(1500)` 讓 `config-changed` 晚於 invoke 的 resolve 送達（真後端就是這個順序，用來驗證改名後的選中不會被回退吃掉）、`__mock.reset()` 清掉暫存重來
-- 更新檢查的三態與兩種車道也演得到：`__mock.update("installed")` 安裝版發現新版（按鈕是 Restart to update）、`__mock.update("portable")` 可攜版發現新版（按鈕是 Download）、`__mock.update("none")` 已是最新（更新列收起來）、`__mock.update("fail")` 檢查失敗（畫面不動，只在活動日誌留一行）；`__mock.updateFails()` 則讓按下 Restart to update 演成失敗，看按鈕彈回與錯誤列
+- 版本列那顆 split button 的每一個狀態都演得到，兩條車道各一套：
+  - **手動檢查**（主鈕或下拉的 Check now）用 `__mock.updateNext(...)` 先選好結果再去按，整條狀態機就走得完：`updateNext("none")` → `Checking…` → `Up to date` → 兩秒後退回；`updateNext("fail")` → `Check failed` → 兩秒後退回；`updateNext("installed", "0.6.0")` → 綠鈕 `Update to v0.6.0`；`updateNext("portable", "0.6.0")` → 綠鈕 `Get v0.6.0`。選好之後每次手動檢查都是同一個結果，要換再叫一次
+  - **背景檢查**（不經操作直接推 `update-available`）用 `__mock.update("installed"／"portable"／"none"／"fail")`。真後端的背景車道對「已最新」與「失敗」都是靜默的，所以那兩個瞬態只在手動那條路上看得到
+  - `__mock.updateFails()` 讓按下綠鈕演成失敗，看鈕從 `Updating…` 彈回 `Update to v…`、原因寫進設定頁的錯誤列
 
 假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
 
@@ -225,7 +230,7 @@ copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
 | 欄位 | 說明 |
 | --- | --- |
 | `closeToTray` | 關閉鈕（X）是否只隱藏到系統匣 |
-| `checkForUpdates` | 是否在背景檢查新版（啟動後一次，之後每 24 小時一次）。**省略時的預設值跟著模式走**：一般模式視為 `true`，可攜模式視為 `false`。關閉時完全不發網路請求。設定頁 General 分節有對應的開關，動過開關才會把這個鍵寫進檔案 |
+| `checkForUpdates` | 是否在**背景**檢查新版（啟動後一次，之後每 24 小時一次）。**省略時的預設值跟著模式走**：一般模式視為 `true`，可攜模式視為 `false`。關閉時背景完全不發網路請求，但版本列上手動按下的檢查不受它管（親手按鈕就是對那一次連外的明示同意）。設定頁 General 分節有對應的開關，動過開關才會把這個鍵寫進檔案 |
 | `[[sources]]` | 一組連線（介面稱 Connection），含 `name`、`host`、`user`、`proxyCommand` 與底下的 `[[sources.forwards]]` |
 
 `[[sources]]` 的欄位：

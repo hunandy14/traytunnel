@@ -134,6 +134,13 @@ function pushConfig() {
  */
 let installFailure: string | null = null;
 
+/** 手動檢查（主鈕與下拉的 Check now）下一次要演出哪一種結果，由 __mock.updateNext() 換 */
+type CheckKind = "installed" | "portable" | "none" | "fail";
+let nextCheck: { kind: CheckKind; version: string } = { kind: "none", version: "9.9.9" };
+
+/** 演一下真的連外要花的時間，不然 Checking… 那顆 spinner 一幀都看不到 */
+const CHECK_DELAY_MS = 1200;
+
 /** 更新資訊改變時的唯一出口，與真後端一樣：存進狀態並推 update-available */
 function setUpdate(info: Snapshot["update"]) {
   state.update = info;
@@ -318,6 +325,7 @@ interface Args {
   originalName?: string | null;
   originalLocal?: number | null;
   remote?: string;
+  version?: string | null;
 }
 
 function handle(cmd: string, args: Args): unknown {
@@ -496,10 +504,50 @@ function handle(cmd: string, args: Args): unknown {
     case "get_config_path":
       return "C:\\Users\\browser-mock\\.traytunnel.toml";
 
+    /**
+     * 手動檢查更新。三種結果都演得到，由 __mock.updateNext() 先選好：
+     * 有新版（兩條車道各一）、已是最新、檢查失敗。
+     *
+     * 跟真後端一樣**不看 state.checkForUpdates**——那個開關管的是背景自動連外，
+     * 使用者親手按下按鈕是另一回事，關著也照樣要查得動。
+     *
+     * 這裡先 setUpdate 再 resolve，刻意重現真後端的事件／回傳競態：
+     * update-available 事件會比 invoke 的 resolve 早到，前端在 checking 狀態下
+     * 必須忍住不讓那個事件插隊改按鈕（見 sheet.ts 的 applyUpdateInfo）。
+     */
+    case "check_for_updates_now":
+      log(null, "checking for updates…");
+      return new Promise<Snapshot["update"]>((resolve, reject) => {
+        window.setTimeout(() => {
+          const { kind, version } = nextCheck;
+          if (kind === "fail") {
+            log(null, "update check failed: (browser mock) simulated network error");
+            reject("(browser mock) simulated network error");
+            return;
+          }
+          if (kind === "none") {
+            setUpdate(null);
+            log(null, "update check: already up to date");
+            resolve(null);
+            return;
+          }
+          const info = { version, installed: kind === "installed" };
+          setUpdate(info);
+          log(null, `update check: v${version} is available`);
+          resolve(info);
+        }, CHECK_DELAY_MS);
+      });
+
+    // 單一版本的 release 頁：真後端會 ShellExecuteW 開系統瀏覽器，這裡把要開的
+    // 版本記進日誌，至少看得出可攜版的 Get 與下拉的 View release notes 各自帶了什麼
+    case "open_release_page":
+      log(null, `(browser mock) open_release_page → ${args.version ?? "releases/latest"}`);
+      return null;
+
     // 也沒有檔案總管可開，只記一行
     case "open_config_dir":
-    // 可攜版的 Download：真後端會 ShellExecuteW 開系統瀏覽器，這裡只記一行
-    // （瀏覽器裡自己開新分頁多半會被彈出視窗攔截，反而演不出東西）
+    // Releases 列表頁：同樣只記一行（瀏覽器裡自己開新分頁多半會被彈出視窗攔截，
+    // 反而演不出東西）
     case "open_releases_page":
       log(null, `(browser mock) ${cmd}`);
       return null;
@@ -563,17 +611,19 @@ function installScenarioHooks() {
       log(null, "all sources removed");
     },
     /**
-     * 演練背景更新檢查的三種結果，兩種車道的 UI 都看得到：
+     * 演練**背景**更新檢查的結果，也就是不經使用者操作、直接推 update-available
+     * 那條路。版本列的標題與 split button 會當場跟著變：
      *
-     *   __mock.update("installed")  安裝版發現新版 → 按鈕是 Restart to update
-     *   __mock.update("portable")   可攜／單檔版發現新版 → 按鈕是 Download
-     *   __mock.update("none")       已是最新 → 更新列整列收起來
+     *   __mock.update("installed")  安裝版發現新版 → 綠鈕 Update to vX.Y.Z
+     *   __mock.update("portable")   可攜／單檔版發現新版 → 綠鈕 Get vX.Y.Z
+     *   __mock.update("none")       已是最新 → 標題退回 Version、鈕退回 Check for updates
      *   __mock.update("fail")       檢查失敗 → 畫面完全不動，只在活動日誌留一行
      *
-     * 對應真後端的行為：查到新版才推 update-available，查不到／失敗都不動畫面
-     * （失敗只 log 一行），所以「已最新」與「檢查失敗」在畫面上都是沒有更新列。
+     * 對應真後端的行為：背景車道查不到／失敗都不動畫面（失敗只 log 一行），
+     * 所以那兩種結果在背景這條路上是看不出來的。想看 Up to date 與 Check failed
+     * 那兩個瞬態，要走手動檢查——用 updateNext() 選好結果再按按鈕。
      */
-    update(kind: "installed" | "portable" | "none" | "fail", version = "9.9.9") {
+    update(kind: CheckKind, version = "9.9.9") {
       if (kind === "fail") {
         log(null, "update check failed: (browser mock) simulated network error");
         return;
@@ -587,8 +637,23 @@ function installScenarioHooks() {
       log(null, `(browser mock) update available: v${version}`);
     },
     /**
-     * 讓下一次（與之後每一次）按 Restart to update 都失敗，用來看錯誤那條路：
-     * 按鈕彈回可按、原因寫在設定頁的錯誤列。傳 null 關掉。
+     * 選好**手動**檢查（主鈕的 Check for updates 或下拉的 Check now）下一次要
+     * 演出什麼結果，然後去按那顆鈕，就能把整條狀態機走一遍：
+     *
+     *   __mock.updateNext("none")       按下去 → Checking… → Up to date → 兩秒後退回
+     *   __mock.updateNext("fail")       按下去 → Checking… → Check failed → 兩秒後退回
+     *   __mock.updateNext("installed")  按下去 → Checking… → 綠鈕 Update to vX.Y.Z
+     *   __mock.updateNext("portable")   按下去 → Checking… → 綠鈕 Get vX.Y.Z
+     *
+     * 選好之後每一次手動檢查都是同一個結果，要換再叫一次。
+     */
+    updateNext(kind: CheckKind, version = "9.9.9") {
+      nextCheck = { kind, version };
+      return nextCheck;
+    },
+    /**
+     * 讓下一次（與之後每一次）按綠色的 Update to vX.Y.Z 都失敗，用來看錯誤那條路：
+     * 鈕從 Updating… 彈回 Update to vX.Y.Z、原因寫在設定頁的錯誤列。傳 null 關掉。
      */
     updateFails(message: string | null = "Failed to download the update") {
       installFailure = message;
