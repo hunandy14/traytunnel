@@ -84,7 +84,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 開發與建置另外需要：
 
 - [Rust 工具鏈](https://www.rust-lang.org/tools/install)（含 MSVC Build Tools）
-- [Node.js](https://nodejs.org/) 18 以上
+- [Node.js](https://nodejs.org/) 20 以上
 
 ## 開發
 
