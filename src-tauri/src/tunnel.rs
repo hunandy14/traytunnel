@@ -29,13 +29,24 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 組單一出口的 ssh 參數，每個 token 獨立傳遞，不做字串拼接。
 /// 連線參數一律取自這個出口所屬的源。
+///
+/// ServerAlive 這一對決定「多久才發現線斷了」：ssh 每 Interval 秒沒收到資料就
+/// 送一次探測，連續 CountMax 次沒回應才判定斷線。10 × 2 大約是 20-30 秒。
+///
+/// 這個值刻意壓得比常見的預設緊。Wi-Fi 斷掉、筆電休眠醒來這類情況下，TCP
+/// 本身不會馬上知道對面沒了，這條 ssh 會維持在「看起來還連著」的狀態；
+/// 本程式的連線判斷看的是本地埠有沒有在 listen，所以那段時間介面顯示 connected、
+/// 使用者的流量卻全部石沉大海。原本的 30 × 3 要 90-120 秒才會進重連，
+/// 那是使用者最容易誤以為「程式壞了」的一段。
+///
+/// 代價是每個出口每 10 秒多一個幾十位元組的探測封包，在這個用途上可以忽略。
 pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-N".into(),
         "-o".into(),
-        "ServerAliveInterval=30".into(),
+        "ServerAliveInterval=10".into(),
         "-o".into(),
-        "ServerAliveCountMax=3".into(),
+        "ServerAliveCountMax=2".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
@@ -507,9 +518,9 @@ mod tests {
             vec![
                 "-N",
                 "-o",
-                "ServerAliveInterval=30",
+                "ServerAliveInterval=10",
                 "-o",
-                "ServerAliveCountMax=3",
+                "ServerAliveCountMax=2",
                 "-o",
                 "ExitOnForwardFailure=yes",
                 "-o",
@@ -556,6 +567,27 @@ mod tests {
         let a = build_exit_args(s, &s.forwards[0]);
         assert!(!a.iter().any(|s| s.starts_with("ProxyCommand=")));
         assert_eq!(a.last().unwrap(), "bob@h.example.com");
+    }
+
+    /// 斷線偵測窗口是規格：Interval × CountMax 決定使用者要盯著一個假的
+    /// connected 多久。Wi-Fi 斷掉時 TCP 本身不會馬上知道，全靠這一對把時間壓下來，
+    /// 被放寬回去的話畫面又會停在「連著卻不通」好幾分鐘
+    #[test]
+    fn the_keepalive_window_stays_under_half_a_minute() {
+        let c = cfg();
+        let s = &c.sources[0];
+        let args = build_exit_args(s, &s.forwards[0]);
+        let value = |key: &str| {
+            args.iter()
+                .find_map(|a| a.strip_prefix(key))
+                .unwrap_or_else(|| panic!("少了 {key}"))
+                .parse::<u32>()
+                .expect("值要是數字")
+        };
+        let interval = value("ServerAliveInterval=");
+        let count = value("ServerAliveCountMax=");
+        assert!(interval * count <= 30, "偵測窗口 {interval}x{count} 秒太寬");
+        assert!(interval >= 5, "探測太密只是白費封包");
     }
 
     #[test]
