@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # 需要完整歷史與所有 tag，workflow_dispatch 才驗得到既有 tag 是否存在
           fetch-depth: 0
@@ -72,18 +72,18 @@ jobs:
           "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
           cache: "npm"
 
       - name: Setup Rust (stable-msvc)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "src-tauri"
 
@@ -147,7 +147,7 @@ jobs:
           Set-Content -Path out/SHA256SUMS.txt -Value $lines -Encoding utf8
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.resolve.outputs.release_tag }}
           name: v${{ steps.resolve.outputs.version }}
