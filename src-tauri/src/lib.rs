@@ -7,6 +7,7 @@ mod state;
 mod traymenu;
 mod tunnel;
 mod update;
+mod winstate;
 mod winsys;
 
 use std::sync::Arc;
@@ -127,6 +128,9 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // 記住主視窗位置／大小，重啟不歸零置中。旗標不含 VISIBLE，
+        // 還原完全不碰顯示狀態，理由見 winstate 模組開頭的說明
+        .plugin(tauri_plugin_window_state::Builder::new().with_state_flags(winstate::flags()).build())
         // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
         // 前端一律走我們自己的指令，不開它的 JS 權限
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -188,6 +192,11 @@ pub fn run() {
                     }
                     None => log::warn!("no window icon layer available, keeping the default"),
                 }
+
+                // 外掛在這個 setup 閉包跑之前就已經把 SIZE 還原完了（window 是在 Tauri
+                // 內部呼叫 setup 之前就依 tauri.conf.json 建好的），這裡補校正一次，
+                // 免得舊設定存的尺寸比目前螢幕大
+                winstate::correct_restored_size(&win);
 
                 // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
                 let st = shared.clone();

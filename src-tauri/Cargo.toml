@@ -19,6 +19,8 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
+# 記住主視窗位置／大小；旗標只挑 POSITION|SIZE|MAXIMIZED，用法見 winstate 模組
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = { version = "0.25", features = ["serde"] }

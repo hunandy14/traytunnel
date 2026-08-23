@@ -20,6 +20,7 @@ use std::time::Duration;
 use semver::Version;
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_window_state::AppHandleExt as _;
 
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -295,11 +296,32 @@ fn open_page(st: &Shared, url: &str) {
 /// 斷掉；等真的要交棒給安裝程式了才 kill，安裝程式接手時不會有殘留的 ssh 子程序。
 /// Windows 上 `install` 不會回來（它自己 `std::process::exit(0)`），
 /// 所以這個函式正常路徑上只會回 Err。
+///
+/// 就是因為它自己 `std::process::exit(0)`，`RunEvent::Exit` 不會發，
+/// tauri-plugin-window-state 落地存檔的那個 hook 因此不會跑——這是「更新後視窗
+/// 歸零置中」的元兇之一。這裡不能再用 `st.app.updater()` 那個便利方法：它預設塞的
+/// `on_before_exit` 只有 `cleanup_before_exit()`（見 updater 外掛 lib.rs 的
+/// `UpdaterExt::updater_builder`），改用 `updater_builder()` 自己補一顆 `on_before_exit`，
+/// 在交棒給安裝程式之前先存一次視窗狀態，同時保留原本的 `cleanup_before_exit()`
+/// （它會清資源表並在 Windows 上把視窗藏起來，不能漏掉）。
 pub async fn install(st: &Shared) -> Result<(), String> {
     if !is_installed(&st.app) {
         return Err("This build cannot update itself".into());
     }
-    let updater = st.app.updater().map_err(|e| e.to_string())?;
+    let handle = st.app.clone();
+    let updater = st
+        .app
+        .updater_builder()
+        .on_before_exit(move || {
+            if let Err(e) = handle.save_window_state(crate::winstate::flags()) {
+                log::warn!(
+                    "could not save window state before the update installer takes over: {e}"
+                );
+            }
+            handle.cleanup_before_exit();
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
     let update = updater
         .check()
         .await
