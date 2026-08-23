@@ -264,12 +264,17 @@ function validateForward(input: {
     return `local: ${where}`;
   }
 
-  // remote 只填埠號是合法的（代表伺服器本機的那個埠），正規化留到寫進狀態時才做
+  // remote 只填埠號是合法的（代表伺服器本機的那個埠），正規化留到寫進狀態時才做。
+  // host:port 分支也要把埠號抽出來驗上限，不能只驗格式——999999 這種位數
+  // 符合 \d+ 但早已超過埠號範圍，跟 sheet.ts 的前端檢查與 Rust 端對稱。
   if (/^\d+$/.test(input.remote)) {
     const port = Number(input.remote);
     if (port < 1 || port > 65535) return "remote: must be 1-65535";
-  } else if (!/^[^\s:]+:\d+$/.test(input.remote)) {
-    return "remote: expected a port or host:port, for example 1080 or 127.0.0.1:1080";
+  } else {
+    const m = /^([^\s:]+):(\d+)$/.exec(input.remote);
+    if (!m) return "remote: expected a port or host:port, for example 1080 or 127.0.0.1:1080";
+    const port = Number(m[2]);
+    if (port < 1 || port > 65535) return "remote: must be 1-65535";
   }
 
   const owner = findSource(input.source) as SourceInfo;

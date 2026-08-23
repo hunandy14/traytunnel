@@ -392,8 +392,12 @@ function fwdLocalValidate(): Partial<Record<ForwardField, string>> {
   if (!remote) errors.remote = "remote is required";
   else if (/^\d+$/.test(remote)) {
     if (!isPort(remote)) errors.remote = "must be 1-65535";
-  } else if (!/^[^\s:]+:\d+$/.test(remote)) {
-    errors.remote = "expected a port or host:port";
+  } else {
+    // host:port 分支也要把埠號抽出來過 isPort，不能只驗格式：
+    // 999999 這種位數符合 \d+ 但早已超過埠號上限，跟 Rust 端的邊界檢查對稱
+    const m = /^([^\s:]+):(\d+)$/.exec(remote);
+    if (!m) errors.remote = "expected a port or host:port";
+    else if (!isPort(m[2])) errors.remote = "must be 1-65535";
   }
   return errors;
 }
