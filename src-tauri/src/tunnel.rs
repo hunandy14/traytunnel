@@ -268,6 +268,14 @@ async fn wait_alive(state: &Arc<AppState>, local: u16, generation: u64, total: D
     true
 }
 
+/// 單一出口的監看迴圈。
+///
+/// 這裡的每一次狀態寫入都走 `set_exit_status_of` 帶著自己那一代的號碼：迴圈算出
+/// 一個狀態到真正寫下去之間隔著埠掃描、spawn、搶 cfg 鎖的等待，halt 有足夠的時間
+/// 插進來換掉世代。沒有守門的話，這條已經作廢的迴圈會把 halt 剛壓下的 stopped
+/// 蓋回 connected，而且不會再有事件來糾正——迴圈下一圈就退出了。
+/// 迴圈中間那幾道 `generation_alive` 是提早收工用的，不是守門：真正的守門在寫入
+/// 那一刻、與寫入同一把鎖內完成。
 async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
     loop {
         if !state.generation_alive(local, generation) {
@@ -295,7 +303,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             busy = port_busy_detail(local, is_listening(local));
         }
         if let Some(detail) = busy {
-            state.set_exit_status(local, status::PORT_BUSY, Some(detail));
+            state.set_exit_status_of(local, generation, status::PORT_BUSY, Some(detail));
             state.log_from(sname, format!("{} : local port {local} busy, retrying in 5s", f.name));
             if !wait_alive(state, local, generation, RETRY).await {
                 return;
@@ -303,14 +311,14 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             continue;
         }
 
-        state.set_exit_status(local, status::CONNECTING, None);
+        state.set_exit_status_of(local, generation, status::CONNECTING, None);
 
         // spawn 失敗的分支自己記下重試訊息，不再補一行「disconnected」
         let mut spawn_failed = false;
         match spawn_ssh(&src, &f) {
             Err(e) => {
                 spawn_failed = true;
-                state.set_exit_status(local, status::ERROR, Some(e.to_string()));
+                state.set_exit_status_of(local, generation, status::ERROR, Some(e.to_string()));
                 state.log_from(
                     sname,
                     format!("{} : failed to start ssh: {e}, retrying in 5s", f.name),
@@ -347,7 +355,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                         Ok(None) => {}
                     }
                     if !state.is_connected(local) && is_listening(local) {
-                        state.set_exit_status(local, status::CONNECTED, None);
+                        state.set_exit_status_of(local, generation, status::CONNECTED, None);
                         state.log_from(sname, format!("{} : up", f.name));
                         test_exit(state, local);
                     }
@@ -363,7 +371,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         state.clear_exit_test(local);
         if !spawn_failed {
             state.log_from(sname, format!("{} : disconnected, retrying in 5s", f.name));
-            state.set_exit_status(local, status::RECONNECTING, None);
+            state.set_exit_status_of(local, generation, status::RECONNECTING, None);
         }
         if !wait_alive(state, local, generation, RETRY).await {
             return;

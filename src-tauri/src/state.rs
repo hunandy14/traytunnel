@@ -123,6 +123,17 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     }
 }
 
+/// 就地寫一筆連線狀態，回傳「有沒有真的變」。有守門與無守門的兩條寫入路徑
+/// 共用這一份「相同就不推事件」的規則，兩邊不會各判各的。
+fn write_status(rt: &mut ExitRuntime, status: &str, detail: &Option<String>) -> bool {
+    if rt.status == status && rt.detail == *detail {
+        return false;
+    }
+    rt.status = status.into();
+    rt.detail = detail.clone();
+    true
+}
+
 /// 開機自啟登錄值的名稱。沿用 productName（沒有就退回套件名），與先前
 /// tauri-plugin-autostart 寫進去的那一份同名，升級的使用者不必重設。
 pub fn autostart_name(app: &AppHandle) -> String {
@@ -317,18 +328,52 @@ impl AppState {
     /// 只更新既存的出口：出口一旦被刪掉，執行期狀態也跟著被 `sync_exits` 清掉，
     /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
     /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
+    ///
+    /// 這一版**不看世代**，給的是「無論如何都要寫下去」的呼叫端：halt 要把狀態
+    /// 壓成 stopped 正是在遞增世代之後，指令層改的也都是當下這一刻的事實。
+    /// 監看迴圈那種「算出來的時候還算數、寫下去時可能已經過期」的狀態一律走
+    /// [`set_exit_status_of`]。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
-        let changed = self.with_exit_mut(local, |rt| {
-            if rt.status == status && rt.detail == detail {
-                return false;
-            }
-            rt.status = status.into();
-            rt.detail = detail.clone();
-            true
-        });
-        if changed != Some(true) {
-            return;
+        let changed = self.with_exit_mut(local, |rt| write_status(rt, status, &detail));
+        if changed == Some(true) {
+            self.announce_status(local, status, detail);
         }
+    }
+
+    /// 世代守門版的狀態寫入：世代不符就整筆丟掉，連事件都不推。
+    ///
+    /// 監看迴圈算出一個狀態到真正寫進去之間，中間隔著 `is_listening`、`spawn`、
+    /// 甚至 `with_config` 搶 cfg 鎖的等待——那段時間足夠讓 halt 插進來把世代換掉。
+    /// 舊迴圈晚到的那一手若照寫，會把 halt 剛壓下去的 stopped 蓋回 connected：
+    /// 出口實際上已經停了，介面卻顯示連著，而且沒有任何後續事件會把它糾正回來
+    /// （舊迴圈下一圈就退出了），只能等使用者自己再按一次。連帶的傷害是
+    /// 「Reconnect all」靠 `is_running` 挑對象，會把這個假的 running 出口重新拉起來。
+    ///
+    /// 比對與寫入必須在**同一次 exits 鎖**內完成，否則「先問世代、再寫狀態」
+    /// 中間一樣有窗口，守門等於沒設。要不要推事件也在鎖裡決定好，
+    /// 但事件與系統匣刷新一律等放掉鎖之後才做（`refresh_tray` 會再取這把鎖）。
+    pub fn set_exit_status_of(
+        &self,
+        local: u16,
+        generation: u64,
+        status: &str,
+        detail: Option<String>,
+    ) {
+        let changed = {
+            let mut exits = self.exits.lock().unwrap();
+            match exits.get_mut(&local) {
+                Some(rt) if rt.generation == generation => write_status(rt, status, &detail),
+                _ => false,
+            }
+        };
+        if changed {
+            self.announce_status(local, status, detail);
+        }
+    }
+
+    /// 狀態真的變了之後的收尾：推事件並重算系統匣。
+    /// 呼叫時**不可以**持有 exits 鎖，`refresh_tray` 會再取一次。
+    fn announce_status(&self, local: u16, status: &str, detail: Option<String>) {
         let _ = self
             .app
             .emit("exit-status", ExitStatusPayload { local, status: status.into(), detail });
