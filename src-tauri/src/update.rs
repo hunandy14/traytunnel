@@ -36,8 +36,16 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LATEST_JSON: &str =
     "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
 
-/// 非安裝版按下 Download 時開的頁面
-const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
+/// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
+/// 使用者可以自己挑要哪一版（含更早的版本）
+const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases";
+
+/// 單一版本的 release 頁前綴。發佈說明與該版的下載資產都在同一頁上，
+/// 所以「View release notes」與可攜版的「Get vX.Y.Z」開的是同一個網址。
+const RELEASE_TAG_PREFIX: &str = "https://github.com/hunandy14/traytunnel/releases/tag/v";
+
+/// 還不知道是哪一版（沒查過或查不到）時，release 頁退回這裡
+const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
 
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,14 +131,43 @@ async fn check_once(st: &Shared) {
     if !st.checks_for_updates() {
         return;
     }
-    let found = if is_installed(&st.app) {
-        check_installed(&st.app).await
-    } else {
-        check_unmanaged(&st.app).await
-    };
-    match found {
+    match check_lane(&st.app).await {
         Ok(found) => st.set_update(found),
         Err(e) => st.log(format!("update check failed: {e}")),
+    }
+}
+
+/// 使用者主動按下的檢查。
+///
+/// 刻意**不**看 `checks_for_updates` 那道閘：它管的是「要不要自己在背景連外」，
+/// 而使用者親手按下這顆鈕，就是對這一次連外的明示同意。拿背景開關去擋一個
+/// 當面的請求，得到的只會是一顆按了沒反應的鈕。
+///
+/// 與背景車道的另一個差別是結果要回傳：按鈕得靠它演出 Up to date／Check
+/// failed 那兩個瞬態，而背景車道對這兩種結果都是靜默的。共用狀態照樣更新，
+/// 兩條車道與介面看到的始終是同一份事實。
+pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
+    let found = check_lane(&st.app).await;
+    match &found {
+        Ok(Some(u)) => {
+            st.set_update(Some(u.clone()));
+            st.log(format!("update check: v{} is available", u.version));
+        }
+        Ok(None) => {
+            st.set_update(None);
+            st.log("update check: already up to date");
+        }
+        Err(e) => st.log(format!("update check failed: {e}")),
+    }
+    found
+}
+
+/// 這次執行該走哪一條車道，背景與手動共用同一個判斷
+async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    if is_installed(app) {
+        check_installed(app).await
+    } else {
+        check_unmanaged(app).await
     }
 }
 
@@ -214,11 +251,35 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
     }
 }
 
-/// 非安裝版的「Download」：開系統瀏覽器到 Releases 頁，讓使用者自己換檔案。
-/// 這條路不下載、不碰自己這顆 exe。
+/// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
+/// 使用者按下「View release notes」時至少看得到最新那一版的說明。
+///
+/// 純函式，網址組法有問題要在測試裡就看得出來，不必等到實機按下去開錯頁。
+pub fn release_url(version: Option<&str>) -> String {
+    let tag = version
+        .map(|v| v.trim().trim_start_matches(['v', 'V']))
+        .filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
+    match tag {
+        Some(v) => format!("{RELEASE_TAG_PREFIX}{v}"),
+        None => LATEST_RELEASE_PAGE.to_string(),
+    }
+}
+
+/// 單一版本的 release 頁：發佈說明與該版的下載資產都在上面。
+/// 可攜／單檔版的「Get vX.Y.Z」與下拉的「View release notes」都走這裡。
+pub fn open_release_page(st: &Shared, version: Option<&str>) {
+    open_page(st, &release_url(version));
+}
+
+/// Releases 列表頁：下拉的「Download from Releases」走這裡，
+/// 讓使用者自己挑版本換檔案。這條路不下載、不碰自己這顆 exe。
 pub fn open_releases_page(st: &Shared) {
-    if let Err(e) = crate::winsys::open_url(RELEASES_PAGE) {
-        st.log(format!("could not open the releases page: {e}"));
+    open_page(st, RELEASES_PAGE);
+}
+
+fn open_page(st: &Shared, url: &str) {
+    if let Err(e) = crate::winsys::open_url(url) {
+        st.log(format!("could not open {url}: {e}"));
     }
 }
 
@@ -357,6 +418,31 @@ mod tests {
         assert_eq!(found, UpdateInfo { version: "0.6.0".into(), installed: true });
         let prefixed = accept_installed("v0.6.0", "0.5.0").expect("帶 v 的一樣認得");
         assert_eq!(prefixed.version, "0.6.0");
+    }
+
+    /// release 頁的網址組法：帶不帶 v 都要組出同一個 tag 頁，
+    /// 不知道版本時退回 releases/latest 而不是組出一個 tag 是空的壞網址
+    #[test]
+    fn a_release_url_points_at_that_version_or_falls_back_to_latest() {
+        assert_eq!(
+            release_url(Some("0.6.0")),
+            "https://github.com/hunandy14/traytunnel/releases/tag/v0.6.0"
+        );
+        assert_eq!(release_url(Some("v0.6.0")), release_url(Some("0.6.0")));
+        assert_eq!(release_url(Some("  0.6.0  ")), release_url(Some("0.6.0")));
+        let latest = "https://github.com/hunandy14/traytunnel/releases/latest";
+        assert_eq!(release_url(None), latest);
+        assert_eq!(release_url(Some("")), latest);
+        assert_eq!(release_url(Some("   ")), latest);
+        // 版本號裡混進路徑分隔符就不是版本號了，不可以讓它把網址帶去別的地方
+        assert_eq!(release_url(Some("0.6.0/../../evil")), latest);
+    }
+
+    /// 「Download from Releases」開的是列表頁，不是 releases/latest 那一頁——
+    /// 整份列表才挑得到更早的版本
+    #[test]
+    fn the_downloads_menu_item_opens_the_release_list() {
+        assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
     }
 
     /// 0.5.0 更新提示誤亮的真正成因，釘在 CI。

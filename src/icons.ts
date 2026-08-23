@@ -10,12 +10,16 @@
  */
 
 import {
+  Check,
+  ChevronDown,
   createElement,
   Download,
   Ellipsis,
+  ExternalLink,
   FileText,
   FolderOpen,
   History,
+  LoaderCircle,
   Minus,
   PanelBottom,
   Pencil,
@@ -25,17 +29,22 @@ import {
   RefreshCw,
   Settings,
   Square,
+  TriangleAlert,
   X,
   type IconNode,
 } from "lucide";
 
 /** 名字沿用 Lucide 官方的 kebab-case，方便對著 lucide.dev 查 */
 const ICONS = {
+  check: Check,
+  "chevron-down": ChevronDown,
   download: Download,
   ellipsis: Ellipsis,
+  "external-link": ExternalLink,
   "file-text": FileText,
   "folder-open": FolderOpen,
   history: History,
+  "loader-circle": LoaderCircle,
   minus: Minus,
   "panel-bottom": PanelBottom,
   pencil: Pencil,
@@ -45,6 +54,7 @@ const ICONS = {
   "refresh-cw": RefreshCw,
   settings: Settings,
   square: Square,
+  "triangle-alert": TriangleAlert,
   x: X,
 } satisfies Record<string, IconNode>;
 

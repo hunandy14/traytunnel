@@ -1139,9 +1139,185 @@ body {
   height: 20px;
 }
 
-.setting-version {
+/* ------------------------------------------------------------ 更新 split button
+   About 版本列右側那顆會變身的鈕，參照 Windows Update：檢查中／已是最新／
+   有新版全部反映在同一顆鈕上，不另開對話框、不增減列。
+
+   **零跳動是這一區的硬性要求**：狀態一換文字長度就變（Check for updates →
+   Checking… → Update to v0.10.0），所以主鈕給固定 min-width、圖示欄給固定
+   邊長，下拉走絕對定位。任何一項拿掉，整列都會在狀態切換時抽動一下。 */
+
+.split {
+  position: relative;
   flex: none;
-  font-size: 11px;
+  display: inline-flex;
+  height: 26px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--hover);
+  /* 下拉要浮出這個框外，不可以裁掉 */
+  overflow: visible;
+}
+
+.split-main {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  /* 最長的狀態文字（Update to v0.10.0）也裝得下，版面不隨狀態抽動 */
+  min-width: 150px;
+  height: 100%;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 3px 0 0 3px;
+  background: transparent;
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 130ms var(--ease), color 130ms var(--ease);
+}
+
+.split-main:hover:not(:disabled) {
+  background: var(--hover-strong);
+}
+
+.split-main:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+/* 圖示欄固定邊長：refresh／spinner／check／download 的實際寬度不一樣，
+   不釘死的話換圖示就會把標籤推來推去 */
+.split-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: inherit;
+}
+
+/* 版本號是等寬數字，Checking… 的點與百分比跳動時標籤寬度才穩 */
+.split-label {
+  font-variant-numeric: tabular-nums;
+}
+
+.split-chevron {
+  flex: none;
+  width: 22px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--line-strong);
+  border-radius: 0 3px 3px 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 130ms var(--ease), color 130ms var(--ease);
+}
+
+.split-chevron:hover:not(:disabled) {
+  background: var(--hover-strong);
+  color: var(--text);
+}
+
+.split-chevron:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.split-chevron .icon {
+  transition: transform 130ms var(--ease);
+}
+
+.split-chevron[aria-expanded="true"] .icon {
+  transform: rotate(180deg);
+}
+
+/* 有新版：整顆升成綠色主要鈕。柄也一起上綠，中間的分隔線改用深色，
+   不然淺色分隔線壓在綠底上會像一道裂縫 */
+.split[data-state="available"],
+.split[data-state="busy"] {
+  border-color: var(--accent);
+}
+
+.split[data-state="available"] .split-main,
+.split[data-state="busy"] .split-main,
+.split[data-state="available"] .split-chevron,
+.split[data-state="busy"] .split-chevron {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.split[data-state="available"] .split-chevron,
+.split[data-state="busy"] .split-chevron {
+  border-left-color: rgba(14, 38, 32, 0.3);
+}
+
+.split[data-state="available"] .split-main:hover,
+.split[data-state="available"] .split-chevron:hover {
+  background: var(--accent-hover);
+}
+
+/* 綠色狀態下即使停用也不要褪成灰字，那是「正在為你更新」而不是「不能按」 */
+.split[data-state="busy"] .split-main:disabled {
+  color: var(--accent-ink);
+}
+
+.split-icon.spin .icon {
+  animation: split-spin 900ms linear infinite;
+}
+
+@keyframes split-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 下拉**往上**開：版本列位在設定頁靠底的位置，而設定頁本身是個
+   overflow-y: auto 的捲動容器——往下開會把捲動範圍撐長，選單一彈出整頁
+   就多出一段可捲區。往上開則單純疊在上方的列上，不動捲動範圍分毫。
+   柄的箭頭轉 180° 之後正好指向選單真正出現的方向。 */
+.split-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 40;
+  min-width: 190px;
+  padding: 4px;
+  background: var(--overlay);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+}
+
+.split-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+
+.split-menu-item:hover,
+.split-menu-item:focus-visible {
+  background: var(--hover-strong);
+}
+
+.split-menu-item .ico {
+  flex: none;
+  display: inline-flex;
+  width: 14px;
   color: var(--muted);
 }
 

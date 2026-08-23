@@ -77,7 +77,23 @@ export const openConfigDir = () => invoke<void>("open_config_dir");
  */
 export const installUpdate = () => invoke<void>("install_update");
 
-/** 可攜／單檔版的更新：開系統瀏覽器到 Releases 頁，不下載也不改寫自己 */
+/**
+ * 使用者主動按下的檢查更新。
+ *
+ * **不受背景檢查開關管**：那個開關管的是自動連外，親手按下就是明示同意這一次。
+ * resolve 成 null 代表已經是最新，reject 代表這次檢查失敗（原因後端會寫進活動日誌）。
+ */
+export const checkForUpdatesNow = () => invoke<UpdateInfo | null>("check_for_updates_now");
+
+/**
+ * 開某一版的 release 頁：發佈說明與那一版的下載資產都在同一頁上，所以可攜版的
+ * 「Get vX.Y.Z」與下拉的「View release notes」共用它。version 給 null 就是
+ * releases/latest。
+ */
+export const openReleasePage = (version: string | null) =>
+  invoke<void>("open_release_page", { version });
+
+/** Releases 列表頁，讓使用者自己挑版本；不下載也不改寫自己 */
 export const openReleasesPage = () => invoke<void>("open_releases_page");
 
 /** 自繪標題列用的視窗指令，close 的行為（縮到匣或結束）由 Rust 端決定 */
