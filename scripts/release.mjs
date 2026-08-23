@@ -54,7 +54,16 @@ if (!version || !SEMVER_RE.test(version)) {
 
 const branch = `release/${version}`;
 
-/** 只是給印出來的指令行加點可讀性，不影響實際執行（實際執行一律走 args 陣列，不經 shell 解析） */
+/**
+ * 把指令與參數組成單一字串，同時作兩種用途：
+ *   1. 印出來給人看的指令行。
+ *   2. Windows 上經 shell 執行 npm 時，實際餵給 spawnSync 的命令字串。
+ *
+ * 之所以組成單一字串而非陣列，是為了配合下面 runReadOnly／runMutating 的
+ * shell:true 用法——見那兩處註解。這裡的呼叫者（npm 子指令與旗標）都是
+ * 寫死的字面值、不含使用者輸入，所以只需最基本的空白包雙引號，不必處理
+ * cmd.exe 那套沒有可靠萬用規則的跳脫字元。
+ */
 function formatCommand(command, args) {
   const parts = args.map((a) => (/\s/.test(a) ? `"${a}"` : a));
   return [command, ...parts].join(" ");
@@ -62,13 +71,25 @@ function formatCommand(command, args) {
 
 /**
  * 唯讀查詢：不論 dry-run 與否都真的執行（不會動到任何東西）。
- * npm 在 Windows 上是 npm.cmd，需要 shell:true 才能被 spawnSync 找到；
- * git/gh/cargo/node 都是 .exe，直接執行即可，不必經過 shell（避免參數裡的
- * 中文與標點被 shell 重新解析）。
+ *
+ * npm 在 Windows 上是 npm.cmd（批次檔），CreateProcess 無法直接執行批次檔，
+ * 必須透過 shell。實測（Node 24 on Windows）直接 spawnSync("npm.cmd", args)
+ * 或先用 where 解出完整路徑再直呼，兩種都會丟 EINVAL，因此 shell:true 是
+ * 必要的，不能省。
+ *
+ * 但 shell:true 搭配「command + args 陣列」的舊寫法會觸發 Node 的 DEP0190
+ * 警告（args 只是原樣接起來、未跳脫，有注入風險）。Node 官方對此的建議
+ * 修法是別再分開傳 args，而是自己組好完整指令字串、整串交給 shell 解析
+ * ——所以這裡改成只傳 formatCommand() 組出的單一字串，不再傳 args 陣列。
+ *
+ * git/gh/cargo/node 都是 .exe，CreateProcess 能直接執行，不必經過 shell
+ * （也避免參數裡的中文與標點被 shell 重新解析）。
  */
 function runReadOnly(command, args) {
   const needsShell = process.platform === "win32" && command === "npm";
-  return spawnSync(command, args, { cwd: root, encoding: "utf8", shell: needsShell });
+  return needsShell
+    ? spawnSync(formatCommand(command, args), { cwd: root, encoding: "utf8", shell: true })
+    : spawnSync(command, args, { cwd: root, encoding: "utf8" });
 }
 
 /** 會改動 git/gh/檔案狀態的步驟：dry-run 時只印出指令，不執行；否則真的跑並檢查結束碼 */
@@ -80,7 +101,9 @@ function runMutating(command, args) {
   }
   console.log(`$ ${label}`);
   const needsShell = process.platform === "win32" && command === "npm";
-  const result = spawnSync(command, args, { cwd: root, encoding: "utf8", shell: needsShell });
+  const result = needsShell
+    ? spawnSync(label, { cwd: root, encoding: "utf8", shell: true })
+    : spawnSync(command, args, { cwd: root, encoding: "utf8" });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   if (result.error) {
