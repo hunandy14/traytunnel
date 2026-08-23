@@ -158,9 +158,14 @@ pub struct Config {
     pub sources: Vec<Source>,
 }
 
-/// 舊制（契約 v2）的設定檔長相，只在自動遷移時用得到
+/// 舊制（契約 v2）的設定檔長相，只在自動遷移時用得到。
+///
+/// `deny_unknown_fields` 是判定舊制的第二道防線：v2 的頂層鍵就只有這五個
+/// （host／user／proxyCommand／closeToTray／forwards，checkForUpdates 是 v3
+/// 之後才有的），冒出別的鍵就代表這份檔案不是它自稱的那種格式，寧可當壞檔備份
+/// 起來也不要照舊制解讀完再把不認得的內容寫掉。
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyConfig {
     host: String,
     user: String,
@@ -435,9 +440,23 @@ fn broken(toml_path: &Path, error: String) -> LoadOutcome {
     LoadOutcome::Broken { config: Config::default(), backup, error }
 }
 
-/// 頂層還有 host 欄位就是舊制設定檔
+/// 舊制設定檔＝頂層有 host **而且**沒有 `[[sources]]`。
+///
+/// 兩個條件缺一不可：只看 host 的話，一份已經有 `[[sources]]`、頂層卻還留著
+/// host 的檔案（半途手改、兩份檔案拼在一起）會被當成舊制去解讀——LegacyConfig
+/// 讀不到那些 sources，遷移完就只剩頂層那一組連線，其餘的源會在下一次存檔時
+/// 被靜靜寫掉。那種檔案的意圖已經無從判斷，交給 [`ambiguous_document`] 去擋。
 fn is_legacy(doc: &DocumentMut) -> bool {
-    doc.get("host").is_some()
+    doc.get("host").is_some() && doc.get("sources").is_none()
+}
+
+/// 新舊兩制的鍵並存：頂層 host 與 `[[sources]]` 同時出現。
+///
+/// 這種檔案沒有安全的解讀方式（照舊制讀會丟掉 sources，照新制讀會丟掉頂層那組
+/// 連線），一律當壞檔處理——壞檔那條路會先備份原檔再退回預設值，使用者手上那份
+/// 資料完整留著，比靜靜挑一半來用好得多。
+fn ambiguous_document(doc: &DocumentMut) -> bool {
+    doc.get("host").is_some() && doc.get("sources").is_some()
 }
 
 /// 從 host 派生源名：源名不可含空白與中括號，但 host 兩者都可能有
@@ -474,6 +493,9 @@ impl LegacyConfig {
 /// 解析設定檔，回傳 (設定, 是否來自舊制)。
 pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     let doc: DocumentMut = strip_bom(raw).parse::<DocumentMut>().map_err(|e| e.to_string())?;
+    if ambiguous_document(&doc) {
+        return Err("設定檔同時有舊制的頂層 host 與新制的 [[sources]]，無法判斷該用哪一份".into());
+    }
     let legacy = is_legacy(&doc);
     let mut cfg: Config = if legacy {
         let old: LegacyConfig = toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
@@ -726,6 +748,14 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
 
     if is_legacy(&doc) {
         migrate_document(&mut doc);
+    } else if ambiguous_document(&doc) {
+        // 新舊兩制並存的壞檔（讀檔時已經備份過一份）。存檔時要順手把舊制那幾個
+        // 頂層鍵清掉，否則寫完還是同一種壞檔：下次啟動又判壞檔，備份會被這份
+        // 內容再蓋一次，使用者原本那份資料就真的沒了
+        doc.remove("host");
+        doc.remove("user");
+        doc.remove("proxyCommand");
+        doc.remove("forwards");
     }
 
     doc["closeToTray"] = value(cfg.close_to_tray);

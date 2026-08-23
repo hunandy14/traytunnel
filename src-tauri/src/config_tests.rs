@@ -725,6 +725,73 @@ fn legacy_file_is_migrated_on_disk_keeping_comments() {
     assert_eq!(&again, out.config());
 }
 
+/// 頂層 host 與 `[[sources]]` 並存的檔案沒有安全的解讀方式：照舊制讀會丟掉
+/// sources，照新制讀會丟掉頂層那一組。一律當壞檔，原檔完整備份起來
+#[test]
+fn a_file_with_both_formats_is_broken_not_migrated() {
+    let dir = tmp_dir("both-formats");
+    let raw = "host = \"old.example.com\"\nuser = \"bob\"\n\n\
+               [[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\n\n\
+               [[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n\n\
+               [[sources]]\nname = \"tk\"\nhost = \"tk.example.com\"\nuser = \"alice\"\n";
+    std::fs::write(dir.join(TOML_NAME), raw).unwrap();
+
+    let out = load_from_dir(&dir);
+    match &out {
+        LoadOutcome::Broken { backup, .. } => {
+            assert!(backup.as_ref().expect("要有備份").exists());
+        }
+        other => panic!("預期 Broken，拿到 {other:?}"),
+    }
+    // 原檔一個字都沒被動過，多源那份資料完整留在備份裡
+    assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    let backed_up = std::fs::read_to_string(dir.join(BROKEN_NAME)).unwrap();
+    assert_eq!(backed_up, raw);
+    assert!(backed_up.contains("hk.example.com") && backed_up.contains("tk.example.com"));
+}
+
+/// 並存的壞檔存過一次之後不可以還是壞檔：舊制那幾個頂層鍵要被清掉，
+/// 否則下次啟動又判壞檔，備份會被存檔後的內容再蓋一次，原資料就真的沒了
+#[test]
+fn saving_over_a_both_formats_file_clears_the_legacy_keys() {
+    let dir = tmp_dir("both-formats-write");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "host = \"old.example.com\"\nuser = \"bob\"\nproxyCommand = \"\"\n\n\
+         [[forwards]]\nname = \"old\"\nlocal = 9\nremote = \"127.0.0.1:9\"\n\n\
+         [[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\n",
+    )
+    .unwrap();
+    let out = load_from_dir(&dir);
+    assert!(matches!(out, LoadOutcome::Broken { backup: Some(_), .. }));
+    assert!(!out.read_only(), "有備份就還可以寫");
+
+    let cfg = out.config().clone();
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(!saved.contains("old.example.com"), "舊制的頂層鍵要被清掉：{saved}");
+    assert!(!saved.contains("[[forwards]]"), "舊制的頂層 forwards 也要清掉：{saved}");
+    // 存完之後就是一份正常的新制檔案，再讀一次不是壞檔
+    let again = load_from_dir(&dir);
+    assert!(matches!(again, LoadOutcome::Loaded(_)), "{saved}");
+    assert_eq!(again.config(), &cfg);
+}
+
+/// 舊制的頂層鍵就那五個，冒出別的鍵代表這份檔案不是它自稱的格式，
+/// 當壞檔備份起來，不要照舊制解讀完再把不認得的內容寫掉
+#[test]
+fn a_legacy_file_with_an_unknown_key_is_broken() {
+    let dir = tmp_dir("legacy-unknown");
+    let raw = "host = \"h.example.com\"\nuser = \"bob\"\nmystery = 42\n";
+    std::fs::write(dir.join(TOML_NAME), raw).unwrap();
+    let out = load_from_dir(&dir);
+    assert!(matches!(out, LoadOutcome::Broken { backup: Some(_), .. }), "拿到 {out:?}");
+    assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    // v2 的五個合法頂層鍵照樣走遷移，deny 不可以誤傷它們
+    let full = "host = \"h.example.com\"\nuser = \"bob\"\nproxyCommand = \"\"\ncloseToTray = false\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = true\n";
+    assert!(parse_document(full).unwrap().1, "v2 的完整鍵集要判成舊制並遷移");
+}
+
 /// PowerShell 5 存檔會帶 UTF-8 BOM，不能因此就把設定當成壞檔
 #[test]
 fn parses_toml_with_utf8_bom() {
