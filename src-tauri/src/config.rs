@@ -766,14 +766,19 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     write_config_at(&dir.join(TOML_NAME), cfg)
 }
 
-/// remote 必須符合 `^[^:\s]+:\d+$`：主機不含冒號與空白，埠是純數字。
+/// remote 必須是 `host:port`：主機不含冒號與空白，埠是純數字而且落在 1-65535。
+///
+/// 埠先確認是純數字再 `parse::<u16>()`：光看是不是數字會放行 `:99999`（ssh 收下
+/// 之後就是一句 Bad forwarding specification，每 5 秒重連一次卻永遠接不起來），
+/// 光靠 parse 又會放行 `+80` 這種 ssh 不認得的寫法。0 不是可連的目的地，一併擋掉，
+/// 與只填埠號那條路（[`normalize_remote`]）的下界對得起來。
 pub fn valid_remote(s: &str) -> bool {
     match s.split_once(':') {
         Some((h, p)) => {
             !h.is_empty()
                 && !h.chars().any(|c| c.is_whitespace())
-                && !p.is_empty()
                 && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|port| port > 0)
         }
         None => false,
     }

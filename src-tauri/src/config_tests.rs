@@ -983,6 +983,37 @@ fn remote_must_be_host_colon_port() {
     assert!(!valid_remote("::1:22"));
 }
 
+/// host:port 的埠也有上下界：只填埠號那條路早就擋掉 0 與越界值，
+/// 寫成完整形式時同一組值一樣要被擋，兩條路不可以一嚴一鬆
+#[test]
+fn host_port_remote_rejects_out_of_range_ports() {
+    assert!(valid_remote("127.0.0.1:1"));
+    assert!(valid_remote("127.0.0.1:65535"));
+    assert!(!valid_remote("127.0.0.1:0"));
+    assert!(!valid_remote("127.0.0.1:65536"));
+    assert!(!valid_remote("127.0.0.1:99999"));
+    assert!(!valid_remote("example.com:4294967296"));
+    // parse 自己會放行 +80／-80，純數字的守衛還是要留著
+    assert!(!valid_remote("127.0.0.1:+80"));
+    assert!(!valid_remote("127.0.0.1:-80"));
+    // 前導零與只填埠號那條路同一個態度：parse 出來的值才算數，0080 就是 80
+    assert!(valid_remote("127.0.0.1:0080"));
+
+    // 手寫檔案與介面輸入兩條路都要擋
+    let with = |remote: &str| {
+        format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"{remote}\"\n"
+        )
+    };
+    for bad in ["127.0.0.1:0", "127.0.0.1:99999"] {
+        assert!(parse_config(&with(bad)).unwrap_err().contains("remote"), "{bad}");
+    }
+    let list = vec![src("hk", vec![fwd("a", 1080)])];
+    assert!(err(&list, None, "ok", 1090, "127.0.0.1:0").starts_with("remote: "));
+    assert!(err(&list, None, "ok", 1090, "127.0.0.1:99999").starts_with("remote: "));
+}
+
 /// 只填埠號＝伺服器本機的那個埠，補成完整形式再存檔
 #[test]
 fn bare_port_normalizes_to_loopback() {
