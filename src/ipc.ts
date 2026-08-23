@@ -48,9 +48,19 @@ export const testConnection = (input: TestConnectionInput) =>
 
 // ------------------------------------------------------------ 轉發設定
 
-/** 回傳錯誤字串代表驗證失敗，null 代表成功。SSH 與 WG 的 forward 列共用 */
+/**
+ * 回傳錯誤字串代表驗證失敗，null 代表成功。SSH 與 WG 的 forward 列共用。
+ *
+ * **過渡墊片**：新契約把「這條列掛在誰底下」的參數從 `source` 改名成
+ * `connection`（因為它現在可能是 wg 連線，不只是 ssh 源），但引擎車道還沒落地
+ * ——目前包裝版裡跑的 Rust `upsert_forward` 仍然只認得 `source`，只送新鍵的話
+ * 存轉發會直接失敗。所以兩個鍵一起送，值相同：舊後端讀 `source`，新後端讀
+ * `connection`，Tauri 對認不得的鍵是直接忽略，兩邊都不會出事。
+ *
+ * **引擎後端落地（改吃 connection／connectionKind）之後，移除 `source` 這一行。**
+ */
 export const upsertForward = (input: ForwardInput) =>
-  invoke<string | null>("upsert_forward", { ...input });
+  invoke<string | null>("upsert_forward", { source: input.connection, ...input });
 
 /** local 是全域唯一鍵，刪任何一種列（forward／socks）都走這一支 */
 export const deleteForward = (local: number) => invoke<void>("delete_forward", { local });
