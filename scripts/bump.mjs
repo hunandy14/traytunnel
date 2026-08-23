@@ -19,10 +19,10 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { packageSectionRange, readCargoVersion } from "./lib/cargo-version.mjs";
+import { SEMVER_RE } from "./lib/semver.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-
-const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 const newVersion = process.argv[2];
 
@@ -44,29 +44,6 @@ function readJsonVersion(path, text) {
   const m = text.match(VERSION_FIELD_RE);
   if (!m) {
     throw new Error(`${path} 找不到 "version" 欄位`);
-  }
-  return m[1];
-}
-
-/** 只在 [package] 區塊裡找（到下一個 [section] 或檔尾為止），避免誤傷 dependencies 裡同名的 version */
-function packageSectionRange(path, text) {
-  const startMatch = text.match(/^\[package\]\s*$/m);
-  if (!startMatch) {
-    throw new Error(`${path} 找不到 [package] 區塊`);
-  }
-  const sectionStart = startMatch.index + startMatch[0].length;
-  const rest = text.slice(sectionStart);
-  const nextSection = rest.match(/^\[.*\]\s*$/m);
-  const sectionEnd = nextSection ? sectionStart + nextSection.index : text.length;
-  return { sectionStart, sectionEnd };
-}
-
-function readCargoVersion(path, text) {
-  const { sectionStart, sectionEnd } = packageSectionRange(path, text);
-  const section = text.slice(sectionStart, sectionEnd);
-  const m = section.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!m) {
-    throw new Error(`${path} 的 [package] 區塊找不到 version`);
   }
   return m[1];
 }

@@ -166,6 +166,8 @@ npm run release <x.y.z>
 
 任一步失敗就地停止（不自動回滾），並印出目前停在哪一步、怎麼收拾。合併前想反悔：`gh pr merge --disable-auto`（取消 auto-merge，PR 留著）或直接把 PR 關掉。
 
+前置檢查會擋下不高於現行版本（`src-tauri/Cargo.toml` 的 `version`）的輸入，相等也算擋下，避免手滑打錯版號或重複發同一版。
+
 正式跑之前可以先 `npm run release <x.y.z> --dry-run`，只印出每一步會執行的指令，不建分支、不改檔案、不 push、不開 PR。
 
 <details>
