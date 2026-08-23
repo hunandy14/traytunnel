@@ -21,6 +21,15 @@ export const RUNNING: ExitStatus[] = [
 export const isRunning = (e: ExitInfo) => RUNNING.includes(e.status);
 export const isBad = (e: ExitInfo) => e.status === "port_busy" || e.status === "error";
 
+/**
+ * 這一列要不要被探測（wg-design.md §5.4 的 should_probe）：`socks` 列是引擎
+ * 自建的代理，恆真；`forward` 列看使用者勾的 probeProxy 旗標。
+ *
+ * 畫面（要不要留協定徽章與出口檢測那一格）與 dev-mock 的假自測排程共用這一份
+ * 判斷，兩邊分別寫一份的話規則一改就會不同步。
+ */
+export const shouldProbe = (e: ExitInfo) => e.kind === "socks" || e.probeProxy;
+
 export type Tone = "grey" | "amber" | "green" | "red";
 
 export function statusTone(status: ExitStatus): Tone {

@@ -165,6 +165,15 @@ export interface SourceInput {
 export type ConnKind = "ssh" | "wg";
 
 /**
+ * 一條連線的判別聯集：`kind` 決定 `data` 是哪一種快照，型別收窄之後就不必
+ * 用 `as` 硬轉、也不會有「wg 連線的 wg 欄位理論上可能不存在」這種假可空。
+ *
+ * main.ts 的 ConnRef（多帶 name／exits 兩個便利欄位）建立在同一個形狀上，
+ * 因此可以直接餵給吃 ConnTarget 的 openSourceSheet，不必再轉一手。
+ */
+export type ConnTarget = { kind: "ssh"; data: SourceInfo } | { kind: "wg"; data: WgProxyInfo };
+
+/**
  * upsert_forward 的輸入；originalLocal 為 null 代表新增。
  *
  * SSH 與 WG 的 `forward` 列共用同一支指令（wg-design.md §5.5）；`kind`
