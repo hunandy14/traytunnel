@@ -49,7 +49,6 @@ import type {
   ExitInfo,
   ExitStatusEvent,
   ExitTestEvent,
-  ProxyProtocol,
   RowKind,
   Snapshot,
   SourceInfo,
@@ -203,24 +202,26 @@ function renderRail(conns: ConnRef[]) {
   railStatusRefs.clear();
 
   for (const conn of conns) {
+    const name = conn.name;
     let btn: HTMLButtonElement;
     if (conn.kind === "ssh") {
-      const hue = hashHue(conn.name);
-      btn = h("button", { class: "src-icon", text: initial(conn.name) });
+      const hue = hashHue(name);
+      btn = h("button", { class: "src-icon", text: initial(name) });
       btn.style.setProperty("--src-bg", `hsl(${hue} 34% 34%)`);
       btn.style.setProperty("--src-ink", `hsl(${hue} 70% 86%)`);
-      btn.title = `${conn.name} — ssh ${conn.data.user}@${conn.data.host}`;
     } else {
       // WG 節點固定用 accent 品牌色 + "WG" 兩字，與 ssh 的雜湊色首字並列（Q10）
       btn = h("button", { class: "src-icon type-wg", text: "WG" });
-      btn.title = `${conn.name} — wg ${conn.data.endpoint || basename(conn.data.confPath)}`;
     }
-    btn.classList.toggle("active", view === "source" && conn.name === selected);
+    // tooltip 與 summary 副標同源，兩處對「這條連線是什麼」不會給出不同答案
+    btn.title = `${name} — ${summarySubText(conn)}`;
+    btn.classList.toggle("active", view === "source" && name === selected);
     const status = h("span", { class: "src-status" });
-    railStatusRefs.set(conn.name, status);
+    railStatusRefs.set(name, status);
     btn.appendChild(status);
     paintRailStatus(conn);
-    btn.addEventListener("click", () => selectConn(conn.name));
+    // 閉包只抓名字，不抓整個 ConnRef（軌道按鈕會活到下一次 renderRail）
+    btn.addEventListener("click", () => selectConn(name));
     list.appendChild(btn);
   }
 
@@ -286,10 +287,11 @@ function render() {
 
   // 選中的連線被刪掉或還沒選過，就落回第一個；
   // 但還在等 config-changed 時不回退，否則改名會被打回舊的連線
-  if (pendingSelect === null && !conns.some((c) => c.name === selected)) {
-    selected = conns[0]?.name ?? null;
+  let conn = conns.find((c) => c.name === selected) ?? null;
+  if (pendingSelect === null && !conn) {
+    conn = conns[0] ?? null;
+    selected = conn?.name ?? null;
   }
-  const conn = conns.find((c) => c.name === selected) ?? null;
 
   // ⋯ 選單的每一項都以「選中的那條連線」為對象。外部變更（別的視窗改了設定檔、
   // 連線被刪掉、整份清空）可能在選單開著時把它換掉或抽走，這時要收起來——
@@ -307,17 +309,24 @@ function render() {
 
 // ---------------------------------------------------------------- 頂部彙總列
 
-/** wg 連線副標顯示 endpoint（U4）；ssh 照舊 "ssh user@host" */
+/**
+ * 連線的身分摘要，summary 副標與左軌 tooltip 共用。
+ * wg 顯示 endpoint（U4）；.conf 還沒解析出 endpoint 時退回檔名，
+ * 至少讓人分得出是哪一份設定。ssh 照舊 "ssh user@host"。
+ */
 function summarySubText(conn: ConnRef): string {
   if (conn.kind === "ssh") return `ssh ${conn.data.user}@${conn.data.host}`;
-  return conn.data.endpoint ? `wg ${conn.data.endpoint}` : "wg";
+  const detail = conn.data.endpoint || basename(conn.data.confPath);
+  return detail ? `wg ${detail}` : "wg";
 }
 
 function renderSummary(conn: ConnRef | null) {
   const exits = visibleExits(conn);
   const total = exits.length;
   const connected = exits.filter((e) => e.status === "connected").length;
-  const running = exits.some(isRunning);
+  // 色調與狀態詞都由 status.ts 那一組純函式算，這裡各算一次共用給三個消費點
+  const tone: Tone = conn ? connTone(conn, exits) : "grey";
+  const statusText = conn ? connStatusText(conn, exits) : "no rows";
 
   // 左段：連線名稱當主標，身分摘要當副標；WG 專屬的引擎狀態點跟標題並排
   const title = el<HTMLDivElement>("summary-title");
@@ -336,13 +345,10 @@ function renderSummary(conn: ConnRef | null) {
   // 引擎旗標與底下各列的彙總算出來，左軌小點與下面的統計分數用的是同一支，
   // 三處不會再各說各話。
   const engineDot = el<HTMLSpanElement>("summary-engine-dot");
-  if (conn?.kind === "wg") {
-    engineDot.hidden = false;
-    engineDot.className = `dot tone-${connTone(conn, exits)}`;
-    engineDot.title = connStatusText(conn, exits);
-  } else {
-    engineDot.hidden = true;
-  }
+  engineDot.hidden = conn?.kind !== "wg";
+  engineDot.className = `dot tone-${tone}`;
+  // 短狀態詞當常態，conf 壞掉時滑過去要看得到完整原因（副標會被省略號截斷）
+  engineDot.title = confError ?? statusText;
 
   // 總開關綁的是引擎旗標（conn.data.enabled），跟列開關綁 exit.enabled 同一個
   // 語意層級：兩者都是「意圖」，不是即時狀態——後者由狀態點負責。
@@ -350,29 +356,19 @@ function renderSummary(conn: ConnRef | null) {
   masterToggle.hidden = conn?.kind !== "wg";
   setToggle(masterToggle, conn?.kind === "wg" && conn.data.enabled, TOGGLE_TITLES);
 
-  // 中段：大分數＋小字狀態，顏色跟兩顆狀態點同源
-  let score: string;
-  let label: string;
-  if (!conn || total === 0) {
-    score = "—";
-    label = "no rows";
-  } else if (!running) {
-    score = `0/${total}`;
-    label = "stopped";
-  } else {
-    score = `${connected}/${total}`;
-    label = "connected";
-  }
-  const tone: Tone = conn ? connTone(conn, exits) : "grey";
+  // 中段：大分數＋小字狀態。分母是看得到的列數（跟畫面上的卡片張數對得起來），
+  // 顏色與底下那行小字則跟兩顆狀態點同源——之前小字自己算一套，會出現
+  // 分數說「stopped」、引擎點說「idle」互相打架的畫面。
   const num = el<HTMLDivElement>("summary-score");
-  num.textContent = score;
+  num.textContent = !conn || total === 0 ? "—" : `${connected}/${total}`;
   num.className = `summary-score-num tone-${tone}`;
-  el<HTMLDivElement>("summary-score-label").textContent = label;
+  el<HTMLDivElement>("summary-score-label").textContent = conn ? statusText : "no rows";
 
   // 右段：⋯ 選單裡的連／斷那一項跟著整條連線的狀態換字。WG 跟的是引擎旗標而不是
   // 列的執行狀態——它按下去呼叫的就是 setWgEnabled，跟旁邊的總開關同一件事，
   // 兩個入口的字面與行為必須一致（引擎開著但列全部停用時，那一項要說 Disconnect）。
-  const toggleOn = conn?.kind === "wg" ? conn.data.enabled : running;
+  const toggleOn =
+    conn?.kind === "wg" ? conn.data.enabled : exits.some(isRunning);
   setIcon(el<HTMLSpanElement>("menu-toggle-ico"), toggleOn ? "square" : "play", 14);
   el<HTMLSpanElement>("menu-toggle-text").textContent = toggleOn ? "Disconnect" : "Connect";
   const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
@@ -418,12 +414,33 @@ function menuItem(id: string, action: () => void) {
  * 語意也不同：逐列迴圈會連帶輾平每一條列自己的 enabled 意圖，而引擎總開關
  * 關掉時列的意圖要原封不動，重新打開時只起原本就啟用的那幾條。
  */
+/**
+ * 已經送出 set_wg_enabled、還在等回應的連線。
+ *
+ * 那顆開關按下去到 config-changed 回來之間，畫面上的旗標還是舊值——連按兩下
+ * 就會依同一個舊值算出同一個 next，送出兩次一模一樣的指令；更糟的是「開→關」
+ * 這種一心二意的連點，最後生效的是哪一個完全看回應順序碰運氣。
+ */
+const wgEnginePending = new Set<string>();
+
 function toggleWgEngine(conn: ConnRef & { kind: "wg" }) {
+  if (wgEnginePending.has(conn.name)) return;
   const next = !conn.data.enabled;
+  // 樂觀更新：先把開關撥過去，使用者才不會覺得按了沒反應。
+  setToggle(el<HTMLButtonElement>("summary-master-toggle"), next, TOGGLE_TITLES);
+  wgEnginePending.add(conn.name);
   void run(
     () => setWgEnabled(conn.name, next),
     `${next ? "connect" : "disconnect"} ${conn.name}`,
-  );
+  ).finally(() => {
+    wgEnginePending.delete(conn.name);
+    // 收尾時照快照重畫一次，把上面那個樂觀的猜測校正回事實。
+    // 多數情況 config-changed 早就到了、這一次 render 只是冪等的重畫；
+    // 但後端**可以合法地拒絕**（例如 .conf 解析不過的連線根本起不來，
+    // 那時它不改旗標也不推 config-changed），少了這一手，開關就會停在
+    // 一個永遠不會被修正的錯誤位置。
+    render();
+  });
 }
 
 /**
@@ -435,10 +452,12 @@ function toggleWgEngine(conn: ConnRef & { kind: "wg" }) {
  * off→on 才是真的重啟（順帶重讀 conf），也才對得起選單上那個字。
  */
 function reconnectWgEngine(conn: ConnRef & { kind: "wg" }) {
+  if (wgEnginePending.has(conn.name)) return;
+  wgEnginePending.add(conn.name);
   void run(async () => {
     await setWgEnabled(conn.name, false);
     await setWgEnabled(conn.name, true);
-  }, `reconnect ${conn.name}`);
+  }, `reconnect ${conn.name}`).finally(() => wgEnginePending.delete(conn.name));
 }
 
 function initSummaryMenu() {
@@ -479,9 +498,11 @@ function initSummaryMenu() {
   menuItem("menu-reconnect-source", () => {
     const conn = currentConn();
     if (!conn) return;
-    // WG 有一顆真的引擎可以重啟，走引擎級的 off→on（順帶重讀 conf）
+    // WG 有一顆真的引擎可以重啟，走引擎級的 off→on（順帶重讀 conf）。
+    // 引擎關著就什麼都不做——「重新連線」不該把一個使用者刻意停掉的連線
+    // 擅自開起來，這一點與下面 SSH 分支「只重接執行中的列」是同一個原則。
     if (conn.kind === "wg") {
-      reconnectWgEngine(conn);
+      if (conn.data.enabled) reconnectWgEngine(conn);
       return;
     }
     // SSH 一個出口就是一條 ssh 程序，只能逐條重接；
@@ -512,16 +533,22 @@ function routeText(exit: ExitInfo): string {
  */
 const NOT_A_PROXY_HINT = "Confirm the destination is a proxy, or turn the flag off";
 
-/** 列開關與連線總開關共用的 tooltip 字面（[開著時, 關著時]） */
+/** 列開關與連線總開關共用的 tooltip 字面（[開著時，關著時]） */
 const TOGGLE_TITLES = ["Disconnect", "Connect"] as const;
 
 /**
- * 記住這條列曾經被識別出來的協定。
+ * 協定識別記憶的**唯一**寫入點，刻意放在 paintCard 的第一行、早退之前。
  *
  * 自測結果（lastTest）只在 connected 時有效，一斷線就整筆清掉；但「這個目的地
  * 是不是代理、是哪一種」不會因為連線斷一下就改變。沒有這層記憶的話，徽章會
  * 跟著每一次停止／重測在「SOCKS5」與「PROXY?」之間來回閃，而 PROXY? 還掛著
  * 一句指責使用者設定錯誤的 tooltip——那條列明明剛剛才成功識別過。
+ *
+ * 為什麼一個寫入點就夠：帶著 protocol 的自測結果一定先經過 applyExitTest，
+ * 而它結尾必定呼叫 paintCard；等到之後 exit-status 把 lastTest 清掉時，
+ * 記憶早就存下來了。放在早退之前是關鍵——沒被選中的連線畫不出卡片，
+ * 但它底下的列同樣會收到自測事件，記憶不能因為「現在沒在看」就漏掉。
+ * （開機第一份快照沒有事件可收，由 applySnapshot 的 carry 直接播種。）
  */
 function rememberProtocol(exit: ExitInfo) {
   const seen = exit.lastTest?.protocol;
@@ -536,26 +563,30 @@ function rememberProtocol(exit: ExitInfo) {
  *                       且測出「不像代理」之後才說這句話
  *   還沒測／測試中      PROXY，淡樣式，不掛 tooltip。中性陳述「這條列被標成
  *                       代理」，不對還沒發生的事下結論、更不指責使用者
+ *
+ * `hint` 是「該不該說那句話」的**唯一**判準，徽章與底下的檢測行都引用它，
+ * 不各自再算一次——兩處講的是同一件事，判準分兩份遲早會分岔。
  */
 function badgeLook(exit: ExitInfo): { text: string; accent: boolean; hint: boolean } {
   if (exit.kind === "socks") return { text: "SOCKS5", accent: true, hint: false };
-  const known = exit.lastTest?.protocol ?? exit.knownProtocol;
+  const known = exit.knownProtocol;
   if (known) return { text: known.toUpperCase(), accent: true, hint: false };
   if (exit.lastTest?.state === "fail") return { text: "PROXY?", accent: false, hint: true };
   return { text: "PROXY", accent: false, hint: false };
 }
 
 function paintCard(exit: ExitInfo) {
+  // 早退之前：這是協定記憶的同步點，跟卡片畫不畫得出來無關
+  rememberProtocol(exit);
+
   const refs = cardRefs.get(exit.local);
   if (!refs) return;
-
-  rememberProtocol(exit);
+  const look = badgeLook(exit);
 
   refs.dot.className = `dot tone-${statusTone(exit.status)}`;
   refs.dot.title = exit.status;
 
   if (refs.badge) {
-    const look = badgeLook(exit);
     refs.badge.textContent = look.text;
     refs.badge.className = `type-badge ${look.accent ? "wg" : "ssh"}`;
     if (look.hint) refs.badge.title = NOT_A_PROXY_HINT;
@@ -572,14 +603,10 @@ function paintCard(exit: ExitInfo) {
       refs.test.appendChild(h("div", { class: "card-test-place", text: two.place }));
       refs.test.appendChild(h("div", { class: "card-test-ip mono", text: two.ip }));
     } else {
-      // 跟徽章同一套判準：只有在「這條列被標成代理、真的測過、而且從來沒有
-      // 識別成功過」的時候才說那句話。曾經識別出協定的列偶爾測失敗一次，
-      // 那是連線問題而不是使用者把旗標設錯了。
+      // 直接引用徽章算好的 hint，不自己再判一次：曾經識別出協定的列偶爾測
+      // 失敗一次，那是連線問題而不是使用者把旗標設錯了，兩處必須同一個答案
       refs.test.className = `card-test tone-text-${t.tone}`;
-      refs.test.title =
-        exit.kind === "forward" && t.tone === "red" && !exit.lastTest?.protocol && !exit.knownProtocol
-          ? NOT_A_PROXY_HINT
-          : "";
+      refs.test.title = look.hint ? NOT_A_PROXY_HINT : "";
       refs.test.textContent = t.text;
     }
   }
@@ -597,12 +624,13 @@ function paintCard(exit: ExitInfo) {
 function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement {
   const dot = h("span", { class: "dot" });
 
-  // 檢測行：shouldProbe 對舊後端的列回 true，維持 PR 之前無條件顯示出口 IP 的行為
+  // 檢測行：舊後端的列被 normalizeSnapshot 補成 probeProxy=true，維持 PR 之前
+  // 無條件顯示出口 IP 的行為
   const showTest = shouldProbe(exit);
-  // 徽章：kind／probeProxy 是本輪才加的欄位，舊後端送來的列兩個都沒有。沒有依據
-  // 就不要替它臆測一個「這是不是代理」的答案——PR 之前這個位置本來就沒有徽章，
-  // 憑空長出一排 PROXY／PROXY? 只會讓人以為設定被改過。後端補上欄位後自然消失。
-  const showBadge = exit.kind !== undefined && showTest;
+  // 徽章：舊後端那個 true 是為了相容假設出來的，不足以拿來宣稱「這條列是代理」。
+  // PR 之前這個位置本來就沒有徽章，憑空長出一排 PROXY／PROXY? 只會讓人以為設定
+  // 被改過。後端補上 kind／probeProxy 後 legacy 不再成立，徽章自然回來。
+  const showBadge = !exit.legacy && showTest;
   let badge: HTMLElement | null = null;
   let nameEl: HTMLElement;
   if (showBadge) {
@@ -656,16 +684,21 @@ function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement 
   return root;
 }
 
-/** 一個區段（標題＋卡片容器）：空的就整段不畫，含標題 */
+/**
+ * 一個區段（標題＋卡片容器）：空的就整段不畫，含標題。
+ * conn 給 null 就只是把區段清成空的——「沒有選中連線」與「這個區段沒有列」
+ * 對畫面來說是同一件事，不必為前者另寫一組四行的重設。
+ */
 function renderGroup(
   head: HTMLElement,
   box: HTMLElement,
   items: ExitInfo[],
-  conn: ConnRef,
+  conn: ConnRef | null,
   dimmed: boolean,
 ) {
   head.hidden = items.length === 0;
   box.classList.toggle("grouped", items.length > 0);
+  if (!conn) return;
   for (const item of items) {
     box.appendChild(buildCard(item, conn, dimmed));
     paintCard(item);
@@ -673,9 +706,7 @@ function renderGroup(
 }
 
 function renderCards(conn: ConnRef | null) {
-  const proxiesHead = el<HTMLDivElement>("proxies-list-head");
   const proxiesBox = el<HTMLDivElement>("proxies-cards");
-  const forwardsHead = el<HTMLDivElement>("forwards-list-head");
   const forwardsBox = el<HTMLDivElement>("forwards-cards");
 
   // grouped 由下面的 renderGroup 依內容重設，這裡不必先手動清一次
@@ -683,27 +714,19 @@ function renderCards(conn: ConnRef | null) {
   forwardsBox.textContent = "";
   cardRefs.clear();
 
-  if (!conn) {
-    proxiesHead.hidden = true;
-    forwardsHead.hidden = true;
-    proxiesBox.classList.remove("grouped");
-    forwardsBox.classList.remove("grouped");
-    return;
-  }
-
   // 分段依機制而非語意（wg-design.md §1.4）：SOCKS5 只放 kind=socks
   // （只有 wg 連線會有），PORT FORWARDS 放全部 kind=forward，含 probeProxy=true
   // 的列——就地顯示徽章＋出口 IP，不搬去別的分組。空區段整段不畫，含標題。
-  const rows = visibleExits(conn);
+  const rows = conn ? visibleExits(conn) : [];
   const socksItems = rows.filter((e) => e.kind === "socks");
   const forwardItems = rows.filter((e) => e.kind !== "socks");
   // 引擎沒開就整片變暗、列開關停用：那些列的意圖還在，但引擎關著它們不可能跑
-  const dimmed = conn.kind === "wg" && !conn.data.enabled;
+  const dimmed = conn?.kind === "wg" && !conn.data.enabled;
 
-  renderGroup(proxiesHead, proxiesBox, socksItems, conn, dimmed);
-  renderGroup(forwardsHead, forwardsBox, forwardItems, conn, dimmed);
+  renderGroup(el<HTMLDivElement>("proxies-list-head"), proxiesBox, socksItems, conn, dimmed);
+  renderGroup(el<HTMLDivElement>("forwards-list-head"), forwardsBox, forwardItems, conn, dimmed);
 
-  if (socksItems.length === 0 && forwardItems.length === 0) {
+  if (conn && socksItems.length === 0 && forwardItems.length === 0) {
     const ghost = h("button", { class: "ghost-card" }, [
       h("span", { class: "ghost-plus" }, [icon("plus", 18)]),
       h("span", { text: "Add forward" }),
@@ -841,43 +864,39 @@ function appendLog(line: string) {
  */
 function applySnapshot(next: Snapshot, replayLogs = false) {
   // detailText 與 knownProtocol 都只活在前端（前者由 exit-status 事件帶進來、
-  // 後者是協定識別的黏著記憶），快照裡沒有這兩個欄位，重整時要自己保住
-  type Carried = { detailText?: string | null; knownProtocol?: ProxyProtocol | null };
-  const keep = new Map<number, Carried>();
-  for (const conn of allConns()) {
-    for (const e of conn.exits) {
-      keep.set(e.local, { detailText: e.detailText, knownProtocol: e.knownProtocol });
-    }
-  }
+  // 後者是協定識別的黏著記憶），快照裡沒有這兩個欄位，重整時要自己保住。
+  // 直接掃原始陣列，不繞 allConns()——這裡只要每一條列，不需要連線的包裝。
+  const keep = new Map<number, ExitInfo>();
+  for (const s of snap.sources) for (const e of s.exits) keep.set(e.local, e);
+  for (const p of snap.wgProxies) for (const e of p.exits) keep.set(e.local, e);
 
-  /** 沿用同一個 local 的列就把前端暫存欄位接過去；快照自己帶的協定也一併記下 */
+  /**
+   * 沿用同一個 local 的列就把前端暫存欄位接過去。
+   *
+   * knownProtocol 的搬運條件比 detailText 嚴格：**目的地換了、或代理旗標被關掉，
+   * 記憶就作廢**。埠號相同不代表是同一條列——使用者可以把 :1080 從一台代理改指
+   * 到另一台完全不同的機器，這時還宣稱它是 SOCKS5 就是在說謊。快照自己帶著
+   * protocol 的話（開機第一份快照沒有事件可收）則直接播種。
+   */
   const carry = (e: ExitInfo): ExitInfo => {
     const prev = keep.get(e.local);
+    const sameTarget = prev !== undefined && prev.remote === e.remote && shouldProbe(e);
     return {
       ...e,
       detailText: prev?.detailText ?? null,
-      knownProtocol: e.lastTest?.protocol ?? prev?.knownProtocol ?? null,
+      knownProtocol: e.lastTest?.protocol ?? (sameTarget ? (prev.knownProtocol ?? null) : null),
     };
   };
 
-  // 三個陣列欄位在型別上都不可空，原本卻只有 sources／wgProxies／logs 其中幾處
-  // 補了 `?? []`，同一個函式裡兩種寫法並存、讀的人分不出哪一個才是真的在防什麼。
-  // 統一成入口處一次正規化：**現階段 wgProxies 確實可能不存在**——引擎車道還沒
-  // 落地，包裝版的 Rust Snapshot 根本還沒有這個欄位，直接 .map 會讓整個 UI 在
-  // 第一次取狀態就掛掉。後端補上 wgProxies 之後這一層就可以拿掉（與 ipc.ts 的
-  // upsertForward 墊片、status.ts 的 shouldProbe 舊形狀分支同一批過渡措施）。
-  const sources = next.sources ?? [];
-  const wgProxies = next.wgProxies ?? [];
-  const logs = next.logs ?? [];
-
+  // 形狀正規化（wgProxies 缺席之類）已經在 ipc.ts 的 normalizeSnapshot 做掉了，
+  // 這裡照宣告的型別信任資料
   snap = {
     ...next,
-    sources: sources.map((s) => ({ ...s, exits: (s.exits ?? []).map(carry) })),
-    wgProxies: wgProxies.map((p) => ({ ...p, exits: (p.exits ?? []).map(carry) })),
-    logs,
+    sources: next.sources.map((s) => ({ ...s, exits: s.exits.map(carry) })),
+    wgProxies: next.wgProxies.map((p) => ({ ...p, exits: p.exits.map(carry) })),
   };
 
-  if (replayLogs) logLines = [...logs].slice(-LOG_CAP);
+  if (replayLogs) logLines = next.logs.slice(-LOG_CAP);
 
   syncSettingsPage(snap);
   render();
@@ -898,12 +917,10 @@ function applyExitStatus(ev: ExitStatusEvent) {
   const { exit, conn } = hit;
   exit.status = ev.status;
   exit.detailText = ev.detail ?? null;
-  if (ev.status !== "connected") {
-    // 清的是「這一輪連線的自測結果」，不是「這個目的地是不是代理」——
-    // knownProtocol 刻意不動，否則徽章會跟著每一次斷線閃回未識別的樣子
-    rememberProtocol(exit);
-    exit.lastTest = null;
-  }
+  // 清的是「這一輪連線的自測結果」，不是「這個目的地是不是代理」——
+  // knownProtocol 刻意不動（那筆識別結果早在它抵達時就由 paintCard 記下了），
+  // 否則徽章會跟著每一次斷線閃回未識別的樣子
+  if (ev.status !== "connected") exit.lastTest = null;
   paintCard(exit);
   // 連線就在手上，不必再拿名字回頭查一次（renderSummary 只在它就是選中的那條時才畫）
   if (view === "source" && conn.name === selected) renderSummary(conn);
@@ -922,8 +939,7 @@ function applyExitTest(ev: ExitTestEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
   const { exit } = hit;
-  // 識別成功就先記進黏著記憶，之後 lastTest 怎麼被清都不影響徽章
-  if (ev.protocol) exit.knownProtocol = ev.protocol;
+  // 識別結果不在這裡另外抄一份：下面的 paintCard 開頭就是記憶的同步點
   exit.lastTest =
     ev.text && ev.state
       ? ev.protocol

@@ -29,7 +29,7 @@ export function h<K extends keyof HTMLElementTagNameMap>(
  * 列開關、連線總開關、表單裡的「目的地是代理」）都走這一支，不要再各自手寫
  * ——之前四處拷貝裡就有一處漏掉了 aria-checked。
  *
- * titles 給了就順便把 tooltip 換成對應的動作詞（[開著時, 關著時]）。
+ * titles 給了就順便把 tooltip 換成對應的動作詞（[開著時，關著時]）。
  */
 export function setToggle(
   node: HTMLElement,
