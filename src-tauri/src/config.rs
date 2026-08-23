@@ -142,6 +142,27 @@ pub struct Source {
     pub forwards: Vec<Forward>,
 }
 
+/// 一顆使用者態 WireGuard 代理：對外表現成一個本地 SOCKS5 埠，
+/// 底下可以再掛靜態埠轉發（設計書 §4.1）。
+///
+/// 私鑰留在 `conf_path` 指的那份外部 `.conf` 裡，`traytunnel.toml` 只存路徑，
+/// 永遠不複製金鑰進來。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WgProxy {
+    pub name: String,
+    /// 指向外部的標準 wg `.conf`；相對路徑以設定檔所在資料夾為基準（W3.19）
+    pub conf_path: String,
+    /// 本地 SOCKS5 監聽埠，與所有 ssh 出口的 local、所有 wg 轉發的 local
+    /// 共用同一個唯一鍵空間，跨種類也不可以重複
+    pub socks_port: u16,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 直接沿用既有的 [`Forward`]，欄位完全相同
+    #[serde(default)]
+    pub forwards: Vec<Forward>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -156,6 +177,9 @@ pub struct Config {
     pub check_for_updates: Option<bool>,
     #[serde(default)]
     pub sources: Vec<Source>,
+    /// 使用者態 WireGuard 代理。對舊設定檔是相容的加法：沒有這一段就是空陣列。
+    #[serde(default)]
+    pub wg_proxies: Vec<WgProxy>,
 }
 
 /// 舊制（契約 v2）的設定檔長相，只在自動遷移時用得到。
@@ -255,6 +279,23 @@ impl Config {
             .map(|s| s.forwards.iter().filter(|f| f.enabled).map(|f| f.local).collect())
             .unwrap_or_default()
     }
+
+    // ---- wg 代理（骨架，行為由 W3 系列的測試定義）----
+
+    /// 依 socksPort 找代理
+    pub fn wg_proxy(&self, _socks_port: u16) -> Option<&WgProxy> {
+        todo!("W3.*：依 socksPort 找 wg 代理")
+    }
+
+    /// 依本地埠找 wg 轉發（只查 wg，ssh 那邊仍走 [`Config::forward`]）
+    pub fn wg_forward(&self, _local: u16) -> Option<&Forward> {
+        todo!("W3.*：依 local 找 wg 轉發")
+    }
+
+    /// 這個本地埠（socksPort 或轉發的 local）屬於哪一顆代理
+    pub fn wg_proxy_of(&self, _local: u16) -> Option<&WgProxy> {
+        todo!("W3.18：wg 埠的所屬代理，日誌前綴要靠它")
+    }
 }
 
 impl Default for Config {
@@ -283,6 +324,7 @@ impl Default for Config {
                     },
                 ],
             }],
+            wg_proxies: Vec::new(),
         }
     }
 }
@@ -486,6 +528,8 @@ impl LegacyConfig {
                 proxy_command: self.proxy_command,
                 forwards: self.forwards,
             }],
+            // 舊制當然沒有 wg 代理
+            wg_proxies: Vec::new(),
         }
     }
 }
@@ -967,6 +1011,33 @@ pub fn validate_source(
         return Some(format!("name: connection {name} already exists"));
     }
     None
+}
+
+/// `wgProxies.confPath` 的相對路徑解析基準是**設定檔所在資料夾**，
+/// 不是行程的工作目錄（W3.19）。絕對路徑原樣回傳。
+pub fn resolve_conf_path(_config_dir: &Path, _conf_path: &str) -> PathBuf {
+    todo!("W3.19")
+}
+
+/// 撞埠時的佔用者描述，跨 ssh 出口／wg 代理／wg 轉發都認得（W3.12）。
+///
+/// 既有的 [`validate_forward`] 只吃 `&[Source]`，看不見 wg 的埠，而它的簽名
+/// 被一整組既有測試釘著不能動。折衷是把「誰佔了這個埠」抽成這一支，
+/// 由 `validate_forward` 與 wg 那一側共用，訊息才分辨得出佔用者的種類。
+pub fn port_owner(_cfg: &Config, _local: u16) -> Option<String> {
+    todo!("W3.12")
+}
+
+/// 新增／編輯 wg 代理的欄位驗證，回傳掛回欄位的訊息（前綴 `name:`／`confPath:`／
+/// `socksPort:`），沒問題時 None（W3.9～W3.11）。
+pub fn validate_wg_proxy(
+    _cfg: &Config,
+    _original_socks_port: Option<u16>,
+    _name: &str,
+    _conf_path: &str,
+    _socks_port: u16,
+) -> Option<String> {
+    todo!("W3.9／W3.10／W3.11／U1 跨類型 upsert 被拒")
 }
 
 #[cfg(test)]

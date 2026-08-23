@@ -7,6 +7,9 @@ mod ssh;
 mod state;
 mod traymenu;
 mod update;
+// WireGuard → 本地 SOCKS5。目前整個模組是骨架，還沒有任何呼叫端，
+// 掛成 pub 只是為了讓「尚未接線」不變成一整面 dead_code 警告。
+pub mod wg;
 mod winstate;
 mod winsys;
 

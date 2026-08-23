@@ -470,6 +470,7 @@ mod tests {
         Config {
             close_to_tray: true,
             check_for_updates: None,
+            wg_proxies: Vec::new(),
             sources: vec![
                 Source {
                     name: "hk".into(),

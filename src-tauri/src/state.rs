@@ -114,7 +114,7 @@ pub struct Snapshot {
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
 /// 號碼在取得位子之後才配發，未取得時不消耗世代序號。
-fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> Option<u64> {
+pub(crate) fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> Option<u64> {
     if slot.is_some() {
         return None;
     }
@@ -176,7 +176,7 @@ fn release_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToke
 ///
 /// 擋在這裡而不是在每個狀態轉換點各清一次：`source_views` 是快照與系統匣共用的
 /// 唯一出口，一道規則就涵蓋所有路徑，之後新增狀態轉換也不會有人忘了補。
-fn visible_test(status: &str, last_test: Option<TestView>) -> Option<TestView> {
+pub(crate) fn visible_test(status: &str, last_test: Option<TestView>) -> Option<TestView> {
     if status == status::CONNECTED {
         last_test
     } else {
@@ -292,6 +292,42 @@ struct ExitRuntime {
     /// 目前活著的監看迴圈是哪一代，None 代表這個出口沒人在跑
     supervisor: Option<u64>,
     job: Option<(u64, Job)>,
+}
+
+/// 一輪連線持有的「殺得掉的東西」（設計書 §4.2）。
+///
+/// ssh 是 Job Object handle、wg 是一棵 tokio 任務樹的 CancellationToken，
+/// 兩者都靠 Drop 收尾，所以 `rt.job.take()`（拿走即殺掉）那條既有語意
+/// 一字不改就同時涵蓋兩種，`store_job`／`kill_job_of`／`kill_all_jobs`
+/// 的世代守門與那幾條競態論證也完全不用重寫。
+///
+/// 骨架階段只把型別與守門的純函式立起來，`ExitRuntime.job` 的換型別留給
+/// 實作車道——先換型別會動到既有那條全綠的路徑，紅燈存證會混進雜訊。
+#[allow(dead_code)]
+pub(crate) enum Worker {
+    Ssh(Job),
+    Wg(crate::wg::CancelGuard),
+}
+
+/// `store_job` 的世代守門，抽成純函式才測得到（W6.2）。
+///
+/// 世代相符才收下並回 true；不符時 `worker` 就在這裡 drop——那條剛 spawn 出來、
+/// 已經沒有人要的連線（ssh 程序樹或 wg 任務樹）當場被收乾淨。
+#[allow(dead_code)]
+pub(crate) fn store_worker(
+    _slot: &mut Option<(u64, Worker)>,
+    _rt_generation: u64,
+    _generation: u64,
+    _worker: Worker,
+) -> bool {
+    todo!("W6.2")
+}
+
+/// `kill_all_jobs` 的核心：收掉所有 worker，回報要寫成 stopped 的埠（W6.3）。
+#[allow(dead_code)]
+pub(crate) fn drain_workers(slots: &mut BTreeMap<u16, Option<(u64, Worker)>>) -> Vec<u16> {
+    let _ = slots;
+    todo!("W6.3")
 }
 
 impl ExitRuntime {

@@ -339,6 +339,7 @@ fn locals_of_only_covers_that_source() {
     let cfg = Config {
         close_to_tray: true,
         check_for_updates: None,
+        wg_proxies: Vec::new(),
         sources: vec![
             src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
             src("tw", vec![fwd("c", 1090)]),
@@ -823,6 +824,7 @@ fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
     let cfg = Config {
         close_to_tray: true,
         check_for_updates: None,
+        wg_proxies: Vec::new(),
         sources: vec![
             Source {
                 name: "hk".into(),
@@ -1100,6 +1102,7 @@ fn write_drops_removed_sources() {
     let mut cfg = Config {
         close_to_tray: true,
         check_for_updates: None,
+        wg_proxies: Vec::new(),
         sources: vec![src("a", vec![fwd("x", 1080)]), src("b", vec![fwd("y", 1083)])],
     };
     write_config(&dir, &cfg).unwrap();
@@ -1124,6 +1127,7 @@ fn write_appends_new_source() {
     let mut cfg = Config {
         close_to_tray: true,
         check_for_updates: None,
+        wg_proxies: Vec::new(),
         sources: vec![src("a", vec![fwd("x", 1080)])],
     };
     write_config(&dir, &cfg).unwrap();
@@ -1252,7 +1256,12 @@ fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
 
     // 落檔：command 端就是把這一筆原樣塞進設定再存，這裡照做一次
     let dir = tmp_dir("normalize-remote");
-    let mut cfg = Config { close_to_tray: true, check_for_updates: None, sources: list };
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: list,
+        wg_proxies: Vec::new(),
+    };
     cfg.sources[0].forwards.push(made.clone());
     write_config(&dir, &cfg).unwrap();
     let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
