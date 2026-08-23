@@ -541,7 +541,14 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
 ///
 /// 值不在這裡填，後面的 sync 會照設定物件覆寫一次；這裡只負責搬結構，
 /// 所以寫在單筆 forward 上方的註解、檔頭的註解都跟著搬過去。
+///
+/// 唯一的例外是新表格的 name：後面的 sync 認 name 找表格（見 [`sync_tables`]），
+/// 這裡不先派生出同一個名字的話，那張剛搬好的表格會對不上而被整個丟掉，
+/// 連帶把搬進去的 `[[sources.forwards]]` 與註解一起賠掉。
 fn migrate_document(doc: &mut DocumentMut) {
+    // 與 LegacyConfig::into_config 派生源名的規則同一條，兩邊才對得上
+    let name = source_name_from_host(doc.get("host").and_then(Item::as_str).unwrap_or_default());
+
     let lead = doc
         .as_table()
         .key("host")
@@ -566,6 +573,7 @@ fn migrate_document(doc: &mut DocumentMut) {
     }
 
     let mut t = Table::new();
+    t["name"] = value(name);
     if let Some(Item::ArrayOfTables(a)) = forwards {
         t.insert("forwards", Item::ArrayOfTables(a));
     }
@@ -574,27 +582,88 @@ fn migrate_document(doc: &mut DocumentMut) {
     doc.insert("sources", Item::ArrayOfTables(arr));
 }
 
-/// 逐張表格就地改寫（多的移除、少的補上），使用者寫在單筆上方的註解才不會消失
+/// 依穩定鍵把設定物件對回既有表格，逐張就地改寫，使用者寫在單筆上方的註解
+/// 才會一直跟著它註解的那一筆走。
+///
+/// 不可以改用位置比對：新增與編輯走的是 retain + push（編輯過的那一筆會跑到陣列
+/// 尾端），刪掉中間一筆也會讓後面全部往前挪，位置比對在這兩種情況下會把註解錯掛
+/// 到別人頭上，或連同表格一起被截掉。所以這裡認鍵：source 認 name、forward 認
+/// local，新陣列逐筆去既有表格裡找同鍵的那一張，找到就地更新欄位（那張表格的
+/// decor 原封不動留著），找不到才開一張新的；舊表格的鍵不在新集合裡就被丟掉。
+///
+/// 限制：改名（source 的 name）與改埠（forward 的 local）等於換了一把鍵，舊表格
+/// 對不上，語意就是刪一筆再增一筆——註解跟著舊鍵一起消失。鍵本身就是使用者辨識
+/// 那一筆的依據，改鍵時註解未必還適用，所以這個取捨是刻意的。
+fn sync_tables<T, K: PartialEq>(
+    tables: &mut ArrayOfTables,
+    items: &[T],
+    table_key: impl Fn(&Table) -> Option<K>,
+    item_key: impl Fn(&T) -> K,
+    apply: impl Fn(&mut Table, &T),
+) {
+    // Option 是「這張舊表格還沒被認領」的記號：同一張不可以被兩筆同時挑走
+    let mut old: Vec<Option<Table>> = tables.iter().cloned().map(Some).collect();
+    let mut out = ArrayOfTables::new();
+    for item in items {
+        let key = item_key(item);
+        let hit = old
+            .iter()
+            .position(|t| t.as_ref().is_some_and(|t| table_key(t).as_ref() == Some(&key)));
+        let mut t = match hit {
+            Some(i) => old[i].take().expect("position 挑中的那張一定還在"),
+            None => Table::new(),
+        };
+        apply(&mut t, item);
+        // position 記的是這張表格在原檔裡的行序，輸出時會照它排序；重排過就一定
+        // 要清掉，否則檔案裡的順序會跟設定物件的順序對不起來
+        t.set_position(None);
+        out.push(t);
+    }
+    *tables = out;
+}
+
+/// 巢狀的 `[[sources.forwards]]`：認 local
 fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
-    while tables.len() > forwards.len() {
-        tables.remove(tables.len() - 1);
-    }
-    for (i, f) in forwards.iter().enumerate() {
-        if i >= tables.len() {
-            tables.push(Table::new());
-        }
-        let t = tables.get_mut(i).expect("剛補齊過，一定拿得到");
-        t["name"] = value(f.name.as_str());
-        t["local"] = value(f.local as i64);
-        t["remote"] = value(f.remote.as_str());
-        t["enabled"] = value(f.enabled);
-    }
+    sync_tables(
+        tables,
+        forwards,
+        |t| t.get("local").and_then(Item::as_integer),
+        |f: &Forward| f.local as i64,
+        |t, f| {
+            t["name"] = value(f.name.as_str());
+            t["local"] = value(f.local as i64);
+            t["remote"] = value(f.remote.as_str());
+            t["enabled"] = value(f.enabled);
+        },
+    );
+}
+
+/// 頂層的 `[[sources]]`：認 name，順手把自己底下的 forwards 也同步掉
+fn sync_sources(tables: &mut ArrayOfTables, sources: &[Source]) {
+    sync_tables(
+        tables,
+        sources,
+        |t| t.get("name").and_then(Item::as_str).map(str::to_owned),
+        |s: &Source| s.name.clone(),
+        |t, s| {
+            t["name"] = value(s.name.as_str());
+            t["host"] = value(s.host.as_str());
+            t["user"] = value(s.user.as_str());
+            t["proxyCommand"] = value(s.proxy_command.as_str());
+            if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
+                t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
+            }
+            if let Some(Item::ArrayOfTables(fts)) = t.get_mut("forwards") {
+                sync_forwards(fts, &s.forwards);
+            }
+        },
+    );
 }
 
 /// 寫回設定，沿用既有檔案的註解與排版。
 ///
-/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張表格就地改寫；讀到的是
-/// 舊制檔案時先把結構遷移成新制再寫。
+/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張表格就地改寫，改寫時依
+/// 穩定鍵認表格（見 [`sync_tables`]）；讀到的是舊制檔案時先把結構遷移成新制再寫。
 pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
     let mut doc = std::fs::read_to_string(path)
         .ok()
@@ -618,25 +687,7 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
         doc["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
     }
     if let Some(Item::ArrayOfTables(tables)) = doc.get_mut("sources") {
-        while tables.len() > cfg.sources.len() {
-            tables.remove(tables.len() - 1);
-        }
-        for (i, s) in cfg.sources.iter().enumerate() {
-            if i >= tables.len() {
-                tables.push(Table::new());
-            }
-            let t = tables.get_mut(i).expect("剛補齊過，一定拿得到");
-            t["name"] = value(s.name.as_str());
-            t["host"] = value(s.host.as_str());
-            t["user"] = value(s.user.as_str());
-            t["proxyCommand"] = value(s.proxy_command.as_str());
-            if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
-                t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
-            }
-            if let Some(Item::ArrayOfTables(fts)) = t.get_mut("forwards") {
-                sync_forwards(fts, &s.forwards);
-            }
-        }
+        sync_sources(tables, &cfg.sources);
     }
 
     write_atomic(path, &doc.to_string())

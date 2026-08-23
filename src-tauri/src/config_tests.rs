@@ -735,6 +735,77 @@ fn write_keeps_per_source_comments() {
     assert_eq!(parse_config(&saved).unwrap(), cfg);
 }
 
+/// 編輯的不是最後一筆時，註解不可以錯掛。
+///
+/// upsert 是 retain + push：編輯 A 之後設定物件的順序會變成 [B, A]，但兩筆的
+/// local 都沒變。純位置比對會把 A 的值寫進原本屬於 B 的那張表格，兩條註解就整個
+/// 對調；認 local 才會各自回到自己那一張。
+#[test]
+fn write_keeps_forward_comments_when_editing_a_middle_entry() {
+    let dir = tmp_dir("forward-comment-reorder");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n\n\
+         # 這是 A 出口\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = true\n\n\
+         # 這是 B 出口\n[[sources.forwards]]\nname = \"b\"\nlocal = 1083\nremote = \"127.0.0.1:1083\"\nenabled = true\n",
+    )
+    .unwrap();
+    let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+
+    // 編輯第一筆：照 upsert 的作法先抽掉再推到尾端
+    let mut edited = cfg.sources[0].forwards[0].clone();
+    edited.enabled = false;
+    cfg.sources[0].forwards.retain(|f| f.local != edited.local);
+    cfg.sources[0].forwards.push(edited);
+    write_config(&dir, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    let back = parse_config(&saved).unwrap();
+    assert_eq!(back, cfg, "重讀回來要跟設定物件一致（含順序）：{saved}");
+    // 註解各自跟著自己那一筆：A 的註解上面接的是 local = 1080 那一段
+    let a = saved.find("# 這是 A 出口").expect("A 的註解要還在");
+    let b = saved.find("# 這是 B 出口").expect("B 的註解要還在");
+    let after_a = &saved[a..];
+    let after_b = &saved[b..];
+    assert!(
+        after_a[..after_a.find("remote").unwrap()].contains("local = 1080"),
+        "A 的註解下面要是 1080 那一筆：{saved}"
+    );
+    assert!(
+        after_b[..after_b.find("remote").unwrap()].contains("local = 1083"),
+        "B 的註解下面要是 1083 那一筆：{saved}"
+    );
+    // 改的是 A 的 enabled，B 不可以被動到
+    assert!(!back.forward(1080).unwrap().enabled);
+    assert!(back.forward(1083).unwrap().enabled);
+}
+
+/// 刪掉中間那個源時，兩側的註解要各歸其主，不可以整批往前挪一格
+#[test]
+fn write_keeps_source_comments_when_dropping_a_middle_entry() {
+    let dir = tmp_dir("source-comment-drop-middle");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "# 香港機\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\nproxyCommand = \"\"\n\n\
+         # 東京機\n[[sources]]\nname = \"tk\"\nhost = \"t\"\nuser = \"u\"\nproxyCommand = \"\"\n\n\
+         # 新加坡機\n[[sources]]\nname = \"sg\"\nhost = \"g\"\nuser = \"u\"\nproxyCommand = \"\"\n",
+    )
+    .unwrap();
+    let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+
+    cfg.sources.retain(|s| s.name != "tk");
+    write_config(&dir, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert_eq!(parse_config(&saved).unwrap(), cfg, "{saved}");
+    assert!(!saved.contains("# 東京機"), "被刪掉那一筆的註解要跟著走：{saved}");
+    let hk = saved.find("# 香港機").expect("香港機的註解要還在");
+    let sg = saved.find("# 新加坡機").expect("新加坡機的註解要還在");
+    let after_hk = &saved[hk..sg];
+    assert!(after_hk.contains("name = \"hk\""), "香港機的註解下面要還是 hk：{saved}");
+    assert!(saved[sg..].contains("name = \"sg\""), "新加坡機的註解下面要還是 sg：{saved}");
+}
+
 #[test]
 fn write_preserves_comments() {
     let dir = tmp_dir("write");
