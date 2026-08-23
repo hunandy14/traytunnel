@@ -392,11 +392,6 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
     else void run(() => startExit(exit.local), `connect ${exit.name}`);
   });
 
-  const restart = h("button", { class: "iconbtn sm", title: "Reconnect" }, [icon("refresh-cw", 15)]);
-  restart.addEventListener("click", () =>
-    void run(() => restartExit(exit.local), `reconnect ${exit.name}`),
-  );
-
   const edit = h("button", { class: "iconbtn sm", title: "Edit" }, [icon("pencil", 15)]);
   edit.addEventListener("click", () => openTunnelSheet(source, exit));
 
@@ -404,7 +399,7 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
     dot,
     h("div", { class: "card-id" }, [name, route]),
     test,
-    h("div", { class: "card-actions" }, [toggle, restart, edit]),
+    h("div", { class: "card-actions" }, [toggle, edit]),
   ]);
 
   const root = h("article", { class: "card" }, [main, detail]);
