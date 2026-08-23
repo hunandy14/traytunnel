@@ -19,27 +19,15 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCargoVersion } from "./lib/cargo-version.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(root, "out");
 
-/** 版本號的單一來源：只在 [package] 區塊裡找第一個 version=，避免誤傷 dependencies 裡同名的 version */
+/** 版本號的單一來源：src-tauri/Cargo.toml 的 [package] version（解析邏輯見 scripts/lib/cargo-version.mjs） */
 function readVersion() {
   const cargoToml = join(root, "src-tauri", "Cargo.toml");
-  const text = readFileSync(cargoToml, "utf8");
-  const startMatch = text.match(/^\[package\]\s*$/m);
-  if (!startMatch) {
-    throw new Error(`${cargoToml} 找不到 [package] 區塊`);
-  }
-  const sectionStart = startMatch.index + startMatch[0].length;
-  const rest = text.slice(sectionStart);
-  const nextSection = rest.match(/^\[.*\]\s*$/m);
-  const section = nextSection ? rest.slice(0, nextSection.index) : rest;
-  const m = section.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!m) {
-    throw new Error(`${cargoToml} 的 [package] 區塊找不到 version`);
-  }
-  return m[1];
+  return readCargoVersion(cargoToml, readFileSync(cargoToml, "utf8"));
 }
 
 /** 位元組數字加上千分位，只是印出來好讀 */

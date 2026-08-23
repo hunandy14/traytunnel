@@ -158,9 +158,14 @@ pub struct Config {
     pub sources: Vec<Source>,
 }
 
-/// 舊制（契約 v2）的設定檔長相，只在自動遷移時用得到
+/// 舊制（契約 v2）的設定檔長相，只在自動遷移時用得到。
+///
+/// `deny_unknown_fields` 是判定舊制的第二道防線：v2 的頂層鍵就只有這五個
+/// （host／user／proxyCommand／closeToTray／forwards，checkForUpdates 是 v3
+/// 之後才有的），冒出別的鍵就代表這份檔案不是它自稱的那種格式，寧可當壞檔備份
+/// 起來也不要照舊制解讀完再把不認得的內容寫掉。
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyConfig {
     host: String,
     user: String,
@@ -435,9 +440,23 @@ fn broken(toml_path: &Path, error: String) -> LoadOutcome {
     LoadOutcome::Broken { config: Config::default(), backup, error }
 }
 
-/// 頂層還有 host 欄位就是舊制設定檔
+/// 舊制設定檔＝頂層有 host **而且**沒有 `[[sources]]`。
+///
+/// 兩個條件缺一不可：只看 host 的話，一份已經有 `[[sources]]`、頂層卻還留著
+/// host 的檔案（半途手改、兩份檔案拼在一起）會被當成舊制去解讀——LegacyConfig
+/// 讀不到那些 sources，遷移完就只剩頂層那一組連線，其餘的源會在下一次存檔時
+/// 被靜靜寫掉。那種檔案的意圖已經無從判斷，交給 [`ambiguous_document`] 去擋。
 fn is_legacy(doc: &DocumentMut) -> bool {
-    doc.get("host").is_some()
+    doc.get("host").is_some() && doc.get("sources").is_none()
+}
+
+/// 新舊兩制的鍵並存：頂層 host 與 `[[sources]]` 同時出現。
+///
+/// 這種檔案沒有安全的解讀方式（照舊制讀會丟掉 sources，照新制讀會丟掉頂層那組
+/// 連線），一律當壞檔處理——壞檔那條路會先備份原檔再退回預設值，使用者手上那份
+/// 資料完整留著，比靜靜挑一半來用好得多。
+fn ambiguous_document(doc: &DocumentMut) -> bool {
+    doc.get("host").is_some() && doc.get("sources").is_some()
 }
 
 /// 從 host 派生源名：源名不可含空白與中括號，但 host 兩者都可能有
@@ -474,6 +493,9 @@ impl LegacyConfig {
 /// 解析設定檔，回傳 (設定, 是否來自舊制)。
 pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     let doc: DocumentMut = strip_bom(raw).parse::<DocumentMut>().map_err(|e| e.to_string())?;
+    if ambiguous_document(&doc) {
+        return Err("設定檔同時有舊制的頂層 host 與新制的 [[sources]]，無法判斷該用哪一份".into());
+    }
     let legacy = is_legacy(&doc);
     let mut cfg: Config = if legacy {
         let old: LegacyConfig = toml_edit::de::from_document(doc).map_err(|e| e.to_string())?;
@@ -481,9 +503,31 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     } else {
         toml_edit::de::from_document(doc).map_err(|e| e.to_string())?
     };
+    trim_config(&mut cfg);
     normalize_remotes(&mut cfg);
     validate_config(&cfg)?;
     Ok((cfg, legacy))
+}
+
+/// 手寫的 `host = " myhost "` 兩邊的空白在這裡就剃掉。
+///
+/// 驗證看的是 `host.trim()`、實際存的卻是原字串，兩份不一樣就會有一整排怪事：
+/// 判空說有值、ssh 拿到的是帶空白的主機名、介面顯示也跟著歪。剃在解析的出口處，
+/// 之後全程式（驗證、ssh 參數、介面、下次存檔）看到的就是同一份值。
+/// 舊制那條路的 host／user 早就在 [`LegacyConfig::into_config`] 剃過，再剃一次是原值。
+///
+/// 出口的 name 也要剃：驗證會擋掉含空白的名字，介面那條路是先 trim 再驗
+/// （[`prepare_forward`]），讀檔這條路要是不剃，同樣一個 `" a "` 在介面上存得進去、
+/// 手寫進檔案卻會讓整份設定變壞檔退回預設值——同一個值兩條路兩種下場。
+fn trim_config(cfg: &mut Config) {
+    for s in cfg.sources.iter_mut() {
+        s.name = s.name.trim().to_string();
+        s.host = s.host.trim().to_string();
+        s.user = s.user.trim().to_string();
+        for f in s.forwards.iter_mut() {
+            f.name = f.name.trim().to_string();
+        }
+    }
 }
 
 /// 讀進來的設定同樣支援純埠號的簡寫：手寫 `remote = "8080"` 一樣算數，在這裡就補成完整形式。
@@ -502,6 +546,34 @@ pub fn parse_config(raw: &str) -> Result<Config, String> {
     parse_document(raw).map(|(cfg, _)| cfg)
 }
 
+/// 一筆出口的欄位哪裡不合規。
+///
+/// 規則只有這一份，訊息各自去寫：讀檔（[`validate_config`]）要講的是「檔案第幾段
+/// 不對」，介面輸入（[`validate_forward`]）要的是掛得回欄位的 `name: ` 前綴，
+/// 兩邊講法不同，但認定合不合規的那條線必須是同一條。
+enum ForwardIssue {
+    Name,
+    Local,
+    Remote,
+}
+
+/// 出口欄位的共同規則：名字非空且不含空白、本地埠是 1-65535、remote 是 host:port。
+///
+/// `remote` 在這裡自己過一次 [`normalize_remote`]，只填埠號的寫法兩條路都算數
+/// （讀檔那條已經正規化過，再跑一次是原值）。
+fn check_forward_fields(name: &str, local: u16, remote: &str) -> Option<ForwardIssue> {
+    if !valid_name(name) {
+        return Some(ForwardIssue::Name);
+    }
+    if local == 0 {
+        return Some(ForwardIssue::Local);
+    }
+    if !valid_remote(&normalize_remote(remote)) {
+        return Some(ForwardIssue::Remote);
+    }
+    None
+}
+
 /// 讀進來的設定必須自洽，否則寧可當壞檔也不要帶著矛盾的狀態跑
 fn validate_config(cfg: &Config) -> Result<(), String> {
     let mut seen_names: Vec<&str> = Vec::new();
@@ -518,19 +590,30 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
             return Err(format!("連線 {} 的 host 與 user 不可為空", s.name));
         }
         for f in &s.forwards {
+            // 欄位規則與介面輸入共用同一個 check_forward_fields，兩條路才不會分岔。
+            // 壞值放行的話會一路餵進 ssh -L，換來的是每 5 秒重連一次卻永遠接不起來
+            match check_forward_fields(&f.name, f.local, &f.remote) {
+                Some(ForwardIssue::Name) => {
+                    return Err(format!(
+                        "[[sources.forwards]] 的 name 不可為空，也不可含空白（連線 {}）",
+                        s.name
+                    ))
+                }
+                Some(ForwardIssue::Local) => {
+                    return Err(format!("出口 {} 的 local 要落在 1-65535", f.name))
+                }
+                Some(ForwardIssue::Remote) => {
+                    return Err(format!(
+                        "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
+                        f.name, f.remote
+                    ))
+                }
+                None => {}
+            }
             if seen_locals.contains(&f.local) {
                 return Err(format!("本地埠重複：{}（跨連線也不可以重複）", f.local));
             }
             seen_locals.push(f.local);
-            // 與介面輸入同一條規則（remote 這時已經過 normalize_remotes，
-            // 手寫純埠號一樣算數）。壞值放行的話會一路餵進 ssh -L，
-            // 換來的是每 5 秒重連一次卻永遠接不起來
-            if !valid_remote(&f.remote) {
-                return Err(format!(
-                    "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
-                    f.name, f.remote
-                ));
-            }
         }
     }
     Ok(())
@@ -541,7 +624,14 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
 ///
 /// 值不在這裡填，後面的 sync 會照設定物件覆寫一次；這裡只負責搬結構，
 /// 所以寫在單筆 forward 上方的註解、檔頭的註解都跟著搬過去。
+///
+/// 唯一的例外是新表格的 name：後面的 sync 認 name 找表格（見 [`sync_tables`]），
+/// 這裡不先派生出同一個名字的話，那張剛搬好的表格會對不上而被整個丟掉，
+/// 連帶把搬進去的 `[[sources.forwards]]` 與註解一起賠掉。
 fn migrate_document(doc: &mut DocumentMut) {
+    // 與 LegacyConfig::into_config 派生源名的規則同一條，兩邊才對得上
+    let name = source_name_from_host(doc.get("host").and_then(Item::as_str).unwrap_or_default());
+
     let lead = doc
         .as_table()
         .key("host")
@@ -566,6 +656,7 @@ fn migrate_document(doc: &mut DocumentMut) {
     }
 
     let mut t = Table::new();
+    t["name"] = value(name);
     if let Some(Item::ArrayOfTables(a)) = forwards {
         t.insert("forwards", Item::ArrayOfTables(a));
     }
@@ -574,27 +665,92 @@ fn migrate_document(doc: &mut DocumentMut) {
     doc.insert("sources", Item::ArrayOfTables(arr));
 }
 
-/// 逐張表格就地改寫（多的移除、少的補上），使用者寫在單筆上方的註解才不會消失
+/// 依穩定鍵把設定物件對回既有表格，逐張就地改寫，使用者寫在單筆上方的註解
+/// 才會一直跟著它註解的那一筆走。
+///
+/// 不可以改用位置比對：新增與編輯走的是 retain + push（編輯過的那一筆會跑到陣列
+/// 尾端），刪掉中間一筆也會讓後面全部往前挪，位置比對在這兩種情況下會把註解錯掛
+/// 到別人頭上，或連同表格一起被截掉。所以這裡認鍵：source 認 name、forward 認
+/// local，新陣列逐筆去既有表格裡找同鍵的那一張，找到就地更新欄位（那張表格的
+/// decor 原封不動留著），找不到才開一張新的；舊表格的鍵不在新集合裡就被丟掉。
+///
+/// 限制：改名（source 的 name）與改埠（forward 的 local）等於換了一把鍵，舊表格
+/// 對不上，語意就是刪一筆再增一筆——註解跟著舊鍵一起消失。鍵本身就是使用者辨識
+/// 那一筆的依據，改鍵時註解未必還適用，所以這個取捨是刻意的。
+///
+/// 改 source 的 name 時範圍還要再大一圈：被丟掉的是整張 `[[sources]]` 表格，
+/// 巢狀在它底下的 `[[sources.forwards]]` 是連同表格一起被換掉的，所以那些出口
+/// 各自上方的註解也會一起沒了（出口本身的值不受影響，會照設定物件重新寫出來）。
+fn sync_tables<T, K: PartialEq>(
+    tables: &mut ArrayOfTables,
+    items: &[T],
+    table_key: impl Fn(&Table) -> Option<K>,
+    item_key: impl Fn(&T) -> K,
+    apply: impl Fn(&mut Table, &T),
+) {
+    // Option 是「這張舊表格還沒被認領」的記號：同一張不可以被兩筆同時挑走
+    let mut old: Vec<Option<Table>> = tables.iter().cloned().map(Some).collect();
+    let mut out = ArrayOfTables::new();
+    for item in items {
+        let key = item_key(item);
+        let hit = old
+            .iter()
+            .position(|t| t.as_ref().is_some_and(|t| table_key(t).as_ref() == Some(&key)));
+        let mut t = match hit {
+            Some(i) => old[i].take().expect("position 挑中的那張一定還在"),
+            None => Table::new(),
+        };
+        apply(&mut t, item);
+        // position 記的是這張表格在原檔裡的行序，輸出時會照它排序；重排過就一定
+        // 要清掉，否則檔案裡的順序會跟設定物件的順序對不起來
+        t.set_position(None);
+        out.push(t);
+    }
+    *tables = out;
+}
+
+/// 巢狀的 `[[sources.forwards]]`：認 local
 fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
-    while tables.len() > forwards.len() {
-        tables.remove(tables.len() - 1);
-    }
-    for (i, f) in forwards.iter().enumerate() {
-        if i >= tables.len() {
-            tables.push(Table::new());
-        }
-        let t = tables.get_mut(i).expect("剛補齊過，一定拿得到");
-        t["name"] = value(f.name.as_str());
-        t["local"] = value(f.local as i64);
-        t["remote"] = value(f.remote.as_str());
-        t["enabled"] = value(f.enabled);
-    }
+    sync_tables(
+        tables,
+        forwards,
+        |t| t.get("local").and_then(Item::as_integer),
+        |f: &Forward| f.local as i64,
+        |t, f| {
+            t["name"] = value(f.name.as_str());
+            t["local"] = value(f.local as i64);
+            t["remote"] = value(f.remote.as_str());
+            t["enabled"] = value(f.enabled);
+        },
+    );
+}
+
+/// 頂層的 `[[sources]]`：認 name，順手把自己底下的 forwards 也同步掉
+fn sync_sources(tables: &mut ArrayOfTables, sources: &[Source]) {
+    sync_tables(
+        tables,
+        sources,
+        |t| t.get("name").and_then(Item::as_str).map(str::to_owned),
+        |s: &Source| s.name.clone(),
+        |t, s| {
+            t["name"] = value(s.name.as_str());
+            t["host"] = value(s.host.as_str());
+            t["user"] = value(s.user.as_str());
+            t["proxyCommand"] = value(s.proxy_command.as_str());
+            if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
+                t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
+            }
+            if let Some(Item::ArrayOfTables(fts)) = t.get_mut("forwards") {
+                sync_forwards(fts, &s.forwards);
+            }
+        },
+    );
 }
 
 /// 寫回設定，沿用既有檔案的註解與排版。
 ///
-/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張表格就地改寫；讀到的是
-/// 舊制檔案時先把結構遷移成新制再寫。
+/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張表格就地改寫，改寫時依
+/// 穩定鍵認表格（見 [`sync_tables`]）；讀到的是舊制檔案時先把結構遷移成新制再寫。
 pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
     let mut doc = std::fs::read_to_string(path)
         .ok()
@@ -603,6 +759,14 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
 
     if is_legacy(&doc) {
         migrate_document(&mut doc);
+    } else if ambiguous_document(&doc) {
+        // 新舊兩制並存的壞檔（讀檔時已經備份過一份）。存檔時要順手把舊制那幾個
+        // 頂層鍵清掉，否則寫完還是同一種壞檔：下次啟動又判壞檔，備份會被這份
+        // 內容再蓋一次，使用者原本那份資料就真的沒了
+        doc.remove("host");
+        doc.remove("user");
+        doc.remove("proxyCommand");
+        doc.remove("forwards");
     }
 
     doc["closeToTray"] = value(cfg.close_to_tray);
@@ -618,25 +782,7 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
         doc["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
     }
     if let Some(Item::ArrayOfTables(tables)) = doc.get_mut("sources") {
-        while tables.len() > cfg.sources.len() {
-            tables.remove(tables.len() - 1);
-        }
-        for (i, s) in cfg.sources.iter().enumerate() {
-            if i >= tables.len() {
-                tables.push(Table::new());
-            }
-            let t = tables.get_mut(i).expect("剛補齊過，一定拿得到");
-            t["name"] = value(s.name.as_str());
-            t["host"] = value(s.host.as_str());
-            t["user"] = value(s.user.as_str());
-            t["proxyCommand"] = value(s.proxy_command.as_str());
-            if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
-                t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
-            }
-            if let Some(Item::ArrayOfTables(fts)) = t.get_mut("forwards") {
-                sync_forwards(fts, &s.forwards);
-            }
-        }
+        sync_sources(tables, &cfg.sources);
     }
 
     write_atomic(path, &doc.to_string())
@@ -676,14 +822,19 @@ pub fn write_config(dir: &Path, cfg: &Config) -> std::io::Result<()> {
     write_config_at(&dir.join(TOML_NAME), cfg)
 }
 
-/// remote 必須符合 `^[^:\s]+:\d+$`：主機不含冒號與空白，埠是純數字。
+/// remote 必須是 `host:port`：主機不含冒號與空白，埠是純數字而且落在 1-65535。
+///
+/// 埠先確認是純數字再 `parse::<u16>()`：光看是不是數字會放行 `:99999`（ssh 收下
+/// 之後就是一句 Bad forwarding specification，每 5 秒重連一次卻永遠接不起來），
+/// 光靠 parse 又會放行 `+80` 這種 ssh 不認得的寫法。0 不是可連的目的地，一併擋掉，
+/// 與只填埠號那條路（[`normalize_remote`]）的下界對得起來。
 pub fn valid_remote(s: &str) -> bool {
     match s.split_once(':') {
         Some((h, p)) => {
             !h.is_empty()
                 && !h.chars().any(|c| c.is_whitespace())
-                && !p.is_empty()
                 && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|port| port > 0)
         }
         None => false,
     }
@@ -742,16 +893,19 @@ pub fn validate_forward(
             return Some(format!("local: no tunnel with port {orig}, it may have been deleted"));
         }
     }
-    if !valid_name(name) {
-        return Some("name: required, and must not contain spaces".into());
-    }
-    if local == 0 {
-        return Some("local: port must be between 1 and 65535".into());
-    }
-    if !valid_remote(&normalize_remote(remote)) {
-        return Some(
-            "remote: must look like host:port, for example 127.0.0.1:1080, or just a port".into(),
-        );
+    // 欄位規則與讀檔共用（見 check_forward_fields），這裡只負責翻成前端要的訊息
+    match check_forward_fields(name, local, remote) {
+        Some(ForwardIssue::Name) => {
+            return Some("name: required, and must not contain spaces".into())
+        }
+        Some(ForwardIssue::Local) => return Some("local: port must be between 1 and 65535".into()),
+        Some(ForwardIssue::Remote) => {
+            return Some(
+                "remote: must look like host:port, for example 127.0.0.1:1080, or just a port"
+                    .into(),
+            )
+        }
+        None => {}
     }
     let clash = sources
         .iter()

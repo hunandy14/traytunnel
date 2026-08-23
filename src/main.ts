@@ -485,10 +485,17 @@ function requestDelete(local: number) {
 /**
  * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
  * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
- * 是 Rust 端直接處理，前端這裡攔不到，是已知限制。
+ * 與 Alt+F4 都是不經過這顆按鈕的關窗路徑（前者是 Rust 端直接處理，後者是
+ * 視窗系統直接關閉），前端這裡一律攔不到，是已知限制。
+ *
+ * 回傳 Promise.allSettled，讓呼叫端能等所有 commit 真的送出去再繼續往下
+ * 呼叫 windowClose——這是裁決採納的廉價保險：目前驗證過同一 tick 內派送
+ * 就足夠安全，這裡加一手只是防未來有人在 flush 與 windowClose 之間插進
+ * 一個 await，讓派送被視窗關閉截斷。allSettled 而非 all：任何一個 commit
+ * 失敗都不該擋住其餘的送出或擋住關窗本身。
  */
-function flushPendingDeletes() {
-  for (const { toast } of [...undoToasts.values()]) toast.flush();
+function flushPendingDeletes(): Promise<unknown> {
+  return Promise.allSettled([...undoToasts.values()].map(({ toast }) => toast.flush()));
 }
 
 /**
@@ -570,22 +577,38 @@ function applySnapshot(next: Snapshot, replayLogs = false) {
   render();
 }
 
+/**
+ * 只要不是 connected 就把舊的自測結果清乾淨，不只 stopped：斷線重連期間
+ * （connecting／reconnecting／port_busy／error）舊的「測試成功」字樣沒有
+ * 理由繼續掛著，那是上一輪連線的結果，跟現在這輪連線狀態對不上。
+ *
+ * 這條規則自己就夠用，不依賴後端另外推事件——即使後端車道之後補上專門的
+ * clear 事件或在 exit-test 帶空 result 過來（見 applyExitTest），這裡仍然
+ * 是第一道、最快生效的防線。
+ */
 function applyExitStatus(ev: ExitStatusEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
   const { exit } = hit;
   exit.status = ev.status;
   exit.detailText = ev.detail ?? null;
-  if (ev.status === "stopped") exit.lastTest = null;
+  if (ev.status !== "connected") exit.lastTest = null;
   paintCard(exit);
   if (view === "source") renderSummary();
   paintRailStatus(hit.source.name);
 }
 
+/**
+ * state／text 缺席（清除事件的 payload 只有 `{ local }`，見 types.ts 的
+ * ExitTestEvent）代表後端要清掉這個出口的自測結果，不是「剛好測出一筆
+ * 空內容的結果」；比照 applyExitStatus 一樣改記成 null，不要把空殼結果
+ * 畫到卡片上。`ev.text && ev.state` 同時當 discriminant：兩者必須一起
+ * 出現才組得成一筆真正的結果。
+ */
 function applyExitTest(ev: ExitTestEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
-  hit.exit.lastTest = { state: ev.state, text: ev.text };
+  hit.exit.lastTest = ev.text && ev.state ? { state: ev.state, text: ev.text } : null;
   paintCard(hit.exit);
 }
 
@@ -636,10 +659,26 @@ hydrateIcons();
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
 );
+/**
+ * 關窗前等 flush 的逾時上限。deleteForward 若因為後端卡住（例如 ssh 行程
+ * 掛住）遲遲不 resolve，Promise.allSettled 也會跟著吊住，關窗鈕會看起來像
+ * 當掉——這裡拿「使用者能不能按得動關窗鈕」換「最壞情況下這一筆刪除的
+ * flush 保險失效」：2.5 秒後直接放行，正常情況（flush 遠快於這個上限）
+ * 完全不受影響，只在真的卡住時才會退化回「花式版」的舊行為，讓視窗照樣
+ * 關得掉。
+ */
+const CLOSE_FLUSH_TIMEOUT_MS = 2500;
+
 el<HTMLButtonElement>("btn-close").addEventListener("click", () => {
-  // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失
-  flushPendingDeletes();
-  void run(windowClose, "close the window");
+  void (async () => {
+    // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失；
+    // 等 flush 完成再關窗，見 flushPendingDeletes 的說明；逾時放行見上方常數註解
+    await Promise.race([
+      flushPendingDeletes(),
+      new Promise((resolve) => window.setTimeout(resolve, CLOSE_FLUSH_TIMEOUT_MS)),
+    ]);
+    await run(windowClose, "close the window");
+  })();
 });
 
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));

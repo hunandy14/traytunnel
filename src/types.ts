@@ -86,11 +86,19 @@ export interface ExitStatusEvent {
   detail?: string | null;
 }
 
-/** "exit-test" 事件 */
+/**
+ * "exit-test" 事件。
+ *
+ * state／text 是可選的：後端清除自測結果時（斷線／停止，見 state.rs 的
+ * clear_exit_test）payload 只有 `{ local }`，state／text 兩個欄位整個不
+ * 存在，不是「空字串」。前端收到 state／text 缺席（連帶容忍空字串，保守
+ * 起見一併當清除訊號）就要把 lastTest 記成 null，不能照樣畫成一筆結果
+ * （見 main.ts 的 applyExitTest；dev-mock.ts 的 clearTest 對齊同一形狀）。
+ */
 export interface ExitTestEvent {
   local: number;
-  state: TestState;
-  text: string;
+  state?: TestState;
+  text?: string;
 }
 
 /** upsert_source 的輸入；originalName 為 null 代表新增 */

@@ -103,8 +103,10 @@ let originalName: string | null = null;
 
 let testBusy = false;
 /**
- * 每次開關 sheet 都遞增，測試中途關掉 sheet 就讓當初送出的那次結果作廢，
- * 不必真的取消後端探測——後端探測本身有 15 秒逾時上限，函式結束時就會收乾淨。
+ * 開關 sheet 或改動任一欄位都遞增，讓當初送出的那次探測結果作廢——
+ * 不必真的取消後端探測，後端探測本身有 15 秒逾時上限，函式結束時就會收乾淨。
+ * 沒有這一手的話，測試在途時把欄位改掉，晚到的舊回應會照樣畫到已經改過的
+ * 表單上，讓人誤以為新內容也測過了。
  */
 let testGeneration = 0;
 
@@ -247,9 +249,10 @@ async function testConnectionNow() {
     return;
   }
 
-  // gen 對不上就代表 sheet 中途被關掉或重開過（testGeneration 已經前進），
-  // 這時連按鈕狀態都不去動——它早被 open/close 那一刻重置過，不能讓晚到的
-  // 這次回應蓋掉正在跑的下一輪測試。
+  // gen 對不上就代表 sheet 中途被關掉／重開過，或欄位在探測進行中被改掉了
+  // （testGeneration 已經前進），這時連按鈕狀態都不去動——它早在那一刻
+  // 被重置過（reopen 或欄位 input handler），不能讓晚到的這次回應蓋掉
+  // 正在跑的下一輪測試。
   const gen = testGeneration;
   setTestBusy(true);
   try {
@@ -309,6 +312,13 @@ export function initSourceSheet(h: Handlers) {
       setFieldError(backdrop(), f, "");
       // 欄位改過了，舊的測試結果已經不對這一份表單負責，藏起來避免誤導
       clearTestResult();
+      // 順便遞增世代：探測還在跑的話，等它回來時 gen 比對會作廢，
+      // 不會把針對舊欄位值跑出來的結果畫到已經改過的表單上。
+      testGeneration++;
+      // 舊探測既然已經作廢，不必再讓 Test 鈕陪著它空等——立刻解鎖，
+      // 讓使用者能馬上針對新內容重新測；晚到的舊回應被上面的 gen 擋住，
+      // 不會回頭把鈕重新鎖上或蓋掉畫面。
+      if (testBusy) setTestBusy(false);
     });
     node.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void save();
@@ -344,6 +354,18 @@ let fwdSource = "";
 /** null 代表這是「新增」 */
 let fwdOriginalLocal: number | null = null;
 
+/**
+ * Save 送出期間鎖住 Save／Delete 兩顆鈕，比照連線 sheet 的 setTestBusy：
+ * 沒有這道鎖，Save 在途時按 Delete 會把 fwdOriginalLocal 指到的那條（可能剛
+ * 存檔改過名字／埠號的）隧道刪掉，而 Save 那個 pending 的 invoke 還在跑，
+ * 兩個請求疊在一起，畫面最後留下的東西完全看後端回應順序碰運氣。
+ */
+function setFwdBusy(next: boolean) {
+  fwdBusy = next;
+  el<HTMLButtonElement>("fwd-save").disabled = next;
+  el<HTMLButtonElement>("fwd-delete").disabled = next;
+}
+
 function fwdClearErrors() {
   for (const f of FWD_FIELDS) setFieldError(fwdBackdrop(), f, "");
   setGeneralError(el<HTMLDivElement>("fwd-error"), "");
@@ -370,8 +392,12 @@ function fwdLocalValidate(): Partial<Record<ForwardField, string>> {
   if (!remote) errors.remote = "remote is required";
   else if (/^\d+$/.test(remote)) {
     if (!isPort(remote)) errors.remote = "must be 1-65535";
-  } else if (!/^[^\s:]+:\d+$/.test(remote)) {
-    errors.remote = "expected a port or host:port";
+  } else {
+    // host:port 分支也要把埠號抽出來過 isPort，不能只驗格式：
+    // 999999 這種位數符合 \d+ 但早已超過埠號上限，跟 Rust 端的邊界檢查對稱
+    const m = /^([^\s:]+):(\d+)$/.exec(remote);
+    if (!m) errors.remote = "expected a port or host:port";
+    else if (!isPort(m[2])) errors.remote = "must be 1-65535";
   }
   return errors;
 }
@@ -379,7 +405,7 @@ function fwdLocalValidate(): Partial<Record<ForwardField, string>> {
 export function openTunnelSheet(source: string, exit: ExitInfo | null) {
   fwdSource = source;
   fwdOriginalLocal = exit ? exit.local : null;
-  fwdBusy = false;
+  setFwdBusy(false);
 
   fwdInput("name").value = exit?.name ?? "";
   fwdInput("local").value = exit ? String(exit.local) : "";
@@ -411,7 +437,7 @@ async function fwdSave() {
     return;
   }
 
-  fwdBusy = true;
+  setFwdBusy(true);
   try {
     const err = await upsertForward({
       source: fwdSource,
@@ -420,14 +446,14 @@ async function fwdSave() {
       local: Number(fwdInput("local").value.trim()),
       remote: fwdInput("remote").value.trim(),
     });
-    fwdBusy = false;
+    setFwdBusy(false);
     if (err) {
       fwdAssignError(err);
       return;
     }
     closeTunnelSheet();
   } catch (e) {
-    fwdBusy = false;
+    setFwdBusy(false);
     setGeneralError(el<HTMLDivElement>("fwd-error"), String(e));
   }
 }
@@ -443,6 +469,8 @@ export function initTunnelSheet(h: TunnelHandlers) {
   el<HTMLButtonElement>("fwd-save").addEventListener("click", () => void fwdSave());
 
   el<HTMLButtonElement>("fwd-delete").addEventListener("click", () => {
+    // Save 送出、還沒等到回應之前不能按刪除：見 setFwdBusy 的說明
+    if (fwdBusy) return;
     const local = fwdOriginalLocal;
     if (local === null) return;
     closeTunnelSheet();

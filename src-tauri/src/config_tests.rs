@@ -440,6 +440,54 @@ fn rejects_empty_host_or_user() {
     assert!(parse_config("[[sources]]\nname=\"s\"\nuser = \"u\"\n").is_err());
 }
 
+/// 新制那條路也要剃空白：驗證看的是 trim 過的值，存下來的卻是原字串的話，
+/// 判空說有值、ssh 拿到的卻是帶空白的主機名，一整排東西都會跟著歪
+#[test]
+fn source_fields_are_trimmed_on_load() {
+    let cfg = parse_config(
+        "[[sources]]\nname = \" hk \"\nhost = \" myhost \"\nuser = \"  bob\t\"\n\
+         [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.sources[0].name, "hk");
+    assert_eq!(cfg.sources[0].host, "myhost");
+    assert_eq!(cfg.sources[0].user, "bob");
+    // 剃完還是空的就是空的，判空與實際存值同一份
+    assert!(parse_config("[[sources]]\nname=\"s\"\nhost=\"  \"\nuser=\"u\"\n").is_err());
+    // 剃完之後存回檔案的也是剃過的值
+    let dir = tmp_dir("trim-write");
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(saved.contains("host = \"myhost\""), "{saved}");
+    assert_eq!(parse_config(&saved).unwrap(), cfg);
+}
+
+/// 出口的 name 也要剃。介面那條路是先 trim 再驗，讀檔這條路不剃的話，同樣一個
+/// `" a "` 在介面上存得進去、手寫進檔案卻讓整份設定變壞檔退回預設值
+#[test]
+fn forward_names_are_trimmed_on_load() {
+    let cfg = parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\" a \"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n",
+    )
+    .expect("前後空白要被剃掉，不可以判成壞檔");
+    assert_eq!(cfg.forward(1080).unwrap().name, "a");
+    // 介面那條路對同一個值的判定：兩邊要同進同出
+    let list = vec![src("hk", vec![])];
+    assert!(prepare_forward(&list, None, " a ", 1080, "127.0.0.1:1080", true).is_ok());
+    // 剃完還是空的、或中間有空白的，照樣是壞檔
+    assert!(parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\"  \"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n"
+    )
+    .is_err());
+    assert!(parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\"two words\"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n"
+    )
+    .is_err());
+}
+
 #[test]
 fn rejects_bad_source_names() {
     assert!(parse_config("[[sources]]\nname=\"\"\nhost=\"h\"\nuser=\"u\"\n").is_err());
@@ -477,6 +525,49 @@ fn rejects_hand_written_bad_remote() {
     assert!(parse_config(&with("127.0.0.1:1080")).is_ok());
     assert!(parse_config(&with("8080")).is_ok());
     assert!(parse_config(&with("example.com:22")).is_ok());
+}
+
+/// 手寫的出口名字與 local 走的也是介面輸入那條規則：讀檔那條路以前只驗 remote，
+/// 空名字與 local = 0 會一路帶進執行期（ssh -L 0:… 是隨機埠，介面上更是無名氏）
+#[test]
+fn rejects_hand_written_bad_forward_name_or_local() {
+    let with = |name: &str, local: u16| {
+        format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"{name}\"\nlocal={local}\nremote=\"127.0.0.1:1080\"\n"
+        )
+    };
+    for bad in ["", "  ", "two words"] {
+        let err = parse_config(&with(bad, 1080)).unwrap_err();
+        assert!(err.contains("name"), "{bad:?} 的訊息要點名 name：{err}");
+    }
+    let err = parse_config(&with("a", 0)).unwrap_err();
+    assert!(err.contains("local"), "local = 0 的訊息要點名 local：{err}");
+    // 合法的照樣過
+    assert!(parse_config(&with("a", 1080)).is_ok());
+}
+
+/// 讀檔與介面輸入認定合不合規的那條線是同一條：同一組欄位，兩邊要同進同出
+#[test]
+fn the_file_and_the_ui_agree_on_forward_fields() {
+    let list = vec![src("hk", vec![])];
+    let cases = [
+        ("a", 1080u16, "127.0.0.1:1080"),
+        ("", 1080, "127.0.0.1:1080"),
+        ("two words", 1080, "127.0.0.1:1080"),
+        ("a", 0, "127.0.0.1:1080"),
+        ("a", 1080, "nope"),
+        ("a", 1080, "8080"),
+    ];
+    for (name, local, remote) in cases {
+        let ui_ok = validate_forward(&list, None, name, local, remote).is_none();
+        let raw = format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"{name}\"\nlocal={local}\nremote=\"{remote}\"\n"
+        );
+        let file_ok = parse_config(&raw).is_ok();
+        assert_eq!(ui_ok, file_ok, "({name:?}, {local}, {remote:?}) 兩條路的判定要一致");
+    }
 }
 
 #[test]
@@ -660,6 +751,123 @@ fn legacy_file_is_migrated_on_disk_keeping_comments() {
     assert_eq!(&again, out.config());
 }
 
+/// 頂層 host 與 `[[sources]]` 並存的檔案沒有安全的解讀方式：照舊制讀會丟掉
+/// sources，照新制讀會丟掉頂層那一組。一律當壞檔，原檔完整備份起來
+#[test]
+fn a_file_with_both_formats_is_broken_not_migrated() {
+    let dir = tmp_dir("both-formats");
+    let raw = "host = \"old.example.com\"\nuser = \"bob\"\n\n\
+               [[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\n\n\
+               [[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n\n\
+               [[sources]]\nname = \"tk\"\nhost = \"tk.example.com\"\nuser = \"alice\"\n";
+    std::fs::write(dir.join(TOML_NAME), raw).unwrap();
+
+    let out = load_from_dir(&dir);
+    match &out {
+        LoadOutcome::Broken { backup, .. } => {
+            assert!(backup.as_ref().expect("要有備份").exists());
+        }
+        other => panic!("預期 Broken，拿到 {other:?}"),
+    }
+    // 原檔一個字都沒被動過，多源那份資料完整留在備份裡
+    assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    let backed_up = std::fs::read_to_string(dir.join(BROKEN_NAME)).unwrap();
+    assert_eq!(backed_up, raw);
+    assert!(backed_up.contains("hk.example.com") && backed_up.contains("tk.example.com"));
+}
+
+/// 並存的壞檔存過一次之後不可以還是壞檔：舊制那幾個頂層鍵要被清掉，
+/// 否則下次啟動又判壞檔，備份會被存檔後的內容再蓋一次，原資料就真的沒了
+#[test]
+fn saving_over_a_both_formats_file_clears_the_legacy_keys() {
+    let dir = tmp_dir("both-formats-write");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "host = \"old.example.com\"\nuser = \"bob\"\nproxyCommand = \"\"\n\n\
+         [[forwards]]\nname = \"old\"\nlocal = 9\nremote = \"127.0.0.1:9\"\n\n\
+         [[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\n",
+    )
+    .unwrap();
+    let out = load_from_dir(&dir);
+    assert!(matches!(out, LoadOutcome::Broken { backup: Some(_), .. }));
+    assert!(!out.read_only(), "有備份就還可以寫");
+
+    let cfg = out.config().clone();
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(!saved.contains("old.example.com"), "舊制的頂層鍵要被清掉：{saved}");
+    assert!(!saved.contains("[[forwards]]"), "舊制的頂層 forwards 也要清掉：{saved}");
+    // 存完之後就是一份正常的新制檔案，再讀一次不是壞檔
+    let again = load_from_dir(&dir);
+    assert!(matches!(again, LoadOutcome::Loaded(_)), "{saved}");
+    assert_eq!(again.config(), &cfg);
+}
+
+/// is_legacy 的「而且沒有 sources」在寫入路徑上同樣是把關的那一句：少了它，
+/// 一份頂層有 host、底下卻已經有具名 `[[sources]]` 的檔案會在存檔時被當成舊制
+/// 遷移，migrate_document 插進去的那個 sources 陣列會整個蓋掉既有的表格，
+/// 使用者寫在每個源上方的註解跟著一起沒了
+#[test]
+fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
+    let dir = tmp_dir("both-formats-decor");
+    let path = dir.join(TOML_NAME);
+    std::fs::write(
+        &path,
+        "host = \"old.example.com\"\nuser = \"bob\"\n\n\
+         # 香港機\n[[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\nproxyCommand = \"\"\n\n\
+         # 東京機\n[[sources]]\nname = \"tk\"\nhost = \"tk.example.com\"\nuser = \"alice\"\nproxyCommand = \"\"\n",
+    )
+    .unwrap();
+
+    // 這種檔案讀起來是壞檔，設定物件從別處來（這裡就是檔案裡那兩個源）
+    let cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: vec![
+            Source {
+                name: "hk".into(),
+                host: "hk.example.com".into(),
+                user: "alice".into(),
+                proxy_command: String::new(),
+                forwards: vec![],
+            },
+            Source {
+                name: "tk".into(),
+                host: "tk.example.com".into(),
+                user: "alice".into(),
+                proxy_command: String::new(),
+                forwards: vec![],
+            },
+        ],
+    };
+    write_config_at(&path, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# 香港機"), "香港機的註解要留著：{saved}");
+    assert!(saved.contains("# 東京機"), "東京機的註解要留著：{saved}");
+    let hk = saved.find("# 香港機").unwrap();
+    let tk = saved.find("# 東京機").unwrap();
+    assert!(saved[hk..tk].contains("name = \"hk\""), "註解要各歸其主：{saved}");
+    assert!(saved[tk..].contains("name = \"tk\""), "註解要各歸其主：{saved}");
+    // 存完之後不再是兩制並存，讀回來就是這兩個源
+    assert_eq!(parse_config(&saved).unwrap(), cfg, "{saved}");
+}
+
+/// 舊制的頂層鍵就那五個，冒出別的鍵代表這份檔案不是它自稱的格式，
+/// 當壞檔備份起來，不要照舊制解讀完再把不認得的內容寫掉
+#[test]
+fn a_legacy_file_with_an_unknown_key_is_broken() {
+    let dir = tmp_dir("legacy-unknown");
+    let raw = "host = \"h.example.com\"\nuser = \"bob\"\nmystery = 42\n";
+    std::fs::write(dir.join(TOML_NAME), raw).unwrap();
+    let out = load_from_dir(&dir);
+    assert!(matches!(out, LoadOutcome::Broken { backup: Some(_), .. }), "拿到 {out:?}");
+    assert_eq!(std::fs::read_to_string(dir.join(TOML_NAME)).unwrap(), raw);
+    // v2 的五個合法頂層鍵照樣走遷移，deny 不可以誤傷它們
+    let full = "host = \"h.example.com\"\nuser = \"bob\"\nproxyCommand = \"\"\ncloseToTray = false\n\n[[forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = true\n";
+    assert!(parse_document(full).unwrap().1, "v2 的完整鍵集要判成舊制並遷移");
+}
+
 /// PowerShell 5 存檔會帶 UTF-8 BOM，不能因此就把設定當成壞檔
 #[test]
 fn parses_toml_with_utf8_bom() {
@@ -733,6 +941,77 @@ fn write_keeps_per_source_comments() {
     assert!(saved.contains("# 東京機"));
     assert!(saved.contains("alice"));
     assert_eq!(parse_config(&saved).unwrap(), cfg);
+}
+
+/// 編輯的不是最後一筆時，註解不可以錯掛。
+///
+/// upsert 是 retain + push：編輯 A 之後設定物件的順序會變成 [B, A]，但兩筆的
+/// local 都沒變。純位置比對會把 A 的值寫進原本屬於 B 的那張表格，兩條註解就整個
+/// 對調；認 local 才會各自回到自己那一張。
+#[test]
+fn write_keeps_forward_comments_when_editing_a_middle_entry() {
+    let dir = tmp_dir("forward-comment-reorder");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n\n\
+         # 這是 A 出口\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = true\n\n\
+         # 這是 B 出口\n[[sources.forwards]]\nname = \"b\"\nlocal = 1083\nremote = \"127.0.0.1:1083\"\nenabled = true\n",
+    )
+    .unwrap();
+    let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+
+    // 編輯第一筆：照 upsert 的作法先抽掉再推到尾端
+    let mut edited = cfg.sources[0].forwards[0].clone();
+    edited.enabled = false;
+    cfg.sources[0].forwards.retain(|f| f.local != edited.local);
+    cfg.sources[0].forwards.push(edited);
+    write_config(&dir, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    let back = parse_config(&saved).unwrap();
+    assert_eq!(back, cfg, "重讀回來要跟設定物件一致（含順序）：{saved}");
+    // 註解各自跟著自己那一筆：A 的註解上面接的是 local = 1080 那一段
+    let a = saved.find("# 這是 A 出口").expect("A 的註解要還在");
+    let b = saved.find("# 這是 B 出口").expect("B 的註解要還在");
+    let after_a = &saved[a..];
+    let after_b = &saved[b..];
+    assert!(
+        after_a[..after_a.find("remote").unwrap()].contains("local = 1080"),
+        "A 的註解下面要是 1080 那一筆：{saved}"
+    );
+    assert!(
+        after_b[..after_b.find("remote").unwrap()].contains("local = 1083"),
+        "B 的註解下面要是 1083 那一筆：{saved}"
+    );
+    // 改的是 A 的 enabled，B 不可以被動到
+    assert!(!back.forward(1080).unwrap().enabled);
+    assert!(back.forward(1083).unwrap().enabled);
+}
+
+/// 刪掉中間那個源時，兩側的註解要各歸其主，不可以整批往前挪一格
+#[test]
+fn write_keeps_source_comments_when_dropping_a_middle_entry() {
+    let dir = tmp_dir("source-comment-drop-middle");
+    std::fs::write(
+        dir.join(TOML_NAME),
+        "# 香港機\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\nproxyCommand = \"\"\n\n\
+         # 東京機\n[[sources]]\nname = \"tk\"\nhost = \"t\"\nuser = \"u\"\nproxyCommand = \"\"\n\n\
+         # 新加坡機\n[[sources]]\nname = \"sg\"\nhost = \"g\"\nuser = \"u\"\nproxyCommand = \"\"\n",
+    )
+    .unwrap();
+    let mut cfg = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+
+    cfg.sources.retain(|s| s.name != "tk");
+    write_config(&dir, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert_eq!(parse_config(&saved).unwrap(), cfg, "{saved}");
+    assert!(!saved.contains("# 東京機"), "被刪掉那一筆的註解要跟著走：{saved}");
+    let hk = saved.find("# 香港機").expect("香港機的註解要還在");
+    let sg = saved.find("# 新加坡機").expect("新加坡機的註解要還在");
+    let after_hk = &saved[hk..sg];
+    assert!(after_hk.contains("name = \"hk\""), "香港機的註解下面要還是 hk：{saved}");
+    assert!(saved[sg..].contains("name = \"sg\""), "新加坡機的註解下面要還是 sg：{saved}");
 }
 
 #[test]
@@ -867,6 +1146,37 @@ fn remote_must_be_host_colon_port() {
     assert!(!valid_remote("has space:22"));
     // 冒號只准一個，[::1]:22 這種寫法目前不支援
     assert!(!valid_remote("::1:22"));
+}
+
+/// host:port 的埠也有上下界：只填埠號那條路早就擋掉 0 與越界值，
+/// 寫成完整形式時同一組值一樣要被擋，兩條路不可以一嚴一鬆
+#[test]
+fn host_port_remote_rejects_out_of_range_ports() {
+    assert!(valid_remote("127.0.0.1:1"));
+    assert!(valid_remote("127.0.0.1:65535"));
+    assert!(!valid_remote("127.0.0.1:0"));
+    assert!(!valid_remote("127.0.0.1:65536"));
+    assert!(!valid_remote("127.0.0.1:99999"));
+    assert!(!valid_remote("example.com:4294967296"));
+    // parse 自己會放行 +80／-80，純數字的守衛還是要留著
+    assert!(!valid_remote("127.0.0.1:+80"));
+    assert!(!valid_remote("127.0.0.1:-80"));
+    // 前導零與只填埠號那條路同一個態度：parse 出來的值才算數，0080 就是 80
+    assert!(valid_remote("127.0.0.1:0080"));
+
+    // 手寫檔案與介面輸入兩條路都要擋
+    let with = |remote: &str| {
+        format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"{remote}\"\n"
+        )
+    };
+    for bad in ["127.0.0.1:0", "127.0.0.1:99999"] {
+        assert!(parse_config(&with(bad)).unwrap_err().contains("remote"), "{bad}");
+    }
+    let list = vec![src("hk", vec![fwd("a", 1080)])];
+    assert!(err(&list, None, "ok", 1090, "127.0.0.1:0").starts_with("remote: "));
+    assert!(err(&list, None, "ok", 1090, "127.0.0.1:99999").starts_with("remote: "));
 }
 
 /// 只填埠號＝伺服器本機的那個埠，補成完整形式再存檔

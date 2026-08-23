@@ -139,6 +139,27 @@ jobs:
           $latest | ConvertTo-Json -Depth 5 | Set-Content -Path out/latest.json -Encoding utf8
           Get-Content out/latest.json
 
+      # latest.json 的 signature 簽的是 bundle/nsis 底下的原始安裝檔，
+      # 但 url 指向的是 scripts/package.mjs 複製改名到 out/ 的另一顆檔案。
+      # 現在 package.mjs 用 copyFileSync 位元組全同，所以能對得上，但這是
+      # 隱性假設——日後 package.mjs 若改成重新打包、加簽名戳或任何非位元組
+      # 複製的動作，這兩顆檔案就會分岔，簽章也就簽不到真正要發布的那顆，
+      # 而且沒有這關卡的話 CI 完全抓不到。這裡用 SHA256 比對兩者，不一致就讓 CI 紅。
+      - name: Verify updater signature matches release asset
+        shell: pwsh
+        run: |
+          $version = "${{ steps.resolve.outputs.version }}"
+          $bundleSetup = "src-tauri/target/release/bundle/nsis/traytunnel_${version}_x64-setup.exe"
+          $releaseSetup = "out/traytunnel-$version-setup.exe"
+
+          $bundleHash = (Get-FileHash -Path $bundleSetup -Algorithm SHA256).Hash
+          $releaseHash = (Get-FileHash -Path $releaseSetup -Algorithm SHA256).Hash
+          if ($bundleHash -ne $releaseHash) {
+            Write-Error "簽章不一致：$releaseSetup（SHA256 $releaseHash）與簽章實際簽的 $bundleSetup（SHA256 $bundleHash）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
+            exit 1
+          }
+          Write-Host "簽章一致性確認：$releaseSetup 與 $bundleSetup 的 SHA256 相同（$releaseHash）"
+
       - name: Generate SHA256SUMS
         shell: pwsh
         run: |
