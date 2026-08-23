@@ -503,7 +503,7 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     } else {
         toml_edit::de::from_document(doc).map_err(|e| e.to_string())?
     };
-    trim_sources(&mut cfg);
+    trim_config(&mut cfg);
     normalize_remotes(&mut cfg);
     validate_config(&cfg)?;
     Ok((cfg, legacy))
@@ -515,11 +515,18 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
 /// 判空說有值、ssh 拿到的是帶空白的主機名、介面顯示也跟著歪。剃在解析的出口處，
 /// 之後全程式（驗證、ssh 參數、介面、下次存檔）看到的就是同一份值。
 /// 舊制那條路的 host／user 早就在 [`LegacyConfig::into_config`] 剃過，再剃一次是原值。
-fn trim_sources(cfg: &mut Config) {
+///
+/// 出口的 name 也要剃：驗證會擋掉含空白的名字，介面那條路是先 trim 再驗
+/// （[`prepare_forward`]），讀檔這條路要是不剃，同樣一個 `" a "` 在介面上存得進去、
+/// 手寫進檔案卻會讓整份設定變壞檔退回預設值——同一個值兩條路兩種下場。
+fn trim_config(cfg: &mut Config) {
     for s in cfg.sources.iter_mut() {
         s.name = s.name.trim().to_string();
         s.host = s.host.trim().to_string();
         s.user = s.user.trim().to_string();
+        for f in s.forwards.iter_mut() {
+            f.name = f.name.trim().to_string();
+        }
     }
 }
 
@@ -670,6 +677,10 @@ fn migrate_document(doc: &mut DocumentMut) {
 /// 限制：改名（source 的 name）與改埠（forward 的 local）等於換了一把鍵，舊表格
 /// 對不上，語意就是刪一筆再增一筆——註解跟著舊鍵一起消失。鍵本身就是使用者辨識
 /// 那一筆的依據，改鍵時註解未必還適用，所以這個取捨是刻意的。
+///
+/// 改 source 的 name 時範圍還要再大一圈：被丟掉的是整張 `[[sources]]` 表格，
+/// 巢狀在它底下的 `[[sources.forwards]]` 是連同表格一起被換掉的，所以那些出口
+/// 各自上方的註解也會一起沒了（出口本身的值不受影響，會照設定物件重新寫出來）。
 fn sync_tables<T, K: PartialEq>(
     tables: &mut ArrayOfTables,
     items: &[T],

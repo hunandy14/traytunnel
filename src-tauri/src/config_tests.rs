@@ -462,6 +462,32 @@ fn source_fields_are_trimmed_on_load() {
     assert_eq!(parse_config(&saved).unwrap(), cfg);
 }
 
+/// 出口的 name 也要剃。介面那條路是先 trim 再驗，讀檔這條路不剃的話，同樣一個
+/// `" a "` 在介面上存得進去、手寫進檔案卻讓整份設定變壞檔退回預設值
+#[test]
+fn forward_names_are_trimmed_on_load() {
+    let cfg = parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\" a \"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n",
+    )
+    .expect("前後空白要被剃掉，不可以判成壞檔");
+    assert_eq!(cfg.forward(1080).unwrap().name, "a");
+    // 介面那條路對同一個值的判定：兩邊要同進同出
+    let list = vec![src("hk", vec![])];
+    assert!(prepare_forward(&list, None, " a ", 1080, "127.0.0.1:1080", true).is_ok());
+    // 剃完還是空的、或中間有空白的，照樣是壞檔
+    assert!(parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\"  \"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n"
+    )
+    .is_err());
+    assert!(parse_config(
+        "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
+         [[sources.forwards]]\nname=\"two words\"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n"
+    )
+    .is_err());
+}
+
 #[test]
 fn rejects_bad_source_names() {
     assert!(parse_config("[[sources]]\nname=\"\"\nhost=\"h\"\nuser=\"u\"\n").is_err());
@@ -775,6 +801,56 @@ fn saving_over_a_both_formats_file_clears_the_legacy_keys() {
     let again = load_from_dir(&dir);
     assert!(matches!(again, LoadOutcome::Loaded(_)), "{saved}");
     assert_eq!(again.config(), &cfg);
+}
+
+/// is_legacy 的「而且沒有 sources」在寫入路徑上同樣是把關的那一句：少了它，
+/// 一份頂層有 host、底下卻已經有具名 `[[sources]]` 的檔案會在存檔時被當成舊制
+/// 遷移，migrate_document 插進去的那個 sources 陣列會整個蓋掉既有的表格，
+/// 使用者寫在每個源上方的註解跟著一起沒了
+#[test]
+fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
+    let dir = tmp_dir("both-formats-decor");
+    let path = dir.join(TOML_NAME);
+    std::fs::write(
+        &path,
+        "host = \"old.example.com\"\nuser = \"bob\"\n\n\
+         # 香港機\n[[sources]]\nname = \"hk\"\nhost = \"hk.example.com\"\nuser = \"alice\"\nproxyCommand = \"\"\n\n\
+         # 東京機\n[[sources]]\nname = \"tk\"\nhost = \"tk.example.com\"\nuser = \"alice\"\nproxyCommand = \"\"\n",
+    )
+    .unwrap();
+
+    // 這種檔案讀起來是壞檔，設定物件從別處來（這裡就是檔案裡那兩個源）
+    let cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: vec![
+            Source {
+                name: "hk".into(),
+                host: "hk.example.com".into(),
+                user: "alice".into(),
+                proxy_command: String::new(),
+                forwards: vec![],
+            },
+            Source {
+                name: "tk".into(),
+                host: "tk.example.com".into(),
+                user: "alice".into(),
+                proxy_command: String::new(),
+                forwards: vec![],
+            },
+        ],
+    };
+    write_config_at(&path, &cfg).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# 香港機"), "香港機的註解要留著：{saved}");
+    assert!(saved.contains("# 東京機"), "東京機的註解要留著：{saved}");
+    let hk = saved.find("# 香港機").unwrap();
+    let tk = saved.find("# 東京機").unwrap();
+    assert!(saved[hk..tk].contains("name = \"hk\""), "註解要各歸其主：{saved}");
+    assert!(saved[tk..].contains("name = \"tk\""), "註解要各歸其主：{saved}");
+    // 存完之後不再是兩制並存，讀回來就是這兩個源
+    assert_eq!(parse_config(&saved).unwrap(), cfg, "{saved}");
 }
 
 /// 舊制的頂層鍵就那五個，冒出別的鍵代表這份檔案不是它自稱的格式，
