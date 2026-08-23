@@ -433,8 +433,16 @@ pub fn read_run_value(name: &str) -> Option<String> {
     read_hkcu_string(RUN_SUBKEY, name)
 }
 
-/// 讀 HKCU 底下的字串值
-pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
+/// 讀 HKCU 底下一個值的原始位元組，`flags` 決定接受哪一種值型別（RRF_RT_*）。
+///
+/// `RegGetValueW` 一律是兩段式：先給空指標問長度，再照那個長度配緩衝取值。
+/// 字串與二進位差的只有那個 flag 與事後怎麼解讀，把這段骨架抽出來共用，
+/// 兩份幾乎一樣的 unsafe 區塊就不必各自維護（也不會只修好其中一份）。
+///
+/// 回傳的是位元組，不是 `Vec<u16>`：`Vec<u8>` 只保證 1 位元組對齊，指標轉型成
+/// u16 去讀是未對齊讀取。字串那一版改用 `chunks_exact` 逐對組回 u16，
+/// 不必為了對齊而讓這支函式跟著分兩種緩衝型別。
+fn read_hkcu_raw(subkey: &str, name: &str, flags: u32) -> Option<Vec<u8>> {
     let subkey = wide(subkey);
     let value = wide(name);
     unsafe {
@@ -443,43 +451,7 @@ pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        );
-        if rc != ERROR_SUCCESS || size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; (size as usize).div_ceil(2)];
-        let rc = RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut size,
-        );
-        if rc != ERROR_SUCCESS {
-            return None;
-        }
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..len]))
-    }
-}
-
-/// 讀 HKCU 底下的位元組值（REG_BINARY）
-fn read_hkcu_binary(subkey: &str, name: &str) -> Option<Vec<u8>> {
-    let subkey = wide(subkey);
-    let value = wide(name);
-    unsafe {
-        let mut size: u32 = 0;
-        let rc = RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_BINARY,
+            flags,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut size,
@@ -492,7 +464,7 @@ fn read_hkcu_binary(subkey: &str, name: &str) -> Option<Vec<u8>> {
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_BINARY,
+            flags,
             std::ptr::null_mut(),
             buf.as_mut_ptr() as *mut core::ffi::c_void,
             &mut size,
@@ -503,6 +475,21 @@ fn read_hkcu_binary(subkey: &str, name: &str) -> Option<Vec<u8>> {
         buf.truncate(size as usize);
         Some(buf)
     }
+}
+
+/// 讀 HKCU 底下的字串值
+pub fn read_hkcu_string(subkey: &str, name: &str) -> Option<String> {
+    let bytes = read_hkcu_raw(subkey, name, RRF_RT_REG_SZ)?;
+    // REG_SZ 是 UTF-16LE，長度含結尾的 NUL；落單的那個位元組（不該發生）直接丟掉
+    let (pairs, _odd) = bytes.as_chunks::<2>();
+    let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    Some(String::from_utf16_lossy(&wide[..len]))
+}
+
+/// 讀 HKCU 底下的位元組值（REG_BINARY）
+fn read_hkcu_binary(subkey: &str, name: &str) -> Option<Vec<u8>> {
+    read_hkcu_raw(subkey, name, RRF_RT_REG_BINARY)
 }
 
 #[cfg(test)]
