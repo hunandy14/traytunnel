@@ -155,7 +155,7 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要一個指令：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要一個指令：
 
 ```
 npm run release <x.y.z>
@@ -192,7 +192,7 @@ git push
 以下兩項是更底層的備援手段，主流程（不論是 `npm run release` 還是上面的手動流程）正常運作時都不需要用到：
 
 <details>
-<summary>備援：手動貼 tag</summary>
+<summary>備援：手動建立並推送 tag</summary>
 
 `autotag.yml` 若因故沒有跑（例如版號變動沒有進到 `main`、workflow 被停用），可以自己補 tag 觸發：
 

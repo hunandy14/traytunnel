@@ -250,7 +250,7 @@ if (dryRun) {
     console.log(`PR：${prUrlMatch[0]}`);
   }
   console.log(
-    "auto-merge 已掛上，CI 綠後自動合併 → 貼 tag → 出貨；" +
+    "auto-merge 已掛上，CI 綠後自動合併 → 貼 tag → 發佈；" +
       "反悔請在 CI 完成前 `gh pr merge --disable-auto` 或關閉 PR。",
   );
 }
