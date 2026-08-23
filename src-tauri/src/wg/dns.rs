@@ -74,3 +74,7 @@ pub fn pick(_v4: Vec<Ipv4Addr>, _v6: Vec<Ipv6Addr>, _have_v4: bool) -> Option<Ip
 pub fn normalize_name(_name: &str) -> Result<String, ResolveError> {
     todo!("W5.10：`example.com.` 與 `example.com` 等價")
 }
+
+#[cfg(test)]
+#[path = "dns_tests.rs"]
+mod tests;

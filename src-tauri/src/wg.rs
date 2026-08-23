@@ -94,3 +94,11 @@ pub fn status_for_handshake(_age: Option<Duration>) -> &'static str {
 pub fn halted_locals(_cfg: &crate::config::Config, _socks_port: u16) -> Vec<u16> {
     todo!("W6.5")
 }
+
+#[cfg(test)]
+#[path = "wg_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "wg_live_tests.rs"]
+mod live_tests;

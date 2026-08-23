@@ -90,3 +90,7 @@ impl WgConf {
         todo!("W1.30：只帶非機密欄位的摘要")
     }
 }
+
+#[cfg(test)]
+#[path = "conf_tests.rs"]
+mod tests;

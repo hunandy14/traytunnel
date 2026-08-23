@@ -1043,3 +1043,12 @@ pub fn validate_wg_proxy(
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+/// W3 系列（wg 設定模型）的測試。
+///
+/// §5 原本說「加進既有的 config_tests.rs」，這裡改成獨立檔掛在同一層：既有那份
+/// 一千四百行的測試檔在這一輪只被允許做「補上新欄位」的機械性修改，把新測試
+/// 隔出來才看得清楚哪些是這一棒加的。模組路徑一樣拿得到 config 的私有項。
+#[cfg(test)]
+#[path = "config_wg_tests.rs"]
+mod wg_tests;

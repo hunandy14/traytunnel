@@ -111,3 +111,7 @@ pub fn reply_for(_err: &stack::ConnectError) -> Reply {
 pub fn reply_for_resolve(_err: &super::dns::ResolveError) -> Reply {
     todo!("W2.22／W2.23：NotFound/NoServers→0x04，其餘→0x01")
 }
+
+#[cfg(test)]
+#[path = "socks5_tests.rs"]
+mod tests;

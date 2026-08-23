@@ -31,3 +31,7 @@ pub async fn spawn(
 ) -> Result<mpsc::Receiver<EngineEvent>, String> {
     todo!("W4.*：引擎組裝")
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;
