@@ -177,13 +177,25 @@ function setStatus(exit: ExitInfo, status: ExitStatus, detail?: string) {
   exit.status = status;
   // 比照 main.ts 的 applyExitStatus：非 connected 一律清舊的自測結果，
   // 不只 stopped——斷線重連期間舊的「測試成功」字樣沒有理由繼續掛著。
-  if (status !== "connected") exit.lastTest = null;
+  // 用 clearTest 推清除形狀的 exit-test 事件，讓瀏覽器模式也演練得到
+  // applyExitTest 的清除分支，而不只是靠本地直接清 state.exits。
+  if (status !== "connected") clearTest(exit);
   void emit("exit-status", { local: exit.local, status, detail: detail ?? null });
 }
 
 function setTest(exit: ExitInfo, testState: TestState, text: string) {
   exit.lastTest = { state: testState, text };
   void emit("exit-test", { local: exit.local, state: testState, text });
+}
+
+/**
+ * 清除某出口的自測結果，payload 只帶 `{ local }`——對齊真後端
+ * clear_exit_test 推的清除事件形狀（state／text 整個不存在，不是空字串），
+ * 見 types.ts 的 ExitTestEvent 與 main.ts 的 applyExitTest。
+ */
+function clearTest(exit: ExitInfo) {
+  exit.lastTest = null;
+  void emit("exit-test", { local: exit.local });
 }
 
 function later(local: number, ms: number, fn: () => void) {

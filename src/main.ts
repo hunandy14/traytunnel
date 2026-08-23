@@ -599,14 +599,16 @@ function applyExitStatus(ev: ExitStatusEvent) {
 }
 
 /**
- * text 是空字串代表後端要清掉這個出口的自測結果（清除訊號，而不是一筆
- * 「文字剛好是空的」測試結果），比照 applyExitStatus 一樣改記成 null，
- * 不要把空殼結果畫到卡片上。
+ * state／text 缺席（清除事件的 payload 只有 `{ local }`，見 types.ts 的
+ * ExitTestEvent）代表後端要清掉這個出口的自測結果，不是「剛好測出一筆
+ * 空內容的結果」；比照 applyExitStatus 一樣改記成 null，不要把空殼結果
+ * 畫到卡片上。`ev.text && ev.state` 同時當 discriminant：兩者必須一起
+ * 出現才組得成一筆真正的結果。
  */
 function applyExitTest(ev: ExitTestEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
-  hit.exit.lastTest = ev.text ? { state: ev.state, text: ev.text } : null;
+  hit.exit.lastTest = ev.text && ev.state ? { state: ev.state, text: ev.text } : null;
   paintCard(hit.exit);
 }
 
