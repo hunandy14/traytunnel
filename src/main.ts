@@ -657,11 +657,24 @@ hydrateIcons();
 el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
 );
+/**
+ * 關窗前等 flush 的逾時上限。deleteForward 若因為後端卡住（例如 ssh 行程
+ * 掛住）遲遲不 resolve，Promise.allSettled 也會跟著吊住，關窗鈕會看起來像
+ * 當掉——這裡拿「使用者能不能按得動關窗鈕」換「最壞情況下這一筆刪除的
+ * flush 保險失效」：2.5 秒後直接放行，正常情況（flush 遠快於這個上限）
+ * 完全不受影響，只在真的卡住時才會退化回「花式版」的舊行為，讓視窗照樣
+ * 關得掉。
+ */
+const CLOSE_FLUSH_TIMEOUT_MS = 2500;
+
 el<HTMLButtonElement>("btn-close").addEventListener("click", () => {
   void (async () => {
     // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失；
-    // 等 flush 完成再關窗，見 flushPendingDeletes 的說明
-    await flushPendingDeletes();
+    // 等 flush 完成再關窗，見 flushPendingDeletes 的說明；逾時放行見上方常數註解
+    await Promise.race([
+      flushPendingDeletes(),
+      new Promise((resolve) => window.setTimeout(resolve, CLOSE_FLUSH_TIMEOUT_MS)),
+    ]);
     await run(windowClose, "close the window");
   })();
 });
