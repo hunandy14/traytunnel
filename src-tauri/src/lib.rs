@@ -194,10 +194,11 @@ pub fn run() {
                     None => log::warn!("no window icon layer available, keeping the default"),
                 }
 
-                // 外掛在這個 setup 閉包跑之前就已經把 SIZE 還原完了（window 是在 Tauri
-                // 內部呼叫 setup 之前就依 tauri.conf.json 建好的），這裡補校正一次，
-                // 免得舊設定存的尺寸比目前螢幕大
-                winstate::correct_restored_size(&win);
+                // 外掛在這個 setup 閉包跑之前就已經把 POSITION／SIZE 還原完了
+                // （window 是在 Tauri 內部呼叫 setup 之前就依 tauri.conf.json 建好的），
+                // 這裡補校正一次：舊設定存的尺寸可能比目前螢幕大，位置也可能落在
+                // 已經拔掉的那台螢幕上
+                winstate::correct_restored_geometry(&win);
 
                 // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
                 let st = shared.clone();
