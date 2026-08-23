@@ -168,18 +168,14 @@ let testBusy = false;
 let testGeneration = 0;
 
 /**
- * 清掉**目前這張分頁**的欄位錯誤與整體錯誤。另一張分頁是 hidden 的，它的紅框
- * 沒有人看得到，每次存檔都連它一起掃是白做的（backdrop() 也提出迴圈，
- * 原本每個欄位都重查一次 DOM）。開 sheet 時要兩張都歸零，走 clearAllErrors。
+ * 清掉整張 sheet 的欄位錯誤與整體錯誤（兩張分頁一起）。
+ *
+ * 曾經拆成「只清目前分頁」與「兩張都清」兩支，省下的是六次 DOM 屬性寫入，
+ * 換來的是一個看得見的坑：清哪些欄位取決於呼叫當下的 activeTab，於是
+ * 「先切分頁再清」與「先清再切分頁」會有不同結果。這種狀態依賴不值那六次寫入。
+ * backdrop() 仍然提出迴圈外，不必每個欄位都重查一次 DOM。
  */
 function clearErrors() {
-  const root = backdrop();
-  const fields: readonly string[] = activeTab === "ssh" ? SSH_FIELDS : WG_FIELDS;
-  for (const f of fields) setFieldError(root, f, "");
-  setGeneralError(el<HTMLDivElement>("src-error"), "");
-}
-
-function clearAllErrors() {
   const root = backdrop();
   for (const f of SSH_FIELDS) setFieldError(root, f, "");
   for (const f of WG_FIELDS) setFieldError(root, f, "");
@@ -275,6 +271,10 @@ function showFoot(mode: "edit" | "confirm") {
  * 「Connected」會殘留在 WG 分頁底下，或是晚到的舊回應直接畫到新分頁上，
  * 兩者都會讓使用者以為現在這張表單已經測過了。按鈕狀態比照欄位 input handler
  * 一併重置，不然作廢掉的那次探測沒有人會再去解鎖它。
+ *
+ * 整體錯誤列（src-error）同理：它也是兩張分頁共用的一條，上一張留下的
+ * 「host is required」掛在 WG 分頁底下毫無道理。逐欄的錯誤不必動——那些
+ * 節點各自屬於自己的分頁，跟著分頁一起被 hidden。
  */
 function setTab(tab: Tab) {
   activeTab = tab;
@@ -282,6 +282,7 @@ function setTab(tab: Tab) {
   el<HTMLButtonElement>("src-tab-wg").classList.toggle("active", tab === "wg");
   el<HTMLElement>("src-fields-ssh").hidden = tab !== "ssh";
   el<HTMLElement>("src-fields-wg").hidden = tab !== "wg";
+  setGeneralError(el<HTMLDivElement>("src-error"), "");
   invalidateTest();
 }
 
@@ -339,8 +340,8 @@ export function openSourceSheet(target: ConnTarget | null) {
   el<HTMLButtonElement>("src-delete").hidden = !target;
   el<HTMLSpanElement>("src-confirm-text").textContent = deleteConfirmText(target);
 
-  clearAllErrors();
-  invalidateTest();
+  // 上面的 setTab 已經 invalidateTest 過了，這裡只補欄位錯誤的歸零
+  clearErrors();
   showFoot("edit");
   open = true;
   showSheet(backdrop(), activeTab === "ssh" ? sshInput("name") : wgInput("wgName"));
@@ -478,6 +479,9 @@ async function testNow() {
 
 /** .conf 路徑輸入框內嵌的 folder icon 鈕：叫原生檔案選擇器，取消時 pickWgConf 回 null */
 async function pickConf() {
+  // Save 在途時表單的值已經被讀走了，這時換掉 .conf 路徑（還可能連帶改 Name）
+  // 只會讓畫面與送出去的內容對不起來——跟 Save／Delete 兩顆鈕受同一道鎖管
+  if (busy) return;
   try {
     const path = await pickWgConf();
     if (path === null) return;
@@ -531,8 +535,15 @@ export function initSourceSheet(h: Handlers) {
   el<HTMLButtonElement>("src-save").addEventListener("click", () => void save());
   el<HTMLButtonElement>("src-test").addEventListener("click", () => void testNow());
 
-  el<HTMLButtonElement>("src-tab-ssh").addEventListener("click", () => setTab("ssh"));
-  el<HTMLButtonElement>("src-tab-wg").addEventListener("click", () => setTab("wg"));
+  // Save 在途時不准切分頁：送出的是哪一組欄位在按下的當下就定了，中途切過去
+  // 只會讓使用者對著另一張表單等一個不屬於它的結果（錯誤路由已經按送出當下的
+  // 分頁走，但畫面本身不該這樣飄）
+  el<HTMLButtonElement>("src-tab-ssh").addEventListener("click", () => {
+    if (!busy) setTab("ssh");
+  });
+  el<HTMLButtonElement>("src-tab-wg").addEventListener("click", () => {
+    if (!busy) setTab("wg");
+  });
 
   el<HTMLButtonElement>("wg-pick").addEventListener("click", () => void pickConf());
 
