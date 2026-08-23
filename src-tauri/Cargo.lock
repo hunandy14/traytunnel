@@ -4496,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "traytunnel"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "ico",
  "log",
