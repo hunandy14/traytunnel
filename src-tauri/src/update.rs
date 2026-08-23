@@ -135,10 +135,34 @@ async fn check_once(st: &Shared) {
 }
 
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
+///
+/// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
 async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(found.map(|u| UpdateInfo { version: u.version, installed: true }))
+    let current = app.package_info().version.to_string();
+    Ok(found.and_then(|u| accept_installed(&u.version, &current)))
+}
+
+/// 外掛回報的那一版要不要真的當成新版，由自家的 [`is_newer`] 再判一次。
+///
+/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
+/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉
+/// 任何東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依手上：
+/// 換版本、有人塞了 version_comparator、或 latest.json 長出沒預期的形狀，
+/// 都可能讓那個 Option 變成 Some 而我們這層毫無反抗餘地。
+///
+/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
+/// 重裝一個他已經在用的版本。因此版本比對這件事自己做一次，任何比不出「嚴格
+/// 大於」的情形（含空字串、解析不出來的怪版本號）一律當成沒有新版。
+fn accept_installed(remote: &str, current: &str) -> Option<UpdateInfo> {
+    if !is_newer(remote, current) {
+        return None;
+    }
+    Some(UpdateInfo {
+        version: remote.trim().trim_start_matches(['v', 'V']).to_string(),
+        installed: true,
+    })
 }
 
 // ------------------------------------------------- 可攜／單檔車道（不就地更新）
@@ -310,6 +334,48 @@ mod tests {
         assert!(!is_newer("latest", "0.4.3"));
         assert!(!is_newer("0.5", "0.4.3"));
         assert!(!is_newer("0.5.0", "not-a-version"));
+    }
+
+    /// 安裝版車道的最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
+    ///
+    /// 0.5.0 那次誤報的教訓是「說有新版」這個判斷不可以整個外包出去，
+    /// 這裡釘住我們自己一定會再判一次。
+    #[test]
+    fn the_installed_lane_refuses_a_version_that_is_not_newer() {
+        assert_eq!(accept_installed("0.5.0", "0.5.0"), None);
+        assert_eq!(accept_installed("0.4.9", "0.5.0"), None);
+        // 版本號怪到解析不出來時同樣不報，寧可漏報也不要叫人去重裝已經在用的版本
+        assert_eq!(accept_installed("", "0.5.0"), None);
+        assert_eq!(accept_installed("latest", "0.5.0"), None);
+    }
+
+    /// 真的有新版時照樣要放行，而且版本號存進去是不帶 v 的（UpdateInfo 的契約，
+    /// 前端會自己補上 v 顯示成 `Update to v0.6.0`）
+    #[test]
+    fn the_installed_lane_still_passes_a_real_update_through() {
+        let found = accept_installed("0.6.0", "0.5.0").expect("0.6.0 比 0.5.0 新");
+        assert_eq!(found, UpdateInfo { version: "0.6.0".into(), installed: true });
+        let prefixed = accept_installed("v0.6.0", "0.5.0").expect("帶 v 的一樣認得");
+        assert_eq!(prefixed.version, "0.6.0");
+    }
+
+    /// 0.5.0 更新提示誤亮的真正成因，釘在 CI。
+    ///
+    /// `hidden` 屬性的 `display: none` 只來自瀏覽器預設樣式表，層疊順序上輸給
+    /// 任何一條作者樣式，所以 `.setting-row { display: flex }` 之類的規則會讓
+    /// `node.hidden = true` 完全失效——當時設定頁的更新列從第一幀起就沒被藏過，
+    /// 畫面上顯示的是 index.html 裡寫死的靜態字串，跟後端查到什麼版本無關。
+    ///
+    /// 樣式表是我們真的會出貨的檔案，比照 `the_shipped_updater_config_parses`
+    /// 的做法直接讀它，把這條全域規則擋在 CI，不讓它哪天被順手刪掉。
+    #[test]
+    fn the_stylesheet_makes_the_hidden_attribute_actually_hide() {
+        let css = include_str!("../../src/styles.css");
+        let normalized: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            normalized.contains("[hidden]{display:none!important;}"),
+            "styles.css 必須有全域的 [hidden] 規則，否則 node.hidden 會被任何一條 display 規則蓋掉"
+        );
     }
 
     /// 機碼名跟著 productName 走，不是 identifier（實機上是 `...\Uninstall\traytunnel`）

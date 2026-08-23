@@ -41,6 +41,24 @@
   padding: 0;
 }
 
+/*
+ * hidden 屬性的 `display: none` **只寫在瀏覽器的預設樣式表裡**，而預設樣式表在
+ * 層疊順序上輸給任何一條作者樣式。因此任何一條給元素設 display 的規則
+ * （`.setting-row { display: flex }` 之類）都會無聲地讓 `node.hidden = true`
+ * 徹底失效：JS 以為藏起來了，畫面上那一塊卻一直在，而且顯示的是 HTML 裡的
+ * 靜態佔位內容——這正是 0.5.0 更新提示誤亮的成因（設定頁的更新列從第一幀起
+ * 就沒被藏過，顯示的是 index.html 裡寫死的「Update available」與
+ * 「Restart to update」，跟真正查到什麼版本無關）。
+ *
+ * 補一條全域的作者規則把它接回來。這裡的 !important 是必要的而不是偷懶：
+ * `[hidden]` 與單一 class 選擇器的優先度相同，不加就得靠「排在所有規則之後」
+ * 這種隨檔案順序漂移的脆弱保證，而下一個新增 display 規則的人不會知道
+ * 自己踩到了什麼。
+ */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -159,10 +177,6 @@ body {
   display: flex;
   flex-direction: column;
   padding: 0 12px 12px;
-}
-
-.view[hidden] {
-  display: none;
 }
 
 .scroll-view {
@@ -483,10 +497,6 @@ body {
   background: var(--overlay);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
-}
-
-.summary-menu[hidden] {
-  display: none;
 }
 
 .summary-menu hr {
@@ -1182,10 +1192,6 @@ body {
   transition: opacity 180ms var(--ease);
 }
 
-.sheet-backdrop[hidden] {
-  display: none;
-}
-
 .sheet-backdrop.open {
   opacity: 1;
 }
@@ -1238,10 +1244,6 @@ body {
   gap: 8px;
   padding: 12px 14px;
   border-top: 1px solid var(--line);
-}
-
-.sheet-foot[hidden] {
-  display: none;
 }
 
 .confirm-text {
