@@ -440,6 +440,28 @@ fn rejects_empty_host_or_user() {
     assert!(parse_config("[[sources]]\nname=\"s\"\nuser = \"u\"\n").is_err());
 }
 
+/// 新制那條路也要剃空白：驗證看的是 trim 過的值，存下來的卻是原字串的話，
+/// 判空說有值、ssh 拿到的卻是帶空白的主機名，一整排東西都會跟著歪
+#[test]
+fn source_fields_are_trimmed_on_load() {
+    let cfg = parse_config(
+        "[[sources]]\nname = \" hk \"\nhost = \" myhost \"\nuser = \"  bob\t\"\n\
+         [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"127.0.0.1:1080\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.sources[0].name, "hk");
+    assert_eq!(cfg.sources[0].host, "myhost");
+    assert_eq!(cfg.sources[0].user, "bob");
+    // 剃完還是空的就是空的，判空與實際存值同一份
+    assert!(parse_config("[[sources]]\nname=\"s\"\nhost=\"  \"\nuser=\"u\"\n").is_err());
+    // 剃完之後存回檔案的也是剃過的值
+    let dir = tmp_dir("trim-write");
+    write_config(&dir, &cfg).unwrap();
+    let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
+    assert!(saved.contains("host = \"myhost\""), "{saved}");
+    assert_eq!(parse_config(&saved).unwrap(), cfg);
+}
+
 #[test]
 fn rejects_bad_source_names() {
     assert!(parse_config("[[sources]]\nname=\"\"\nhost=\"h\"\nuser=\"u\"\n").is_err());

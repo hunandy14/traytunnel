@@ -481,9 +481,24 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     } else {
         toml_edit::de::from_document(doc).map_err(|e| e.to_string())?
     };
+    trim_sources(&mut cfg);
     normalize_remotes(&mut cfg);
     validate_config(&cfg)?;
     Ok((cfg, legacy))
+}
+
+/// 手寫的 `host = " myhost "` 兩邊的空白在這裡就剃掉。
+///
+/// 驗證看的是 `host.trim()`、實際存的卻是原字串，兩份不一樣就會有一整排怪事：
+/// 判空說有值、ssh 拿到的是帶空白的主機名、介面顯示也跟著歪。剃在解析的出口處，
+/// 之後全程式（驗證、ssh 參數、介面、下次存檔）看到的就是同一份值。
+/// 舊制那條路的 host／user 早就在 [`LegacyConfig::into_config`] 剃過，再剃一次是原值。
+fn trim_sources(cfg: &mut Config) {
+    for s in cfg.sources.iter_mut() {
+        s.name = s.name.trim().to_string();
+        s.host = s.host.trim().to_string();
+        s.user = s.user.trim().to_string();
+    }
 }
 
 /// 讀進來的設定同樣支援純埠號的簡寫：手寫 `remote = "8080"` 一樣算數，在這裡就補成完整形式。
