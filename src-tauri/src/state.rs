@@ -183,6 +183,37 @@ fn visible_test(status: &str, last_test: Option<TestView>) -> Option<TestView> {
     }
 }
 
+/// 設定 + 執行期狀態 → 每個源與其出口的當下樣貌。
+/// 兩把鎖都由呼叫端持著，這裡只做純粹的組裝。
+fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceView> {
+    cfg.sources
+        .iter()
+        .map(|s| SourceView {
+            name: s.name.clone(),
+            host: s.host.clone(),
+            user: s.user.clone(),
+            proxy_command: s.proxy_command.clone(),
+            exits: s
+                .forwards
+                .iter()
+                .map(|f| {
+                    let rt = exits.get(&f.local);
+                    let status =
+                        rt.map(|r| r.status.clone()).unwrap_or_else(|| status::STOPPED.to_string());
+                    ExitView {
+                        name: f.name.clone(),
+                        local: f.local,
+                        remote: f.remote.clone(),
+                        enabled: f.enabled,
+                        last_test: visible_test(&status, rt.and_then(|r| r.last_test.clone())),
+                        status,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// 就地寫一筆連線狀態，回傳「有沒有真的變」。有守門與無守門的兩條寫入路徑
 /// 共用這一份「相同就不推事件」的規則，兩邊不會各判各的。
 fn write_status(rt: &mut ExitRuntime, status: &str, detail: &Option<String>) -> bool {
@@ -689,38 +720,21 @@ impl AppState {
     ///
     /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
     pub fn source_views(&self) -> Vec<SourceView> {
+        self.with_config(|cfg| build_views(cfg, &self.exits.lock().unwrap()))
+    }
+
+    /// 取快照的同時配一張系統匣套用號碼牌，兩者在**同一次 exits 鎖內**完成。
+    ///
+    /// 號碼牌的用途是讓晚算出來的快照永遠贏過早算出來的（`traymenu::refresh`
+    /// 會拿它跟全域計數器比，比輸就整份丟掉）。快照與號碼之間要是放掉了鎖，
+    /// 這個保證就不成立：兩條執行緒可以在「A 取完快照、還沒配號」時交錯，
+    /// 讓 A 拿到比較大的號碼卻載著比較舊的快照，於是 B 那份新的先被貼上去、
+    /// 又被 A 那份舊的蓋掉，系統匣就這樣停在過期的狀態直到下一次狀態變化。
+    fn views_with_seq(&self) -> (Vec<SourceView>, u64) {
         self.with_config(|cfg| {
             let exits = self.exits.lock().unwrap();
-            cfg.sources
-                .iter()
-                .map(|s| SourceView {
-                    name: s.name.clone(),
-                    host: s.host.clone(),
-                    user: s.user.clone(),
-                    proxy_command: s.proxy_command.clone(),
-                    exits: s
-                        .forwards
-                        .iter()
-                        .map(|f| {
-                            let rt = exits.get(&f.local);
-                            let status = rt
-                                .map(|r| r.status.clone())
-                                .unwrap_or_else(|| status::STOPPED.to_string());
-                            ExitView {
-                                name: f.name.clone(),
-                                local: f.local,
-                                remote: f.remote.clone(),
-                                enabled: f.enabled,
-                                last_test: visible_test(
-                                    &status,
-                                    rt.and_then(|r| r.last_test.clone()),
-                                ),
-                                status,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect()
+            let views = build_views(cfg, &exits);
+            (views, crate::traymenu::next_seq())
         })
     }
 
@@ -746,24 +760,18 @@ impl AppState {
     /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
     /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let sources = self.source_views();
-        self.refresh_tray_with(&sources);
+        let (sources, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, seq);
         let _ = self.app.emit("config-changed", self.snapshot_with(sources));
     }
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
     ///
-    /// 鎖紀律：先取快照（鎖在 `source_views` 裡取完就放掉），之後只碰快照，
-    /// 真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
-    /// 號碼牌緊貼快照配出，中間不插任何事，才不會有「號碼新、快照舊」的交錯。
+    /// 鎖紀律：先取快照與號碼牌（鎖在 `views_with_seq` 裡取完就放掉），之後只碰
+    /// 快照，真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     pub fn refresh_tray(&self) {
-        self.refresh_tray_with(&self.source_views());
-    }
-
-    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
-    fn refresh_tray_with(&self, sources: &[SourceView]) {
-        let seq = crate::traymenu::next_seq();
-        crate::traymenu::refresh(&self.app, sources, seq);
+        let (sources, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, seq);
     }
 }
 
