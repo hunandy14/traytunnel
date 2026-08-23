@@ -60,7 +60,7 @@ pub struct ExitTestPayload {
     pub result: Option<TestView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TestView {
     pub state: String,
     pub text: String,
@@ -223,6 +223,34 @@ fn write_status(rt: &mut ExitRuntime, status: &str, detail: &Option<String>) -> 
     }
     rt.status = status.into();
     rt.detail = detail.clone();
+    true
+}
+
+/// 世代守門版的狀態寫入：世代不符就**一個欄位都不動**並回 false。
+///
+/// 守門本身抽成純函式才測得到。這道判斷是 `set_exit_status_of` 唯一的防線，
+/// 而它防的是一條要靠時序才重現得出來的競態——寫進 `AppState` 裡的話，
+/// 測試就得生出一個真的 AppHandle，等於這道守門永遠沒有測試護著，
+/// 被誰順手拿掉也不會有人發現。
+fn guarded_write_status(
+    rt: &mut ExitRuntime,
+    generation: u64,
+    status: &str,
+    detail: &Option<String>,
+) -> bool {
+    if rt.generation != generation {
+        return false;
+    }
+    write_status(rt, status, detail)
+}
+
+/// 憑證守門版的自測寫入：憑證不符就**一個欄位都不動**並回 false。
+/// 抽成純函式的理由同 [`guarded_write_status`]。
+fn guarded_write_test(rt: &mut ExitRuntime, token: TestToken, view: &TestView) -> bool {
+    if rt.token() != token {
+        return false;
+    }
+    rt.last_test = Some(view.clone());
     true
 }
 
@@ -457,10 +485,11 @@ impl AppState {
     /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
     /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
     ///
-    /// 這一版**不看世代**，給的是「無論如何都要寫下去」的呼叫端：halt 要把狀態
-    /// 壓成 stopped 正是在遞增世代之後，指令層改的也都是當下這一刻的事實。
-    /// 監看迴圈那種「算出來的時候還算數、寫下去時可能已經過期」的狀態一律走
-    /// [`set_exit_status_of`]。
+    /// 這一版**不看世代**。目前唯一的呼叫端是 `tunnel::halt`，而它正是在遞增
+    /// 世代之後才把狀態壓成 stopped——帶著守門反而寫不進去。監看迴圈那種
+    /// 「算出來的時候還算數、寫下去時可能已經過期」的狀態一律走
+    /// [`set_exit_status_of`]；日後要是有新的呼叫端，先確認它寫的真的是
+    /// 「當下這一刻的事實」，不然預設就該用有守門的那一版。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
         let changed = self.with_exit_mut(local, |rt| write_status(rt, status, &detail));
         if changed == Some(true) {
@@ -489,10 +518,9 @@ impl AppState {
     ) {
         let changed = {
             let mut exits = self.exits.lock().unwrap();
-            match exits.get_mut(&local) {
-                Some(rt) if rt.generation == generation => write_status(rt, status, &detail),
-                _ => false,
-            }
+            exits
+                .get_mut(&local)
+                .is_some_and(|rt| guarded_write_status(rt, generation, status, &detail))
         };
         if changed {
             self.announce_status(local, status, detail);
@@ -531,13 +559,7 @@ impl AppState {
         let view = TestView { state: state.into(), text: text.into() };
         let written = {
             let mut exits = self.exits.lock().unwrap();
-            match exits.get_mut(&local) {
-                Some(rt) if rt.token() == token => {
-                    rt.last_test = Some(view.clone());
-                    true
-                }
-                _ => false,
-            }
+            exits.get_mut(&local).is_some_and(|rt| guarded_write_test(rt, token, &view))
         };
         if written {
             let _ = self.app.emit("exit-test", ExitTestPayload { local, result: Some(view) });
@@ -929,6 +951,99 @@ mod tests {
 
     fn token(generation: u64, epoch: u64) -> TestToken {
         TestToken { generation, epoch }
+    }
+
+    // ------------------------------------------------------------ 世代／憑證守門
+
+    /// halt 之後的樣子：世代已經被換掉，狀態壓成 stopped，自測清乾淨
+    fn halted(generation: u64, epoch: u64) -> ExitRuntime {
+        ExitRuntime {
+            status: status::STOPPED.into(),
+            detail: None,
+            last_test: None,
+            generation,
+            test_epoch: epoch,
+            supervisor: None,
+            job: None,
+        }
+    }
+
+    /// 守門的核心契約：世代不符時是**零寫入**，不是「寫了但不推事件」。
+    ///
+    /// 這正是那條競態的形狀——halt 已經把出口壓成 stopped 並換了世代，
+    /// 舊監看迴圈晚一步把 connected 交上來。放它進去的話出口會顯示連著、
+    /// 實際上線已經停了，而且再也沒有事件會來糾正。
+    #[test]
+    fn a_stale_generation_writes_nothing() {
+        let mut rt = halted(8, 1);
+        assert!(!guarded_write_status(&mut rt, 7, status::CONNECTED, &None), "回 false");
+        assert_eq!(rt.status, status::STOPPED, "狀態不可以被舊迴圈蓋掉");
+        assert_eq!(rt.detail, None);
+    }
+
+    /// detail 也在守門範圍內：只擋 status 不擋 detail 的話，
+    /// 出口會顯示 stopped 卻掛著上一輪的錯誤訊息
+    #[test]
+    fn a_stale_generation_does_not_touch_the_detail_either() {
+        let mut rt = ExitRuntime {
+            status: status::PORT_BUSY.into(),
+            detail: Some("Local port 1080 is already in use.".into()),
+            generation: 8,
+            ..Default::default()
+        };
+        assert!(!guarded_write_status(&mut rt, 7, status::ERROR, &Some("boom".into())));
+        assert_eq!(rt.status, status::PORT_BUSY);
+        assert_eq!(rt.detail.as_deref(), Some("Local port 1080 is already in use."));
+    }
+
+    /// 世代相符時照常寫進去——守門不能嚴到把當代的更新也擋掉
+    #[test]
+    fn the_current_generation_still_writes_through() {
+        let mut rt = halted(8, 1);
+        assert!(guarded_write_status(&mut rt, 8, status::CONNECTED, &None));
+        assert_eq!(rt.status, status::CONNECTED);
+    }
+
+    /// 世代相符但值沒變時回 false，走的是「不重推事件」那條規則，
+    /// 與守門擋下來是兩回事
+    #[test]
+    fn an_unchanged_status_reports_no_change_even_when_the_generation_matches() {
+        let mut rt = halted(8, 1);
+        assert!(!guarded_write_status(&mut rt, 8, status::STOPPED, &None));
+        assert_eq!(rt.status, status::STOPPED);
+    }
+
+    /// 自測寫入的守門同樣要零寫入：重接之後 last_test 是空的，
+    /// 舊探測的結果不可以把上一條連線的出口 IP 填回來
+    #[test]
+    fn a_stale_token_writes_no_test_result() {
+        let mut rt = halted(8, 2);
+        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4  Taipei, TW".into() };
+        assert!(!guarded_write_test(&mut rt, token(7, 2), &view), "世代不符要擋下");
+        assert_eq!(rt.last_test, None);
+        // 世代對、期號不對（ssh 自己掛掉後在同一代裡重連）一樣要擋下
+        assert!(!guarded_write_test(&mut rt, token(8, 1), &view), "期號不符要擋下");
+        assert_eq!(rt.last_test, None);
+    }
+
+    /// 舊憑證也不可以覆蓋掉當代已經寫進去的結果
+    #[test]
+    fn a_stale_token_cannot_overwrite_a_current_result() {
+        let mut rt = halted(8, 2);
+        let fresh = TestView { state: test_state::OK.into(), text: "5.6.7.8".into() };
+        assert!(guarded_write_test(&mut rt, token(8, 2), &fresh));
+        let stale = TestView { state: test_state::FAIL.into(), text: "no response".into() };
+        assert!(!guarded_write_test(&mut rt, token(8, 1), &stale));
+        assert_eq!(rt.last_test.as_ref(), Some(&fresh), "當代的結果要留著");
+    }
+
+    /// 憑證相符時照常寫進去
+    #[test]
+    fn a_current_token_writes_the_test_result_through() {
+        let mut rt = halted(8, 2);
+        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4".into() };
+        assert!(guarded_write_test(&mut rt, token(8, 2), &view));
+        assert_eq!(rt.last_test.as_ref(), Some(&view));
     }
 
     /// 同一輪連線裡重複按自測要擋下來，否則一個埠會同時飛出好幾份探測
