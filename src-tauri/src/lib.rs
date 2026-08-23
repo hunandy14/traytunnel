@@ -75,8 +75,9 @@ fn close_main(state: &Shared) {
     }
 }
 
-/// 開機自啟自癒：舊版 PowerShell 留下的 Run 登錄項會讓 toggle 顯示 ON 卻其實
-/// 啟動不到這支程式，啟動時發現登錄值沒指向目前的執行檔就重寫一次。
+/// 開機自啟自癒：Run 登錄值未指向目前執行檔時，於啟動時重寫一次。
+/// 涵蓋路徑失效與非本程式寫入的殘留格式——這兩種情況下 toggle 都會顯示 ON，
+/// 實際卻啟動不到這支程式。
 fn heal_autostart(app: &AppHandle, state: &Shared) {
     let name = state::autostart_name(app);
     if !winsys::autostart_enabled(&name) {
@@ -183,7 +184,7 @@ pub fn run() {
 
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
                 // 工作列的視窗按鈕吃的是 SM_CXICON（175% 下 56px），codegen 給的是
-                // ICO 第一層 16px，得自己挑層再設一次才不會被 GDI 放大成一團糊
+                // ICO 第一層 16px，得自己挑層再設一次才不會被 GDI 放大而模糊
                 match appicon::window_icon() {
                     Some(icon) => {
                         if let Err(e) = win.set_icon(icon) {
@@ -263,8 +264,8 @@ pub fn run() {
             heal_autostart(&handle, &shared);
 
             if is_tray_start() {
-                // 這裡自己就彈了一顆，順手把「關到系統匣」那顆提示領掉，
-                // 免得使用者第一次按 X 時又被通知一次
+                // 這條路徑自己已經彈過一顆通知，順帶把「關到系統匣」那顆一次性
+                // 提示領掉，避免使用者第一次按 X 時再被通知一次
                 let _ = shared.take_tray_hint();
                 balloon(&handle, "Started in the system tray. Double-click the tray icon to open.");
             } else {
@@ -327,8 +328,8 @@ fn toggle_all(st: &Shared) {
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     let menu = traymenu::build(app, &traymenu::menu_model(&shared.source_views()))?;
 
-    // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可讓系統匣先長出來
-    // 也不要 panic 掉整支程式，圖示之後照樣可以補
+    // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來
+    // 也不要讓整支程式 panic，圖示之後照樣可以補
     let icon = appicon::tray_icon().or_else(|| app.default_window_icon().cloned());
     if icon.is_none() {
         log::warn!("no tray icon available, building the tray without one");

@@ -144,7 +144,7 @@ async fn check_once(st: &Shared) {
 /// 而使用者親手按下這顆鈕，就是對這一次連外的明示同意。拿背景開關去擋一個
 /// 當面的請求，得到的只會是一顆按了沒反應的鈕。
 ///
-/// 與背景車道的另一個差別是結果要回傳：按鈕得靠它演出 Up to date／Check
+/// 與背景車道的另一個差別是結果要回傳：按鈕靠它呈現 Up to date／Check
 /// failed 那兩個瞬態，而背景車道對這兩種結果都是靜默的。共用狀態照樣更新，
 /// 兩條車道與介面看到的始終是同一份事實。
 pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
@@ -299,7 +299,7 @@ fn open_page(st: &Shared, url: &str) {
 ///
 /// 就是因為它自己 `std::process::exit(0)`，`RunEvent::Exit` 不會發，
 /// tauri-plugin-window-state 落地存檔的那個 hook 因此不會跑——這是「更新後視窗
-/// 歸零置中」的元兇之一。這裡不能再用 `st.app.updater()` 那個便利方法：它預設塞的
+/// 歸零置中」的成因。這裡不可以用 `st.app.updater()` 那個便利方法：它預設塞的
 /// `on_before_exit` 只有 `cleanup_before_exit()`（見 updater 外掛 lib.rs 的
 /// `UpdaterExt::updater_builder`），改用 `updater_builder()` 自己補一顆 `on_before_exit`，
 /// 在交棒給安裝程式之前先存一次視窗狀態，同時保留原本的 `cleanup_before_exit()`
@@ -421,8 +421,7 @@ mod tests {
 
     /// 安裝版車道的最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
     ///
-    /// 0.5.0 那次誤報的教訓是「說有新版」這個判斷不可以整個外包出去，
-    /// 這裡釘住我們自己一定會再判一次。
+    /// 「有沒有新版」這個判斷不可以整個外包給外部相依，這裡釘住自己一定會再判一次。
     #[test]
     fn the_installed_lane_refuses_a_version_that_is_not_newer() {
         assert_eq!(accept_installed("0.5.0", "0.5.0"), None);
@@ -467,15 +466,13 @@ mod tests {
         assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
     }
 
-    /// 0.5.0 更新提示誤亮的真正成因，釘在 CI。
-    ///
     /// `hidden` 屬性的 `display: none` 只來自瀏覽器預設樣式表，層疊順序上輸給
     /// 任何一條作者樣式，所以 `.setting-row { display: flex }` 之類的規則會讓
-    /// `node.hidden = true` 完全失效——當時設定頁的更新列從第一幀起就沒被藏過，
-    /// 畫面上顯示的是 index.html 裡寫死的靜態字串，跟後端查到什麼版本無關。
+    /// `node.hidden = true` 完全失效：JS 以為藏起來了，畫面上那一塊卻一直在，
+    /// 而且顯示的是 index.html 裡寫死的靜態佔位內容。
     ///
-    /// 樣式表是我們真的會出貨的檔案，比照 `the_shipped_updater_config_parses`
-    /// 的做法直接讀它，把這條全域規則擋在 CI，不讓它哪天被順手刪掉。
+    /// 樣式表是真的會出貨的檔案，比照 `the_shipped_updater_config_parses`
+    /// 的做法直接讀它，把這條全域規則擋在 CI，避免它被刪掉。
     #[test]
     fn the_stylesheet_makes_the_hidden_attribute_actually_hide() {
         let css = include_str!("../../src/styles.css");
@@ -497,7 +494,7 @@ mod tests {
 
     /// tauri.conf.json 的 plugins.updater 一旦寫壞（少了 pubkey、endpoint 不是
     /// 合法網址），外掛會在 setup 階段回 Err，`run()` 當場 panic——使用者連視窗
-    /// 都看不到。那是執行期才會爆的東西，這裡拿我們真的會發佈的那份設定解析一次，
+    /// 都看不到。那是執行期才會發生的失敗，這裡拿真的會發佈的那份設定解析一次，
     /// 把它擋在 CI。
     #[test]
     fn the_shipped_updater_config_parses() {

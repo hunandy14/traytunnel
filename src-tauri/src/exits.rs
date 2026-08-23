@@ -64,15 +64,15 @@ pub fn probe(port: u16) -> ExitTest {
 mod tests {
     use super::*;
 
-    /// 這支測試就是為了擋住原本的 bug：URL 的 scheme 必須是 ureq 認得的，
-    /// 否則探測會在送出請求前就失敗，UI 上看起來像瞬間 no response。
+    /// URL 的 scheme 必須是 ureq 認得的，否則探測會在送出請求前就失敗，
+    /// UI 上看起來像瞬間 no response。
     #[test]
     fn proxy_url_is_accepted_by_ureq() {
         assert!(ureq::Proxy::new(&proxy_url(1080)).is_ok());
     }
 
     /// DNS 一定要走代理：ureq 3 用 resolve_target 區分，socks5h 才是「不在本機解析」。
-    /// 這條釘住 scheme，避免哪天有人手滑改回 socks5://。
+    /// 這條釘住 scheme，避免被改回 socks5://。
     #[test]
     fn proxy_does_not_resolve_target_locally() {
         let proxy = ureq::Proxy::new(&proxy_url(1080)).unwrap();

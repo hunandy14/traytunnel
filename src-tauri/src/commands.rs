@@ -425,8 +425,8 @@ pub fn open_config_dir(state: State<'_, Shared>) {
 
 /// 背景檢查更新的開關。
 ///
-/// 關掉之後完全不再連外，順手把已經找到的那一版也從畫面上收掉——使用者說了
-/// 不要再被更新的事情打擾，留著那一列只是繼續打擾他。打開則立刻查一次，
+/// 關掉之後完全不再連外，並把已經找到的那一版也從畫面上收掉——使用者既然選擇
+/// 不再接收更新提示，留著那一列等同繼續提示。打開則立刻查一次，
 /// 不必等到明天的排程。
 #[tauri::command]
 pub fn set_check_for_updates(state: State<'_, Shared>, on: bool) -> Result<(), String> {
@@ -455,7 +455,7 @@ pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
 /// 使用者主動按下的「Check now」。
 ///
 /// **不受背景檢查開關管**：那個開關管的是自動連外，親手按下這顆鈕就是對這一次
-/// 連外的明示同意。結果直接回傳，讓按鈕演得出 Up to date 與 Check failed
+/// 連外的明示同意。結果直接回傳，讓按鈕呈現得出 Up to date 與 Check failed
 /// 那兩個瞬態——Err 就是失敗，Ok(None) 就是已經最新。
 #[tauri::command]
 pub async fn check_for_updates_now(state: State<'_, Shared>) -> Result<Option<UpdateInfo>, String> {
