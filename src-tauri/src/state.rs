@@ -602,14 +602,41 @@ impl AppState {
         });
     }
 
-    /// 收掉所有出口的 ssh 程序，離開程式時用
+    /// 收掉所有出口的 ssh 程序，離開程式時用。
+    ///
+    /// 程序收掉了，狀態也要跟著寫成 stopped：這個函式不只跑在「馬上就要 exit」
+    /// 的路上，就地更新那條路是在交棒給安裝程式之前呼叫它，安裝失敗時程式還會
+    /// 留在原地——狀態沒改的話，介面與系統匣會停在「connected」，而背後那些
+    /// ssh 早就沒了。
+    ///
+    /// **死鎖警告**：這裡不可以呼叫 `set_exit_status`，它會經由 `with_exit_mut`
+    /// 再取一次同一把 exits 鎖，當場自我死鎖。所以在 guard 裡直接改 `rt.status`
+    /// 並把要通知的埠蒐集起來，放掉 guard 之後才推事件；`refresh_tray` 也一樣
+    /// （它會取 cfg 與 exits 兩把鎖），而且整批只重算一次——系統匣本來就是
+    /// 整份重建，逐埠各刷一次只是白做工。
     pub fn kill_all_jobs(&self) {
-        let mut exits = self.exits.lock().unwrap();
-        for rt in exits.values_mut() {
-            rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            rt.supervisor = None;
-            let _ = rt.job.take();
+        let mut stopped = Vec::new();
+        {
+            let mut exits = self.exits.lock().unwrap();
+            for (local, rt) in exits.iter_mut() {
+                rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                rt.supervisor = None;
+                let _ = rt.job.take();
+                if write_status(rt, status::STOPPED, &None) {
+                    stopped.push(*local);
+                }
+            }
         }
+        if stopped.is_empty() {
+            return;
+        }
+        for local in stopped {
+            let _ = self.app.emit(
+                "exit-status",
+                ExitStatusPayload { local, status: status::STOPPED.into(), detail: None },
+            );
+        }
+        self.refresh_tray();
     }
 
     /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，

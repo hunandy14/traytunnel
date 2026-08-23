@@ -318,8 +318,16 @@ fn open_page(st: &Shared, url: &str) {
 /// 一堆執行期狀態，存進共用狀態只是徒增麻煩，而使用者按下按鈕的當下重查一次，
 /// 拿到的也一定是最新的那一版。
 ///
-/// **下載完成之後才收隧道**：下載可能要幾十秒，這段時間沒有理由先把使用者的連線
-/// 斷掉；等真的要交棒給安裝程式了才 kill，安裝程式接手時不會有殘留的 ssh 子程序。
+/// **收隧道與標記退出全部搬進 `on_before_exit`**，那顆 hook 是外掛在
+/// `ShellExecuteW` 起安裝程式的前一刻同步呼叫的（見 2.10.1 updater.rs 的
+/// `install_inner`），是這條路上唯一「確定要交棒了」的時機。
+///
+/// 原本這兩件事寫在呼叫 `install` 之前，代價是 `install` 只要回 Err（解壓失敗、
+/// 起不了安裝程式……）程式就留在原地，而使用者的隧道已經全被殺光、`exiting`
+/// 也已經被拉起來：介面上每個出口還顯示連著，實際上一條都不通，而且按下關閉鈕
+/// 會直接退出程式而不是縮回系統匣（`CloseRequested` 那道判斷看的正是 `exiting`）。
+/// 沒有任何路徑會把這些收回來。下載那幾十秒同樣不該先斷線——這一點原本就對，
+/// 搬進 hook 之後依然成立，而且連「下載成功、安裝失敗」的縫也一起補上了。
 /// Windows 上 `install` 不會回來（它自己 `std::process::exit(0)`），
 /// 所以這個函式正常路徑上只會回 Err。
 ///
@@ -334,18 +342,22 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if !is_installed(&st.app) {
         return Err("This build cannot update itself".into());
     }
-    let handle = st.app.clone();
+    let hook = st.clone();
     let updater = st
         .app
         .updater_builder()
         .timeout(CHECK_TIMEOUT)
         .on_before_exit(move || {
-            if let Err(e) = handle.save_window_state(crate::winstate::flags()) {
+            // hook 是同步的而且很短。kill_all_jobs 會取 exits 鎖，但它在自己
+            // 內部就放掉了，這個閉包裡其餘三個呼叫都不碰 AppState 的任何鎖
+            hook.mark_exiting();
+            hook.kill_all_jobs();
+            if let Err(e) = hook.app.save_window_state(crate::winstate::flags()) {
                 log::warn!(
                     "could not save window state before the update installer takes over: {e}"
                 );
             }
-            handle.cleanup_before_exit();
+            hook.app.cleanup_before_exit();
         })
         .build()
         .map_err(|e| e.to_string())?;
@@ -362,8 +374,7 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
 
     st.log("update downloaded, handing over to the installer");
-    st.mark_exiting();
-    st.kill_all_jobs();
+    // 隧道與 exiting 旗標交給 on_before_exit 處理：安裝真的起得來才動它們
     update.install(bytes).map_err(|e| e.to_string())
 }
 
