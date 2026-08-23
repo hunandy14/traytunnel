@@ -51,6 +51,29 @@ const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/relea
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 安裝版查 latest.json 的逾時。
+///
+/// updater 外掛的 builder 預設是 `None`，也就是**完全沒有上限**：GitHub 那邊
+/// 一旦是半開的連線（封包進得去、回應永遠不來），這個 async 任務就再也不會回來。
+/// 背景檢查每 24 小時起一次，卡住的任務會一直累積；手動按下的那顆「Check now」
+/// 更糟，前端的 await 沒有逾時，按鈕會永遠停在轉圈。
+///
+/// 給得比可攜車道的 10 秒寬一些：這條路要拉的是完整的 latest.json 並驗簽章。
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 下載安裝檔的逾時。
+///
+/// 與 CHECK_TIMEOUT 分開設是因為兩段的性質完全不同：查版本只拉一份幾百位元組的
+/// JSON，超過半分鐘一定是卡住了；下載拉的是十幾 MB 的安裝檔，而 reqwest 的
+/// `timeout` 管的是**整個請求含讀完 body** 的總時間，設窄了會把慢速但正常的
+/// 下載一起砍掉（使用者看到的是「更新老是失敗」，而不是「網路慢」）。
+/// 因此這裡放寬到 10 分鐘：它要擋的是永遠不會結束的連線，不是慢的連線。
+///
+/// 這一段的值傳不進 builder——外掛建 `Update` 物件時把 timeout 寫死成 `None`
+/// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
+/// 所以只能在拿到 Update 物件之後對它的 pub 欄位直接賦值。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
 const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
@@ -175,8 +198,11 @@ async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
 ///
 /// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
+/// 這裡不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
+/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道 CHECK_TIMEOUT。
 async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater =
+        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
     let current = app.package_info().version.to_string();
     Ok(found.and_then(|u| accept_installed(&u.version, &current)))
@@ -312,6 +338,7 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     let updater = st
         .app
         .updater_builder()
+        .timeout(CHECK_TIMEOUT)
         .on_before_exit(move || {
             if let Err(e) = handle.save_window_state(crate::winstate::flags()) {
                 log::warn!(
@@ -322,11 +349,14 @@ pub async fn install(st: &Shared) -> Result<(), String> {
         })
         .build()
         .map_err(|e| e.to_string())?;
-    let update = updater
+    let mut update = updater
         .check()
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No update available".to_string())?;
+    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
+    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
 
     st.log(format!("downloading update v{}", update.version));
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
