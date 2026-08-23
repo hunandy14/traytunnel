@@ -38,7 +38,8 @@ import {
   upsertWgProxy,
   upsertWgSocks,
 } from "./ipc";
-import type { ConnKind, ExitInfo, Snapshot, SourceInfo, WgProxyInfo } from "./types";
+import type { ConnKind, ConnTarget, ExitInfo, Snapshot } from "./types";
+import { basename, validateConnName } from "./util";
 import { loadAppVersion } from "./version";
 
 // ---------------------------------------------------------------- sheet 共用
@@ -151,15 +152,22 @@ function setTestBusy(next: boolean) {
   btn.classList.toggle("loading", next);
 }
 
-/** 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤 */
-function assignError(msg: string) {
+/**
+ * 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤。
+ *
+ * `tab` 一定要由呼叫端把「送出那一刻」的分頁傳進來，不能在這裡讀 activeTab：
+ * upsert 在途時使用者切了分頁的話，回應到達時的 activeTab 已經是另一個分頁，
+ * 錯誤會被掛到完全無關的欄位上。saveSsh／saveWg 各自送的是自己那一組欄位，
+ * 錯誤歸屬在呼叫的當下就已經確定了。
+ */
+function assignError(msg: string, tab: Tab) {
   const m = /^\s*(name|host|user|proxycommand|confpath)\s*:\s*([\s\S]+)$/i.exec(msg);
   if (!m) {
     setGeneralError(el<HTMLDivElement>("src-error"), msg);
     return;
   }
   const lower = m[1].toLowerCase();
-  if (activeTab === "wg") {
+  if (tab === "wg") {
     // wg 分頁：name 對應 wgName 這個欄位鍵，confPath 直接對應
     const key: WgField = lower === "confpath" ? "conf" : "wgName";
     setFieldError(backdrop(), key, m[2].trim());
@@ -172,31 +180,25 @@ function assignError(msg: string) {
 
 /**
  * 送出前先做一輪本地檢查，訊息與後端用同一套欄位前綴。
- * name 的規則照 Rust 端 valid_source_name：不可空白、不可含中括號
- * （日誌行前綴是 `[源名]`，名字裡再冒出一個 `]` 會讓前端切不出正確的源名）。
+ * name 的三條規則（不可空白／不可含空白／不可含中括號）跟 dev-mock 與 Rust 端
+ * 的 valid_source_name 共用 util.ts 的 validateConnName，不各寫一份。
  */
 function localValidateSsh(): Partial<Record<SshField, string>> {
   const errors: Partial<Record<SshField, string>> = {};
-  const name = sshInput("name").value.trim();
+  const nameErr = validateConnName(sshInput("name").value.trim());
   const host = sshInput("host").value.trim();
-  const user = sshInput("user").value.trim();
-  if (!name) errors.name = "name is required";
-  else if (/\s/.test(name)) errors.name = "must not contain spaces";
-  else if (/[[\]]/.test(name)) errors.name = "must not contain brackets";
+  if (nameErr) errors.name = nameErr;
   if (!host) errors.host = "host is required";
   else if (/\s/.test(host)) errors.host = "must not contain spaces";
-  if (!user) errors.user = "user is required";
+  if (!sshInput("user").value.trim()) errors.user = "user is required";
   return errors;
 }
 
 function localValidateWg(): Partial<Record<WgField, string>> {
   const errors: Partial<Record<WgField, string>> = {};
-  const name = wgInput("wgName").value.trim();
-  const conf = wgInput("conf").value.trim();
-  if (!name) errors.wgName = "name is required";
-  else if (/\s/.test(name)) errors.wgName = "must not contain spaces";
-  else if (/[[\]]/.test(name)) errors.wgName = "must not contain brackets";
-  if (!conf) errors.conf = ".conf path is required";
+  const nameErr = validateConnName(wgInput("wgName").value.trim());
+  if (nameErr) errors.wgName = nameErr;
+  if (!wgInput("conf").value.trim()) errors.conf = ".conf path is required";
   return errors;
 }
 
@@ -205,16 +207,26 @@ function showFoot(mode: "edit" | "confirm") {
   el<HTMLElement>("src-confirm").hidden = mode !== "confirm";
 }
 
+/**
+ * 切分頁。兩張分頁共用同一條測試列，所以切過去之前一定要把上一張的測試結果
+ * 收乾淨、並讓在途的那次探測作廢（testGeneration++）——否則 SSH 那邊的
+ * 「Connected」會殘留在 WG 分頁底下，或是晚到的舊回應直接畫到新分頁上，
+ * 兩者都會讓使用者以為現在這張表單已經測過了。按鈕狀態比照欄位 input handler
+ * 一併重置，不然作廢掉的那次探測沒有人會再去解鎖它。
+ */
 function setTab(tab: Tab) {
   activeTab = tab;
   el<HTMLButtonElement>("src-tab-ssh").classList.toggle("active", tab === "ssh");
   el<HTMLButtonElement>("src-tab-wg").classList.toggle("active", tab === "wg");
   el<HTMLElement>("src-fields-ssh").hidden = tab !== "ssh";
   el<HTMLElement>("src-fields-wg").hidden = tab !== "wg";
+  clearTestResult();
+  testGeneration++;
+  if (testBusy) setTestBusy(false);
 }
 
-/** 傳給 openSourceSheet 的編輯對象：null 代表新增 */
-export type ConnTarget = { kind: "ssh"; data: SourceInfo } | { kind: "wg"; data: WgProxyInfo };
+/** 傳給 openSourceSheet 的編輯對象：null 代表新增。型別本體在 types.ts */
+export type { ConnTarget };
 
 export function openSourceSheet(target: ConnTarget | null) {
   originalName = target ? target.data.name : null;
@@ -296,7 +308,8 @@ async function saveSsh() {
     });
     busy = false;
     if (err) {
-      assignError(err);
+      // 送出的是 ssh 那組欄位，錯誤就一定歸 ssh 分頁——不看回應到達時的 activeTab
+      assignError(err, "ssh");
       return;
     }
     closeSourceSheet();
@@ -325,7 +338,7 @@ async function saveWg() {
     });
     busy = false;
     if (err) {
-      assignError(err);
+      assignError(err, "wg");
       return;
     }
     closeSourceSheet();
@@ -411,8 +424,7 @@ async function pickConf() {
     // 只是預填，使用者仍然可以自己改
     const nameField = wgInput("wgName");
     if (!nameField.value.trim()) {
-      const base = path.split(/[\\/]/).pop() ?? path;
-      nameField.value = base.replace(/\.conf$/i, "");
+      nameField.value = basename(path).replace(/\.conf$/i, "");
     }
   } catch (e) {
     setFieldError(backdrop(), "conf", String(e));
