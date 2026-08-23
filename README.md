@@ -57,6 +57,10 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 
 每個 Release 也會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）。另外還有一個 `latest.json`，那是應用內更新自己要讀的清單（版本號、安裝檔網址與簽章），不必手動下載。
 
+本專案使用 SignPath Foundation 提供的憑證做程式碼簽章。
+
+Free code signing provided by [SignPath.io](https://signpath.io/) , certificate by [SignPath Foundation](https://signpath.org/) .
+
 ## 介面
 
 介面上的用詞與設定檔的結構對應：一個 `[[sources]]` 在畫面上叫一條**連線**（connection），底下的每個 `[[sources.forwards]]` 叫一條**隧道**（tunnel）。
