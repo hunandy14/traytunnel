@@ -77,7 +77,7 @@ jobs:
 
       # tag 不存在才動手：建 annotated tag、push，再主動 dispatch release.yml。
       # GitHub 防遞迴機制——用 GITHUB_TOKEN push 的 tag 不會觸發其他 workflow 的
-      # on: push: tags，所以這裡必須自己 gh workflow run 補一腳。
+      # on: push: tags，因此這裡必須自行以 gh workflow run 觸發。
       - name: Create annotated tag and push
         if: steps.check.outputs.exists == 'false'
         shell: bash
