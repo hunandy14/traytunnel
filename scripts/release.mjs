@@ -5,7 +5,7 @@
  *   （npm 轉發純位置參數不需要 `--`，但 `--dry-run` 這種旗標視 npm 版本可能要加，
  *    保險起見兩種寫法都能用；也可以直接 node scripts/release.mjs <x.y.z> --dry-run）
  *
- * 背景：main 已開 branch protection，要求 ci 檢查綠才可合併。這支腳本開完 PR 後
+ * main 開了 branch protection，要求 ci 檢查綠才可合併。這支腳本開完 PR 後
  * 立刻 `gh pr merge --auto --merge`：CI 綠了 GitHub 就自動合併，合併觸發
  * autotag.yml 貼 tag、release.yml 建置發佈，全程不必再手動介入。
  *
@@ -77,10 +77,10 @@ function formatCommand(command, args) {
  * 或先用 where 解出完整路徑再直呼，兩種都會丟 EINVAL，因此 shell:true 是
  * 必要的，不能省。
  *
- * 但 shell:true 搭配「command + args 陣列」的舊寫法會觸發 Node 的 DEP0190
- * 警告（args 只是原樣接起來、未跳脫，有注入風險）。Node 官方對此的建議
- * 修法是別再分開傳 args，而是自己組好完整指令字串、整串交給 shell 解析
- * ——所以這裡改成只傳 formatCommand() 組出的單一字串，不再傳 args 陣列。
+ * shell:true 時只可以傳 formatCommand() 組出的單一指令字串，不可以分開傳
+ * args 陣列：那個組合會觸發 Node 的 DEP0190 警告（陣列只是原樣接起來、
+ * 未跳脫，有注入風險），Node 官方的指引就是自己組好完整指令字串、
+ * 整串交給 shell 解析。
  *
  * git/gh/cargo/node 都是 .exe，CreateProcess 能直接執行，不必經過 shell
  * （也避免參數裡的中文與標點被 shell 重新解析）。

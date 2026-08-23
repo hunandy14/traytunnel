@@ -7,7 +7,7 @@
 //!
 //! 就地更新那條路是例外——`tauri-plugin-updater` 在 Windows 上裝完新版是直接
 //! `std::process::exit(0)`，繞過 `RunEvent::Exit`，外掛的存檔 hook 因此不會跑。
-//! 這個地雷在 `update::install` 裡用 `updater_builder().on_before_exit(..)` 補：
+//! 這個落差在 `update::install` 裡用 `updater_builder().on_before_exit(..)` 補：
 //! 交棒給安裝程式之前自己呼叫一次 `save_window_state`。
 
 use tauri::{PhysicalSize, Runtime, WebviewWindow};

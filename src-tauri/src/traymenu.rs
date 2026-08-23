@@ -344,7 +344,7 @@ mod tests {
     }
 
     /// hover 提示與右鍵狀態行必須是同一個分數，分母都是全部出口（含停用的），
-    /// 不然滑過去看到的與按下去看到的會互相打架
+    /// 否則滑過去看到的與按下去看到的會互相矛盾
     #[test]
     fn tooltip_and_status_line_share_one_score() {
         let mut sources = two_sources();

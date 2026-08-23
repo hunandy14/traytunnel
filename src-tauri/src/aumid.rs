@@ -164,7 +164,7 @@ pub fn read_shortcut_aumid(lnk: &Path) -> Option<String> {
 
 /// 建立或更新帶 AUMID 的開始選單捷徑，回傳 true 代表這次真的寫了檔。
 pub fn ensure_shortcut(lnk: &Path, exe: &Path, aumid: &str, description: &str) -> io::Result<bool> {
-    // 指向對的執行檔還不夠，屬性也得在：舊版留下的捷徑可能根本沒帶 AUMID
+    // 指向對的執行檔還不夠，屬性也得在：既有捷徑可能沒帶 AUMID 屬性
     let pointing_here = !shortcut_is_stale(read_shortcut_target(lnk).as_deref(), exe);
     if pointing_here && read_shortcut_aumid(lnk).as_deref() == Some(aumid) {
         return Ok(false);
@@ -253,7 +253,7 @@ pub fn prepare(aumid: &str, product: &str, exe: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// 捷徑不存在、或指到別的執行檔（例如程式搬過家）都要重寫
+    /// 捷徑不存在、或指到別的執行檔（例如執行檔換了位置）都要重寫
     #[test]
     fn stale_when_missing_or_pointing_elsewhere() {
         let exe = Path::new(r"C:\Apps\Traytunnel\traytunnel.exe");
@@ -292,7 +292,7 @@ mod tests {
     }
 
     /// 真的寫一次 HKCU\Software\Classes\AppUserModelId\{id} 再讀回來，最後清掉。
-    /// IconUri 現在要指到落地的 PNG 檔，不是 exe——toast 只吃圖片檔。
+    /// IconUri 必須指到落地的 PNG 檔，不是 exe——toast 只吃圖片檔。
     #[test]
     fn aumid_registry_entry_round_trips() {
         let id = format!("com.traytunnel.desktop.test{}", std::process::id());

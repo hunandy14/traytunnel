@@ -106,7 +106,7 @@ pub struct Snapshot {
 }
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
-/// 號碼是拿到位子之後才取的，沒搶到就不白燒一個世代序號。
+/// 號碼在取得位子之後才配發，未取得時不消耗世代序號。
 fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> Option<u64> {
     if slot.is_some() {
         return None;
@@ -234,7 +234,7 @@ impl AppState {
     /// （源、出口、字串全部），而狀態一變就會連推好幾次事件，複製量相當可觀。
     ///
     /// 閉包裡不可以再碰任何會鎖 cfg 的方法（`update_config`、`with_config`
-    /// 自己），否則當場自我死鎖。要跨鎖持有的話，在閉包裡複製需要的那幾筆
+    /// 自己），否則會當場造成自我死鎖。要跨鎖持有的話，在閉包裡複製需要的那幾筆
     /// 出來就好——目前全程式沒有任何一處真的需要整份 owned 設定。
     pub fn with_config<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
         f(&self.cfg.lock().unwrap())
@@ -457,9 +457,9 @@ impl AppState {
     /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，
     /// 之後一律回 false。
     ///
-    /// 名字用 take_ 是因為它會改狀態——原本叫 tray_hint_shown，讀起來像個
-    /// getter，實際上是 swap(true)，呼叫端很容易以為只是問一下。已經自己彈過
-    /// 通知的路徑（例如 --tray 啟動）直接呼叫它把提示領掉即可。
+    /// 命名用 take_ 前綴是為了標示它會改狀態：實作是 swap(true)，不是單純查詢，
+    /// 呼叫一次提示就被領走。已經自己彈過通知的路徑（例如 --tray 啟動）
+    /// 直接呼叫它把提示領掉即可。
     pub fn take_tray_hint(&self) -> bool {
         !self.tray_hint_shown.swap(true, Ordering::SeqCst)
     }
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(logs.back().unwrap(), &format!("line {}", LOG_CAPACITY + 99));
     }
 
-    /// F2：start 對已經在跑的出口不能再起一條 ssh，否則舊的 ssh 還佔著埠，
+    /// start 對已經在跑的出口不能再起一條 ssh，否則舊的 ssh 還佔著埠，
     /// 新的監看迴圈會掃到自己人而誤報 port_busy
     #[test]
     fn second_claim_is_refused_while_one_is_running() {
@@ -607,7 +607,7 @@ mod tests {
         };
         assert_eq!(claim_slot(&mut slot, &mut next), Some(1));
         assert_eq!(claim_slot(&mut slot, &mut next), None);
-        // 沒搶到就不該白燒世代序號
+        // 未取得位子時不該消耗世代序號
         assert_eq!(seq, 1);
     }
 
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(claim_slot(&mut slot, &mut next), None);
     }
 
-    /// halt 之後舊迴圈才慢半拍退出，不能讓它把新迴圈的位子清掉
+    /// halt 之後舊迴圈較晚才退出，不能讓它把新迴圈的位子清掉
     #[test]
     fn stale_supervisor_cannot_release_a_newer_one() {
         let mut slot = None;

@@ -82,7 +82,7 @@ fn without_a_home_dir_it_uses_the_exe_dir_dotfile() {
     assert_ne!(loc.path, exe.join(TOML_NAME));
 }
 
-// ------------------------------ 檔名含 p 的可攜記號（Rufus 那套）
+// ------------------------------ 檔名含 p 的可攜記號（Rufus 慣例）
 
 /// 產品名 traytunnel 不是 p 結尾，這是整個記號成立的前提
 #[test]
@@ -838,7 +838,7 @@ fn write_drops_removed_sources() {
     assert!(empty.sources.is_empty());
 }
 
-/// 新增源時就地補一張新桌，讀回來要一模一樣
+/// 新增源時就地補一張新表格，讀回來要一模一樣
 #[test]
 fn write_appends_new_source() {
     let dir = tmp_dir("grow-src");
@@ -875,7 +875,7 @@ fn bare_port_normalizes_to_loopback() {
     assert_eq!(normalize_remote("1080"), "127.0.0.1:1080");
     assert_eq!(normalize_remote("1"), "127.0.0.1:1");
     assert_eq!(normalize_remote("65535"), "127.0.0.1:65535");
-    // 前後空白算使用者手滑，一起吃掉
+    // 前後空白一併去除
     assert_eq!(normalize_remote("  8080  "), "127.0.0.1:8080");
     // 前導零是有意放行的：0080 就是 80，parse 出來的值才算數
     assert_eq!(normalize_remote("0080"), "127.0.0.1:80");
@@ -885,8 +885,8 @@ fn bare_port_normalizes_to_loopback() {
     assert!(validate_forward(&list, None, "ok", 1090, "1080").is_none());
 }
 
-/// 純數字的守衛是載重的：`parse::<u16>()` 自己會放行 `+80`，
-/// 補糖時把它當成 80 會讓一個 ssh 絕對不認的字串偷偷變成合法值
+/// 純數字的守衛是必要的：`parse::<u16>()` 自己會放行 `+80`，
+/// 補全時若把它當成 80，一個 ssh 不認得的字串就會靜靜變成合法值
 #[test]
 fn a_signed_number_is_not_a_bare_port() {
     assert_eq!(normalize_remote("+80"), "+80");
@@ -896,7 +896,7 @@ fn a_signed_number_is_not_a_bare_port() {
     assert!(err(&list, None, "ok", 1090, "-80").starts_with("remote: "));
 }
 
-/// 越界的埠不補糖，照舊擋在 remote 這欄（`0`／`70000` 都不是合法目的地）
+/// 越界的埠不做簡寫補全，一律擋在 remote 這欄（`0`／`70000` 都不是合法目的地）
 #[test]
 fn out_of_range_bare_port_is_rejected() {
     assert_eq!(normalize_remote("0"), "0");
@@ -917,7 +917,7 @@ fn host_port_remotes_pass_through_untouched() {
     assert_eq!(normalize_remote("127.0.0.1:1080"), "127.0.0.1:1080");
     assert_eq!(normalize_remote("example.com:22"), "example.com:22");
     assert_eq!(normalize_remote("10.0.0.5:8080"), "10.0.0.5:8080");
-    // 不是純數字也不是 host:port 的照樣被擋，糖不會把它救回來
+    // 不是純數字也不是 host:port 的照樣被擋，簡寫補全不會讓它變成合法值
     assert_eq!(normalize_remote("nope"), "nope");
     assert_eq!(normalize_remote("127.0.0.1"), "127.0.0.1");
     let list = vec![src("hk", vec![fwd("a", 1080)])];
@@ -934,7 +934,7 @@ fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
     let list = vec![src("hk", vec![fwd("a", 1080)])];
     let made = prepare_forward(&list, None, "  web  ", 1090, "8080", true)
         .expect("補完的形式是合法 remote，應該過");
-    // 產出：名字順手 trim，remote 是完整形式
+    // 產出：名字經過 trim，remote 是完整形式
     assert_eq!(
         made,
         Forward { name: "web".into(), local: 1090, remote: "127.0.0.1:8080".into(), enabled: true }

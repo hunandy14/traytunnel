@@ -16,7 +16,7 @@ const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 /// 從內嵌的多層 ICO 裡挑最接近 `want` 的一層，解成 RGBA。
 ///
 /// Tauri codegen 的 `default_window_icon()` 只取 ICO 的第一層固定尺寸（我們的第一層
-/// 是 16px），高 DPI 時交給 GDI 拉伸就會糊掉（tauri#14596、#9335），所以系統匣與主
+/// 是 16px），高 DPI 時交給 GDI 拉伸就會模糊（tauri#14596、#9335），所以系統匣與主
 /// 視窗都自己挑層再明確設定。
 fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
     let dir = ico::IconDir::read(Cursor::new(APP_ICO)).ok()?;
@@ -43,7 +43,7 @@ mod tests {
     use super::*;
 
     /// 內嵌的 ICO 必須含系統匣（SM_CXSMICON）與視窗（SM_CXICON）常用的整數縮放
-    /// 尺寸，少了哪一層就會退回讓 GDI 拉伸而糊掉。125%／150%／175% 的 40／48／56
+    /// 尺寸，少了哪一層就會退回讓 GDI 拉伸而模糊。125%／150%／175% 的 40／48／56
     /// 沒有專用層，靠 pick_icon_layer 往上取一層再由系統縮小。
     #[test]
     fn embedded_ico_has_the_icon_layers() {

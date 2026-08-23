@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
-/// 可攜模式的檔名：放在執行檔旁邊就生效（KeePass／Rufus 那套同名檔慣例）
+/// 可攜模式的檔名：放在執行檔旁邊就生效（KeePass／Rufus 的同名檔慣例）
 pub const TOML_NAME: &str = "traytunnel.toml";
 
 /// 家目錄模式的檔名，點開頭，不去污染使用者家目錄的檔案清單
@@ -53,7 +53,7 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-/// 執行檔主檔名裡的可攜記號：Rufus 的 `rufus-4.5p.exe` 那套，記號是**結尾**的 p。
+/// 執行檔主檔名裡的可攜記號：沿用 Rufus 的 `rufus-4.5p.exe` 慣例，記號是**結尾**的 p。
 ///
 /// 只認結尾而不是任意位置，否則 Windows 複製檔案自動取的
 /// 「traytunnel - Copy.exe」（Copy 裡有 p）會莫名其妙變成可攜模式。
@@ -486,7 +486,7 @@ pub fn parse_document(raw: &str) -> Result<(Config, bool), String> {
     Ok((cfg, legacy))
 }
 
-/// 讀進來的設定也吃埠號糖：手寫 `remote = "8080"` 一樣算數，在這裡就補成完整形式。
+/// 讀進來的設定同樣支援純埠號的簡寫：手寫 `remote = "8080"` 一樣算數，在這裡就補成完整形式。
 ///
 /// 補在解析的出口處，程式其他地方（ssh 參數、介面顯示、下次存檔）拿到的就永遠是
 /// `host:port`，不必各自再判斷一次；下次存檔時檔案裡那個 `8080` 也會被寫成完整形式。
@@ -574,7 +574,7 @@ fn migrate_document(doc: &mut DocumentMut) {
     doc.insert("sources", Item::ArrayOfTables(arr));
 }
 
-/// 逐張桌就地改寫（多的砍掉、少的補上），使用者寫在單筆上方的註解才不會消失
+/// 逐張表格就地改寫（多的移除、少的補上），使用者寫在單筆上方的註解才不會消失
 fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
     while tables.len() > forwards.len() {
         tables.remove(tables.len() - 1);
@@ -593,7 +593,7 @@ fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
 
 /// 寫回設定，沿用既有檔案的註解與排版。
 ///
-/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張桌就地改寫；讀到的是
+/// `[[sources]]` 與巢狀的 `[[sources.forwards]]` 都逐張表格就地改寫；讀到的是
 /// 舊制檔案時先把結構遷移成新制再寫。
 pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
     let mut doc = std::fs::read_to_string(path)
@@ -689,7 +689,7 @@ pub fn valid_remote(s: &str) -> bool {
     }
 }
 
-/// REMOTE 欄位的輸入糖：只填埠號（純數字且落在 1-65535）時視為「伺服器本機的那個埠」，
+/// REMOTE 欄位的簡寫形式：只填埠號（純數字且落在 1-65535）時視為「伺服器本機的那個埠」，
 /// 補成 `127.0.0.1:<port>`。其他寫法原樣送回去給 `valid_remote` 判，
 /// 所以越界的埠（`0`、`70000`）不會被補成合法值，而是照舊被擋在 remote 這欄。
 ///

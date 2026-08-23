@@ -14,7 +14,7 @@ use crate::exits::{probe, ExitTest};
 use crate::state::{status, test_state, AppState};
 use crate::winsys::{is_listening, Job};
 
-/// CREATE_NO_WINDOW，杜絕黑窗一閃
+/// CREATE_NO_WINDOW，避免主控台視窗一閃而過
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 連線偵測輪詢間隔
 const POLL: Duration = Duration::from_millis(2000);
@@ -24,7 +24,7 @@ const RETRY: Duration = Duration::from_secs(5);
 /// 判定 port_busy 前先給這段緩衝再看一次，免得重接時誤報佔用
 const PORT_GRACE: Duration = Duration::from_millis(500);
 /// 連線測試的總上限，涵蓋 spawn 到程序退出的整段等待；
-/// ssh 自己的 ConnectTimeout 管不到 ProxyCommand 卡住的情況，這裡兜底。
+/// ssh 自己的 ConnectTimeout 管不到 ProxyCommand 卡住的情況，因此在這裡設一道總上限。
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 組單一出口的 ssh 參數，每個 token 獨立傳遞，不做字串拼接。
@@ -188,7 +188,7 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
 ///
 /// 語意是「確保這個出口有一條線在跑」：已經有監看迴圈時直接 no-op，
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
-/// 還佔著的埠，白白誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
+/// 還佔著的埠，誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
     if state.with_config(|c| c.forward(local).is_none()) {
         return;
@@ -285,7 +285,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         // 迴圈自己因為 enabled=false 就退出，會在沒有遞增世代的情況下把
         // 監看位子還掉，剛好插進來的 start 就會被這個早退吃掉一次 claim。
 
-        // (b) spawn 前先看埠是不是已經被系統上的其他程序佔住
+        // spawn 前先看埠是不是已經被系統上的其他程序佔住
         let mut busy = port_busy_detail(local, is_listening(local));
         if busy.is_some() {
             tokio::time::sleep(PORT_GRACE).await;
@@ -305,7 +305,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
 
         state.set_exit_status(local, status::CONNECTING, None);
 
-        // spawn 失敗時自己交代重試，不要再補一行「disconnected」
+        // spawn 失敗的分支自己記下重試訊息，不再補一行「disconnected」
         let mut spawn_failed = false;
         match spawn_ssh(&src, &f) {
             Err(e) => {
@@ -320,7 +320,8 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                 state.store_job(local, generation, job);
                 state.log_from(sname, format!("{} : ssh starting (pid {pid})", f.name));
                 if let Some(stderr) = child.stderr.take() {
-                    // ssh 的錯誤訊息只寫進檔案日誌，維持活動區與原版一致
+                    // ssh stderr 噪音大，只寫進檔案日誌，不進活動區——
+                    // 活動區只保留本程式自身的事件
                     let name = format!("{sname}/{}", f.name);
                     tauri::async_runtime::spawn(async move {
                         let mut lines = BufReader::new(stderr).lines();
@@ -380,7 +381,7 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
         return; // 同一個埠已經在測了
     }
     state.set_exit_test(local, test_state::TESTING, "testing...");
-    // 自測是飛在半空的：探測期間使用者可能已經中斷或重接了這個出口，
+    // 自測在背景非同步進行：探測期間使用者可能已經中斷或重接了這個出口，
     // 那時 halt 早就把 last_test 清乾淨，晚到的結果不可以再寫回去
     let generation = state.generation(local);
     let st = state.clone();

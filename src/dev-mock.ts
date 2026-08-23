@@ -55,11 +55,11 @@ const DEFAULT_SNAPSHOT: Snapshot = {
     },
   ],
   logs: [],
-  // 預設沒有新版，更新列不出現；三種更新情境由 __mock 那邊演（見 installScenarioHooks）
+  // 預設沒有新版，更新列不出現；三種更新情境由 __mock 那邊演練（見 installScenarioHooks）
   update: null,
 };
 
-/** 假的出口自測結果，照原版「ip  city, country」格式；沒列到的埠就當作測不到 */
+/** 假的出口自測結果，格式與真後端一致（`ip  city, country`）；沒列到的埠就當作測不到 */
 const FAKE_TEST: Record<number, string> = {
   1080: "203.0.113.42  Tokyo, JP",
   1081: "203.0.113.42  Tokyo, JP",
@@ -94,7 +94,7 @@ function persist() {
   try {
     sessionStorage.setItem(STORE_KEY, JSON.stringify({ ...state, logs: [] }));
   } catch {
-    /* 無痕模式之類的存不進去就算了，記憶體裡還是對的 */
+    /* 無痕模式之類的存不進去就略過，記憶體裡的狀態仍然正確 */
   }
 }
 
@@ -296,7 +296,7 @@ function validateSource(input: {
 
 // ---------------------------------------------------------------- 連線測試
 
-/** 演一下真後端的延遲感：spawn ssh、等它跑完，總要花一點時間 */
+/** 模擬真後端的延遲：spawn ssh、等它跑完，總要花一點時間 */
 const TEST_CONNECTION_DELAY_MS = 1500;
 
 /**
