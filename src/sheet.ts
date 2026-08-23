@@ -104,7 +104,7 @@ let originalName: string | null = null;
 let testBusy = false;
 /**
  * 每次開關 sheet 都遞增，測試中途關掉 sheet 就讓當初送出的那次結果作廢，
- * 不必真的取消後端探測——反正它自己有 15 秒兜底逾時，函式結束就收乾淨。
+ * 不必真的取消後端探測——後端探測本身有 15 秒逾時上限，函式結束時就會收乾淨。
  */
 let testGeneration = 0;
 
@@ -189,7 +189,7 @@ export function openSourceSheet(src: SourceInfo | null) {
 function closeSourceSheet() {
   if (!open) return;
   open = false;
-  // 讓還在飛的測試結果作廢，reopen 之後 gen 對不上就不會被顯示出來
+  // 讓仍在進行中的測試結果作廢，reopen 之後 gen 對不上就不會被顯示出來
   testGeneration++;
   hideSheet(backdrop(), () => !open);
 }
@@ -530,7 +530,7 @@ function mainLook(): { icon: IconName; label: string; disabled: boolean; spin: b
     case "available":
       return {
         icon: "download",
-        // available 一定伴隨 updateInfo，兜底只是為了不讓型別上的 null 變成畫面上的 undefined
+        // available 一定伴隨 updateInfo，這個退路只是為了不讓型別上的 null 變成畫面上的 undefined
         label: updateInfo ? updateActionLabel(updateInfo) : "Update available",
         disabled: false,
         spin: false,

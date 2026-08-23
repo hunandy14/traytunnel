@@ -1,10 +1,10 @@
 /**
  * 出口／源狀態的純函式工具與卡片文字格式化，不碰 DOM。
  *
- * sourceTone 原本直接吃 SourceInfo 並自己過濾 pendingDelete（哪些出口正在等
- * undo 倒數、畫面上先當它不存在）——但 pendingDelete 是 main.ts 自己的簿記，
- * 不屬於這裡的狀態判斷。改成直接吃「已經濾好的出口清單」，濾除的動作留在
- * main.ts（呼叫既有的 visibleExits 再傳進來）。
+ * 這一層只依當下的出口狀態做判斷，不持有任何畫面簿記：pendingDelete
+ * （哪些出口正在等 undo 倒數、畫面上先當它不存在）屬於 main.ts，
+ * 因此 sourceTone 吃的是「已經濾好的出口清單」，過濾動作留在呼叫端
+ * （main.ts 的 visibleExits）。
  */
 
 import type { ExitInfo, ExitStatus } from "./types";

@@ -525,7 +525,7 @@ function fill(box: HTMLElement, lines: string[], emptyText: string) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
-/** 日誌只剩下獨立的活動頁一個出口，主區不再掛即時的小視窗 */
+/** 日誌只有獨立的活動頁一個出口，主區不掛即時視窗 */
 function renderLogs() {
   if (view === "log") fill(el<HTMLDivElement>("full-log"), logLines, "No activity yet");
 }
