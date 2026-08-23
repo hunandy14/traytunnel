@@ -24,12 +24,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # 需要完整歷史與所有 tag，workflow_dispatch 才驗得到既有 tag 是否存在
-          fetch-depth: 0
 
       # 版本防呆：tag 觸發時比對 tag（去 v）與 Cargo.toml version，
-      # workflow_dispatch 則以 Cargo.toml 為準並確認對應 tag 已存在。
+      # workflow_dispatch 則以 Cargo.toml 為準，並用 git ls-remote 向遠端
+      # 確認對應 tag 已存在（不吃本地 checkout 深度，對齊 autotag.yml 的作法）。
       # windows-latest 預設 shell 是 pwsh，這裡明定 shell 並用 PowerShell 語法。
       - name: Resolve release version and tag
         id: resolve
@@ -63,7 +61,7 @@ jobs:
             $releaseTag = $tagName
           } else {
             $releaseTag = "v$version"
-            $exists = git tag -l $releaseTag
+            $exists = git ls-remote --tags origin "refs/tags/$releaseTag"
             if ([string]::IsNullOrWhiteSpace($exists)) {
               Write-Error "workflow_dispatch 手動觸發，但 tag $releaseTag 不存在——請先 npm run bump、commit、git tag $releaseTag 並 git push --tags，再重新執行本 workflow"
               exit 1
