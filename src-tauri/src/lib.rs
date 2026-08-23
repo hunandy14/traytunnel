@@ -3,14 +3,17 @@ mod aumid;
 mod commands;
 mod config;
 mod exits;
+mod ssh;
 mod state;
 mod traymenu;
-mod tunnel;
 mod update;
 mod winstate;
 mod winsys;
 
 use std::sync::Arc;
+
+// tunnel 搬進 ssh 模組後在此轉口，讓既有呼叫端維持 `tunnel::...` 不必改路徑
+pub use ssh::tunnel;
 
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
