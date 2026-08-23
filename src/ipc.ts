@@ -64,6 +64,22 @@ export const upsertWgProxy = (input: WgProxyInput) =>
 /** 刪 WG 連線，底下所有列一併刪掉，運行中的先停 */
 export const deleteWgProxy = (name: string) => invoke<void>("delete_wg_proxy", { name });
 
+/**
+ * 連線層的引擎總開關（wg-design.md §5.5 第 3 支）。前端的連線總開關與 ⋯ 選單的
+ * Connect／Disconnect 都走這一支，不要退回「逐列迴圈呼叫 start_exit／stop_exit」。
+ *
+ * 與 ssh 的 set_source_enabled **刻意不對稱**：ssh 沒有「連線」這個執行實體，
+ * 停它只能逐條改寫每個出口的 enabled；wg 的連線是一顆真的引擎，這一支只改寫
+ * 連線自己的 enabled，**底下各列的 enabled 意圖一個都不碰**——
+ *
+ *   on = false：停引擎、收掉所有列的監聽器，各列的意圖原封不動
+ *   on = true ：起引擎，並且只啟動 enabled = true 的列
+ *
+ * 使用者重新打開連線時，原本刻意停用的那幾條列才不會被一起打開。
+ */
+export const setWgEnabled = (name: string, on: boolean) =>
+  invoke<void>("set_wg_enabled", { name, on });
+
 /** 存檔前的 .conf 測試：解析＋真握手，15 秒上限，回傳形狀與 test_connection 一致 */
 export const testWgConf = (confPath: string) =>
   invoke<TestConnectionResult>("test_wg_conf", { confPath });
