@@ -16,7 +16,7 @@
  * 4. 主區的全域設定頁 —— 兩個 toggle 即時生效，失敗就把畫面翻回去。
  */
 
-import { afterTransition, el } from "./dom";
+import { afterTransition, el, isToggleOn, setToggle } from "./dom";
 import { setIcon, type IconName } from "./icons";
 import {
   checkForUpdatesNow,
@@ -60,6 +60,38 @@ function setFieldError(root: HTMLElement, key: string, msg: string) {
 function setGeneralError(node: HTMLElement, msg: string) {
   node.textContent = msg;
   node.classList.toggle("show", Boolean(msg));
+}
+
+/**
+ * 後端錯誤字串（約定 `field: message`）的統一路由，四張 sheet 共用。
+ *
+ * `keyMap` 明列**這張 sheet 認得的前綴**與它對應的欄位鍵。認不得的前綴一律
+ * 原文進 general error——這一點是刻意的，兩個方向的錯誤都出過事：
+ *
+ *   - 只用正規表示式抓前綴、再直接拿去當欄位鍵：ssh 分頁收到 `confPath:`
+ *     （wg 才有的欄位）時會去找不存在的 `.field-confPath`，querySelector 回
+ *     null，接著在它身上取 `.field-error` 就是一個 TypeError——真正的錯誤訊息
+ *     反而被這個例外蓋掉，使用者什麼都看不到。
+ *   - 反過來，用「不是 A 就當成 B」的二分法兜底：wg 分頁會把任何沒見過的前綴
+ *     全部押到 Name 欄，等於指著一個沒問題的欄位說它錯了。
+ *
+ * 原文而不是去掉前綴：general error 是給人讀的最後一道，寧可多一個前綴也不要
+ * 誤砍掉訊息本身的一部分（後端也會回 `ssh: Could not resolve hostname …`
+ * 這種**本身就以冒號開頭**、前綴並不是欄位名的句子）。
+ */
+function applyFieldError(
+  root: HTMLElement,
+  msg: string,
+  keyMap: Record<string, string>,
+  generalNode: HTMLElement,
+) {
+  const m = /^\s*([A-Za-z]+)\s*:\s*([\s\S]+)$/.exec(msg);
+  const key = m ? keyMap[m[1].toLowerCase()] : undefined;
+  if (!m || !key) {
+    setGeneralError(generalNode, msg);
+    return;
+  }
+  setFieldError(root, key, m[2].trim());
 }
 
 /** Test 按鈕的就地結果：成功綠字、失敗紅字，空字串就整行藏起來 */
@@ -135,9 +167,22 @@ let testBusy = false;
  */
 let testGeneration = 0;
 
+/**
+ * 清掉**目前這張分頁**的欄位錯誤與整體錯誤。另一張分頁是 hidden 的，它的紅框
+ * 沒有人看得到，每次存檔都連它一起掃是白做的（backdrop() 也提出迴圈，
+ * 原本每個欄位都重查一次 DOM）。開 sheet 時要兩張都歸零，走 clearAllErrors。
+ */
 function clearErrors() {
-  for (const f of SSH_FIELDS) setFieldError(backdrop(), f, "");
-  for (const f of WG_FIELDS) setFieldError(backdrop(), f, "");
+  const root = backdrop();
+  const fields: readonly string[] = activeTab === "ssh" ? SSH_FIELDS : WG_FIELDS;
+  for (const f of fields) setFieldError(root, f, "");
+  setGeneralError(el<HTMLDivElement>("src-error"), "");
+}
+
+function clearAllErrors() {
+  const root = backdrop();
+  for (const f of SSH_FIELDS) setFieldError(root, f, "");
+  for (const f of WG_FIELDS) setFieldError(root, f, "");
   setGeneralError(el<HTMLDivElement>("src-error"), "");
 }
 
@@ -153,6 +198,36 @@ function setTestBusy(next: boolean) {
 }
 
 /**
+ * 「這一刻起，先前那次測試的結果都不算數了」——清畫面上的結果、讓在途的回應
+ * 作廢（gen 對不上就不會被畫出來）、把按鈕解鎖。
+ *
+ * 改欄位、選檔、切分頁、開關 sheet 這四種情境要的都是同一件事，之前各自手寫
+ * 三行，漏掉其中一行（例如切分頁只清了結果沒動 gen）就是一條競態。
+ */
+function invalidateTest() {
+  clearTestResult();
+  testGeneration++;
+  if (testBusy) setTestBusy(false);
+}
+
+/**
+ * 兩張分頁各自認得的前綴。刻意分開列：ssh 分頁上沒有 confPath 這個欄位，
+ * wg 分頁上也沒有 host／user，把不屬於自己的前綴列進來只會製造一個指不到
+ * 任何 DOM 的欄位鍵。
+ */
+const SSH_ERROR_KEYS: Record<string, SshField> = {
+  name: "name",
+  host: "host",
+  user: "user",
+  proxycommand: "proxyCommand",
+};
+
+const WG_ERROR_KEYS: Record<string, WgField> = {
+  name: "wgName",
+  confpath: "conf",
+};
+
+/**
  * 後端回傳的錯誤字串約定用 `field: message` 開頭，認不出前綴就當成整體錯誤。
  *
  * `tab` 一定要由呼叫端把「送出那一刻」的分頁傳進來，不能在這裡讀 activeTab：
@@ -161,21 +236,8 @@ function setTestBusy(next: boolean) {
  * 錯誤歸屬在呼叫的當下就已經確定了。
  */
 function assignError(msg: string, tab: Tab) {
-  const m = /^\s*(name|host|user|proxycommand|confpath)\s*:\s*([\s\S]+)$/i.exec(msg);
-  if (!m) {
-    setGeneralError(el<HTMLDivElement>("src-error"), msg);
-    return;
-  }
-  const lower = m[1].toLowerCase();
-  if (tab === "wg") {
-    // wg 分頁：name 對應 wgName 這個欄位鍵，confPath 直接對應
-    const key: WgField = lower === "confpath" ? "conf" : "wgName";
-    setFieldError(backdrop(), key, m[2].trim());
-    return;
-  }
-  // ssh 分頁：欄位鍵是 camelCase，比對過的前綴要轉回來
-  const key: SshField = lower === "proxycommand" ? "proxyCommand" : (lower as SshField);
-  setFieldError(backdrop(), key, m[2].trim());
+  const keys = tab === "wg" ? WG_ERROR_KEYS : SSH_ERROR_KEYS;
+  applyFieldError(backdrop(), msg, keys, el<HTMLDivElement>("src-error"));
 }
 
 /**
@@ -220,13 +282,23 @@ function setTab(tab: Tab) {
   el<HTMLButtonElement>("src-tab-wg").classList.toggle("active", tab === "wg");
   el<HTMLElement>("src-fields-ssh").hidden = tab !== "ssh";
   el<HTMLElement>("src-fields-wg").hidden = tab !== "wg";
-  clearTestResult();
-  testGeneration++;
-  if (testBusy) setTestBusy(false);
+  invalidateTest();
 }
 
 /** 傳給 openSourceSheet 的編輯對象：null 代表新增。型別本體在 types.ts */
 export type { ConnTarget };
+
+/**
+ * 刪除確認那一行的文案。ssh 底下掛的一律是隧道，wg 底下混著 socks 與 forward
+ * 兩種列所以只能統稱 row；單複數再各自變化。三層巢狀三元運算子讀起來要數
+ * 括號才知道哪個分支配哪個，拆成一個名詞變數就一目了然。
+ */
+function deleteConfirmText(target: ConnTarget | null): string {
+  if (!target) return "Delete this connection?";
+  const count = target.data.exits.length;
+  const noun = target.kind === "ssh" ? "tunnel" : "row";
+  return `Delete ${target.data.name} and its ${count} ${noun}${count === 1 ? "" : "s"}?`;
+}
 
 export function openSourceSheet(target: ConnTarget | null) {
   originalName = target ? target.data.name : null;
@@ -265,16 +337,10 @@ export function openSourceSheet(target: ConnTarget | null) {
   el<HTMLSpanElement>("src-title").textContent = target ? "Edit connection" : "Add connection";
   el<HTMLButtonElement>("src-save").textContent = target ? "Save" : "Add";
   el<HTMLButtonElement>("src-delete").hidden = !target;
-  el<HTMLSpanElement>("src-confirm-text").textContent = target
-    ? target.kind === "ssh"
-      ? `Delete ${target.data.name} and its ${target.data.exits.length} tunnel${target.data.exits.length === 1 ? "" : "s"}?`
-      : `Delete ${target.data.name} and its ${target.data.exits.length} row${target.data.exits.length === 1 ? "" : "s"}?`
-    : "Delete this connection?";
+  el<HTMLSpanElement>("src-confirm-text").textContent = deleteConfirmText(target);
 
-  clearErrors();
-  clearTestResult();
-  setTestBusy(false);
-  testGeneration++;
+  clearAllErrors();
+  invalidateTest();
   showFoot("edit");
   open = true;
   showSheet(backdrop(), activeTab === "ssh" ? sshInput("name") : wgInput("wgName"));
@@ -284,7 +350,7 @@ function closeSourceSheet() {
   if (!open) return;
   open = false;
   // 讓仍在進行中的測試結果作廢，reopen 之後 gen 對不上就不會被顯示出來
-  testGeneration++;
+  invalidateTest();
   hideSheet(backdrop(), () => !open);
 }
 
@@ -417,14 +483,19 @@ async function pickConf() {
     if (path === null) return;
     wgInput("conf").value = path;
     setFieldError(backdrop(), "conf", "");
-    clearTestResult();
-    testGeneration++;
-    if (testBusy) setTestBusy(false);
+    invalidateTest();
     // 選檔當下順手帶一個名字，使用者還沒自己填的話——跟 remote 的正規化一樣，
-    // 只是預填，使用者仍然可以自己改
+    // 只是預填，使用者仍然可以自己改。
+    //
+    // 預填完立刻驗一次：檔名不受連線名的規則管，「My VPN.conf」這種帶空格的
+    // 名字在 Windows 上再正常不過，直接塞進去等於埋一顆到按下 Save 才爆的雷
+    // ——而且那時錯誤指著的是一個使用者根本沒動過的欄位。當場標紅，他馬上
+    // 就知道要改。
     const nameField = wgInput("wgName");
     if (!nameField.value.trim()) {
-      nameField.value = basename(path).replace(/\.conf$/i, "");
+      const suggested = basename(path).replace(/\.conf$/i, "");
+      nameField.value = suggested;
+      setFieldError(backdrop(), "wgName", validateConnName(suggested) ?? "");
     }
   } catch (e) {
     setFieldError(backdrop(), "conf", String(e));
@@ -473,25 +544,16 @@ export function initSourceSheet(h: Handlers) {
     if (e.key === "Escape" && open) closeSourceSheet();
   });
 
-  for (const f of SSH_FIELDS) {
-    const node = sshInput(f);
+  // 兩張分頁的欄位佈線完全一樣（改了就清該欄的錯、作廢在途的測試、Enter 送出），
+  // 差別只在欄位鍵屬於哪一組，合成同一個迴圈跑
+  const allFields: { key: string; node: HTMLInputElement }[] = [
+    ...SSH_FIELDS.map((f) => ({ key: f as string, node: sshInput(f) })),
+    ...WG_FIELDS.map((f) => ({ key: f as string, node: wgInput(f) })),
+  ];
+  for (const { key, node } of allFields) {
     node.addEventListener("input", () => {
-      setFieldError(backdrop(), f, "");
-      clearTestResult();
-      testGeneration++;
-      if (testBusy) setTestBusy(false);
-    });
-    node.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") void save();
-    });
-  }
-  for (const f of WG_FIELDS) {
-    const node = wgInput(f);
-    node.addEventListener("input", () => {
-      setFieldError(backdrop(), f, "");
-      clearTestResult();
-      testGeneration++;
-      if (testBusy) setTestBusy(false);
+      setFieldError(backdrop(), key, "");
+      invalidateTest();
     });
     node.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void save();
@@ -546,10 +608,14 @@ function fwdClearErrors() {
   setGeneralError(el<HTMLDivElement>("fwd-error"), "");
 }
 
+const FWD_ERROR_KEYS: Record<string, ForwardField> = {
+  name: "name",
+  local: "local",
+  remote: "remote",
+};
+
 function fwdAssignError(msg: string) {
-  const m = /^\s*(name|local|remote)\s*:\s*([\s\S]+)$/i.exec(msg);
-  if (m) setFieldError(fwdBackdrop(), m[1].toLowerCase(), m[2].trim());
-  else setGeneralError(el<HTMLDivElement>("fwd-error"), msg);
+  applyFieldError(fwdBackdrop(), msg, FWD_ERROR_KEYS, el<HTMLDivElement>("fwd-error"));
 }
 
 const isPort = (v: string) => /^\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
@@ -586,7 +652,7 @@ export function openTunnelSheet(connection: string, connectionKind: ConnKind, ex
   fwdInput("name").value = exit?.name ?? "";
   fwdInput("local").value = exit ? String(exit.local) : "";
   fwdInput("remote").value = exit?.remote ?? "";
-  fwdProxyToggle().classList.toggle("on", Boolean(exit?.probeProxy));
+  setToggle(fwdProxyToggle(), Boolean(exit?.probeProxy));
 
   el<HTMLSpanElement>("fwd-title").textContent = exit ? "Edit forward" : "Add forward";
   el<HTMLButtonElement>("fwd-save").textContent = exit ? "Save" : "Add";
@@ -623,7 +689,7 @@ async function fwdSave() {
       name: fwdInput("name").value.trim(),
       local: Number(fwdInput("local").value.trim()),
       remote: fwdInput("remote").value.trim(),
-      probeProxy: fwdProxyToggle().classList.contains("on"),
+      probeProxy: isToggleOn(fwdProxyToggle()),
     });
     setFwdBusy(false);
     if (err) {
@@ -646,8 +712,12 @@ export function initTunnelSheet(h: TunnelHandlers) {
   el<HTMLButtonElement>("fwd-close").addEventListener("click", closeTunnelSheet);
   el<HTMLButtonElement>("fwd-cancel").addEventListener("click", closeTunnelSheet);
   el<HTMLButtonElement>("fwd-save").addEventListener("click", () => void fwdSave());
-  fwdProxyToggle().addEventListener("click", (e) => {
-    (e.currentTarget as HTMLElement).classList.toggle("on");
+  fwdProxyToggle().addEventListener("click", () => {
+    // Save 送出期間整張表單的值都已經被讀走了，這時再改開關只會讓畫面與
+    // 送出去的內容對不起來——跟 Save／Delete 兩顆鈕受同一道鎖管
+    if (fwdBusy) return;
+    const node = fwdProxyToggle();
+    setToggle(node, !isToggleOn(node));
   });
 
   el<HTMLButtonElement>("fwd-delete").addEventListener("click", () => {
@@ -707,10 +777,15 @@ function socksClearErrors() {
   setGeneralError(el<HTMLDivElement>("socks-error"), "");
 }
 
+/**
+ * 這張 sheet 只有 name／local 兩欄，後端卻也會回 `connection:` 開頭的錯誤
+ * （socks 列只能掛在 wg 連線底下）。它不在 keyMap 裡，所以會落到整體錯誤列，
+ * 而不是被硬塞進某一個欄位——那正是 applyFieldError 兜底規則要處理的情況。
+ */
+const SOCKS_ERROR_KEYS: Record<string, SocksField> = { name: "name", local: "local" };
+
 function socksAssignError(msg: string) {
-  const m = /^\s*(name|local)\s*:\s*([\s\S]+)$/i.exec(msg);
-  if (m) setFieldError(socksBackdrop(), m[1].toLowerCase(), m[2].trim());
-  else setGeneralError(el<HTMLDivElement>("socks-error"), msg);
+  applyFieldError(socksBackdrop(), msg, SOCKS_ERROR_KEYS, el<HTMLDivElement>("socks-error"));
 }
 
 function socksLocalValidate(): Partial<Record<SocksField, string>> {
@@ -810,11 +885,6 @@ export function initSocksSheet(h: SocksHandlers) {
 const tgClose = () => el<HTMLButtonElement>("tg-close");
 const tgAutostart = () => el<HTMLButtonElement>("tg-autostart");
 const tgUpdates = () => el<HTMLButtonElement>("tg-updates");
-
-function setToggle(node: HTMLElement, on: boolean) {
-  node.classList.toggle("on", on);
-  node.setAttribute("aria-checked", String(on));
-}
 
 function settingsError(msg: string) {
   setGeneralError(el<HTMLDivElement>("settings-error"), msg);
@@ -957,7 +1027,7 @@ export function syncSettingsPage(snap: Snapshot) {
 
 function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>) {
   node.addEventListener("click", async () => {
-    const next = !node.classList.contains("on");
+    const next = !isToggleOn(node);
     setToggle(node, next);
     settingsError("");
     try {
