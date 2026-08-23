@@ -10,6 +10,7 @@
 
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { shouldProbe } from "./status";
 import type {
   ExitInfo,
   ExitStatus,
@@ -21,8 +22,9 @@ import type {
   TestState,
   WgProxyInfo,
 } from "./types";
+import { validateConnName } from "./util";
 
-const STORE_KEY = "traytunnel-dev-mock-v4";
+const STORE_KEY = "traytunnel-dev-mock-v5";
 
 /** local 全域唯一，出口一律用埠號跨連線找 —— 這裡把 ssh 源與 wg 連線的所屬統一成一種形狀 */
 type Owner = { kind: "ssh"; source: SourceInfo } | { kind: "wg"; proxy: WgProxyInfo };
@@ -140,6 +142,30 @@ const DEFAULT_SNAPSHOT: Snapshot = {
           name: "nas-ssh",
           local: 2222,
           remote: "10.0.0.5:22",
+          kind: "forward",
+          probeProxy: false,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+      ],
+    },
+    // ⑥ .conf 讀不到／解析不過的連線：副標讓位給紅字錯誤、引擎點恆紅，
+    //    引擎旗標也是關的（起不來），用來驗 confError 那條顯示路徑
+    {
+      name: "office-wg",
+      confPath: "C:\\Users\\browser-mock\\wg\\office.conf",
+      enabled: false,
+      confError: "office.conf: missing PrivateKey in [Interface] (line 3)",
+      endpoint: "",
+      addresses: [],
+      dns: [],
+      allowedIps: [],
+      exits: [
+        {
+          name: "intranet",
+          local: 1087,
+          remote: "10.1.0.20:443",
           kind: "forward",
           probeProxy: false,
           enabled: true,
@@ -283,11 +309,6 @@ function ownerOf(local: number): string {
   return hit ? ownerName(hit.owner) : "";
 }
 
-/** 這一列要不要被探測：kind=socks 恆真，其餘看 probeProxy（wg-design.md §5.4 的 should_probe） */
-function shouldProbe(exit: ExitInfo): boolean {
-  return exit.kind === "socks" || exit.probeProxy;
-}
-
 /**
  * 已知與真後端的落差：Rust 端的 state.set_exit_status 在狀態與 detail 都
  * 沒變時會直接 return、不重推 exit-status 事件（見 src-tauri/src/state.rs），
@@ -348,8 +369,16 @@ function runTest(exit: ExitInfo, source: string) {
   );
 }
 
-function start(exit: ExitInfo, source: string) {
-  exit.enabled = true;
+/**
+ * 起一條列。
+ *
+ * `setIntent` 是給引擎總開關用的逃生口：set_wg_enabled 起引擎時要「只啟動
+ * enabled = true 的列」，**不能反過來把列的 enabled 寫成 true**——那樣使用者
+ * 原本刻意停用的列會在連線重新打開時全部復活（wg-design.md §5.5 的對照表）。
+ * 使用者親手按列開關或 start_exit 走的才是預設的 true（那本來就是在表達意圖）。
+ */
+function start(exit: ExitInfo, source: string, setIntent = true) {
+  if (setIntent) exit.enabled = true;
   setStatus(exit, "connecting");
   log(source, `${exit.name}: starting tunnel on :${exit.local}`);
   later(exit.local, 1100, () => {
@@ -365,8 +394,9 @@ function start(exit: ExitInfo, source: string) {
   });
 }
 
-function stop(exit: ExitInfo, source: string) {
-  exit.enabled = false;
+/** 停一條列；`setIntent` 的用意與 start 相同，見上方說明 */
+function stop(exit: ExitInfo, source: string, setIntent = true) {
+  if (setIntent) exit.enabled = false;
   const old = timers.get(exit.local);
   if (old) window.clearTimeout(old);
   setStatus(exit, "stopped");
@@ -376,28 +406,19 @@ function stop(exit: ExitInfo, source: string) {
 // ---------------------------------------------------------------- 驗證
 
 /**
- * 與 Rust 端相同的驗證規則；錯誤字串用 `field: message` 開頭讓 UI 能逐欄顯示。
- * local 是跨連線全域唯一的，撞到別的連線也要擋下來並指出是誰佔走的。
+ * 兩種列共通的那一段驗證：名稱必填、埠號範圍、跨連線撞埠、kind 不可變、
+ * 同一條連線內不可重名。forward 與 socks 只差在 forward 多一個 remote，
+ * 這一段照抄兩份的話，改任何一條規則都得記得改兩個地方。
  *
- * kind 建立後不可變（U1）：編輯既有列時若 input.kind 跟現況不符，直接回錯誤，
- * 不動任何欄位。connectionKind 與連線的實際型別不符（例如拿 ssh 源名去掛
- * wg 的 forward 列）也一併擋下（W3.37）。
+ * local 是跨連線全域唯一的，撞到別的連線也要擋下來並指出是誰佔走的。
+ * kind 建立後不可變（U1）：編輯既有列時若目標 kind 跟現況不符，直接回錯誤，
+ * 不動任何欄位。
  */
-function validateForward(input: {
-  connection: string;
-  connectionKind: "ssh" | "wg";
-  originalLocal: number | null;
-  name: string;
-  local: number;
-  remote: string;
-  kind: RowKind;
-}): string | null {
-  const owner = findConn(input.connection);
-  if (!owner) return `connection ${input.connection} not found`;
-  if (owner.kind !== input.connectionKind) return "kind: connection type mismatch";
-  if (input.kind === "socks" && owner.kind !== "wg") {
-    return "kind: socks rows are only allowed under a WireGuard connection";
-  }
+function validateRowCommon(
+  input: { connection: string; originalLocal: number | null; name: string; local: number },
+  owner: Owner,
+  kind: RowKind,
+): string | null {
   if (!input.name) return "name: name is required";
   if (!Number.isInteger(input.local) || input.local < 1 || input.local > 65535) {
     return "local: must be 1-65535";
@@ -414,9 +435,38 @@ function validateForward(input: {
   }
 
   const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
-  if (existing && existing.exit.kind !== input.kind) {
+  if (existing && existing.exit.kind !== kind) {
     return "kind: 列的種類建立後不可變更，請刪除後重新新增";
   }
+
+  const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
+  const dupName = rows.find((e) => e.name === input.name && e.local !== input.originalLocal);
+  if (dupName) return "name: another exit in this connection already uses this name";
+  return null;
+}
+
+/**
+ * 與 Rust 端相同的驗證規則；錯誤字串用 `field: message` 開頭讓 UI 能逐欄顯示。
+ *
+ * connectionKind 與連線的實際型別不符（例如拿 ssh 源名去掛 wg 的 forward 列）
+ * 要擋下（W3.37）。forward 列的 kind 恆為 "forward"（兩支 upsert 各自帶入固定的
+ * kind，見 wg-design.md §5.5），所以這裡沒有「socks 列掛到 ssh 源底下」這種分支
+ * ——那條路走不到，留著只會讓人以為 input.kind 是可變的。
+ */
+function validateForward(input: {
+  connection: string;
+  connectionKind: "ssh" | "wg";
+  originalLocal: number | null;
+  name: string;
+  local: number;
+  remote: string;
+}): string | null {
+  const owner = findConn(input.connection);
+  if (!owner) return `connection ${input.connection} not found`;
+  if (owner.kind !== input.connectionKind) return "kind: connection type mismatch";
+
+  const common = validateRowCommon(input, owner, "forward");
+  if (common) return common;
 
   // remote 只填埠號是合法的（代表伺服器本機的那個埠），正規化留到寫進狀態時才做。
   // host:port 分支也要把埠號抽出來驗上限，不能只驗格式——999999 這種位數
@@ -430,10 +480,6 @@ function validateForward(input: {
     const port = Number(m[2]);
     if (port < 1 || port > 65535) return "remote: must be 1-65535";
   }
-
-  const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
-  const dupName = rows.find((e) => e.name === input.name && e.local !== input.originalLocal);
-  if (dupName) return "name: another exit in this connection already uses this name";
   return null;
 }
 
@@ -447,29 +493,7 @@ function validateWgSocks(input: {
   const owner = findConn(input.connection);
   if (!owner) return `connection ${input.connection} not found`;
   if (owner.kind !== "wg") return "connection: socks rows are only allowed under a WireGuard connection";
-  if (!input.name) return "name: name is required";
-  if (!Number.isInteger(input.local) || input.local < 1 || input.local > 65535) {
-    return "local: must be 1-65535";
-  }
-
-  const clash = find(input.local);
-  if (clash && clash.exit.local !== input.originalLocal) {
-    const clashOwner = ownerName(clash.owner);
-    const where =
-      clashOwner === input.connection
-        ? `already used by ${clash.exit.name}`
-        : `already used by ${clash.exit.name} in ${clashOwner}`;
-    return `local: ${where}`;
-  }
-
-  const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
-  if (existing && existing.exit.kind !== "socks") {
-    return "kind: 列的種類建立後不可變更，請刪除後重新新增";
-  }
-
-  const dupName = owner.proxy.exits.find((e) => e.name === input.name && e.local !== input.originalLocal);
-  if (dupName) return "name: another exit in this connection already uses this name";
-  return null;
+  return validateRowCommon(input, owner, "socks");
 }
 
 function validateSource(input: {
@@ -478,10 +502,9 @@ function validateSource(input: {
   host: string;
   user: string;
 }): string | null {
-  if (!input.name) return "name: name is required";
-  if (/\s/.test(input.name)) return "name: must not contain spaces";
-  // 照 Rust 端 valid_source_name：不可含中括號，日誌行前綴 `[源名]` 才切得出來
-  if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
+  // 名稱的三條規則與表單共用 util.ts 的 validateConnName，兩邊訊息保證一致
+  const nameErr = validateConnName(input.name);
+  if (nameErr) return `name: ${nameErr}`;
   const dup = findConn(input.name);
   if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
   if (!input.host) return "host: host is required";
@@ -496,9 +519,8 @@ function validateWgProxy(input: {
   name: string;
   confPath: string;
 }): string | null {
-  if (!input.name) return "name: name is required";
-  if (/\s/.test(input.name)) return "name: must not contain spaces";
-  if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
+  const nameErr = validateConnName(input.name);
+  if (nameErr) return `name: ${nameErr}`;
 
   if (input.originalName !== null) {
     const original = findConn(input.originalName);
@@ -699,6 +721,31 @@ function handle(cmd: string, args: Args): unknown {
         pushConfig();
         log(input.name, `WireGuard connection added (${input.confPath})`);
       }
+      return null;
+    }
+
+    /**
+     * 引擎總開關（wg-design.md §5.5 第 3 支）。與 ssh 的 stop_source 刻意不對稱：
+     *
+     *   on = false：停引擎、收掉所有列的監聽器，**各列自身的 enabled 意圖不動**
+     *   on = true ：起引擎，只啟動 enabled = true 的列（尊重逐列的意圖）
+     *
+     * 所以這裡的 start／stop 都帶 setIntent = false。先動狀態再 pushConfig，
+     * 快照才會帶著剛剛那批 connecting／stopped 出去，而不是一份過期的 stopped。
+     */
+    case "set_wg_enabled": {
+      const proxy = findWgProxy(args.name as string);
+      if (!proxy) return null;
+      const on = Boolean(args.on);
+      if (proxy.enabled === on) return null;
+      proxy.enabled = on;
+      if (on) {
+        for (const e of proxy.exits) if (e.enabled && e.status === "stopped") start(e, proxy.name, false);
+      } else {
+        for (const e of proxy.exits) if (e.status !== "stopped") stop(e, proxy.name, false);
+      }
+      pushConfig();
+      log(proxy.name, on ? "engine started" : "engine stopped");
       return null;
     }
 
