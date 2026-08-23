@@ -77,7 +77,7 @@ impl Drop for Job {
     }
 }
 
-/// 本地是否有程序在該埠 Listen（等同原版的 Get-NetTCPConnection -State Listen）。
+/// 本地是否有程序在該埠 Listen（相當於 `Get-NetTCPConnection -State Listen`）。
 /// IPv4 與 IPv6 都查，ssh 綁在 ::1 的情況一樣認得。
 pub fn is_listening(port: u16) -> bool {
     listening_v4(port) || listening_v6(port)
@@ -171,7 +171,7 @@ pub fn local_time_hms() -> String {
 /// 系統匣圖示這台機器實際要的像素尺寸。
 ///
 /// 100% DPI 是 16，175% 就是 28——Windows 會照這個尺寸向 tray-icon 要圖，
-/// 給錯尺寸就由 GDI 拉伸，高 DPI 下糊掉的根源。
+/// 給錯尺寸就由 GDI 拉伸，這是高 DPI 下圖示模糊的根源。
 pub fn small_icon_size() -> (u32, u32) {
     metrics(SM_CXSMICON, SM_CYSMICON, (16, 16))
 }
@@ -180,7 +180,7 @@ pub fn small_icon_size() -> (u32, u32) {
 ///
 /// 工作列的視窗按鈕、Alt+Tab 與 ICON_BIG 取的都是這個尺寸：100% DPI 是 32，
 /// 175% 就是 56。Tauri codegen 的 `default_window_icon()` 只給 ICO 的第一層
-/// （我們的第一層是 16px），交給 GDI 從 16 拉到 56 就是工作列圖示糊掉的原因。
+/// （我們的第一層是 16px），交給 GDI 從 16 拉到 56 就是工作列圖示模糊的原因。
 pub fn large_icon_size() -> (u32, u32) {
     metrics(SM_CXICON, SM_CYICON, (32, 32))
 }
@@ -306,7 +306,7 @@ pub fn delete_hkcu_key(subkey: &str) -> io::Result<()> {
 /// `explorer.exe /select,<path>` 的逗號後面不能再多一個空白，路徑本身又可能含空白，
 /// 所以整段命令列自己組（`raw_arg`）而不是交給 `arg()` 逐段加引號。
 /// 檔案還不存在（例如剛被使用者刪掉）時退而開啟它所在的資料夾。
-/// explorer 是 GUI 程式，仍加上 CREATE_NO_WINDOW 杜絕黑窗一閃。
+/// explorer 是 GUI 程式，仍加上 CREATE_NO_WINDOW 避免主控台視窗一閃而過。
 pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -370,8 +370,8 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 // ------------------------------------------------------------------ 開機自啟
 //
-// 直接操作 HKCU 的 Run 登錄項，不再依賴 tauri-plugin-autostart。
-// 值的名稱與內容格式都沿用它原本寫的那一份，升級的使用者不必重設。
+// 直接操作 HKCU 的 Run 登錄項，不經 tauri-plugin-autostart。
+// 值的名稱與內容格式與該外掛相容，既有使用者升級後不必重設。
 
 /// 開機自啟的登錄項所在
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -517,13 +517,13 @@ mod tests {
     #[test]
     fn exact_layer_wins() {
         assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
-        // 175% DPI 的 28px 現在有專用層
+        // 175% DPI 的 28px 有專用層
         assert_eq!(pick_icon_layer(&LAYERS, 28), Some(3));
         assert_eq!(pick_icon_layer(&LAYERS, 32), Some(4));
     }
 
-    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層，
-    /// 放大才會糊，縮小不會
+    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層：
+    /// 放大會模糊，縮小不會
     #[test]
     fn large_icon_sizes_never_upscale() {
         // 100%／125%／150%／175%／200%／250%／300% 的 SM_CXICON
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(pick_icon_layer(&[], 16), None);
     }
 
-    /// 取表那段是手寫 FFI，緩衝配置與重試都改過，用一個真的 listener 釘住行為：
+    /// 取表那段是手寫 FFI，用一個真的 listener 釘住行為：
     /// 綁得起來的埠一定要被看見，否則 spawn 前的埠檢查就失去意義
     #[test]
     fn detects_a_real_listener() {
@@ -569,7 +569,7 @@ mod tests {
         assert!(is_listening(port), "剛綁上的 {port} 應該查得到");
     }
 
-    /// 自啟登錄值的內容格式是與舊版（tauri-plugin-autostart）相容的關鍵：
+    /// 自啟登錄值的內容格式是與 tauri-plugin-autostart 相容的關鍵：
     /// 一定要有 --tray，路徑一定要有引號（安裝路徑含空白時沒引號會被截斷）
     #[test]
     fn autostart_command_quotes_the_path_and_keeps_the_tray_flag() {
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(wide(""), vec![0]);
     }
 
-    /// explorer 的命令列很挑：`/select,` 後面不可以有空白，路徑要自己加引號
+    /// explorer 的命令列格式嚴格：`/select,` 後面不可以有空白，路徑要自己加引號
     /// （使用者名稱含空白、或裝在 Program Files 底下都會踩到），
     /// 而且引號只能包路徑、不能把 `/select,` 一起包進去。
     #[test]
