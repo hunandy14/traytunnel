@@ -10,8 +10,12 @@ import { afterTransition, el, h } from "./dom";
 const UNDO_MS = 5000;
 
 export interface UndoToast {
-  /** 立刻結束倒數並執行 commit（例如視窗要關掉前） */
-  flush: () => void;
+  /**
+   * 立刻結束倒數並執行 commit（例如視窗要關掉前）。
+   * 回傳 commit 完成的 Promise，讓呼叫端（目前是關窗前的 flushPendingDeletes）
+   * 有機會等它真的做完再繼續，不必假設同一輪 tick 就能派送出去。
+   */
+  flush: () => Promise<void>;
   /**
    * 直接收掉這個 toast，commit 與 undo 都不執行。
    * 用在「要刪的東西已經連根被刪掉了」這種情境，例如整個源被刪掉時，
@@ -54,20 +58,21 @@ export function showUndoToast(
   requestAnimationFrame(() => toast.classList.add("in"));
 
   let done = false;
-  const finish = (fn: () => void | Promise<void>) => {
-    if (done) return;
+  /** 回傳 fn() 的 Promise，讓 flush() 能等 commit 真的做完 */
+  const finish = (fn: () => void | Promise<void>): Promise<void> => {
+    if (done) return Promise.resolve();
     done = true;
     window.clearTimeout(timer);
     toast.classList.remove("in");
     afterTransition(toast, () => toast.remove());
-    void fn();
+    return Promise.resolve(fn());
   };
 
-  const timer = window.setTimeout(() => finish(onCommit), UNDO_MS);
-  undoBtn.addEventListener("click", () => finish(onUndo));
+  const timer = window.setTimeout(() => void finish(onCommit), UNDO_MS);
+  undoBtn.addEventListener("click", () => void finish(onUndo));
 
   return {
     flush: () => finish(onCommit),
-    dismiss: () => finish(() => {}),
+    dismiss: () => void finish(() => {}),
   };
 }

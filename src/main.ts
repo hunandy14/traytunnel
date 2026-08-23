@@ -485,10 +485,17 @@ function requestDelete(local: number) {
 /**
  * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
  * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
- * 是 Rust 端直接處理，前端這裡攔不到，是已知限制。
+ * 與 Alt+F4 都是不經過這顆按鈕的關窗路徑（前者是 Rust 端直接處理，後者是
+ * 視窗系統直接關閉），前端這裡一律攔不到，是已知限制。
+ *
+ * 回傳 Promise.allSettled，讓呼叫端能等所有 commit 真的送出去再繼續往下
+ * 呼叫 windowClose——這是裁決採納的廉價保險：目前驗證過同一 tick 內派送
+ * 就足夠安全，這裡加一手只是防未來有人在 flush 與 windowClose 之間插進
+ * 一個 await，讓派送被視窗關閉截斷。allSettled 而非 all：任何一個 commit
+ * 失敗都不該擋住其餘的送出或擋住關窗本身。
  */
-function flushPendingDeletes() {
-  for (const { toast } of [...undoToasts.values()]) toast.flush();
+function flushPendingDeletes(): Promise<unknown> {
+  return Promise.allSettled([...undoToasts.values()].map(({ toast }) => toast.flush()));
 }
 
 /**
@@ -651,9 +658,12 @@ el<HTMLButtonElement>("btn-min").addEventListener("click", () =>
   void run(windowMinimize, "minimize the window"),
 );
 el<HTMLButtonElement>("btn-close").addEventListener("click", () => {
-  // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失
-  flushPendingDeletes();
-  void run(windowClose, "close the window");
+  void (async () => {
+    // 關窗前先把還在倒數的刪除 undo 補提交，免得倒數被視窗關閉打斷、刪除靜靜消失；
+    // 等 flush 完成再關窗，見 flushPendingDeletes 的說明
+    await flushPendingDeletes();
+    await run(windowClose, "close the window");
+  })();
 });
 
 el<HTMLButtonElement>("btn-logs").addEventListener("click", () => setView("log"));
