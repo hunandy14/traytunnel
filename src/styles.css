@@ -660,14 +660,22 @@ body {
   color: var(--muted);
 }
 
-/* 外層只負責量出可用高度，捲動交給裡面的群組容器自己做，
-   這樣清單再長，外框與圓角都還留在畫面上 */
+/* 外層量出可用高度並負責整體捲動，各分組依自身內容高度排列（.cards.grouped
+   的 flex: none，見下面那條），這樣清單再長，外框與圓角都還留在畫面上。
+
+   曾經是外層 overflow: hidden、把捲動交給裡面單一的 .cards.grouped 自己做；
+   改雙區段（SOCKS5／PORT FORWARDS）之後兩個分組疊在一起，捲動收回外層才好
+   預期。 */
 .cards-scroll {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+}
+
+.cards-scroll .cards.grouped {
+  flex: none;
 }
 
 .cards {
@@ -1669,18 +1677,6 @@ body {
 .toggle:disabled {
   cursor: default;
   pointer-events: none;
-}
-
-/* 清單改雙區段（SOCKS5／PORT FORWARDS），空區段整段不畫（含標題）。原本
-   `.cards-scroll { overflow: hidden }` 是把捲動交給裡面單一的 `.cards.grouped`
-   自己做；現在兩個分組疊在一起，改成外層 .cards-scroll 整體捲動、各分組
-   依內容自身高度排列（flex: none，不搶或讓出空間），行為更好預期。 */
-.cards-scroll {
-  overflow-y: auto;
-}
-
-.cards-scroll .cards.grouped {
-  flex: none;
 }
 
 /* 表單裡開關列的標籤＋開關排版，跟舊版「WG 啟用開關」列共用同一套版式

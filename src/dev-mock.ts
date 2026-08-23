@@ -12,6 +12,7 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { shouldProbe } from "./status";
 import type {
+  ConnTarget,
   ExitInfo,
   ExitStatus,
   ProxyProtocol,
@@ -26,12 +27,17 @@ import { validateConnName } from "./util";
 
 const STORE_KEY = "traytunnel-dev-mock-v5";
 
-/** local 全域唯一，出口一律用埠號跨連線找 —— 這裡把 ssh 源與 wg 連線的所屬統一成一種形狀 */
-type Owner = { kind: "ssh"; source: SourceInfo } | { kind: "wg"; proxy: WgProxyInfo };
+/**
+ * local 全域唯一，出口一律用埠號跨連線找 —— 這裡把 ssh 源與 wg 連線的所屬統一成
+ * 一種形狀。直接沿用前端那邊的 ConnTarget（判別聯集，payload 一律叫 `data`），
+ * 假後端與 UI 對「一條連線」的形狀認知因此完全一致，不必再各留一份。
+ */
+type Owner = ConnTarget;
 
-function ownerName(owner: Owner): string {
-  return owner.kind === "ssh" ? owner.source.name : owner.proxy.name;
-}
+const ownerName = (owner: Owner): string => owner.data.name;
+
+/** 這條連線底下的列。兩種連線的欄位名現在一樣，收窄之後直接取 */
+const ownerRows = (owner: Owner): ExitInfo[] => owner.data.exits;
 
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
@@ -285,9 +291,9 @@ function findWgProxy(name: string): WgProxyInfo | undefined {
 /** 兩種連線共用同一個命名空間，日誌前綴 `[名字]` 才不會撞 */
 function findConn(name: string): Owner | undefined {
   const src = findSource(name);
-  if (src) return { kind: "ssh", source: src };
+  if (src) return { kind: "ssh", data: src };
   const wg = findWgProxy(name);
-  if (wg) return { kind: "wg", proxy: wg };
+  if (wg) return { kind: "wg", data: wg };
   return undefined;
 }
 
@@ -295,11 +301,11 @@ function findConn(name: string): Owner | undefined {
 function find(local: number): { exit: ExitInfo; owner: Owner } | undefined {
   for (const source of state.sources) {
     const exit = source.exits.find((e) => e.local === local);
-    if (exit) return { exit, owner: { kind: "ssh", source } };
+    if (exit) return { exit, owner: { kind: "ssh", data: source } };
   }
   for (const proxy of state.wgProxies) {
     const exit = proxy.exits.find((e) => e.local === local);
-    if (exit) return { exit, owner: { kind: "wg", proxy } };
+    if (exit) return { exit, owner: { kind: "wg", data: proxy } };
   }
   return undefined;
 }
@@ -439,8 +445,7 @@ function validateRowCommon(
     return "kind: 列的種類建立後不可變更，請刪除後重新新增";
   }
 
-  const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
-  const dupName = rows.find((e) => e.name === input.name && e.local !== input.originalLocal);
+  const dupName = ownerRows(owner).find((e) => e.name === input.name && e.local !== input.originalLocal);
   if (dupName) return "name: another exit in this connection already uses this name";
   return null;
 }
@@ -505,6 +510,17 @@ function validateSource(input: {
   // 名稱的三條規則與表單共用 util.ts 的 validateConnName，兩邊訊息保證一致
   const nameErr = validateConnName(input.name);
   if (nameErr) return `name: ${nameErr}`;
+
+  // U1：連線型別建立後不可變，與 validateWgProxy 對稱的那一半防護。少了它，
+  // 拿一個指向 WG 連線的 originalName 呼叫 upsert_source，下面 findSource 會
+  // 找不到而落進「新增」分支，憑空生出一條同名的 ssh 源，命名空間直接撞車。
+  if (input.originalName !== null) {
+    const original = findConn(input.originalName);
+    if (original && original.kind !== "ssh") {
+      return "name: connection type is immutable, delete and re-add instead";
+    }
+  }
+
   const dup = findConn(input.name);
   if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
   if (!input.host) return "host: host is required";
@@ -793,18 +809,23 @@ function handle(cmd: string, args: Args): unknown {
       if (/^\d+$/.test(input.remote)) input.remote = `127.0.0.1:${input.remote}`;
 
       const owner = findConn(input.connection) as Owner;
-      const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
+      const rows = ownerRows(owner);
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
       if (existing) {
+        // 停→改→起，**最後**才 pushConfig：中間那個瞬間 enabled 是 false、
+        // status 是 stopped，在那時照相等於送出一份「已經不成立」的快照。
+        // 前端 applySnapshot 會照單全收，之後只剩 exit-status 事件補得回
+        // status，enabled 沒有事件可以補——開關就這樣卡在 OFF，旁邊卻是一顆
+        // 綠色的狀態點。真後端是落檔完成才推 config-changed，這裡對齊它。
         const wasRunning = existing.exit.status !== "stopped";
         if (wasRunning) stop(existing.exit, ownerName(owner));
         existing.exit.name = input.name;
         existing.exit.local = input.local;
         existing.exit.remote = input.remote;
         existing.exit.probeProxy = input.probeProxy;
+        if (wasRunning) start(existing.exit, ownerName(owner));
         pushConfig();
         log(ownerName(owner), `${input.name}: updated`);
-        if (wasRunning) start(existing.exit, ownerName(owner));
       } else {
         rows.push({
           name: input.name,
@@ -837,15 +858,17 @@ function handle(cmd: string, args: Args): unknown {
       const owner = findConn(input.connection) as Owner & { kind: "wg" };
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
       if (existing) {
+        // 停→改→起→pushConfig，理由同 upsert_forward：中途照相會送出一份
+        // enabled:false 的過期快照，而 enabled 沒有事件補得回來
         const wasRunning = existing.exit.status !== "stopped";
-        if (wasRunning) stop(existing.exit, owner.proxy.name);
+        if (wasRunning) stop(existing.exit, owner.data.name);
         existing.exit.name = input.name;
         existing.exit.local = input.local;
+        if (wasRunning) start(existing.exit, owner.data.name);
         pushConfig();
-        log(owner.proxy.name, `${input.name}: updated`);
-        if (wasRunning) start(existing.exit, owner.proxy.name);
+        log(owner.data.name, `${input.name}: updated`);
       } else {
-        owner.proxy.exits.unshift({
+        owner.data.exits.unshift({
           name: input.name,
           local: input.local,
           remote: null,
@@ -856,7 +879,7 @@ function handle(cmd: string, args: Args): unknown {
           lastTest: null,
         });
         pushConfig();
-        log(owner.proxy.name, `${input.name}: added`);
+        log(owner.data.name, `${input.name}: added`);
       }
       return null;
     }
@@ -866,11 +889,7 @@ function handle(cmd: string, args: Args): unknown {
       if (hit) {
         const name = ownerName(hit.owner);
         stop(hit.exit, name);
-        if (hit.owner.kind === "ssh") {
-          hit.owner.source.exits = hit.owner.source.exits.filter((e) => e.local !== hit.exit.local);
-        } else {
-          hit.owner.proxy.exits = hit.owner.proxy.exits.filter((e) => e.local !== hit.exit.local);
-        }
+        hit.owner.data.exits = hit.owner.data.exits.filter((e) => e.local !== hit.exit.local);
         pushConfig();
         log(name, `${hit.exit.name}: deleted`);
       }
