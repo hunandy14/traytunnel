@@ -45,12 +45,18 @@ pub struct ExitStatusPayload {
     pub detail: Option<String>,
 }
 
-/// 事件：exit-test，同時也是 Snapshot 裡的 lastTest
+/// 事件：exit-test。
+///
+/// `result` 是 None 時代表「把這個出口的自測顯示清掉」，斷線、停用、重接都會發。
+///
+/// 用 `flatten` 而不是多包一層物件，是為了向後相容：Some 序列化出來就是
+/// `{local, state, text}`，與這個事件原本的形狀一模一樣，讀結果的那一端不必改；
+/// None 只剩 `{local}`，state／text 讀出來是 undefined，語意上正是「沒有結果」。
 #[derive(Debug, Clone, Serialize)]
 pub struct ExitTestPayload {
     pub local: u16,
-    pub state: String,
-    pub text: String,
+    #[serde(flatten)]
+    pub result: Option<TestView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,9 +136,9 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
 /// 上一條連線發出去、還在路上的那份探測（`probe` 最久要 12 秒）就會通過
 /// 世代檢查，把舊連線的出口 IP 寫成新連線的自測結果。
 ///
-/// 自測期號補上這個落差：任何會讓既有自測結果失效的事件都會換號，
-/// 換號的唯一入口是 [`AppState::invalidate_tests`]。兩個號碼合起來當一張憑證，
-/// 呼叫端只要原樣帶著它走，不必自己記得該比哪幾個號。
+/// 自測期號補上這個落差：換號的唯一入口是 [`AppState::clear_exit_test`]，
+/// 而斷線、停用、重接都會經過那裡。兩個號碼合起來當一張憑證，呼叫端只要
+/// 原樣帶著它走，不必自己記得該比哪幾個號。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestToken {
     generation: u64,
@@ -157,6 +163,23 @@ fn claim_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken)
 fn release_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken) {
     if slots.get(&local) == Some(&token) {
         slots.remove(&local);
+    }
+}
+
+/// 快照裡該不該帶著自測結果：只有 connected 的出口才帶。
+///
+/// 自測結果講的是「這條線通到哪裡」，線一斷它就不再是事實。前端對事件流已經
+/// 是這個規矩（狀態一離開 connected 就把顯示清掉），快照這邊要是照舊把
+/// `last_test` 原樣送出去，任何一次 config-changed 都會把前端剛清掉的舊字
+/// 回灌回畫面上——使用者看到的會是一個斷線的出口配著上一輪的出口 IP。
+///
+/// 擋在這裡而不是在每個狀態轉換點各清一次：`source_views` 是快照與系統匣共用的
+/// 唯一出口，一道規則就涵蓋所有路徑，之後新增狀態轉換也不會有人忘了補。
+fn visible_test(status: &str, last_test: Option<TestView>) -> Option<TestView> {
+    if status == status::CONNECTED {
+        last_test
+    } else {
+        None
     }
 }
 
@@ -455,18 +478,15 @@ impl AppState {
             let mut exits = self.exits.lock().unwrap();
             match exits.get_mut(&local) {
                 Some(rt) if rt.token() == token => {
-                    rt.last_test = Some(view);
+                    rt.last_test = Some(view.clone());
                     true
                 }
                 _ => false,
             }
         };
-        if !written {
-            return;
+        if written {
+            let _ = self.app.emit("exit-test", ExitTestPayload { local, result: Some(view) });
         }
-        let _ = self
-            .app
-            .emit("exit-test", ExitTestPayload { local, state: state.into(), text: text.into() });
     }
 
     /// 出口斷線或停掉時把舊的自測結果清乾淨，並讓在途的探測就地作廢。
@@ -476,10 +496,15 @@ impl AppState {
     /// 把舊連線的出口 IP 寫成新連線的自測結果。
     pub fn clear_exit_test(&self, local: u16) {
         let counter = &self.generation;
-        self.with_exit_mut(local, |rt| {
+        let had = self.with_exit_mut(local, |rt| {
             rt.test_epoch = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            rt.last_test = None;
+            rt.last_test.take().is_some()
         });
+        // 本來就沒有結果可清就不推事件：斷線重連每 5 秒會走一次這裡，
+        // 沒有這道閘的話會一直送出內容相同的空事件
+        if had == Some(true) {
+            let _ = self.app.emit("exit-test", ExitTestPayload { local, result: None });
+        }
     }
 
     /// 取這個出口當下的自測憑證。一次鎖把兩個號碼一起讀出來，
@@ -651,15 +676,19 @@ impl AppState {
                         .iter()
                         .map(|f| {
                             let rt = exits.get(&f.local);
+                            let status = rt
+                                .map(|r| r.status.clone())
+                                .unwrap_or_else(|| status::STOPPED.to_string());
                             ExitView {
                                 name: f.name.clone(),
                                 local: f.local,
                                 remote: f.remote.clone(),
                                 enabled: f.enabled,
-                                status: rt
-                                    .map(|r| r.status.clone())
-                                    .unwrap_or_else(|| status::STOPPED.to_string()),
-                                last_test: rt.and_then(|r| r.last_test.clone()),
+                                last_test: visible_test(
+                                    &status,
+                                    rt.and_then(|r| r.last_test.clone()),
+                                ),
+                                status,
                             }
                         })
                         .collect(),
@@ -794,6 +823,49 @@ mod tests {
         assert!(!without.contains('['));
         // 時間戳仍是 HH:mm:ss，長度固定 8
         assert_eq!(with.split("  ").next().unwrap().len(), 8);
+    }
+
+    /// 有結果時序列化出來的形狀不可以變：state／text 要平鋪在 local 旁邊，
+    /// 與這個事件原本的樣子一致，收結果的那一端不必為了清除語意改寫
+    #[test]
+    fn a_test_result_still_goes_out_flat() {
+        let payload = ExitTestPayload {
+            local: 1080,
+            result: Some(TestView {
+                state: test_state::OK.into(),
+                text: "1.2.3.4  Taipei, TW".into(),
+            }),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["local"], 1080);
+        assert_eq!(json["state"], test_state::OK);
+        assert_eq!(json["text"], "1.2.3.4  Taipei, TW");
+    }
+
+    /// 清除是同一個事件的另一種形狀：只剩 local，沒有 state／text
+    #[test]
+    fn a_cleared_test_carries_no_result_fields() {
+        let json = serde_json::to_value(ExitTestPayload { local: 1080, result: None }).unwrap();
+        assert_eq!(json["local"], 1080);
+        assert!(json.get("state").is_none(), "清除事件不可以帶著空字串假裝有結果");
+        assert!(json.get("text").is_none());
+    }
+
+    /// 快照只在 connected 時帶自測結果，否則斷線後的任何一次 config-changed
+    /// 都會把前端剛清掉的舊出口 IP 回灌回畫面上
+    #[test]
+    fn a_snapshot_only_carries_the_test_while_connected() {
+        let view = || Some(TestView { state: test_state::OK.into(), text: "1.2.3.4".into() });
+        assert!(visible_test(status::CONNECTED, view()).is_some());
+        for s in [
+            status::STOPPED,
+            status::CONNECTING,
+            status::RECONNECTING,
+            status::PORT_BUSY,
+            status::ERROR,
+        ] {
+            assert!(visible_test(s, view()).is_none(), "{s} 不該帶著上一輪的自測結果");
+        }
     }
 
     fn token(generation: u64, epoch: u64) -> TestToken {
