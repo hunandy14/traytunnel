@@ -21,21 +21,26 @@
  *   git checkout main                                            收尾留在 main
  *
  * --dry-run：只印出每一步將執行的指令，不做任何會改動 git/gh/檔案狀態的動作。
- * 前置檢查裡「唯讀」的幾項（git status、目前分支、gh auth status）不論
- * dry-run 與否都真的執行——反正不會動到任何東西，也才能在 dry-run 下驗證
- * 失敗訊息。`git pull --ff-only` 因為會真的移動本地 main，dry-run 時只印出
- * 指令、不執行。
+ * 前置檢查裡「唯讀」的幾項（git status、目前分支、gh auth status、新版號是否嚴格
+ * 大於 src-tauri/Cargo.toml 現行版號）不論 dry-run 與否都真的執行——反正不會動到
+ * 任何東西，也才能在 dry-run 下驗證失敗訊息。`git pull --ff-only` 因為會真的移動
+ * 本地 main，dry-run 時只印出指令、不執行。
+ *
+ * 版號比較：只接受嚴格 semver x.y.z（不支援 pre-release），新版號必須嚴格大於現行版號，
+ * 相等也會擋——邏輯見 scripts/lib/semver.mjs；現行版號讀法與 bump.mjs 共用
+ * scripts/lib/cargo-version.mjs，避免兩處各自解析 Cargo.toml。
  *
  * 無相依，直接 node scripts/release.mjs <x.y.z> [--dry-run]。
  */
 
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCargoVersion } from "./lib/cargo-version.mjs";
+import { SEMVER_RE, compareSemver } from "./lib/semver.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-
-const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 const rawArgs = process.argv.slice(2);
 const dryRun = rawArgs.includes("--dry-run");
@@ -151,6 +156,26 @@ if (authResult.status !== 0) {
   );
 }
 console.log("  gh 已登入");
+
+const cargoTomlPath = join(root, "src-tauri", "Cargo.toml");
+let currentVersion;
+let versionCompare;
+try {
+  currentVersion = readCargoVersion(cargoTomlPath, readFileSync(cargoTomlPath, "utf8"));
+  versionCompare = compareSemver(version, currentVersion);
+} catch (err) {
+  fail(
+    `檢查版號失敗：${err.message}`,
+    "確認 src-tauri/Cargo.toml 的 [package] version 是嚴格 semver（x.y.z，不支援 pre-release）。",
+  );
+}
+if (versionCompare <= 0) {
+  fail(
+    `現行版本 ${currentVersion}，你輸入的 ${version} 不高於它，發版中止`,
+    "改用嚴格大於現行版本的版本號重新執行。",
+  );
+}
+console.log(`  新版號 ${version} 高於現行版本 ${currentVersion}`);
 
 console.log("");
 console.log("-- 執行步驟 --");
