@@ -96,7 +96,7 @@ jobs:
       # setup.exe 簽出 .sig；缺了它 bundler 會直接失敗（本地不帶私鑰要建置的話
       # 用 npm run build:exe，--no-bundle 不會走到簽章那一步）。
       # 產私鑰時沒有設密碼，但環境變數仍要給空字串，否則 tauri 會停下來問。
-      - name: Build all targets
+      - name: Build app and bundles
         run: npm run build:all
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
