@@ -1,5 +1,5 @@
 /**
- * 瀏覽器 UI 開發模式的假後端（IPC 契約 v3）。
+ * 瀏覽器 UI 開發模式的假後端（IPC 契約 v4：SSH＋WireGuard）。
  *
  * 用官方的 @tauri-apps/api/mocks：mockIPC 攔下所有 invoke，shouldMockEvents
  * 讓 listen/emit 也走記憶體，前端程式碼完全不用為了 mock 改寫。
@@ -13,13 +13,23 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   ExitInfo,
   ExitStatus,
+  ProxyProtocol,
+  RowKind,
   Snapshot,
   SourceInfo,
   TestConnectionResult,
   TestState,
+  WgProxyInfo,
 } from "./types";
 
-const STORE_KEY = "traytunnel-dev-mock-v3";
+const STORE_KEY = "traytunnel-dev-mock-v4";
+
+/** local 全域唯一，出口一律用埠號跨連線找 —— 這裡把 ssh 源與 wg 連線的所屬統一成一種形狀 */
+type Owner = { kind: "ssh"; source: SourceInfo } | { kind: "wg"; proxy: WgProxyInfo };
+
+function ownerName(owner: Owner): string {
+  return owner.kind === "ssh" ? owner.source.name : owner.proxy.name;
+}
 
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
@@ -32,8 +42,28 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       user: "ubuntu",
       proxyCommand: "cloudflared access ssh --hostname %h",
       exits: [
-        { name: "socks-jp", local: 1080, remote: "127.0.0.1:1080", enabled: true, status: "stopped", lastTest: null },
-        { name: "pg-jp", local: 1081, remote: "10.0.4.12:5432", enabled: true, status: "stopped", lastTest: null },
+        // ② forward + probeProxy=true：後端是代理服務，會做出口檢測並識別協定
+        {
+          name: "socks-jp",
+          local: 1080,
+          remote: "127.0.0.1:1080",
+          kind: "forward",
+          probeProxy: true,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+        // ① forward + probeProxy=false：純轉發，只有狀態點
+        {
+          name: "pg-jp",
+          local: 1081,
+          remote: "10.0.4.12:5432",
+          kind: "forward",
+          probeProxy: false,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
       ],
     },
     {
@@ -42,8 +72,26 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       user: "ec2-user",
       proxyCommand: "cloudflared access ssh --hostname %h",
       exits: [
-        { name: "socks-tw", local: 1083, remote: "127.0.0.1:1083", enabled: true, status: "stopped", lastTest: null },
-        { name: "edge-tw", local: 1084, remote: "127.0.0.1:1084", enabled: true, status: "stopped", lastTest: null },
+        {
+          name: "socks-tw",
+          local: 1083,
+          remote: "127.0.0.1:1083",
+          kind: "forward",
+          probeProxy: true,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+        {
+          name: "edge-tw",
+          local: 1084,
+          remote: "127.0.0.1:1084",
+          kind: "forward",
+          probeProxy: false,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
       ],
     },
     {
@@ -54,16 +102,64 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       exits: [],
     },
   ],
+  wgProxies: [
+    {
+      name: "home-relay",
+      confPath: "C:\\Users\\browser-mock\\wg\\home-relay.conf",
+      enabled: true,
+      confError: null,
+      endpoint: "vpn.example.com:51820",
+      addresses: ["10.9.0.2/32"],
+      dns: ["10.9.0.1"],
+      allowedIps: ["0.0.0.0/0", "::/0"],
+      exits: [
+        // ⑤ socks 列：引擎自建 SOCKS5，恆測、協定已知，排在最前（SOCKS5 區段）
+        {
+          name: "proxy",
+          local: 1085,
+          remote: null,
+          kind: "socks",
+          probeProxy: true,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+        // ④ forward + probeProxy=true：接隧道對面已經在跑的代理服務
+        {
+          name: "corp",
+          local: 1086,
+          remote: "10.0.0.9:1080",
+          kind: "forward",
+          probeProxy: true,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+        // ③ forward：本地埠 → 隧道內固定目的地，語意等同 ssh 的 -L
+        {
+          name: "nas-ssh",
+          local: 2222,
+          remote: "10.0.0.5:22",
+          kind: "forward",
+          probeProxy: false,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        },
+      ],
+    },
+  ],
   logs: [],
   // 預設沒有新版，更新列不出現；三種更新情境由 __mock 那邊演練（見 installScenarioHooks）
   update: null,
 };
 
 /** 假的出口自測結果，格式與真後端一致（`ip  city, country`）；沒列到的埠就當作測不到 */
-const FAKE_TEST: Record<number, string> = {
-  1080: "203.0.113.42  Tokyo, JP",
-  1081: "203.0.113.42  Tokyo, JP",
-  1083: "198.51.100.17  Taipei, TW",
+const FAKE_TEST: Record<number, { text: string; protocol?: ProxyProtocol }> = {
+  1080: { text: "203.0.113.42  Tokyo, JP", protocol: "socks5" },
+  1083: { text: "198.51.100.17  Taipei, TW", protocol: "socks5" },
+  1085: { text: "45.32.99.10  Amsterdam, NL", protocol: "socks5" },
+  1086: { text: "45.32.99.10  Amsterdam, NL", protocol: "http" },
 };
 
 /** 這些埠一啟動就會撞埠，讓 port_busy 這條路徑在瀏覽器也演練得到 */
@@ -81,6 +177,10 @@ function load(): Snapshot {
       for (const s of saved.sources) {
         s.exits = s.exits.map((e) => ({ ...e, status: "stopped", lastTest: null }));
       }
+      for (const p of saved.wgProxies ?? []) {
+        p.exits = p.exits.map((e) => ({ ...e, status: "stopped", lastTest: null }));
+      }
+      saved.wgProxies = saved.wgProxies ?? [];
       saved.logs = [];
       return saved;
     }
@@ -152,17 +252,40 @@ function findSource(name: string): SourceInfo | undefined {
   return state.sources.find((s) => s.name === name);
 }
 
-/** local 全域唯一，所以出口一律用埠號跨源找 */
-function find(local: number): { exit: ExitInfo; source: SourceInfo } | undefined {
+function findWgProxy(name: string): WgProxyInfo | undefined {
+  return state.wgProxies.find((p) => p.name === name);
+}
+
+/** 兩種連線共用同一個命名空間，日誌前綴 `[名字]` 才不會撞 */
+function findConn(name: string): Owner | undefined {
+  const src = findSource(name);
+  if (src) return { kind: "ssh", source: src };
+  const wg = findWgProxy(name);
+  if (wg) return { kind: "wg", proxy: wg };
+  return undefined;
+}
+
+/** local 全域唯一，所以出口一律用埠號跨連線找，順便把它所屬的連線帶回來 */
+function find(local: number): { exit: ExitInfo; owner: Owner } | undefined {
   for (const source of state.sources) {
     const exit = source.exits.find((e) => e.local === local);
-    if (exit) return { exit, source };
+    if (exit) return { exit, owner: { kind: "ssh", source } };
+  }
+  for (const proxy of state.wgProxies) {
+    const exit = proxy.exits.find((e) => e.local === local);
+    if (exit) return { exit, owner: { kind: "wg", proxy } };
   }
   return undefined;
 }
 
 function ownerOf(local: number): string {
-  return find(local)?.source.name ?? "";
+  const hit = find(local);
+  return hit ? ownerName(hit.owner) : "";
+}
+
+/** 這一列要不要被探測：kind=socks 恆真，其餘看 probeProxy（wg-design.md §5.4 的 should_probe） */
+function shouldProbe(exit: ExitInfo): boolean {
+  return exit.kind === "socks" || exit.probeProxy;
 }
 
 /**
@@ -183,9 +306,9 @@ function setStatus(exit: ExitInfo, status: ExitStatus, detail?: string) {
   void emit("exit-status", { local: exit.local, status, detail: detail ?? null });
 }
 
-function setTest(exit: ExitInfo, testState: TestState, text: string) {
-  exit.lastTest = { state: testState, text };
-  void emit("exit-test", { local: exit.local, state: testState, text });
+function setTest(exit: ExitInfo, testState: TestState, text: string, protocol?: ProxyProtocol) {
+  exit.lastTest = protocol ? { state: testState, text, protocol } : { state: testState, text };
+  void emit("exit-test", { local: exit.local, state: testState, text, protocol });
 }
 
 /**
@@ -204,16 +327,18 @@ function later(local: number, ms: number, fn: () => void) {
   timers.set(local, window.setTimeout(fn, ms));
 }
 
+/** 只有要被探測的列（kind=socks 或 probeProxy=true）才跑自測，純轉發列連排程都不進（wg-design.md §5.4） */
 function runTest(exit: ExitInfo, source: string) {
   if (exit.status !== "connected") return;
+  if (!shouldProbe(exit)) return;
   setTest(exit, "testing", "testing…");
   window.setTimeout(
     () => {
       if (exit.status !== "connected") return;
       const result = FAKE_TEST[exit.local];
       if (result) {
-        setTest(exit, "ok", result);
-        log(source, `port ${exit.local} : ${result}`);
+        setTest(exit, "ok", result.text, result.protocol);
+        log(source, `port ${exit.local} : ${result.text}`);
       } else {
         setTest(exit, "fail", "no response");
         log(source, `port ${exit.local} : no response`);
@@ -252,16 +377,27 @@ function stop(exit: ExitInfo, source: string) {
 
 /**
  * 與 Rust 端相同的驗證規則；錯誤字串用 `field: message` 開頭讓 UI 能逐欄顯示。
- * local 是跨源全域唯一的，撞到別的源也要擋下來並指出是誰佔走的。
+ * local 是跨連線全域唯一的，撞到別的連線也要擋下來並指出是誰佔走的。
+ *
+ * kind 建立後不可變（U1）：編輯既有列時若 input.kind 跟現況不符，直接回錯誤，
+ * 不動任何欄位。connectionKind 與連線的實際型別不符（例如拿 ssh 源名去掛
+ * wg 的 forward 列）也一併擋下（W3.37）。
  */
 function validateForward(input: {
-  source: string;
+  connection: string;
+  connectionKind: "ssh" | "wg";
   originalLocal: number | null;
   name: string;
   local: number;
   remote: string;
+  kind: RowKind;
 }): string | null {
-  if (!findSource(input.source)) return `source ${input.source} not found`;
+  const owner = findConn(input.connection);
+  if (!owner) return `connection ${input.connection} not found`;
+  if (owner.kind !== input.connectionKind) return "kind: connection type mismatch";
+  if (input.kind === "socks" && owner.kind !== "wg") {
+    return "kind: socks rows are only allowed under a WireGuard connection";
+  }
   if (!input.name) return "name: name is required";
   if (!Number.isInteger(input.local) || input.local < 1 || input.local > 65535) {
     return "local: must be 1-65535";
@@ -269,11 +405,17 @@ function validateForward(input: {
 
   const clash = find(input.local);
   if (clash && clash.exit.local !== input.originalLocal) {
+    const clashOwner = ownerName(clash.owner);
     const where =
-      clash.source.name === input.source
+      clashOwner === input.connection
         ? `already used by ${clash.exit.name}`
-        : `already used by ${clash.exit.name} in ${clash.source.name}`;
+        : `already used by ${clash.exit.name} in ${clashOwner}`;
     return `local: ${where}`;
+  }
+
+  const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
+  if (existing && existing.exit.kind !== input.kind) {
+    return "kind: 列的種類建立後不可變更，請刪除後重新新增";
   }
 
   // remote 只填埠號是合法的（代表伺服器本機的那個埠），正規化留到寫進狀態時才做。
@@ -289,9 +431,44 @@ function validateForward(input: {
     if (port < 1 || port > 65535) return "remote: must be 1-65535";
   }
 
-  const owner = findSource(input.source) as SourceInfo;
-  const dupName = owner.exits.find((e) => e.name === input.name && e.local !== input.originalLocal);
-  if (dupName) return "name: another exit in this source already uses this name";
+  const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
+  const dupName = rows.find((e) => e.name === input.name && e.local !== input.originalLocal);
+  if (dupName) return "name: another exit in this connection already uses this name";
+  return null;
+}
+
+/** WG 專屬的 socks 列驗證：沒有 remote，connection 必須是 wg 連線 */
+function validateWgSocks(input: {
+  connection: string;
+  originalLocal: number | null;
+  name: string;
+  local: number;
+}): string | null {
+  const owner = findConn(input.connection);
+  if (!owner) return `connection ${input.connection} not found`;
+  if (owner.kind !== "wg") return "connection: socks rows are only allowed under a WireGuard connection";
+  if (!input.name) return "name: name is required";
+  if (!Number.isInteger(input.local) || input.local < 1 || input.local > 65535) {
+    return "local: must be 1-65535";
+  }
+
+  const clash = find(input.local);
+  if (clash && clash.exit.local !== input.originalLocal) {
+    const clashOwner = ownerName(clash.owner);
+    const where =
+      clashOwner === input.connection
+        ? `already used by ${clash.exit.name}`
+        : `already used by ${clash.exit.name} in ${clashOwner}`;
+    return `local: ${where}`;
+  }
+
+  const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
+  if (existing && existing.exit.kind !== "socks") {
+    return "kind: 列的種類建立後不可變更，請刪除後重新新增";
+  }
+
+  const dupName = owner.proxy.exits.find((e) => e.name === input.name && e.local !== input.originalLocal);
+  if (dupName) return "name: another exit in this connection already uses this name";
   return null;
 }
 
@@ -305,11 +482,34 @@ function validateSource(input: {
   if (/\s/.test(input.name)) return "name: must not contain spaces";
   // 照 Rust 端 valid_source_name：不可含中括號，日誌行前綴 `[源名]` 才切得出來
   if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
-  const dup = state.sources.find((s) => s.name === input.name && s.name !== input.originalName);
-  if (dup) return "name: another source already uses this name";
+  const dup = findConn(input.name);
+  if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
   if (!input.host) return "host: host is required";
   if (/\s/.test(input.host)) return "host: must not contain spaces";
   if (!input.user) return "user: user is required";
+  return null;
+}
+
+/** WG 連線的驗證：名稱與 ssh 源共用同一個命名空間；U1——不可把 ssh 源改成 wg 連線 */
+function validateWgProxy(input: {
+  originalName: string | null;
+  name: string;
+  confPath: string;
+}): string | null {
+  if (!input.name) return "name: name is required";
+  if (/\s/.test(input.name)) return "name: must not contain spaces";
+  if (/[[\]]/.test(input.name)) return "name: must not contain brackets";
+
+  if (input.originalName !== null) {
+    const original = findConn(input.originalName);
+    if (original && original.kind !== "wg") {
+      return "name: connection type is immutable, delete and re-add instead";
+    }
+  }
+
+  const dup = findConn(input.name);
+  if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
+  if (!input.confPath.trim()) return "confPath: path is required";
   return null;
 }
 
@@ -331,6 +531,23 @@ function fakeTestConnection(host: string): TestConnectionResult {
   };
 }
 
+/** .conf 路徑打中假資料裡任何 wg 連線目前的路徑，或看起來像 .conf 就演成功 */
+function fakeTestWgConf(confPath: string): TestConnectionResult {
+  const trimmed = confPath.trim();
+  if (!trimmed) return { ok: false, message: "no .conf file selected" };
+  if (!/\.conf$/i.test(trimmed)) {
+    return { ok: false, message: "not a valid WireGuard config: missing [Interface] section" };
+  }
+  return { ok: true, message: "Handshake succeeded (128ms)" };
+}
+
+/** 假的檔案選擇器結果，循環吐出幾個看起來合理的路徑，示範成功與尚未使用兩種情境 */
+const FAKE_CONF_PICKS = [
+  "C:\\Users\\browser-mock\\wg\\jp-node.conf",
+  "C:\\Users\\browser-mock\\Documents\\wireguard\\office.conf",
+];
+let fakeConfPickIdx = -1;
+
 // ---------------------------------------------------------------- 指令
 
 interface Args {
@@ -341,9 +558,13 @@ interface Args {
   user?: string;
   proxyCommand?: string;
   source?: string;
+  connection?: string;
+  connectionKind?: "ssh" | "wg";
   originalName?: string | null;
   originalLocal?: number | null;
   remote?: string;
+  probeProxy?: boolean;
+  confPath?: string;
   version?: string | null;
 }
 
@@ -359,26 +580,27 @@ function handle(cmd: string, args: Args): unknown {
     case "get_state":
       return structuredClone(state);
 
-    // ---------------------------------------------------------- 出口層級
+    // ---------------------------------------------------------- 出口層級（ssh／wg 共用同一個埠鍵空間）
 
     case "start_exit": {
       const hit = find(args.local as number);
-      if (hit) start(hit.exit, hit.source.name);
+      if (hit) start(hit.exit, ownerName(hit.owner));
       return null;
     }
 
     case "stop_exit": {
       const hit = find(args.local as number);
-      if (hit) stop(hit.exit, hit.source.name);
+      if (hit) stop(hit.exit, ownerName(hit.owner));
       return null;
     }
 
     case "restart_exit": {
       const hit = find(args.local as number);
       if (!hit) return null;
-      log(hit.source.name, `${hit.exit.name}: reconnecting`);
-      stop(hit.exit, hit.source.name);
-      window.setTimeout(() => start(hit.exit, hit.source.name), 250);
+      const owner = ownerName(hit.owner);
+      log(owner, `${hit.exit.name}: reconnecting`);
+      stop(hit.exit, owner);
+      window.setTimeout(() => start(hit.exit, owner), 250);
       return null;
     }
 
@@ -444,15 +666,78 @@ function handle(cmd: string, args: Args): unknown {
       return null;
     }
 
-    // ---------------------------------------------------------- 轉發設定
+    // ---------------------------------------------------------- WireGuard 連線層
+
+    case "upsert_wg_proxy": {
+      const input = {
+        originalName: args.originalName ?? null,
+        name: (args.name ?? "").trim(),
+        confPath: (args.confPath ?? "").trim(),
+      };
+      const err = validateWgProxy(input);
+      if (err) return err;
+
+      const existing = input.originalName === null ? undefined : findWgProxy(input.originalName);
+      if (existing) {
+        // 編輯不重接：conf 變更要重接由使用者透過「重新連線」動作觸發，這裡只改欄位
+        existing.name = input.name;
+        existing.confPath = input.confPath;
+        pushConfig();
+        log(input.name, `connection updated (${input.confPath})`);
+      } else {
+        state.wgProxies.push({
+          name: input.name,
+          confPath: input.confPath,
+          enabled: false,
+          confError: null,
+          endpoint: "",
+          addresses: [],
+          dns: [],
+          allowedIps: [],
+          exits: [],
+        });
+        pushConfig();
+        log(input.name, `WireGuard connection added (${input.confPath})`);
+      }
+      return null;
+    }
+
+    case "delete_wg_proxy": {
+      const proxy = findWgProxy(args.name as string);
+      if (!proxy) return null;
+      for (const e of proxy.exits) if (e.status !== "stopped") stop(e, proxy.name);
+      state.wgProxies = state.wgProxies.filter((p) => p.name !== proxy.name);
+      pushConfig();
+      log(null, `WireGuard connection ${proxy.name} deleted`);
+      return null;
+    }
+
+    case "test_wg_conf": {
+      const confPath = (args.confPath ?? "").trim();
+      return new Promise<TestConnectionResult>((resolve) => {
+        window.setTimeout(() => resolve(fakeTestWgConf(confPath)), TEST_CONNECTION_DELAY_MS);
+      });
+    }
+
+    case "pick_wg_conf": {
+      fakeConfPickIdx = (fakeConfPickIdx + 1) % FAKE_CONF_PICKS.length;
+      const path = FAKE_CONF_PICKS[fakeConfPickIdx];
+      log(null, `(browser mock) picked ${path}`);
+      return path;
+    }
+
+    // ---------------------------------------------------------- 轉發設定（forward 列，ssh／wg 共用）
 
     case "upsert_forward": {
       const input = {
-        source: (args.source ?? "").trim(),
+        connection: (args.connection ?? "").trim(),
+        connectionKind: (args.connectionKind ?? "ssh") as "ssh" | "wg",
         originalLocal: args.originalLocal ?? null,
         name: (args.name ?? "").trim(),
         local: Number(args.local),
         remote: (args.remote ?? "").trim(),
+        kind: "forward" as RowKind,
+        probeProxy: Boolean(args.probeProxy),
       };
       const err = validateForward(input);
       if (err) return err;
@@ -460,28 +745,71 @@ function handle(cmd: string, args: Args): unknown {
       // 純埠號補成伺服器本機的 host:port，比照真後端會做的正規化
       if (/^\d+$/.test(input.remote)) input.remote = `127.0.0.1:${input.remote}`;
 
-      const owner = findSource(input.source) as SourceInfo;
+      const owner = findConn(input.connection) as Owner;
+      const rows = owner.kind === "ssh" ? owner.source.exits : owner.proxy.exits;
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
       if (existing) {
         const wasRunning = existing.exit.status !== "stopped";
-        if (wasRunning) stop(existing.exit, existing.source.name);
+        if (wasRunning) stop(existing.exit, ownerName(owner));
         existing.exit.name = input.name;
         existing.exit.local = input.local;
         existing.exit.remote = input.remote;
+        existing.exit.probeProxy = input.probeProxy;
         pushConfig();
-        log(owner.name, `${input.name}: updated`);
-        if (wasRunning) start(existing.exit, owner.name);
+        log(ownerName(owner), `${input.name}: updated`);
+        if (wasRunning) start(existing.exit, ownerName(owner));
       } else {
-        owner.exits.push({
+        rows.push({
           name: input.name,
           local: input.local,
           remote: input.remote,
+          kind: "forward",
+          probeProxy: input.probeProxy,
           enabled: true,
           status: "stopped",
           lastTest: null,
         });
         pushConfig();
-        log(owner.name, `${input.name}: added`);
+        log(ownerName(owner), `${input.name}: added`);
+      }
+      return null;
+    }
+
+    // ---------------------------------------------------------- SOCKS5 代理列（WG 專屬）
+
+    case "upsert_wg_socks": {
+      const input = {
+        connection: (args.connection ?? "").trim(),
+        originalLocal: args.originalLocal ?? null,
+        name: (args.name ?? "").trim(),
+        local: Number(args.local),
+      };
+      const err = validateWgSocks(input);
+      if (err) return err;
+
+      const owner = findConn(input.connection) as Owner & { kind: "wg" };
+      const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
+      if (existing) {
+        const wasRunning = existing.exit.status !== "stopped";
+        if (wasRunning) stop(existing.exit, owner.proxy.name);
+        existing.exit.name = input.name;
+        existing.exit.local = input.local;
+        pushConfig();
+        log(owner.proxy.name, `${input.name}: updated`);
+        if (wasRunning) start(existing.exit, owner.proxy.name);
+      } else {
+        owner.proxy.exits.unshift({
+          name: input.name,
+          local: input.local,
+          remote: null,
+          kind: "socks",
+          probeProxy: true,
+          enabled: true,
+          status: "stopped",
+          lastTest: null,
+        });
+        pushConfig();
+        log(owner.proxy.name, `${input.name}: added`);
       }
       return null;
     }
@@ -489,10 +817,15 @@ function handle(cmd: string, args: Args): unknown {
     case "delete_forward": {
       const hit = find(args.local as number);
       if (hit) {
-        stop(hit.exit, hit.source.name);
-        hit.source.exits = hit.source.exits.filter((e) => e.local !== hit.exit.local);
+        const name = ownerName(hit.owner);
+        stop(hit.exit, name);
+        if (hit.owner.kind === "ssh") {
+          hit.owner.source.exits = hit.owner.source.exits.filter((e) => e.local !== hit.exit.local);
+        } else {
+          hit.owner.proxy.exits = hit.owner.proxy.exits.filter((e) => e.local !== hit.exit.local);
+        }
         pushConfig();
-        log(hit.source.name, `${hit.exit.name}: deleted`);
+        log(name, `${hit.exit.name}: deleted`);
       }
       return null;
     }
@@ -604,15 +937,15 @@ function installScenarioHooks() {
       if (old) window.clearTimeout(old);
       setStatus(hit.exit, status, detail);
     },
-    test(local: number, testState: TestState, text: string) {
+    test(local: number, testState: TestState, text: string, protocol?: ProxyProtocol) {
       const hit = find(local);
-      if (hit) setTest(hit.exit, testState, text);
+      if (hit) setTest(hit.exit, testState, text, protocol);
     },
     /** 演練斷線重連：connected → reconnecting → connected */
     drop(local: number) {
       const hit = find(local);
       if (!hit) return;
-      const source = hit.source.name;
+      const source = ownerName(hit.owner);
       setStatus(hit.exit, "reconnecting");
       log(source, `${hit.exit.name}: connection lost, reconnecting...`);
       later(local, 2500, () => {
@@ -622,12 +955,14 @@ function installScenarioHooks() {
         runTest(hit.exit, source);
       });
     },
-    /** 把所有源清掉，用來看零源的引導空狀態 */
+    /** 把所有源與 wg 連線清掉，用來看零連線的引導空狀態 */
     wipe() {
       for (const s of state.sources) for (const e of s.exits) stop(e, s.name);
+      for (const p of state.wgProxies) for (const e of p.exits) stop(e, p.name);
       state.sources = [];
+      state.wgProxies = [];
       pushConfig();
-      log(null, "all sources removed");
+      log(null, "all connections removed");
     },
     /**
      * 演練**背景**更新檢查的結果，也就是不經使用者操作、直接推 update-available
@@ -701,5 +1036,6 @@ export function installDevMock() {
   log(null, "(browser mock) no Tauri runtime, using fake backend");
   window.setTimeout(() => {
     for (const s of state.sources) for (const e of s.exits) if (e.enabled) start(e, s.name);
+    for (const p of state.wgProxies) if (p.enabled) for (const e of p.exits) if (e.enabled) start(e, p.name);
   }, 250);
 }
