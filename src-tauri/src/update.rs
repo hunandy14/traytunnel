@@ -299,7 +299,7 @@ fn open_page(st: &Shared, url: &str) {
 ///
 /// 就是因為它自己 `std::process::exit(0)`，`RunEvent::Exit` 不會發，
 /// tauri-plugin-window-state 落地存檔的那個 hook 因此不會跑——這是「更新後視窗
-/// 歸零置中」的成因。這裡不可以用 `st.app.updater()` 那個便利方法：它預設塞的
+/// 歸零置中」的成因之一。這裡不可以用 `st.app.updater()` 那個便利方法：它預設塞的
 /// `on_before_exit` 只有 `cleanup_before_exit()`（見 updater 外掛 lib.rs 的
 /// `UpdaterExt::updater_builder`），改用 `updater_builder()` 自己補一顆 `on_before_exit`，
 /// 在交棒給安裝程式之前先存一次視窗狀態，同時保留原本的 `cleanup_before_exit()`

@@ -320,7 +320,8 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                 state.store_job(local, generation, job);
                 state.log_from(sname, format!("{} : ssh starting (pid {pid})", f.name));
                 if let Some(stderr) = child.stderr.take() {
-                    // ssh 的錯誤訊息只寫進檔案日誌，不進活動區
+                    // ssh stderr 噪音大，只寫進檔案日誌，不進活動區——
+                    // 活動區只保留本程式自身的事件
                     let name = format!("{sname}/{}", f.name);
                     tauri::async_runtime::spawn(async move {
                         let mut lines = BufReader::new(stderr).lines();
