@@ -154,18 +154,39 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要一個指令：
+
+```
+npm run release <x.y.z>
+```
+
+它（`scripts/release.mjs`）會依序：建立 `release/<x.y.z>` 分支 → 跑 `npm run bump <x.y.z>` 同步版本號 → 同步 `Cargo.lock`／`package-lock.json` → commit → push → `gh pr create` 開 PR → `gh pr merge --auto --merge` 掛上 auto-merge → 切回 `main`。
+
+`main` 已開 branch protection，要求 `.github/workflows/ci.yml` 綠燈才能合併；`gh pr merge --auto` 會等 CI 通過後自動合併，合併進 `main` 後 `autotag.yml` 偵測到版號變動，自動建立並推送 tag `v<x.y.z>`，接著觸發 `release.yml` 建置發佈——全程不必再手動介入。
+
+任一步失敗就地停止（不自動回滾），並印出目前停在哪一步、怎麼收拾。合併前想反悔：`gh pr merge --disable-auto`（取消 auto-merge，PR 留著）或直接把 PR 關掉。
+
+正式跑之前可以先 `npm run release <x.y.z> --dry-run`，只印出每一步會執行的指令，不建分支、不改檔案、不 push、不開 PR。
+
+<details>
+<summary>備援：手動流程（不用 <code>npm run release</code>）</summary>
+
+`npm run release` 本質上就是把下面這串手動步驟接起來；需要更細的掌控（例如中途要插入其他改動再一起 commit）時可以照這樣手動跑：
 
 ```
 npm run bump <x.y.z>
-git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json
+cargo update -p traytunnel --manifest-path src-tauri/Cargo.toml
+npm install --package-lock-only
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock package.json package-lock.json
 git commit -m "版本升級至 <x.y.z>"
 git push
 ```
 
 開 PR、合併進 `main` 後，`autotag.yml` 偵測到 `src-tauri/Cargo.toml` 的版號變動，會自動建立 annotated tag `v<x.y.z>` 並推送，接著主動 dispatch `release.yml` 觸發建置發佈（GitHub 的防遞迴機制不會讓 `GITHUB_TOKEN` push 的 tag 自己觸發其他 workflow，所以由 `autotag.yml` 補這一腳）；`release.yml` 收到後照原本邏輯確認同名 tag 已存在再建置。
 
-以下是備援手段，主流程正常運作時不需要用到：
+</details>
+
+以下兩項是更底層的備援手段，主流程（不論是 `npm run release` 還是上面的手動流程）正常運作時都不需要用到：
 
 <details>
 <summary>備援：手動貼 tag</summary>
