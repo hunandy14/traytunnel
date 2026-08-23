@@ -19,6 +19,8 @@ import type {
   TestConnectionInput,
   TestConnectionResult,
   UpdateInfo,
+  WgProxyInput,
+  WgSocksInput,
 } from "./types";
 
 export const getState = () => invoke<Snapshot>("get_state");
@@ -46,11 +48,32 @@ export const testConnection = (input: TestConnectionInput) =>
 
 // ------------------------------------------------------------ 轉發設定
 
-/** 回傳錯誤字串代表驗證失敗，null 代表成功 */
+/** 回傳錯誤字串代表驗證失敗，null 代表成功。SSH 與 WG 的 forward 列共用 */
 export const upsertForward = (input: ForwardInput) =>
   invoke<string | null>("upsert_forward", { ...input });
 
+/** local 是全域唯一鍵，刪任何一種列（forward／socks）都走這一支 */
 export const deleteForward = (local: number) => invoke<void>("delete_forward", { local });
+
+// ------------------------------------------------------------ WireGuard 連線
+
+/** 回傳錯誤字串代表驗證失敗，null 代表成功；originalName 為 null 代表新增 */
+export const upsertWgProxy = (input: WgProxyInput) =>
+  invoke<string | null>("upsert_wg_proxy", { ...input });
+
+/** 刪 WG 連線，底下所有列一併刪掉，運行中的先停 */
+export const deleteWgProxy = (name: string) => invoke<void>("delete_wg_proxy", { name });
+
+/** 存檔前的 .conf 測試：解析＋真握手，15 秒上限，回傳形狀與 test_connection 一致 */
+export const testWgConf = (confPath: string) =>
+  invoke<TestConnectionResult>("test_wg_conf", { confPath });
+
+/** 原生檔案選擇器，選 .conf；取消時回 null */
+export const pickWgConf = () => invoke<string | null>("pick_wg_conf");
+
+/** WG 專屬：新增／編輯引擎自建 SOCKS5 代理列，originalLocal 為 null 代表新增 */
+export const upsertWgSocks = (input: WgSocksInput) =>
+  invoke<string | null>("upsert_wg_socks", { ...input });
 
 // ------------------------------------------------------------ 全域設定
 
