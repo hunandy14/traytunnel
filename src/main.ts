@@ -570,22 +570,36 @@ function applySnapshot(next: Snapshot, replayLogs = false) {
   render();
 }
 
+/**
+ * 只要不是 connected 就把舊的自測結果清乾淨，不只 stopped：斷線重連期間
+ * （connecting／reconnecting／port_busy／error）舊的「測試成功」字樣沒有
+ * 理由繼續掛著，那是上一輪連線的結果，跟現在這輪連線狀態對不上。
+ *
+ * 這條規則自己就夠用，不依賴後端另外推事件——即使後端車道之後補上專門的
+ * clear 事件或在 exit-test 帶空 result 過來（見 applyExitTest），這裡仍然
+ * 是第一道、最快生效的防線。
+ */
 function applyExitStatus(ev: ExitStatusEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
   const { exit } = hit;
   exit.status = ev.status;
   exit.detailText = ev.detail ?? null;
-  if (ev.status === "stopped") exit.lastTest = null;
+  if (ev.status !== "connected") exit.lastTest = null;
   paintCard(exit);
   if (view === "source") renderSummary();
   paintRailStatus(hit.source.name);
 }
 
+/**
+ * text 是空字串代表後端要清掉這個出口的自測結果（清除訊號，而不是一筆
+ * 「文字剛好是空的」測試結果），比照 applyExitStatus 一樣改記成 null，
+ * 不要把空殼結果畫到卡片上。
+ */
 function applyExitTest(ev: ExitTestEvent) {
   const hit = locate(ev.local);
   if (!hit) return;
-  hit.exit.lastTest = { state: ev.state, text: ev.text };
+  hit.exit.lastTest = ev.text ? { state: ev.state, text: ev.text } : null;
   paintCard(hit.exit);
 }
 

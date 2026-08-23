@@ -86,7 +86,13 @@ export interface ExitStatusEvent {
   detail?: string | null;
 }
 
-/** "exit-test" 事件 */
+/**
+ * "exit-test" 事件。
+ *
+ * text 是空字串代表清除訊號——後端要把這個出口的自測結果收掉（例如斷線
+ * 重連），不是「剛好測出一筆空文字的結果」；前端收到時要把 lastTest 記成
+ * null，不能照樣畫成一筆結果（見 main.ts 的 applyExitTest）。
+ */
 export interface ExitTestEvent {
   local: number;
   state: TestState;

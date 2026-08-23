@@ -175,7 +175,9 @@ function ownerOf(local: number): string {
  */
 function setStatus(exit: ExitInfo, status: ExitStatus, detail?: string) {
   exit.status = status;
-  if (status === "stopped") exit.lastTest = null;
+  // 比照 main.ts 的 applyExitStatus：非 connected 一律清舊的自測結果，
+  // 不只 stopped——斷線重連期間舊的「測試成功」字樣沒有理由繼續掛著。
+  if (status !== "connected") exit.lastTest = null;
   void emit("exit-status", { local: exit.local, status, detail: detail ?? null });
 }
 
