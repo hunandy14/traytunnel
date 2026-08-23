@@ -5,6 +5,10 @@ description = "Windows 系統匣 SSH 隧道管理工具"
 authors = ["Charlotte.HonG"]
 license = "MIT"
 edition = "2021"
+# 這份下限本來就隱性存在（相依樹裡有比這更新的要求），寫明是為了讓
+# 版本太舊時 cargo 直接給一句話，而不是丟一串看不出所以然的編譯錯誤。
+# 目前自家程式碼裡卡最緊的是 winsys 的 `as_chunks`（1.88 起穩定）。
+rust-version = "1.88"
 
 [lib]
 # `_lib` 後綴避免在 Windows 上與 bin 目標同名衝突

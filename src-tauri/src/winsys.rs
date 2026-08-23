@@ -440,7 +440,7 @@ pub fn read_run_value(name: &str) -> Option<String> {
 /// 兩份幾乎一樣的 unsafe 區塊就不必各自維護（也不會只修好其中一份）。
 ///
 /// 回傳的是位元組，不是 `Vec<u16>`：`Vec<u8>` 只保證 1 位元組對齊，指標轉型成
-/// u16 去讀是未對齊讀取。字串那一版改用 `chunks_exact` 逐對組回 u16，
+/// u16 去讀是未對齊讀取。字串那一版改用 `as_chunks::<2>()` 逐對組回 u16，
 /// 不必為了對齊而讓這支函式跟著分兩種緩衝型別。
 fn read_hkcu_raw(subkey: &str, name: &str, flags: u32) -> Option<Vec<u8>> {
     let subkey = wide(subkey);
