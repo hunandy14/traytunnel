@@ -4,6 +4,7 @@
 //! 世代序號與 Job Object handle，彼此互不影響。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -361,6 +362,25 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> T,
     {
+        self.update_config_checked(|c| Ok::<T, Infallible>(edit(c))).map(|r| match r {
+            Ok(v) => v,
+            // 閉包回的是 Infallible，這一支永遠到不了
+            Err(never) => match never {},
+        })
+    }
+
+    /// 與 `update_config` 相同，但閉包有否決權：回 Err 就當作這次操作沒發生
+    /// ——不寫檔、記憶體不動，錯誤原樣交回呼叫端。
+    ///
+    /// 唯一性那種「要看過整份設定才知道」的驗證必須在閉包裡再做一次。指令層的
+    /// 標準流程是「先 with_config 讀一份來驗，驗過了再 update_config 寫下去」，
+    /// 而這兩步之間 cfg 鎖是放開的：兩個同時進來的新增可以雙雙通過驗證，
+    /// 再一前一後把兩筆同名的源（或同一個本地埠）push 進去。閉包裡這一次
+    /// 重驗是在鎖裡做的，成本只是再走一遍幾個字串比較。
+    pub fn update_config_checked<F, T, E>(&self, edit: F) -> std::io::Result<Result<T, E>>
+    where
+        F: FnOnce(&mut Config) -> Result<T, E>,
+    {
         if self.is_read_only() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -370,12 +390,16 @@ impl AppState {
         }
         let mut guard = self.cfg.lock().unwrap();
         let mut next = guard.clone();
-        let out = edit(&mut next);
+        let out = match edit(&mut next) {
+            Ok(v) => v,
+            // 被否決：next 是一份還沒公開過的複本，直接丟掉就等於什麼都沒發生
+            Err(e) => return Ok(Err(e)),
+        };
         crate::config::write_config_at(&self.path, &next)?;
         *guard = next;
         drop(guard);
         self.sync_exits();
-        Ok(out)
+        Ok(Ok(out))
     }
 
     /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態。
