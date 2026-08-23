@@ -147,6 +147,13 @@ pub struct Source {
 pub struct Config {
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// 要不要在背景檢查新版。
+    ///
+    /// 刻意是 `Option`：這一項的預設值**跟著執行模式走**（一般模式開、可攜模式
+    /// 關），設定檔裡沒寫的時候不能在這裡就決定成某個布林，否則可攜模式讀進來
+    /// 就會拿到一般模式的預設值。實際生效的值一律問 [`Config::checks_for_updates`]。
+    #[serde(default)]
+    pub check_for_updates: Option<bool>,
     #[serde(default)]
     pub sources: Vec<Source>,
 }
@@ -176,6 +183,15 @@ impl Source {
 }
 
 impl Config {
+    /// 這次執行到底要不要檢查更新。
+    ///
+    /// 設定檔沒寫（`None`）時看模式：一般模式視為開啟，可攜模式視為關閉——
+    /// 可攜版常見的用法就是丟在隨身碟或隔離環境裡跑，預設不主動連外比較合理，
+    /// 而且它本來也只能提示、不能就地更新。寫了就照使用者寫的算。
+    pub fn checks_for_updates(&self, portable: bool) -> bool {
+        self.check_for_updates.unwrap_or(!portable)
+    }
+
     /// 依本地埠找出口，本地埠是出口的全域唯一鍵
     pub fn forward(&self, local: u16) -> Option<&Forward> {
         self.sources.iter().find_map(|s| s.forward(local))
@@ -240,6 +256,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             close_to_tray: true,
+            // 預設值跟著模式走，所以這裡刻意留空（見 checks_for_updates）
+            check_for_updates: None,
             sources: vec![Source {
                 name: "your-host".into(),
                 host: "your-host.example.com".into(),
@@ -311,6 +329,10 @@ pub fn default_document() -> String {
          \n\
          # 關閉鈕（X）是否只隱藏到系統匣。\n\
          closeToTray = {close}\n\
+         \n\
+         # 是否在背景檢查新版（啟動後一次，之後每天一次）。\n\
+         # 省略時：一般模式視為 true，可攜模式視為 false。關閉時完全不連外。\n\
+         #checkForUpdates = true\n\
          \n\
          # 每個 [[sources]] 是一組 ssh 連線參數，底下可以掛多個轉發出口。\n\
          [[sources]]\n\
@@ -436,6 +458,8 @@ impl LegacyConfig {
     fn into_config(self) -> Config {
         Config {
             close_to_tray: self.close_to_tray,
+            // 舊制沒有這個欄位，遷移後照樣讓它跟著模式走
+            check_for_updates: None,
             sources: vec![Source {
                 name: source_name_from_host(&self.host),
                 host: self.host.trim().to_string(),
@@ -582,6 +606,13 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
     }
 
     doc["closeToTray"] = value(cfg.close_to_tray);
+
+    // 沒有明確設定就不要把鍵寫進去：一寫下去，那個當下算出來的預設值就被固定了，
+    // 同一份可攜設定被一般模式讀到（或反過來）時，預設值就跟著模式走不動了。
+    // 使用者在設定頁動過開關才會變成 Some，那時才落檔。
+    if let Some(on) = cfg.check_for_updates {
+        doc["checkForUpdates"] = value(on);
+    }
 
     if !matches!(doc.get("sources"), Some(Item::ArrayOfTables(_))) {
         doc["sources"] = Item::ArrayOfTables(ArrayOfTables::new());

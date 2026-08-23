@@ -6,6 +6,7 @@ mod exits;
 mod state;
 mod traymenu;
 mod tunnel;
+mod update;
 mod winsys;
 
 use std::sync::Arc;
@@ -126,6 +127,9 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
+        // 前端一律走我們自己的指令，不開它的 JS 權限
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::start_exit,
@@ -145,6 +149,9 @@ pub fn run() {
             commands::set_autostart,
             commands::get_config_path,
             commands::open_config_dir,
+            commands::set_check_for_updates,
+            commands::install_update,
+            commands::open_releases_page,
             commands::window_close,
             commands::window_minimize,
             commands::exit_app,
@@ -158,7 +165,7 @@ pub fn run() {
             let outcome = config::load_from_path(&loc.path);
             let cfg: Config = outcome.config().clone();
             let shared: Shared =
-                Arc::new(AppState::new(handle.clone(), loc.path.clone(), cfg.clone()));
+                Arc::new(AppState::new(handle.clone(), loc.path.clone(), loc.portable, cfg.clone()));
             // 壞檔又備份不出來時，原檔是使用者僅存的一份，這次執行一律不准回寫。
             // 要趕在任何存檔路徑（含系統匣、自啟自癒）跑起來之前拉閘。
             if outcome.read_only() {
@@ -255,6 +262,8 @@ pub fn run() {
 
             // enabled 的出口開機就自己連
             tunnel::start_enabled(&shared);
+            // 更新檢查排在最後：它自己先睡幾秒，啟動路徑上不佔任何時間
+            update::spawn_checker(&shared);
             Ok(())
         })
         .run(tauri::generate_context!())

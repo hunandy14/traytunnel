@@ -37,6 +37,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 本地埠衝突三層防護：設定階段擋重複埠（跨連線也擋，訊息會點名佔用者與它所屬的連線）、spawn 前偵測埠是否已被其他程序佔用（狀態顯示 `port_busy`，每 5 秒重查而不盲目 spawn），最後由 ssh 的 `ExitOnForwardFailure=yes` 兜底
 - 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地（此功能會經隧道向第三方服務 ipinfo.io 發出請求）
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
+- 應用內更新：啟動幾秒後與之後每 24 小時各查一次 Releases 上的 `latest.json`，有新版時設定頁的 About 分節會多出一列 `v<新版> available`。**安裝版**（NSIS 裝的那一份）可以就地更新，按 Restart to update 會下載經 minisign 簽章驗證的安裝檔並交棒給它，程式自己退出、裝完由安裝程式重啟；**一般單檔與可攜版**不會改寫自己，按鈕是 Download，只開系統瀏覽器到 Releases 頁讓你自己換檔案。是不是安裝版由登錄檔的解除安裝資訊判定（`InstallLocation` 要真的就是這支執行檔的所在資料夾）。檢查失敗完全靜默，只在活動日誌留一行；整個機制可以用 `checkForUpdates` 關掉，關掉後完全不發網路請求（可攜模式預設就是關的）
 - 單一實例：重複啟動只會把既有的主視窗叫出來
 - 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Reconnect all`，多組連線時每組收成一個子選單（底下有 `Reconnect`）
 - 系統匣圖示依 `SM_CXSMICON` 從多層 ICO 挑原生尺寸的那一層（含 16／20／24／28／32px），高 DPI 下不會被 GDI 拉伸糊掉
@@ -53,7 +54,7 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 | `traytunnel-<版本>p.exe` | 可攜版，與上面**同一顆二進位**，檔名以 `p` 結尾＝設定檔跟著 exe 走 |
 | `traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
-每個 Release 也會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）。
+每個 Release 也會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）。另外還有一個 `latest.json`，那是應用內更新自己要讀的清單（版本號、安裝檔網址與簽章），不必手動下載。
 
 ## 介面
 
@@ -106,6 +107,7 @@ npm run dev
 - 假資料有三條連線（`tokyo` 兩條隧道、`taipei` 兩條隧道、`lab` 零隧道示範空狀態），涵蓋每條隧道獨立的 `connecting → connected`、自測 `testing → ok`／`fail`、固定會撞埠的 `port_busy`，以及跨連線的本地埠衝突；隧道的連接／中斷／重新連接、整條連線的啟停與重接、隧道的新增／編輯／刪除（含 undo）、連線的新增／編輯／刪除都能實際操作
 - 設定存檔只寫進 `sessionStorage`，不會碰到真的設定檔
 - 另外掛了 `window.__mock` 供演練特定狀態：`__mock.drop(1080)` 模擬斷線重連、`__mock.status(1080, "error", "…")` 直接指定狀態、`__mock.wipe()` 清掉所有連線看零連線空狀態、`__mock.configDelay(1500)` 讓 `config-changed` 晚於 invoke 的 resolve 送達（真後端就是這個順序，用來驗證改名後的選中不會被回退吃掉）、`__mock.reset()` 清掉暫存重來
+- 更新檢查的三態與兩種車道也演得到：`__mock.update("installed")` 安裝版發現新版（按鈕是 Restart to update）、`__mock.update("portable")` 可攜版發現新版（按鈕是 Download）、`__mock.update("none")` 已是最新（更新列收起來）、`__mock.update("fail")` 檢查失敗（畫面不動，只在活動日誌留一行）；`__mock.updateFails()` 則讓按下 Restart to update 演成失敗，看按鈕彈回與錯誤列
 
 假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
 
@@ -129,6 +131,8 @@ npm run dev
 
 版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
 
+更新簽章：`tauri.conf.json` 開了 `bundle.createUpdaterArtifacts`，打包時會替 NSIS 安裝檔簽出一份 `.sig`（就落在安裝檔旁邊）。因此 `build:setup`／`build:all` 在**沒有簽章私鑰**的環境會在最後一步失敗——安裝檔本身已經產出，但簽不出 `.sig`，`tauri` 以非零狀態結束，後面的 `scripts/package.mjs` 也就不會跑到。平常只是要驗程式請用 `build:exe`（`--no-bundle` 根本不會走到簽章那一步）；真的要在本地打包安裝檔時，先設好 `TAURI_SIGNING_PRIVATE_KEY`（私鑰檔的**內容**）與 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（沒設密碼也要給空字串，否則 tauri 會停下來問）。私鑰放在 repo 的 `secrets\`，已列入 `.gitignore`；CI 的 `release.yml` 則從 GitHub Secrets 取同一把鑰匙。私鑰與 `tauri.conf.json` 裡的 `plugins.updater.pubkey` 對不起來時 tauri 會印一行警告，那種簽章在使用者端會驗不過。
+
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
 免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成 `p` 結尾（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見下方「設定檔」）。
@@ -145,7 +149,7 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all` 並把 `out/*.exe` 上傳成 GitHub Release。主流程只需要：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責貼 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要：
 
 ```
 npm run bump <x.y.z>
@@ -221,6 +225,7 @@ copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
 | 欄位 | 說明 |
 | --- | --- |
 | `closeToTray` | 關閉鈕（X）是否只隱藏到系統匣 |
+| `checkForUpdates` | 是否在背景檢查新版（啟動後一次，之後每 24 小時一次）。**省略時的預設值跟著模式走**：一般模式視為 `true`，可攜模式視為 `false`。關閉時完全不發網路請求。設定頁 General 分節有對應的開關，動過開關才會把這個鍵寫進檔案 |
 | `[[sources]]` | 一組連線（介面稱 Connection），含 `name`、`host`、`user`、`proxyCommand` 與底下的 `[[sources.forwards]]` |
 
 `[[sources]]` 的欄位：

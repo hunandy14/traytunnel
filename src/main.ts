@@ -9,6 +9,7 @@ import {
   onExitStatus,
   onExitTest,
   onLog,
+  onUpdateAvailable,
   restartExit,
   startExit,
   startSource,
@@ -39,7 +40,14 @@ import {
 import { showErrorToast, showUndoToast, type UndoToast } from "./toast";
 import type { ExitInfo, ExitStatusEvent, ExitTestEvent, Snapshot, SourceInfo } from "./types";
 
-const EMPTY: Snapshot = { closeToTray: true, autostart: false, sources: [], logs: [] };
+const EMPTY: Snapshot = {
+  closeToTray: true,
+  autostart: false,
+  checkForUpdates: true,
+  sources: [],
+  logs: [],
+  update: null,
+};
 
 let snap: Snapshot = EMPTY;
 
@@ -609,6 +617,11 @@ async function init() {
     await onExitStatus(applyExitStatus);
     await onExitTest(applyExitTest);
     await onConfigChanged((s) => applySnapshot(s));
+    // 更新檢查是背景跑的，結果晚於啟動快照才到，靠這個事件補進來
+    await onUpdateAvailable((info) => {
+      snap = { ...snap, update: info };
+      syncSettingsPage(snap);
+    });
   } catch (e) {
     appendLog(`ui error: ${String(e)}`);
   }

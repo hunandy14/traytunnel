@@ -80,14 +80,29 @@ pub struct SourceView {
     pub exits: Vec<ExitView>,
 }
 
+/// 有新版可用時的資訊：同時是 Snapshot 的 `update` 欄位與 `update-available`
+/// 事件的內容。沒有新版（或還沒查過、檢查失敗）時一律是 None，介面就不顯示那一列。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    /// 遠端公告的新版本號，不帶 v
+    pub version: String,
+    /// true＝安裝版，可以就地下載安裝；false＝可攜／單檔版，只能開瀏覽器讓使用者自己換
+    pub installed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub close_to_tray: bool,
     pub autostart: bool,
+    /// 實際生效的值（設定檔沒寫時已經照模式決定好了），設定頁的開關直接吃它
+    pub check_for_updates: bool,
     pub sources: Vec<SourceView>,
     /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
     pub logs: Vec<String>,
+    /// 背景檢查發現的新版，沒有就是 null（介面靠它決定要不要顯示更新列）
+    pub update: Option<UpdateInfo>,
 }
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
@@ -166,6 +181,9 @@ pub struct AppState {
     /// 這次執行生效的設定檔完整路徑，由 config::config_location() 解析而來；
     /// 全程式的回寫、備份與「開啟設定資料夾」都以它為準
     pub path: PathBuf,
+    /// 這次是不是可攜模式（設定檔就在執行檔旁邊），同樣來自 config_location()。
+    /// 目前只有「檢查更新」這一項的預設值跟著它走
+    portable: bool,
     cfg: Mutex<Config>,
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
@@ -177,14 +195,17 @@ pub struct AppState {
     exiting: AtomicBool,
     /// 設定檔壞掉又備份不出來時會被拉起來，之後一律拒絕回寫
     read_only: AtomicBool,
+    /// 背景更新檢查的結果，None 代表目前沒有新版可用
+    update: Mutex<Option<UpdateInfo>>,
 }
 
 impl AppState {
-    pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
+    pub fn new(app: AppHandle, path: PathBuf, portable: bool, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         AppState {
             app,
             path,
+            portable,
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
@@ -193,6 +214,7 @@ impl AppState {
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
+            update: Mutex::new(None),
         }
     }
 
@@ -454,6 +476,30 @@ impl AppState {
         crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
+    /// 這次執行要不要檢查更新：設定檔沒寫的話，一般模式開、可攜模式關
+    pub fn checks_for_updates(&self) -> bool {
+        self.with_config(|c| c.checks_for_updates(self.portable))
+    }
+
+    /// 記下背景檢查的結果並推事件；跟上次一樣就不重推。
+    ///
+    /// 每 24 小時會再查一次，同一個新版本重複推的話，設定頁那一列會無謂重畫，
+    /// 也讓事件流看起來像真的又發生了什麼事。
+    pub fn set_update(&self, info: Option<UpdateInfo>) {
+        {
+            let mut slot = self.update.lock().unwrap();
+            if *slot == info {
+                return;
+            }
+            *slot = info.clone();
+        }
+        let _ = self.app.emit("update-available", info);
+    }
+
+    pub fn update_info(&self) -> Option<UpdateInfo> {
+        self.update.lock().unwrap().clone()
+    }
+
     /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
     ///
     /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
@@ -498,8 +544,10 @@ impl AppState {
         Snapshot {
             close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
+            check_for_updates: self.checks_for_updates(),
             sources,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
+            update: self.update_info(),
         }
     }
 

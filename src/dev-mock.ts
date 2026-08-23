@@ -24,6 +24,7 @@ const STORE_KEY = "traytunnel-dev-mock-v3";
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
   autostart: false,
+  checkForUpdates: true,
   sources: [
     {
       name: "tokyo",
@@ -54,6 +55,8 @@ const DEFAULT_SNAPSHOT: Snapshot = {
     },
   ],
   logs: [],
+  // 預設沒有新版，更新列不出現；三種更新情境由 __mock 那邊演（見 installScenarioHooks）
+  update: null,
 };
 
 /** 假的出口自測結果，照原版「ip  city, country」格式；沒列到的埠就當作測不到 */
@@ -123,6 +126,19 @@ function pushConfig() {
   const payload = structuredClone(state);
   if (configDelay > 0) window.setTimeout(() => void emit("config-changed", payload), configDelay);
   else void emit("config-changed", payload);
+}
+
+/**
+ * 下一次 install_update 要不要演成失敗，null 代表照常（永不 resolve）。
+ * 由 __mock.updateFails() 開關。
+ */
+let installFailure: string | null = null;
+
+/** 更新資訊改變時的唯一出口，與真後端一樣：存進狀態並推 update-available */
+function setUpdate(info: Snapshot["update"]) {
+  state.update = info;
+  persist();
+  void emit("update-available", info);
 }
 
 function findSource(name: string): SourceInfo | undefined {
@@ -468,14 +484,37 @@ function handle(cmd: string, args: Args): unknown {
       log(null, state.autostart ? "autostart enabled" : "autostart disabled");
       return null;
 
+    // 真後端關掉時會順手把已經找到的那一版從畫面上收掉，這裡照做
+    case "set_check_for_updates":
+      state.checkForUpdates = Boolean(args.on);
+      if (!state.checkForUpdates) state.update = null;
+      pushConfig();
+      log(null, state.checkForUpdates ? "update checks enabled" : "update checks disabled");
+      return null;
+
     // 瀏覽器裡沒有真的設定檔，給一條看得出樣子的假路徑（夠長，順便驗省略號）
     case "get_config_path":
       return "C:\\Users\\browser-mock\\.traytunnel.toml";
 
     // 也沒有檔案總管可開，只記一行
     case "open_config_dir":
+    // 可攜版的 Download：真後端會 ShellExecuteW 開系統瀏覽器，這裡只記一行
+    // （瀏覽器裡自己開新分頁多半會被彈出視窗攔截，反而演不出東西）
+    case "open_releases_page":
       log(null, `(browser mock) ${cmd}`);
       return null;
+
+    /**
+     * 安裝版的 Restart to update。真後端成功時**永遠不會 resolve**——安裝程式
+     * 一接手，程式就 exit 了，所以按鈕會一直停用著、畫面停在原樣。這裡刻意
+     * 回一個不會 settle 的 promise 把那個行為演到位；要看失敗那條路
+     * （按鈕彈回來、錯誤列顯示原因）請用 __mock.updateFails()。
+     */
+    case "install_update":
+      log(null, "downloading update…");
+      log(null, "(browser mock) the real app would exit and hand over to the installer here");
+      if (installFailure) return Promise.reject(installFailure);
+      return new Promise<never>(() => {});
 
     default:
       log(null, `(browser mock) unhandled command: ${cmd}`);
@@ -522,6 +561,38 @@ function installScenarioHooks() {
       state.sources = [];
       pushConfig();
       log(null, "all sources removed");
+    },
+    /**
+     * 演練背景更新檢查的三種結果，兩種車道的 UI 都看得到：
+     *
+     *   __mock.update("installed")  安裝版發現新版 → 按鈕是 Restart to update
+     *   __mock.update("portable")   可攜／單檔版發現新版 → 按鈕是 Download
+     *   __mock.update("none")       已是最新 → 更新列整列收起來
+     *   __mock.update("fail")       檢查失敗 → 畫面完全不動，只在活動日誌留一行
+     *
+     * 對應真後端的行為：查到新版才推 update-available，查不到／失敗都不動畫面
+     * （失敗只 log 一行），所以「已最新」與「檢查失敗」在畫面上都是沒有更新列。
+     */
+    update(kind: "installed" | "portable" | "none" | "fail", version = "9.9.9") {
+      if (kind === "fail") {
+        log(null, "update check failed: (browser mock) simulated network error");
+        return;
+      }
+      if (kind === "none") {
+        log(null, "(browser mock) update check: already up to date");
+        setUpdate(null);
+        return;
+      }
+      setUpdate({ version, installed: kind === "installed" });
+      log(null, `(browser mock) update available: v${version}`);
+    },
+    /**
+     * 讓下一次（與之後每一次）按 Restart to update 都失敗，用來看錯誤那條路：
+     * 按鈕彈回可按、原因寫在設定頁的錯誤列。傳 null 關掉。
+     */
+    updateFails(message: string | null = "Failed to download the update") {
+      installFailure = message;
+      return installFailure;
     },
     owner: ownerOf,
     /** 演練「config-changed 晚於 invoke resolve」的事件順序，0 是預設的即時送達 */

@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, Source};
 use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
-use crate::{close_main, do_exit, tunnel, winsys, Shared};
+use crate::{close_main, do_exit, tunnel, update, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
 const SAVE_FAILED: &str = "Failed to save settings";
@@ -421,6 +421,42 @@ pub fn open_config_dir(state: State<'_, Shared>) {
     if let Err(e) = winsys::reveal_in_explorer(&st.path) {
         st.log(format!("could not open the config folder: {e}"));
     }
+}
+
+/// 背景檢查更新的開關。
+///
+/// 關掉之後完全不再連外，順手把已經找到的那一版也從畫面上收掉——使用者說了
+/// 不要再被更新的事情打擾，留著那一列只是繼續打擾他。打開則立刻查一次，
+/// 不必等到明天的排程。
+#[tauri::command]
+pub fn set_check_for_updates(state: State<'_, Shared>, on: bool) -> Result<(), String> {
+    let st = state.inner();
+    st.update_config(|c| c.check_for_updates = Some(on)).map_err(|e| save_error_message(st, e))?;
+    st.emit_config_changed();
+    st.log(if on { "update checks enabled" } else { "update checks disabled" });
+    if on {
+        update::check_now(st);
+    } else {
+        st.set_update(None);
+    }
+    Ok(())
+}
+
+/// 安裝版的「Restart to update」：下載並交棒給 NSIS 安裝程式。
+///
+/// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，
+/// 所以前端不必為成功的情況做任何收尾。回 Err 才代表這次更新沒能開始。
+#[tauri::command]
+pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
+    let st = state.inner().clone();
+    update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
+}
+
+/// 可攜／單檔版的「Download」：開系統瀏覽器到 Releases 頁，剩下的交給使用者。
+/// 這條路不下載任何東西，也不會動到執行中的這顆 exe。
+#[tauri::command]
+pub fn open_releases_page(state: State<'_, Shared>) {
+    update::open_releases_page(state.inner());
 }
 
 #[tauri::command]

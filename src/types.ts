@@ -54,12 +54,28 @@ export interface SourceInfo {
   exits: ExitInfo[];
 }
 
+/**
+ * 有新版可用時的資訊。null（或欄位不存在）代表沒有新版，設定頁就不顯示更新列。
+ *
+ * installed 決定使用者看到的是哪一種動作：安裝版可以就地更新（Restart to
+ * update），可攜／單檔版只能開瀏覽器到 Releases 自己換檔案（Download）。
+ */
+export interface UpdateInfo {
+  /** 遠端公告的新版本號，不帶 v */
+  version: string;
+  installed: boolean;
+}
+
 export interface Snapshot {
   closeToTray: boolean;
   autostart: boolean;
+  /** 實際生效的值：設定檔沒寫時，一般模式是 true、可攜模式是 false */
+  checkForUpdates: boolean;
   sources: SourceInfo[];
   /** 活動日誌的整行（含時間戳與 [源名] 前綴），舊到新 */
   logs: string[];
+  /** 背景更新檢查的結果，沒有新版就是 null */
+  update: UpdateInfo | null;
 }
 
 /** "exit-status" 事件 */

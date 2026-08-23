@@ -11,6 +11,7 @@
 
 import {
   createElement,
+  Download,
   Ellipsis,
   FileText,
   FolderOpen,
@@ -30,6 +31,7 @@ import {
 
 /** 名字沿用 Lucide 官方的 kebab-case，方便對著 lucide.dev 查 */
 const ICONS = {
+  download: Download,
   ellipsis: Ellipsis,
   "file-text": FileText,
   "folder-open": FolderOpen,
