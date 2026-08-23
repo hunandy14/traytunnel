@@ -18,7 +18,8 @@
     </div>
 
     <div class="shell">
-      <!-- 左側連線軌道：上半是可捲動的連線清單＋新增，下半固定住日誌與設定 -->
+      <!-- 左側連線軌道：上半是可捲動的連線清單＋新增，下半固定住日誌與設定。
+           SSH 源與 WG 連線共用同一條軌道，只靠 icon 底色／內容區分（Q10）。 -->
       <nav class="rail" aria-label="Connections">
         <div class="rail-list" id="rail-list"></div>
         <div class="rail-foot">
@@ -32,7 +33,11 @@
         <section class="view" id="view-source">
           <div class="panel summary">
             <div class="summary-text">
-              <div class="summary-title" id="summary-title">Starting…</div>
+              <div class="summary-title-row">
+                <!-- WG 專屬：連線引擎狀態點，跟標題並排；SSH 連線一律 hidden -->
+                <span class="dot" id="summary-engine-dot" hidden></span>
+                <div class="summary-title" id="summary-title">Starting…</div>
+              </div>
               <div class="summary-sub" id="summary-sub">ssh tunnel</div>
             </div>
             <div class="summary-score">
@@ -40,6 +45,8 @@
               <div class="summary-score-label" id="summary-score-label">connected</div>
             </div>
             <div class="summary-actions">
+              <!-- WG 專屬：連線總開關，關閉時底下所有列變暗但保留各自的意圖 -->
+              <button class="toggle" id="summary-master-toggle" hidden role="switch" title="Connection switch"></button>
               <!-- 動作全部收進 ⋯ 選單（自繪，不是原生右鍵選單） -->
               <div class="summary-more-wrap">
                 <button
@@ -52,7 +59,11 @@
                 ></button>
                 <div class="summary-menu" id="summary-menu" role="menu" hidden>
                   <button class="summary-menu-item" id="menu-add-exit" role="menuitem">
-                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add tunnel
+                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add forward…
+                  </button>
+                  <!-- WG 專屬：引擎自建 SOCKS5 代理，SSH 連線不顯示這一項 -->
+                  <button class="summary-menu-item" id="menu-add-socks" role="menuitem" hidden>
+                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add proxy…
                   </button>
                   <button class="summary-menu-item" id="menu-toggle-source" role="menuitem">
                     <span class="ico" id="menu-toggle-ico"></span>
@@ -62,7 +73,7 @@
                     <span class="ico" data-icon="refresh-cw" data-icon-size="14"></span>Reconnect
                   </button>
                   <button class="summary-menu-item" id="menu-activity" role="menuitem">
-                    <span class="ico" data-icon="history" data-icon-size="14"></span>Activity
+                    <span class="ico" data-icon="history" data-icon-size="14"></span>Activity log
                   </button>
                   <hr />
                   <button class="summary-menu-item" id="menu-edit-source" role="menuitem">
@@ -73,11 +84,19 @@
             </div>
           </div>
 
-          <div class="list-head">
-            <span class="list-label">Tunnels</span>
-          </div>
-          <div class="cards-scroll">
-            <div class="cards" id="cards"></div>
+          <!-- 兩段分組依機制而非語意：SOCKS5 只放引擎自建代理（WG 專屬，清單置頂），
+               PORT FORWARDS 放全部轉發（SSH／WG 皆有，含 probeProxy=true 的列，就地
+               顯示徽章＋出口 IP，不搬去別的分組）。空區段整段不畫，含標題。 -->
+          <div class="cards-scroll" id="cards-scroll">
+            <div class="list-head" id="proxies-list-head" hidden>
+              <span class="list-label">SOCKS5</span>
+            </div>
+            <div class="cards" id="proxies-cards"></div>
+
+            <div class="list-head" id="forwards-list-head" hidden>
+              <span class="list-label">PORT FORWARDS</span>
+            </div>
+            <div class="cards" id="forwards-cards"></div>
           </div>
         </section>
 
@@ -86,7 +105,7 @@
           <button class="big-ghost" id="btn-first-source">
             <span class="big-ghost-plus" data-icon="plus" data-icon-size="28"></span>
             <span class="big-ghost-title">Add connection</span>
-            <span class="big-ghost-hint">An ssh host that your tunnels run through</span>
+            <span class="big-ghost-hint">An ssh host or a WireGuard proxy that your tunnels run through</span>
           </button>
         </section>
 
@@ -176,35 +195,65 @@
       </main>
     </div>
 
-    <!-- 連線的新增／編輯 sheet（情境式，維持覆蓋層） -->
+    <!-- 連線的新增／編輯 sheet（情境式，維持覆蓋層）。類型分頁只在新增時顯示，
+         編輯既有連線時類型已固定，改用標題旁的唯讀徽章（U1：連線類型建立後不可變）。
+         WG 表單只有名稱與 .conf 路徑兩項——SOCKS5 與轉發都在各自獨立的表單裡設定。 -->
     <div class="sheet-backdrop" id="src-backdrop" hidden>
       <div class="sheet" role="dialog" aria-modal="true" aria-label="Connection">
         <header class="sheet-head">
           <span class="sheet-title" id="src-title">Add connection</span>
+          <span class="type-badge" id="src-type-badge" hidden></span>
           <button class="tbtn" id="src-close" title="Close" data-icon="x"></button>
         </header>
 
         <div class="sheet-body">
-          <label class="sheet-field field-name">
-            <span class="edit-label">Name</span>
-            <span class="input"><input id="src-name" spellcheck="false" placeholder="tokyo" /></span>
-            <span class="field-error"></span>
-          </label>
-          <label class="sheet-field field-host">
-            <span class="edit-label">Host</span>
-            <span class="input"><input id="src-host" spellcheck="false" placeholder="gateway.example.com" /></span>
-            <span class="field-error"></span>
-          </label>
-          <label class="sheet-field field-user">
-            <span class="edit-label">User</span>
-            <span class="input"><input id="src-user" spellcheck="false" placeholder="ubuntu" /></span>
-            <span class="field-error"></span>
-          </label>
-          <label class="sheet-field field-proxyCommand">
-            <span class="edit-label">ProxyCommand</span>
-            <span class="input"><input id="src-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
-            <span class="field-error"></span>
-          </label>
+          <div class="type-tabs" id="src-type-tabs" role="tablist">
+            <button class="type-tab" id="src-tab-ssh" role="tab" type="button">SSH</button>
+            <button class="type-tab" id="src-tab-wg" role="tab" type="button">WireGuard</button>
+          </div>
+
+          <!-- SSH 欄位 -->
+          <div class="type-fields" id="src-fields-ssh">
+            <label class="sheet-field field-name">
+              <span class="edit-label">Name</span>
+              <span class="input"><input id="src-name" spellcheck="false" placeholder="tokyo" /></span>
+              <span class="field-error"></span>
+            </label>
+            <label class="sheet-field field-host">
+              <span class="edit-label">Host</span>
+              <span class="input"><input id="src-host" spellcheck="false" placeholder="gateway.example.com" /></span>
+              <span class="field-error"></span>
+            </label>
+            <label class="sheet-field field-user">
+              <span class="edit-label">User</span>
+              <span class="input"><input id="src-user" spellcheck="false" placeholder="ubuntu" /></span>
+              <span class="field-error"></span>
+            </label>
+            <label class="sheet-field field-proxyCommand">
+              <span class="edit-label">ProxyCommand</span>
+              <span class="input"><input id="src-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
+              <span class="field-error"></span>
+            </label>
+          </div>
+
+          <!-- WireGuard 欄位：名稱在前（U4），.conf 路徑輸入框內嵌 folder icon 選檔鈕，
+               不是外掛一顆獨立按鈕（U4）。field 類名跟 ssh 那組不同，避免同名 class
+               在 DOM 裡撞到（兩組欄位同時存在，只是靠 hidden 切換）。 -->
+          <div class="type-fields" id="src-fields-wg" hidden>
+            <label class="sheet-field field-wgName">
+              <span class="edit-label">Name</span>
+              <span class="input"><input id="wg-name" spellcheck="false" placeholder="home-relay" /></span>
+              <span class="field-error"></span>
+            </label>
+            <label class="sheet-field field-conf">
+              <span class="edit-label">.conf path</span>
+              <span class="input with-icon" id="wg-conf-drop">
+                <input id="wg-conf" class="mono" spellcheck="false" placeholder="C:\Users\you\wg\home-relay.conf" readonly />
+                <button class="input-icon-btn" id="wg-pick" type="button" title="Browse…" data-icon="folder-open" data-icon-size="14"></button>
+              </span>
+              <span class="field-error"></span>
+            </label>
+          </div>
 
           <div class="field-error general" id="src-error"></div>
           <div class="test-result" id="src-test-result"></div>
@@ -228,18 +277,20 @@
       </div>
     </div>
 
-    <!-- 隧道的新增／編輯 sheet（與源編輯共用同一套 .sheet 元件） -->
+    <!-- 轉發（forward 列）的新增／編輯 sheet，SSH／WG 共用同一套表單。「目的地是
+         代理」開關緊貼 REMOTE 欄位下方，修飾的是「這個目的地」，隨時可改
+         （不像列的 kind 建立後不可變）。 -->
     <div class="sheet-backdrop" id="fwd-backdrop" hidden>
-      <div class="sheet" role="dialog" aria-modal="true" aria-label="Tunnel">
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="Forward">
         <header class="sheet-head">
-          <span class="sheet-title" id="fwd-title">Edit tunnel</span>
+          <span class="sheet-title" id="fwd-title">Edit forward</span>
           <button class="tbtn" id="fwd-close" title="Close" data-icon="x"></button>
         </header>
 
         <div class="sheet-body">
           <label class="sheet-field field-name">
             <span class="edit-label">Name</span>
-            <span class="input"><input id="fwd-name" spellcheck="false" placeholder="socks" /></span>
+            <span class="input"><input id="fwd-name" spellcheck="false" placeholder="forward" /></span>
             <span class="field-error"></span>
           </label>
           <label class="sheet-field field-local">
@@ -247,11 +298,19 @@
             <span class="input"><input id="fwd-local" class="mono" spellcheck="false" placeholder="1080" /></span>
             <span class="field-error"></span>
           </label>
-          <label class="sheet-field field-remote">
-            <span class="edit-label">Remote</span>
-            <span class="input"><input id="fwd-remote" class="mono" spellcheck="false" placeholder="1080 (server-side port) or host:port" /></span>
-            <span class="field-error"></span>
-          </label>
+
+          <div class="proxy-flag-group">
+            <label class="sheet-field field-remote">
+              <span class="edit-label">Remote</span>
+              <span class="input"><input id="fwd-remote" class="mono" spellcheck="false" placeholder="1080 (server-side port) or host:port" /></span>
+              <span class="field-error"></span>
+            </label>
+            <div class="sheet-toggle-row proxy-flag-row">
+              <span class="toggle-row-label">Destination is a proxy</span>
+              <button class="toggle" id="fwd-is-proxy" role="switch" type="button"></button>
+            </div>
+            <span class="setting-hint proxy-flag-row">Automatically detects the protocol and shows the exit IP when the port serves a proxy</span>
+          </div>
 
           <div class="field-error general" id="fwd-error"></div>
         </div>
@@ -261,6 +320,40 @@
           <div class="spacer"></div>
           <button class="btn ghost" id="fwd-cancel">Cancel</button>
           <button class="btn primary" id="fwd-save">Save</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- WG 專屬：新增／編輯引擎自建 SOCKS5 代理列，只有名稱／本地埠兩欄——
+         這是跟轉發平行的另一種機制（沒有目的地），不是轉發表單的開關切出來的。 -->
+    <div class="sheet-backdrop" id="socks-backdrop" hidden>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="SOCKS5 proxy">
+        <header class="sheet-head">
+          <span class="sheet-title" id="socks-title">Add SOCKS5 proxy</span>
+          <button class="tbtn" id="socks-close" title="Close" data-icon="x"></button>
+        </header>
+
+        <div class="sheet-body">
+          <label class="sheet-field field-name">
+            <span class="edit-label">Name</span>
+            <span class="input"><input id="socks-name" spellcheck="false" placeholder="proxy" /></span>
+            <span class="field-error"></span>
+          </label>
+          <label class="sheet-field field-local">
+            <span class="edit-label">Local port</span>
+            <span class="input"><input id="socks-local" class="mono" spellcheck="false" placeholder="1080" /></span>
+            <span class="field-error"></span>
+          </label>
+          <span class="setting-hint">Starts a local SOCKS5 proxy server on this connection</span>
+
+          <div class="field-error general" id="socks-error"></div>
+        </div>
+
+        <footer class="sheet-foot">
+          <button class="btn danger-ghost" id="socks-delete">Delete</button>
+          <div class="spacer"></div>
+          <button class="btn ghost" id="socks-cancel">Cancel</button>
+          <button class="btn primary" id="socks-save">Save</button>
         </footer>
       </div>
     </div>
