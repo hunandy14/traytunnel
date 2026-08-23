@@ -74,10 +74,24 @@ export interface ExitInfo {
    * lastTest.protocol 會隨著斷線／重測被清掉（自測結果只在 connected 時有效），
    * 但「這個目的地是不是代理」這件事不會因為連線斷一下就變了。徽章若直接跟著
    * lastTest 走，列每停一次就會從 SOCKS5 閃成「PROXY?」外加一句指責使用者設錯
-   * 的 tooltip。所以識別結果在這裡黏著記憶，跨 status／test 轉換保留，
-   * 只有使用者改掉這條列（換 remote／關掉 probeProxy）才會失去意義。
+   * 的 tooltip。所以識別結果在這裡黏著記憶，跨 status／test 轉換保留。
+   *
+   * 失效時機由 main.ts 的 applySnapshot 落實：**換了 remote 或關掉 probeProxy
+   * 就不再搬過去**——那時記憶指的已經是另一個目的地，留著就是說謊。
    */
   knownProtocol?: ProxyProtocol | null;
+  /**
+   * 只在前端用的暫存欄位：這一筆是不是**舊後端**送來的形狀（沒有 kind／
+   * probeProxy 兩個欄位）。由 ipc.ts 的 normalizeSnapshot 在 IPC 邊界標記，
+   * 讓下游可以照常信任型別、不必到處寫 `kind === undefined`。
+   *
+   * 目前唯一的用途是「不要替舊資料臆測代理徽章」：那兩個欄位不存在時，
+   * normalize 會把 probeProxy 補成 true 以保住出口 IP 檢測行（PR 之前是無條件
+   * 顯示的），但那是為了相容而假設的值，不足以拿來宣稱「這條列是代理」。
+   *
+   * **引擎後端補上 kind／probeProxy 之後，這個欄位連同 normalize 的補值一起移除。**
+   */
+  legacy?: boolean;
 }
 
 /** 一個 ssh 來源（一組 user@host + ProxyCommand），底下掛自己的出口 */
