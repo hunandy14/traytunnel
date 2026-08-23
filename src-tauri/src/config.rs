@@ -502,6 +502,34 @@ pub fn parse_config(raw: &str) -> Result<Config, String> {
     parse_document(raw).map(|(cfg, _)| cfg)
 }
 
+/// 一筆出口的欄位哪裡不合規。
+///
+/// 規則只有這一份，訊息各自去寫：讀檔（[`validate_config`]）要講的是「檔案第幾段
+/// 不對」，介面輸入（[`validate_forward`]）要的是掛得回欄位的 `name: ` 前綴，
+/// 兩邊講法不同，但認定合不合規的那條線必須是同一條。
+enum ForwardIssue {
+    Name,
+    Local,
+    Remote,
+}
+
+/// 出口欄位的共同規則：名字非空且不含空白、本地埠是 1-65535、remote 是 host:port。
+///
+/// `remote` 在這裡自己過一次 [`normalize_remote`]，只填埠號的寫法兩條路都算數
+/// （讀檔那條已經正規化過，再跑一次是原值）。
+fn check_forward_fields(name: &str, local: u16, remote: &str) -> Option<ForwardIssue> {
+    if !valid_name(name) {
+        return Some(ForwardIssue::Name);
+    }
+    if local == 0 {
+        return Some(ForwardIssue::Local);
+    }
+    if !valid_remote(&normalize_remote(remote)) {
+        return Some(ForwardIssue::Remote);
+    }
+    None
+}
+
 /// 讀進來的設定必須自洽，否則寧可當壞檔也不要帶著矛盾的狀態跑
 fn validate_config(cfg: &Config) -> Result<(), String> {
     let mut seen_names: Vec<&str> = Vec::new();
@@ -518,19 +546,30 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
             return Err(format!("連線 {} 的 host 與 user 不可為空", s.name));
         }
         for f in &s.forwards {
+            // 欄位規則與介面輸入共用同一個 check_forward_fields，兩條路才不會分岔。
+            // 壞值放行的話會一路餵進 ssh -L，換來的是每 5 秒重連一次卻永遠接不起來
+            match check_forward_fields(&f.name, f.local, &f.remote) {
+                Some(ForwardIssue::Name) => {
+                    return Err(format!(
+                        "[[sources.forwards]] 的 name 不可為空，也不可含空白（連線 {}）",
+                        s.name
+                    ))
+                }
+                Some(ForwardIssue::Local) => {
+                    return Err(format!("出口 {} 的 local 要落在 1-65535", f.name))
+                }
+                Some(ForwardIssue::Remote) => {
+                    return Err(format!(
+                        "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
+                        f.name, f.remote
+                    ))
+                }
+                None => {}
+            }
             if seen_locals.contains(&f.local) {
                 return Err(format!("本地埠重複：{}（跨連線也不可以重複）", f.local));
             }
             seen_locals.push(f.local);
-            // 與介面輸入同一條規則（remote 這時已經過 normalize_remotes，
-            // 手寫純埠號一樣算數）。壞值放行的話會一路餵進 ssh -L，
-            // 換來的是每 5 秒重連一次卻永遠接不起來
-            if !valid_remote(&f.remote) {
-                return Err(format!(
-                    "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
-                    f.name, f.remote
-                ));
-            }
         }
     }
     Ok(())
@@ -793,16 +832,19 @@ pub fn validate_forward(
             return Some(format!("local: no tunnel with port {orig}, it may have been deleted"));
         }
     }
-    if !valid_name(name) {
-        return Some("name: required, and must not contain spaces".into());
-    }
-    if local == 0 {
-        return Some("local: port must be between 1 and 65535".into());
-    }
-    if !valid_remote(&normalize_remote(remote)) {
-        return Some(
-            "remote: must look like host:port, for example 127.0.0.1:1080, or just a port".into(),
-        );
+    // 欄位規則與讀檔共用（見 check_forward_fields），這裡只負責翻成前端要的訊息
+    match check_forward_fields(name, local, remote) {
+        Some(ForwardIssue::Name) => {
+            return Some("name: required, and must not contain spaces".into())
+        }
+        Some(ForwardIssue::Local) => return Some("local: port must be between 1 and 65535".into()),
+        Some(ForwardIssue::Remote) => {
+            return Some(
+                "remote: must look like host:port, for example 127.0.0.1:1080, or just a port"
+                    .into(),
+            )
+        }
+        None => {}
     }
     let clash = sources
         .iter()

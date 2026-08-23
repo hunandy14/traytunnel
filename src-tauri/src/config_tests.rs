@@ -479,6 +479,49 @@ fn rejects_hand_written_bad_remote() {
     assert!(parse_config(&with("example.com:22")).is_ok());
 }
 
+/// 手寫的出口名字與 local 走的也是介面輸入那條規則：讀檔那條路以前只驗 remote，
+/// 空名字與 local = 0 會一路帶進執行期（ssh -L 0:… 是隨機埠，介面上更是無名氏）
+#[test]
+fn rejects_hand_written_bad_forward_name_or_local() {
+    let with = |name: &str, local: u16| {
+        format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"{name}\"\nlocal={local}\nremote=\"127.0.0.1:1080\"\n"
+        )
+    };
+    for bad in ["", "  ", "two words"] {
+        let err = parse_config(&with(bad, 1080)).unwrap_err();
+        assert!(err.contains("name"), "{bad:?} 的訊息要點名 name：{err}");
+    }
+    let err = parse_config(&with("a", 0)).unwrap_err();
+    assert!(err.contains("local"), "local = 0 的訊息要點名 local：{err}");
+    // 合法的照樣過
+    assert!(parse_config(&with("a", 1080)).is_ok());
+}
+
+/// 讀檔與介面輸入認定合不合規的那條線是同一條：同一組欄位，兩邊要同進同出
+#[test]
+fn the_file_and_the_ui_agree_on_forward_fields() {
+    let list = vec![src("hk", vec![])];
+    let cases = [
+        ("a", 1080u16, "127.0.0.1:1080"),
+        ("", 1080, "127.0.0.1:1080"),
+        ("two words", 1080, "127.0.0.1:1080"),
+        ("a", 0, "127.0.0.1:1080"),
+        ("a", 1080, "nope"),
+        ("a", 1080, "8080"),
+    ];
+    for (name, local, remote) in cases {
+        let ui_ok = validate_forward(&list, None, name, local, remote).is_none();
+        let raw = format!(
+            "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
+             [[sources.forwards]]\nname=\"{name}\"\nlocal={local}\nremote=\"{remote}\"\n"
+        );
+        let file_ok = parse_config(&raw).is_ok();
+        assert_eq!(ui_ok, file_ok, "({name:?}, {local}, {remote:?}) 兩條路的判定要一致");
+    }
+}
+
 #[test]
 fn empty_host_makes_the_file_broken_not_overwritten() {
     let dir = tmp_dir("empty-host");
