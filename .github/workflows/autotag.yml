@@ -96,5 +96,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run release.yml
-          echo "tag 已建立並已觸發 release：${{ steps.resolve.outputs.tag }}"
+          tag="${{ steps.resolve.outputs.tag }}"
+          gh workflow run release.yml --ref "$tag"
+          echo "tag 已建立並已觸發 release（--ref $tag）：$tag"
