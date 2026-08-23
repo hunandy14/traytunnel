@@ -22,6 +22,9 @@
   --accent: #2dd4a7;
   --accent-hover: #4adebb;
   --accent-ink: #0e2620;
+  /* --accent 的 RGB 分量，給需要調透明度的地方用 rgba(var(--accent-rgb), α)。
+     改品牌色時這兩行要一起改——CSS 沒辦法從 hex 變數裡把分量拆出來。 */
+  --accent-rgb: 45, 212, 167;
 
   --green: #22c55e;
   --amber: #f59e0b;
@@ -1529,7 +1532,7 @@ body {
    指示條都不變），只換掉底色與內容——SSH 是「名稱雜湊色 + 首字」，WG 固定
    用 --accent 這個品牌色 + 'WG' 兩字。 */
 .src-icon.type-wg {
-  background: rgba(45, 212, 167, 0.22);
+  background: rgba(var(--accent-rgb), 0.22);
   color: var(--accent);
   font-size: 11px;
   letter-spacing: 0.3px;
@@ -1537,7 +1540,7 @@ body {
 
 /* sheet 標題旁的唯讀徽章（連線 sheet 編輯模式用，取代可切換的分頁）：
    類型建立後就固定、編輯時不可再切換，配色跟軌道上 WG 節點的底色公式
-   一致（同一組 rgba(45,212,167,…)）。 */
+   一致（同一組 rgba(var(--accent-rgb), α)）。 */
 .type-badge {
   flex: none;
   font-size: 9px;
@@ -1555,8 +1558,8 @@ body {
 
 .type-badge.wg {
   color: var(--accent);
-  border: 1px solid rgba(45, 212, 167, 0.4);
-  background: rgba(45, 212, 167, 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 #src-type-badge {
@@ -1658,7 +1661,7 @@ body {
 
 /* SOCKS5 是連線底下的掛件，跟埠轉發並列在同一份清單裡（清單置頂），列名
    旁掛一個小徽章跟一般轉發列略作區分——直接借軌道上 WG 節點／sheet 唯讀
-   徽章同一組 rgba(45,212,167,…) 配色，不是另外發明。 */
+   徽章同一組 rgba(var(--accent-rgb), α) 配色，不是另外發明。 */
 .card-name-row {
   display: flex;
   align-items: center;

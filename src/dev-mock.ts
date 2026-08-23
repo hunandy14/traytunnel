@@ -12,6 +12,7 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { shouldProbe } from "./status";
 import type {
+  ConnKind,
   ConnTarget,
   ExitInfo,
   ExitStatus,
@@ -28,16 +29,14 @@ import { validateConnName } from "./util";
 const STORE_KEY = "traytunnel-dev-mock-v5";
 
 /**
- * local 全域唯一，出口一律用埠號跨連線找 —— 這裡把 ssh 源與 wg 連線的所屬統一成
- * 一種形狀。直接沿用前端那邊的 ConnTarget（判別聯集，payload 一律叫 `data`），
- * 假後端與 UI 對「一條連線」的形狀認知因此完全一致，不必再各留一份。
+ * local 全域唯一，出口一律用埠號跨連線找。「一條連線」的形狀直接用前端那邊的
+ * ConnTarget（判別聯集，payload 一律叫 `data`）——假後端與 UI 對此的認知因此
+ * 完全一致，不必再各留一份，連別名都不取，讀的人一眼就知道是同一個型別。
  */
-type Owner = ConnTarget;
-
-const ownerName = (owner: Owner): string => owner.data.name;
+const ownerName = (owner: ConnTarget): string => owner.data.name;
 
 /** 這條連線底下的列。兩種連線的欄位名現在一樣，收窄之後直接取 */
-const ownerRows = (owner: Owner): ExitInfo[] => owner.data.exits;
+const ownerRows = (owner: ConnTarget): ExitInfo[] => owner.data.exits;
 
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
@@ -289,7 +288,7 @@ function findWgProxy(name: string): WgProxyInfo | undefined {
 }
 
 /** 兩種連線共用同一個命名空間，日誌前綴 `[名字]` 才不會撞 */
-function findConn(name: string): Owner | undefined {
+function findConn(name: string): ConnTarget | undefined {
   const src = findSource(name);
   if (src) return { kind: "ssh", data: src };
   const wg = findWgProxy(name);
@@ -298,7 +297,7 @@ function findConn(name: string): Owner | undefined {
 }
 
 /** local 全域唯一，所以出口一律用埠號跨連線找，順便把它所屬的連線帶回來 */
-function find(local: number): { exit: ExitInfo; owner: Owner } | undefined {
+function find(local: number): { exit: ExitInfo; owner: ConnTarget } | undefined {
   for (const source of state.sources) {
     const exit = source.exits.find((e) => e.local === local);
     if (exit) return { exit, owner: { kind: "ssh", data: source } };
@@ -409,6 +408,26 @@ function stop(exit: ExitInfo, source: string, setIntent = true) {
   log(source, `${exit.name}: stopped`);
 }
 
+/**
+ * 編輯一條既有的列：停→改→起→pushConfig。
+ *
+ * 這個順序是不變式，兩支 upsert 共用同一份實作以免其中一支被改壞：
+ *
+ *   - 執行中的列要先停再改（埠號可能就是被改的那一個）。
+ *   - pushConfig **一定放在最後**。中間那個瞬間 enabled 是 false、status 是
+ *     stopped，在那時照相等於送出一份「已經不成立」的快照；前端會照單全收，
+ *     之後 status 還有 exit-status 事件補得回來，**enabled 沒有任何事件可以補**
+ *     ——開關就這樣卡在 OFF，旁邊卻是一顆綠色的狀態點。真後端是落檔完成才推
+ *     config-changed，這裡對齊它。
+ */
+function editRow(exit: ExitInfo, source: string, mutate: () => void) {
+  const wasRunning = exit.status !== "stopped";
+  if (wasRunning) stop(exit, source);
+  mutate();
+  if (wasRunning) start(exit, source);
+  pushConfig();
+}
+
 // ---------------------------------------------------------------- 驗證
 
 /**
@@ -422,7 +441,7 @@ function stop(exit: ExitInfo, source: string, setIntent = true) {
  */
 function validateRowCommon(
   input: { connection: string; originalLocal: number | null; name: string; local: number },
-  owner: Owner,
+  owner: ConnTarget,
   kind: RowKind,
 ): string | null {
   if (!input.name) return "name: name is required";
@@ -501,28 +520,41 @@ function validateWgSocks(input: {
   return validateRowCommon(input, owner, "socks");
 }
 
-function validateSource(input: {
-  originalName: string | null;
-  name: string;
-  host: string;
-  user: string;
-}): string | null {
+/**
+ * 兩種連線層共通的三條規則：名稱本身合法、型別建立後不可變（U1）、名稱不撞。
+ *
+ * ssh 與 wg 共用同一個命名空間，所以「不可變」這條要兩邊對稱地擋——只擋一邊
+ * 等於沒擋：拿一個指向 WG 連線的 originalName 呼叫 upsert_source，findSource
+ * 會找不到而落進「新增」分支，憑空生出一條同名的 ssh 源，直接撞車。
+ */
+function validateConnCommon(
+  input: { originalName: string | null; name: string },
+  kind: ConnKind,
+): string | null {
   // 名稱的三條規則與表單共用 util.ts 的 validateConnName，兩邊訊息保證一致
   const nameErr = validateConnName(input.name);
   if (nameErr) return `name: ${nameErr}`;
 
-  // U1：連線型別建立後不可變，與 validateWgProxy 對稱的那一半防護。少了它，
-  // 拿一個指向 WG 連線的 originalName 呼叫 upsert_source，下面 findSource 會
-  // 找不到而落進「新增」分支，憑空生出一條同名的 ssh 源，命名空間直接撞車。
   if (input.originalName !== null) {
     const original = findConn(input.originalName);
-    if (original && original.kind !== "ssh") {
+    if (original && original.kind !== kind) {
       return "name: connection type is immutable, delete and re-add instead";
     }
   }
 
   const dup = findConn(input.name);
   if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
+  return null;
+}
+
+function validateSource(input: {
+  originalName: string | null;
+  name: string;
+  host: string;
+  user: string;
+}): string | null {
+  const common = validateConnCommon(input, "ssh");
+  if (common) return common;
   if (!input.host) return "host: host is required";
   if (/\s/.test(input.host)) return "host: must not contain spaces";
   if (!input.user) return "user: user is required";
@@ -535,18 +567,8 @@ function validateWgProxy(input: {
   name: string;
   confPath: string;
 }): string | null {
-  const nameErr = validateConnName(input.name);
-  if (nameErr) return `name: ${nameErr}`;
-
-  if (input.originalName !== null) {
-    const original = findConn(input.originalName);
-    if (original && original.kind !== "wg") {
-      return "name: connection type is immutable, delete and re-add instead";
-    }
-  }
-
-  const dup = findConn(input.name);
-  if (dup && input.name !== input.originalName) return "name: another connection already uses this name";
+  const common = validateConnCommon(input, "wg");
+  if (common) return common;
   if (!input.confPath.trim()) return "confPath: path is required";
   return null;
 }
@@ -717,7 +739,11 @@ function handle(cmd: string, args: Args): unknown {
 
       const existing = input.originalName === null ? undefined : findWgProxy(input.originalName);
       if (existing) {
-        // 編輯不重接：conf 變更要重接由使用者透過「重新連線」動作觸發，這裡只改欄位
+        // 編輯不重接：conf 變更要重接由使用者透過「重新連線」動作觸發，這裡只改欄位。
+        // 但換了檔案就要把舊的解析錯誤清掉——否則使用者照著紅字把 .conf 修好、
+        // 重新選檔存起來之後，那行紅字還是永遠掛在那裡，整條復原動線根本走不完。
+        // （真後端是重新解析新檔後才知道結果；mock 沒有真的解析器，換檔就假設它可解析。）
+        if (existing.confPath !== input.confPath) existing.confError = null;
         existing.name = input.name;
         existing.confPath = input.confPath;
         pushConfig();
@@ -753,6 +779,13 @@ function handle(cmd: string, args: Args): unknown {
       const proxy = findWgProxy(args.name as string);
       if (!proxy) return null;
       const on = Boolean(args.on);
+      // conf 解析不過的連線起不來——引擎沒有東西可以拿去建隧道。放它通過的話
+      // 畫面會出現一個規格上不存在的狀態：引擎點是紅的（confError），底下的列
+      // 卻一條條變綠。旗標維持 false，只在活動日誌留一行原因。
+      if (on && proxy.confError) {
+        log(proxy.name, `cannot start: ${proxy.confError}`);
+        return null;
+      }
       if (proxy.enabled === on) return null;
       proxy.enabled = on;
       if (on) {
@@ -808,23 +841,16 @@ function handle(cmd: string, args: Args): unknown {
       // 純埠號補成伺服器本機的 host:port，比照真後端會做的正規化
       if (/^\d+$/.test(input.remote)) input.remote = `127.0.0.1:${input.remote}`;
 
-      const owner = findConn(input.connection) as Owner;
+      const owner = findConn(input.connection) as ConnTarget;
       const rows = ownerRows(owner);
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
       if (existing) {
-        // 停→改→起，**最後**才 pushConfig：中間那個瞬間 enabled 是 false、
-        // status 是 stopped，在那時照相等於送出一份「已經不成立」的快照。
-        // 前端 applySnapshot 會照單全收，之後只剩 exit-status 事件補得回
-        // status，enabled 沒有事件可以補——開關就這樣卡在 OFF，旁邊卻是一顆
-        // 綠色的狀態點。真後端是落檔完成才推 config-changed，這裡對齊它。
-        const wasRunning = existing.exit.status !== "stopped";
-        if (wasRunning) stop(existing.exit, ownerName(owner));
-        existing.exit.name = input.name;
-        existing.exit.local = input.local;
-        existing.exit.remote = input.remote;
-        existing.exit.probeProxy = input.probeProxy;
-        if (wasRunning) start(existing.exit, ownerName(owner));
-        pushConfig();
+        editRow(existing.exit, ownerName(owner), () => {
+          existing.exit.name = input.name;
+          existing.exit.local = input.local;
+          existing.exit.remote = input.remote;
+          existing.exit.probeProxy = input.probeProxy;
+        });
         log(ownerName(owner), `${input.name}: updated`);
       } else {
         rows.push({
@@ -855,17 +881,13 @@ function handle(cmd: string, args: Args): unknown {
       const err = validateWgSocks(input);
       if (err) return err;
 
-      const owner = findConn(input.connection) as Owner & { kind: "wg" };
+      const owner = findConn(input.connection) as ConnTarget & { kind: "wg" };
       const existing = input.originalLocal === null ? undefined : find(input.originalLocal);
       if (existing) {
-        // 停→改→起→pushConfig，理由同 upsert_forward：中途照相會送出一份
-        // enabled:false 的過期快照，而 enabled 沒有事件補得回來
-        const wasRunning = existing.exit.status !== "stopped";
-        if (wasRunning) stop(existing.exit, owner.data.name);
-        existing.exit.name = input.name;
-        existing.exit.local = input.local;
-        if (wasRunning) start(existing.exit, owner.data.name);
-        pushConfig();
+        editRow(existing.exit, owner.data.name, () => {
+          existing.exit.name = input.name;
+          existing.exit.local = input.local;
+        });
         log(owner.data.name, `${input.name}: updated`);
       } else {
         owner.data.exits.unshift({
