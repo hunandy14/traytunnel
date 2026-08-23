@@ -524,6 +524,53 @@ mod tests {
         );
     }
 
+    /// release workflow 組出來的 latest.json 必須是 updater 外掛吃得下的形狀。
+    ///
+    /// 這條路上完全沒有型別把關：workflow 是一段 PowerShell，外掛是外部相依，
+    /// 中間只靠一份執行期才會下載的 JSON 對接。形狀一旦對不上，症狀是安裝版的
+    /// 更新從此靜默失效——檢查失敗只會在活動日誌留一行，沒有人會注意到。
+    ///
+    /// 最脆弱的是 `pub_date`：workflow 寫的是
+    /// `[System.DateTime]::UtcNow.ToString("o")`（7 位小數再接 Z），而外掛拿
+    /// RFC3339 去解析它，解不出來時是整份 release 反序列化失敗，不是忽略那個欄位。
+    /// 有人把它改成 `ToString()` 或別的格式，這裡就會紅。
+    #[test]
+    fn the_release_workflow_manifest_still_deserializes() {
+        let raw = r#"{
+            "version": "0.5.0",
+            "pub_date": "2026-08-22T09:41:07.1234567Z",
+            "platforms": {
+                "windows-x86_64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo=",
+                    "url": "https://github.com/hunandy14/traytunnel/releases/download/v0.5.0/traytunnel-0.5.0-setup.exe"
+                }
+            }
+        }"#;
+        let release: tauri_plugin_updater::RemoteRelease =
+            serde_json::from_str(raw).expect("release.yml 產出的 latest.json 必須解析得出來");
+
+        assert_eq!(release.version.to_string(), "0.5.0");
+        assert!(release.pub_date.is_some(), "pub_date 解析成功才代表格式對得上");
+        // 目標鍵要跟 tauri 對這個平台用的字串一致，否則會是 TargetNotFound
+        assert!(release.download_url("windows-x86_64").is_ok());
+        assert!(release.signature("windows-x86_64").is_ok());
+    }
+
+    /// 上面那條要能真的擋住格式改動，前提是外掛對 pub_date 嚴格。
+    /// 這裡釘住「非 RFC3339 會失敗」，免得有人以為那個欄位隨便寫都行。
+    #[test]
+    fn a_pub_date_that_is_not_rfc3339_is_rejected() {
+        let raw = r#"{
+            "version": "0.5.0",
+            "pub_date": "2026-08-22 09:41:07",
+            "platforms": {
+                "windows-x86_64": { "signature": "sig", "url": "https://example.com/a.exe" }
+            }
+        }"#;
+        let parsed = serde_json::from_str::<tauri_plugin_updater::RemoteRelease>(raw);
+        assert!(parsed.is_err(), "外掛對 pub_date 是嚴格的，這裡不該通過");
+    }
+
     /// 機碼名跟著 productName 走，不是 identifier（實機上是 `...\Uninstall\traytunnel`）
     #[test]
     fn uninstall_key_is_under_hkcu_uninstall() {
