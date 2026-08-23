@@ -493,9 +493,11 @@ mod tests {
         assert_eq!(endpoint.scheme(), "https", "非 https 的 endpoint 在 release 建置會被拒絕");
         assert!(endpoint.as_str().ends_with("/latest.json"), "{endpoint}");
 
-        // 安裝走 passive（NSIS 的 /P /R）：使用者只看到進度條，裝完自動重啟
+        // 安裝走 quiet（NSIS 的 /S）：全靜默，連進度條都不出現，裝完自動重啟。
+        // 更新是使用者在設定頁按下按鈕才發生的，他已經知道自己在等什麼，
+        // 中途再彈一個進度視窗搶焦點只是打斷他手邊的事
         let windows = parsed.windows.expect("windows 區塊要在");
-        assert_eq!(windows.install_mode.to_string(), "passive");
+        assert_eq!(windows.install_mode.to_string(), "quiet");
 
         // 沒有這一項就簽不出 .sig，release workflow 組 latest.json 那步會直接失敗
         assert_eq!(
