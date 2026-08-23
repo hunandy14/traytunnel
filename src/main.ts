@@ -369,11 +369,12 @@ function paintCard(exit: ExitInfo) {
   refs.detail.title = detail;
   refs.detail.classList.toggle("show", Boolean(detail));
 
-  const running = isRunning(exit);
-  setIcon(refs.toggle, running ? "square" : "play", 15);
-  refs.toggle.title = running ? "Disconnect" : "Connect";
-  refs.toggle.classList.toggle("danger", running);
-  refs.toggle.classList.toggle("go", !running);
+  // switch 表達「意圖」（exit.enabled，跟系統匣勾選同一個依據），
+  // 不是連線的即時狀態——那是上面的狀態點在管，兩者刻意分開顯示。
+  const on = exit.enabled;
+  refs.toggle.classList.toggle("on", on);
+  refs.toggle.setAttribute("aria-checked", String(on));
+  refs.toggle.title = on ? "Disconnect" : "Connect";
 }
 
 function buildCard(exit: ExitInfo, source: string): HTMLElement {
@@ -383,16 +384,13 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
   const test = h("div", { class: "card-test" });
   const detail = h("div", { class: "card-detail" });
 
-  const toggle = h("button", { class: "iconbtn sm" });
+  // 沿用設定頁既有的 .toggle 開關樣式；綁的是 exit.enabled（意圖），
+  // 跟 stopExit／startExit 既有的 IPC 與系統匣勾選同一套邏輯，行為對齊。
+  const toggle = h("button", { class: "toggle", attrs: { role: "switch", type: "button" } });
   toggle.addEventListener("click", () => {
-    if (isRunning(exit)) void run(() => stopExit(exit.local), `disconnect ${exit.name}`);
+    if (exit.enabled) void run(() => stopExit(exit.local), `disconnect ${exit.name}`);
     else void run(() => startExit(exit.local), `connect ${exit.name}`);
   });
-
-  const restart = h("button", { class: "iconbtn sm", title: "Reconnect" }, [icon("refresh-cw", 15)]);
-  restart.addEventListener("click", () =>
-    void run(() => restartExit(exit.local), `reconnect ${exit.name}`),
-  );
 
   const edit = h("button", { class: "iconbtn sm", title: "Edit" }, [icon("pencil", 15)]);
   edit.addEventListener("click", () => openTunnelSheet(source, exit));
@@ -401,7 +399,7 @@ function buildCard(exit: ExitInfo, source: string): HTMLElement {
     dot,
     h("div", { class: "card-id" }, [name, route]),
     test,
-    h("div", { class: "card-actions" }, [toggle, restart, edit]),
+    h("div", { class: "card-actions" }, [toggle, edit]),
   ]);
 
   const root = h("article", { class: "card" }, [main, detail]);
