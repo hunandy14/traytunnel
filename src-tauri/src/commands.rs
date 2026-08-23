@@ -224,25 +224,38 @@ pub fn upsert_source(
     }
 
     let target = name.clone();
-    if let Err(e) = st.update_config(|c| match original_name.as_deref() {
-        Some(orig) => {
-            if let Some(s) = c.source_mut(orig) {
-                s.name = target.clone();
-                s.host = host.clone();
-                s.user = user.clone();
-                s.proxy_command = proxy_command.clone();
-            }
+    let written = st.update_config_checked(|c| {
+        // 便宜的重驗：上面那次驗證與這次寫入之間 cfg 鎖是放開的，兩個同時進來的
+        // 新增可以雙雙通過驗證，再一前一後 push 進兩筆同名的源。這一次是在鎖裡做的
+        if let Some(err) =
+            config::validate_source(&c.sources, original_name.as_deref(), &target, &host, &user)
+        {
+            return Err(err);
         }
-        // 新的源底下還沒有任何出口
-        None => c.sources.push(Source {
-            name: target.clone(),
-            host: host.clone(),
-            user: user.clone(),
-            proxy_command: proxy_command.clone(),
-            forwards: Vec::new(),
-        }),
-    }) {
-        return Some(save_error_message(st, e));
+        match original_name.as_deref() {
+            Some(orig) => {
+                if let Some(s) = c.source_mut(orig) {
+                    s.name = target.clone();
+                    s.host = host.clone();
+                    s.user = user.clone();
+                    s.proxy_command = proxy_command.clone();
+                }
+            }
+            // 新的源底下還沒有任何出口
+            None => c.sources.push(Source {
+                name: target.clone(),
+                host: host.clone(),
+                user: user.clone(),
+                proxy_command: proxy_command.clone(),
+                forwards: Vec::new(),
+            }),
+        }
+        Ok(())
+    });
+    match written {
+        Err(e) => return Some(save_error_message(st, e)),
+        Ok(Err(err)) => return Some(err),
+        Ok(Ok(())) => {}
     }
 
     st.emit_config_changed();
@@ -312,7 +325,19 @@ pub fn upsert_forward(
     let was_enabled = forward.enabled;
     let name = forward.name.clone();
 
-    if let Err(e) = st.update_config(|c| {
+    let written = st.update_config_checked(|c| {
+        // 同 upsert_source 的理由：驗證與寫入之間 cfg 鎖是放開的，兩個同時進來的
+        // 新增可以雙雙通過驗證，再一前一後 push 進兩筆佔著同一個本地埠的出口。
+        // 這裡只重驗唯一性那一段（值本身已經正規化過了），成本是幾個整數比較
+        if let Some(err) = config::validate_forward(
+            &c.sources,
+            original_local,
+            &forward.name,
+            forward.local,
+            &forward.remote,
+        ) {
+            return Err(err);
+        }
         if let Some(orig) = original_local {
             // 先從原本的源拔掉，再掛進目標源，同源編輯也走同一條路
             for s in c.sources.iter_mut() {
@@ -322,8 +347,12 @@ pub fn upsert_forward(
         if let Some(s) = c.source_mut(&source) {
             s.forwards.push(forward.clone());
         }
-    }) {
-        return Some(save_error_message(st, e));
+        Ok(())
+    });
+    match written {
+        Err(e) => return Some(save_error_message(st, e)),
+        Ok(Err(err)) => return Some(err),
+        Ok(Ok(())) => {}
     }
 
     // 存檔成功之後才停掉舊的那條線（換埠或換源時舊埠也才會放掉）。存檔失敗時

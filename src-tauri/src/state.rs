@@ -3,7 +3,8 @@
 //! 每個出口（以本地埠為唯一鍵）各自帶一份執行期狀態：連線狀態、自測結果、
 //! 世代序號與 Job Object handle，彼此互不影響。
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -45,15 +46,21 @@ pub struct ExitStatusPayload {
     pub detail: Option<String>,
 }
 
-/// 事件：exit-test，同時也是 Snapshot 裡的 lastTest
+/// 事件：exit-test。
+///
+/// `result` 是 None 時代表「把這個出口的自測顯示清掉」，斷線、停用、重接都會發。
+///
+/// 用 `flatten` 而不是多包一層物件，是為了向後相容：Some 序列化出來就是
+/// `{local, state, text}`，與這個事件原本的形狀一模一樣，讀結果的那一端不必改；
+/// None 只剩 `{local}`，state／text 讀出來是 undefined，語意上正是「沒有結果」。
 #[derive(Debug, Clone, Serialize)]
 pub struct ExitTestPayload {
     pub local: u16,
-    pub state: String,
-    pub text: String,
+    #[serde(flatten)]
+    pub result: Option<TestView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TestView {
     pub state: String,
     pub text: String,
@@ -123,6 +130,130 @@ fn release_slot(slot: &mut Option<u64>, generation: u64) {
     }
 }
 
+/// 一次自測的憑證：這個出口的**連線世代**加上**自測期號**。
+///
+/// 只靠連線世代是不夠的。世代只在 halt／restart 時換號，而 ssh 自己掛掉時
+/// 監看迴圈是內圈 break 之後在同一代裡重跑一輪——連線換了、世代沒換，
+/// 上一條連線發出去、還在路上的那份探測（`probe` 最久要 12 秒）就會通過
+/// 世代檢查，把舊連線的出口 IP 寫成新連線的自測結果。
+///
+/// 自測期號補上這個落差：換號的唯一入口是 [`AppState::clear_exit_test`]，
+/// 而斷線、停用、重接都會經過那裡。兩個號碼合起來當一張憑證，呼叫端只要
+/// 原樣帶著它走，不必自己記得該比哪幾個號。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestToken {
+    generation: u64,
+    epoch: u64,
+}
+
+/// 搶下自測佔位，回傳 false 代表「同一張憑證真的還在測」，這次不要再發一份探測。
+///
+/// 憑證不同時**搶佔**而不是拒絕：位子上那份是上一輪連線留下的在途探測，
+/// 它的結果已經被憑證判死，沒有理由讓一個註定被丟掉的探測把新的自測擋在門外
+/// ——擋掉的話這個出口就再也不會有自測結果，只能等使用者自己按。
+fn claim_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken) -> bool {
+    if slots.get(&local) == Some(&token) {
+        return false;
+    }
+    slots.insert(local, token);
+    true
+}
+
+/// 探測結束時歸還佔位，只還得掉自己那一張：被搶佔過的舊探測晚一步跑完，
+/// 不可以把接手者的佔位清掉，否則下一份探測會與接手者並存。
+fn release_test(slots: &mut HashMap<u16, TestToken>, local: u16, token: TestToken) {
+    if slots.get(&local) == Some(&token) {
+        slots.remove(&local);
+    }
+}
+
+/// 快照裡該不該帶著自測結果：只有 connected 的出口才帶。
+///
+/// 自測結果講的是「這條線通到哪裡」，線一斷它就不再是事實。前端對事件流已經
+/// 是這個規矩（狀態一離開 connected 就把顯示清掉），快照這邊要是照舊把
+/// `last_test` 原樣送出去，任何一次 config-changed 都會把前端剛清掉的舊字
+/// 回灌回畫面上——使用者看到的會是一個斷線的出口配著上一輪的出口 IP。
+///
+/// 擋在這裡而不是在每個狀態轉換點各清一次：`source_views` 是快照與系統匣共用的
+/// 唯一出口，一道規則就涵蓋所有路徑，之後新增狀態轉換也不會有人忘了補。
+fn visible_test(status: &str, last_test: Option<TestView>) -> Option<TestView> {
+    if status == status::CONNECTED {
+        last_test
+    } else {
+        None
+    }
+}
+
+/// 設定 + 執行期狀態 → 每個源與其出口的當下樣貌。
+/// 兩把鎖都由呼叫端持著，這裡只做純粹的組裝。
+fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceView> {
+    cfg.sources
+        .iter()
+        .map(|s| SourceView {
+            name: s.name.clone(),
+            host: s.host.clone(),
+            user: s.user.clone(),
+            proxy_command: s.proxy_command.clone(),
+            exits: s
+                .forwards
+                .iter()
+                .map(|f| {
+                    let rt = exits.get(&f.local);
+                    let status =
+                        rt.map(|r| r.status.clone()).unwrap_or_else(|| status::STOPPED.to_string());
+                    ExitView {
+                        name: f.name.clone(),
+                        local: f.local,
+                        remote: f.remote.clone(),
+                        enabled: f.enabled,
+                        last_test: visible_test(&status, rt.and_then(|r| r.last_test.clone())),
+                        status,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// 就地寫一筆連線狀態，回傳「有沒有真的變」。有守門與無守門的兩條寫入路徑
+/// 共用這一份「相同就不推事件」的規則，兩邊不會各判各的。
+fn write_status(rt: &mut ExitRuntime, status: &str, detail: &Option<String>) -> bool {
+    if rt.status == status && rt.detail == *detail {
+        return false;
+    }
+    rt.status = status.into();
+    rt.detail = detail.clone();
+    true
+}
+
+/// 世代守門版的狀態寫入：世代不符就**一個欄位都不動**並回 false。
+///
+/// 守門本身抽成純函式才測得到。這道判斷是 `set_exit_status_of` 唯一的防線，
+/// 而它防的是一條要靠時序才重現得出來的競態——寫進 `AppState` 裡的話，
+/// 測試就得生出一個真的 AppHandle，等於這道守門永遠沒有測試護著，
+/// 被誰順手拿掉也不會有人發現。
+fn guarded_write_status(
+    rt: &mut ExitRuntime,
+    generation: u64,
+    status: &str,
+    detail: &Option<String>,
+) -> bool {
+    if rt.generation != generation {
+        return false;
+    }
+    write_status(rt, status, detail)
+}
+
+/// 憑證守門版的自測寫入：憑證不符就**一個欄位都不動**並回 false。
+/// 抽成純函式的理由同 [`guarded_write_status`]。
+fn guarded_write_test(rt: &mut ExitRuntime, token: TestToken, view: &TestView) -> bool {
+    if rt.token() != token {
+        return false;
+    }
+    rt.last_test = Some(view.clone());
+    true
+}
+
 /// 開機自啟登錄值的名稱。沿用 productName（沒有就退回套件名），與先前
 /// tauri-plugin-autostart 寫進去的那一份同名，升級的使用者不必重設。
 pub fn autostart_name(app: &AppHandle) -> String {
@@ -155,9 +286,19 @@ struct ExitRuntime {
     /// 目前有效的世代序號，換號即代表舊的監看迴圈作廢；
     /// 號碼取自全域計數器，出口被刪掉又重建也不會撞號
     generation: u64,
+    /// 目前有效的自測期號，換號即代表在途的探測結果不算數了。
+    /// 與 generation 分開的理由見 [`TestToken`]
+    test_epoch: u64,
     /// 目前活著的監看迴圈是哪一代，None 代表這個出口沒人在跑
     supervisor: Option<u64>,
     job: Option<(u64, Job)>,
+}
+
+impl ExitRuntime {
+    /// 這個出口當下的自測憑證
+    fn token(&self) -> TestToken {
+        TestToken { generation: self.generation, epoch: self.test_epoch }
+    }
 }
 
 /// 手寫而不是 derive：新項目的 status 一定要是 stopped。
@@ -170,6 +311,7 @@ impl Default for ExitRuntime {
             detail: None,
             last_test: None,
             generation: 0,
+            test_epoch: 0,
             supervisor: None,
             job: None,
         }
@@ -188,7 +330,9 @@ pub struct AppState {
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
     exits: Mutex<BTreeMap<u16, ExitRuntime>>,
-    testing: Mutex<HashSet<u16>>,
+    /// 正在自測的埠，值是那份探測拿在手上的憑證。互斥比的是憑證而不只是埠，
+    /// 舊連線留下的在途探測才擋不住新一輪的自測
+    testing: Mutex<HashMap<u16, TestToken>>,
     /// 全域世代計數器，發出去的號碼永不重複
     generation: AtomicU64,
     tray_hint_shown: AtomicBool,
@@ -209,7 +353,7 @@ impl AppState {
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
-            testing: Mutex::new(HashSet::new()),
+            testing: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             tray_hint_shown: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -246,6 +390,25 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> T,
     {
+        self.update_config_checked(|c| Ok::<T, Infallible>(edit(c))).map(|r| match r {
+            Ok(v) => v,
+            // 閉包回的是 Infallible，這一支永遠到不了
+            Err(never) => match never {},
+        })
+    }
+
+    /// 與 `update_config` 相同，但閉包有否決權：回 Err 就當作這次操作沒發生
+    /// ——不寫檔、記憶體不動，錯誤原樣交回呼叫端。
+    ///
+    /// 唯一性那種「要看過整份設定才知道」的驗證必須在閉包裡再做一次。指令層的
+    /// 標準流程是「先 with_config 讀一份來驗，驗過了再 update_config 寫下去」，
+    /// 而這兩步之間 cfg 鎖是放開的：兩個同時進來的新增可以雙雙通過驗證，
+    /// 再一前一後把兩筆同名的源（或同一個本地埠）push 進去。閉包裡這一次
+    /// 重驗是在鎖裡做的，成本只是再走一遍幾個字串比較。
+    pub fn update_config_checked<F, T, E>(&self, edit: F) -> std::io::Result<Result<T, E>>
+    where
+        F: FnOnce(&mut Config) -> Result<T, E>,
+    {
         if self.is_read_only() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -255,12 +418,16 @@ impl AppState {
         }
         let mut guard = self.cfg.lock().unwrap();
         let mut next = guard.clone();
-        let out = edit(&mut next);
+        let out = match edit(&mut next) {
+            Ok(v) => v,
+            // 被否決：next 是一份還沒公開過的複本，直接丟掉就等於什麼都沒發生
+            Err(e) => return Ok(Err(e)),
+        };
         crate::config::write_config_at(&self.path, &next)?;
         *guard = next;
         drop(guard);
         self.sync_exits();
-        Ok(out)
+        Ok(Ok(out))
     }
 
     /// 設定裡新增或刪掉出口後，補齊／清掉對應的執行期狀態。
@@ -317,18 +484,52 @@ impl AppState {
     /// 只更新既存的出口：出口一旦被刪掉，執行期狀態也跟著被 `sync_exits` 清掉，
     /// 這時晚到的狀態更新若順手把項目補回來，就會生出一個設定裡根本不存在的
     /// 幽靈出口，之後每次 `source_views` 都得靠設定過濾才看不見它。
+    ///
+    /// 這一版**不看世代**。目前唯一的呼叫端是 `tunnel::halt`，而它正是在遞增
+    /// 世代之後才把狀態壓成 stopped——帶著守門反而寫不進去。監看迴圈那種
+    /// 「算出來的時候還算數、寫下去時可能已經過期」的狀態一律走
+    /// [`set_exit_status_of`]；日後要是有新的呼叫端，先確認它寫的真的是
+    /// 「當下這一刻的事實」，不然預設就該用有守門的那一版。
     pub fn set_exit_status(&self, local: u16, status: &str, detail: Option<String>) {
-        let changed = self.with_exit_mut(local, |rt| {
-            if rt.status == status && rt.detail == detail {
-                return false;
-            }
-            rt.status = status.into();
-            rt.detail = detail.clone();
-            true
-        });
-        if changed != Some(true) {
-            return;
+        let changed = self.with_exit_mut(local, |rt| write_status(rt, status, &detail));
+        if changed == Some(true) {
+            self.announce_status(local, status, detail);
         }
+    }
+
+    /// 世代守門版的狀態寫入：世代不符就整筆丟掉，連事件都不推。
+    ///
+    /// 監看迴圈算出一個狀態到真正寫進去之間，中間隔著 `is_listening`、`spawn`、
+    /// 甚至 `with_config` 搶 cfg 鎖的等待——那段時間足夠讓 halt 插進來把世代換掉。
+    /// 舊迴圈晚到的那一手若照寫，會把 halt 剛壓下去的 stopped 蓋回 connected：
+    /// 出口實際上已經停了，介面卻顯示連著，而且沒有任何後續事件會把它糾正回來
+    /// （舊迴圈下一圈就退出了），只能等使用者自己再按一次。連帶的傷害是
+    /// 「Reconnect all」靠 `is_running` 挑對象，會把這個假的 running 出口重新拉起來。
+    ///
+    /// 比對與寫入必須在**同一次 exits 鎖**內完成，否則「先問世代、再寫狀態」
+    /// 中間一樣有窗口，守門等於沒設。要不要推事件也在鎖裡決定好，
+    /// 但事件與系統匣刷新一律等放掉鎖之後才做（`refresh_tray` 會再取這把鎖）。
+    pub fn set_exit_status_of(
+        &self,
+        local: u16,
+        generation: u64,
+        status: &str,
+        detail: Option<String>,
+    ) {
+        let changed = {
+            let mut exits = self.exits.lock().unwrap();
+            exits
+                .get_mut(&local)
+                .is_some_and(|rt| guarded_write_status(rt, generation, status, &detail))
+        };
+        if changed {
+            self.announce_status(local, status, detail);
+        }
+    }
+
+    /// 狀態真的變了之後的收尾：推事件並重算系統匣。
+    /// 呼叫時**不可以**持有 exits 鎖，`refresh_tray` 會再取一次。
+    fn announce_status(&self, local: u16, status: &str, detail: Option<String>) {
         let _ = self
             .app
             .emit("exit-status", ExitStatusPayload { local, status: status.into(), detail });
@@ -349,30 +550,64 @@ impl AppState {
         !matches!(self.exit_status(local).as_deref(), None | Some(status::STOPPED))
     }
 
-    /// 更新某個出口的自測狀態並推事件。與 `set_exit_status` 同理，
-    /// 只更新既存的出口，不讓已刪掉的埠靠一次晚到的自測結果復活
-    pub fn set_exit_test(&self, local: u16, state: &str, text: &str) {
+    /// 更新某個出口的自測狀態並推事件，憑證不符就整筆丟掉。
+    ///
+    /// 與 `set_exit_status_of` 同一套規矩：比對與寫入在同一次 exits 鎖內完成，
+    /// 中途被 halt／restart／斷線重連換掉憑證的探測寫不進去。順帶保留原本
+    /// 「只更新既存的出口」的性質，已刪掉的埠不會靠一次晚到的自測結果復活。
+    pub fn set_exit_test_of(&self, local: u16, token: TestToken, state: &str, text: &str) {
         let view = TestView { state: state.into(), text: text.into() };
-        if self.with_exit_mut(local, |rt| rt.last_test = Some(view)).is_none() {
-            return;
+        let written = {
+            let mut exits = self.exits.lock().unwrap();
+            exits.get_mut(&local).is_some_and(|rt| guarded_write_test(rt, token, &view))
+        };
+        if written {
+            let _ = self.app.emit("exit-test", ExitTestPayload { local, result: Some(view) });
         }
-        let _ = self
-            .app
-            .emit("exit-test", ExitTestPayload { local, state: state.into(), text: text.into() });
     }
 
-    /// 出口斷線或停掉時把舊的自測結果清乾淨
+    /// 出口斷線或停掉時把舊的自測結果清乾淨，並讓在途的探測就地作廢。
+    ///
+    /// 換期號這一手對「ssh 自己掛掉、監看迴圈在同一代裡重跑一輪」特別要緊：
+    /// 那條路不換連線世代，沒有期號的話上一條連線發出去的探測會通過世代檢查，
+    /// 把舊連線的出口 IP 寫成新連線的自測結果。
     pub fn clear_exit_test(&self, local: u16) {
-        self.with_exit_mut(local, |rt| rt.last_test = None);
+        let counter = &self.generation;
+        let had = self.with_exit_mut(local, |rt| {
+            rt.test_epoch = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.last_test.take().is_some()
+        });
+        // 本來就沒有結果可清就不推事件：斷線重連每 5 秒會走一次這裡，
+        // 沒有這道閘的話會一直送出內容相同的空事件
+        if had == Some(true) {
+            let _ = self.app.emit("exit-test", ExitTestPayload { local, result: None });
+        }
     }
 
-    /// 標記某個埠開始測試，回傳 false 代表已經在測了
-    pub fn begin_test(&self, local: u16) -> bool {
-        self.testing.lock().unwrap().insert(local)
+    /// 取這個出口當下的自測憑證。一次鎖把兩個號碼一起讀出來，
+    /// 中間不會被插進一半（讀到舊世代配新期號那種不存在的組合）。
+    pub fn test_token(&self, local: u16) -> TestToken {
+        self.exits
+            .lock()
+            .unwrap()
+            .get(&local)
+            .map(ExitRuntime::token)
+            .unwrap_or(TestToken { generation: 0, epoch: 0 })
     }
 
-    pub fn end_test(&self, local: u16) {
-        self.testing.lock().unwrap().remove(&local);
+    /// 憑證還算不算數，用來決定要不要把探測結果寫回去
+    pub fn test_alive(&self, local: u16, token: TestToken) -> bool {
+        self.exits.lock().unwrap().get(&local).is_some_and(|rt| rt.token() == token)
+    }
+
+    /// 標記某個埠開始測試，回傳 false 代表同一張憑證真的還在測
+    pub fn begin_test(&self, local: u16, token: TestToken) -> bool {
+        claim_test(&mut self.testing.lock().unwrap(), local, token)
+    }
+
+    /// 探測跑完歸還佔位，只還得掉自己那一張
+    pub fn end_test(&self, local: u16, token: TestToken) {
+        release_test(&mut self.testing.lock().unwrap(), local, token);
     }
 
     /// 讓該出口進入新世代並騰出位子，舊的監看迴圈看到世代不符就會自行退出。
@@ -444,14 +679,41 @@ impl AppState {
         });
     }
 
-    /// 收掉所有出口的 ssh 程序，離開程式時用
+    /// 收掉所有出口的 ssh 程序，離開程式時用。
+    ///
+    /// 程序收掉了，狀態也要跟著寫成 stopped：這個函式不只跑在「馬上就要 exit」
+    /// 的路上，就地更新那條路是在交棒給安裝程式之前呼叫它，安裝失敗時程式還會
+    /// 留在原地——狀態沒改的話，介面與系統匣會停在「connected」，而背後那些
+    /// ssh 早就沒了。
+    ///
+    /// **死鎖警告**：這裡不可以呼叫 `set_exit_status`，它會經由 `with_exit_mut`
+    /// 再取一次同一把 exits 鎖，當場自我死鎖。所以在 guard 裡直接改 `rt.status`
+    /// 並把要通知的埠蒐集起來，放掉 guard 之後才推事件；`refresh_tray` 也一樣
+    /// （它會取 cfg 與 exits 兩把鎖），而且整批只重算一次——系統匣本來就是
+    /// 整份重建，逐埠各刷一次只是白做工。
     pub fn kill_all_jobs(&self) {
-        let mut exits = self.exits.lock().unwrap();
-        for rt in exits.values_mut() {
-            rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            rt.supervisor = None;
-            let _ = rt.job.take();
+        let mut stopped = Vec::new();
+        {
+            let mut exits = self.exits.lock().unwrap();
+            for (local, rt) in exits.iter_mut() {
+                rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                rt.supervisor = None;
+                let _ = rt.job.take();
+                if write_status(rt, status::STOPPED, &None) {
+                    stopped.push(*local);
+                }
+            }
         }
+        if stopped.is_empty() {
+            return;
+        }
+        for local in stopped {
+            let _ = self.app.emit(
+                "exit-status",
+                ExitStatusPayload { local, status: status::STOPPED.into(), detail: None },
+            );
+        }
+        self.refresh_tray();
     }
 
     /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，
@@ -504,34 +766,21 @@ impl AppState {
     ///
     /// 鎖序是 cfg → exits，全程式只有這裡同時持有兩把，不會反向配對。
     pub fn source_views(&self) -> Vec<SourceView> {
+        self.with_config(|cfg| build_views(cfg, &self.exits.lock().unwrap()))
+    }
+
+    /// 取快照的同時配一張系統匣套用號碼牌，兩者在**同一次 exits 鎖內**完成。
+    ///
+    /// 號碼牌的用途是讓晚算出來的快照永遠贏過早算出來的（`traymenu::refresh`
+    /// 會拿它跟全域計數器比，比輸就整份丟掉）。快照與號碼之間要是放掉了鎖，
+    /// 這個保證就不成立：兩條執行緒可以在「A 取完快照、還沒配號」時交錯，
+    /// 讓 A 拿到比較大的號碼卻載著比較舊的快照，於是 B 那份新的先被貼上去、
+    /// 又被 A 那份舊的蓋掉，系統匣就這樣停在過期的狀態直到下一次狀態變化。
+    fn views_with_seq(&self) -> (Vec<SourceView>, u64) {
         self.with_config(|cfg| {
             let exits = self.exits.lock().unwrap();
-            cfg.sources
-                .iter()
-                .map(|s| SourceView {
-                    name: s.name.clone(),
-                    host: s.host.clone(),
-                    user: s.user.clone(),
-                    proxy_command: s.proxy_command.clone(),
-                    exits: s
-                        .forwards
-                        .iter()
-                        .map(|f| {
-                            let rt = exits.get(&f.local);
-                            ExitView {
-                                name: f.name.clone(),
-                                local: f.local,
-                                remote: f.remote.clone(),
-                                enabled: f.enabled,
-                                status: rt
-                                    .map(|r| r.status.clone())
-                                    .unwrap_or_else(|| status::STOPPED.to_string()),
-                                last_test: rt.and_then(|r| r.last_test.clone()),
-                            }
-                        })
-                        .collect(),
-                })
-                .collect()
+            let views = build_views(cfg, &exits);
+            (views, crate::traymenu::next_seq())
         })
     }
 
@@ -557,24 +806,18 @@ impl AppState {
     /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
     /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let sources = self.source_views();
-        self.refresh_tray_with(&sources);
+        let (sources, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, seq);
         let _ = self.app.emit("config-changed", self.snapshot_with(sources));
     }
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
     ///
-    /// 鎖紀律：先取快照（鎖在 `source_views` 裡取完就放掉），之後只碰快照，
-    /// 真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
-    /// 號碼牌緊貼快照配出，中間不插任何事，才不會有「號碼新、快照舊」的交錯。
+    /// 鎖紀律：先取快照與號碼牌（鎖在 `views_with_seq` 裡取完就放掉），之後只碰
+    /// 快照，真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     pub fn refresh_tray(&self) {
-        self.refresh_tray_with(&self.source_views());
-    }
-
-    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
-    fn refresh_tray_with(&self, sources: &[SourceView]) {
-        let seq = crate::traymenu::next_seq();
-        crate::traymenu::refresh(&self.app, sources, seq);
+        let (sources, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, seq);
     }
 }
 
@@ -661,6 +904,195 @@ mod tests {
         assert!(!without.contains('['));
         // 時間戳仍是 HH:mm:ss，長度固定 8
         assert_eq!(with.split("  ").next().unwrap().len(), 8);
+    }
+
+    /// 有結果時序列化出來的形狀不可以變：state／text 要平鋪在 local 旁邊，
+    /// 與這個事件原本的樣子一致，收結果的那一端不必為了清除語意改寫
+    #[test]
+    fn a_test_result_still_goes_out_flat() {
+        let payload = ExitTestPayload {
+            local: 1080,
+            result: Some(TestView {
+                state: test_state::OK.into(),
+                text: "1.2.3.4  Taipei, TW".into(),
+            }),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["local"], 1080);
+        assert_eq!(json["state"], test_state::OK);
+        assert_eq!(json["text"], "1.2.3.4  Taipei, TW");
+    }
+
+    /// 清除是同一個事件的另一種形狀：只剩 local，沒有 state／text
+    #[test]
+    fn a_cleared_test_carries_no_result_fields() {
+        let json = serde_json::to_value(ExitTestPayload { local: 1080, result: None }).unwrap();
+        assert_eq!(json["local"], 1080);
+        assert!(json.get("state").is_none(), "清除事件不可以帶著空字串假裝有結果");
+        assert!(json.get("text").is_none());
+    }
+
+    /// 快照只在 connected 時帶自測結果，否則斷線後的任何一次 config-changed
+    /// 都會把前端剛清掉的舊出口 IP 回灌回畫面上
+    #[test]
+    fn a_snapshot_only_carries_the_test_while_connected() {
+        let view = || Some(TestView { state: test_state::OK.into(), text: "1.2.3.4".into() });
+        assert!(visible_test(status::CONNECTED, view()).is_some());
+        for s in [
+            status::STOPPED,
+            status::CONNECTING,
+            status::RECONNECTING,
+            status::PORT_BUSY,
+            status::ERROR,
+        ] {
+            assert!(visible_test(s, view()).is_none(), "{s} 不該帶著上一輪的自測結果");
+        }
+    }
+
+    fn token(generation: u64, epoch: u64) -> TestToken {
+        TestToken { generation, epoch }
+    }
+
+    // ------------------------------------------------------------ 世代／憑證守門
+
+    /// halt 之後的樣子：世代已經被換掉，狀態壓成 stopped，自測清乾淨
+    fn halted(generation: u64, epoch: u64) -> ExitRuntime {
+        ExitRuntime {
+            status: status::STOPPED.into(),
+            detail: None,
+            last_test: None,
+            generation,
+            test_epoch: epoch,
+            supervisor: None,
+            job: None,
+        }
+    }
+
+    /// 守門的核心契約：世代不符時是**零寫入**，不是「寫了但不推事件」。
+    ///
+    /// 這正是那條競態的形狀——halt 已經把出口壓成 stopped 並換了世代，
+    /// 舊監看迴圈晚一步把 connected 交上來。放它進去的話出口會顯示連著、
+    /// 實際上線已經停了，而且再也沒有事件會來糾正。
+    #[test]
+    fn a_stale_generation_writes_nothing() {
+        let mut rt = halted(8, 1);
+        assert!(!guarded_write_status(&mut rt, 7, status::CONNECTED, &None), "回 false");
+        assert_eq!(rt.status, status::STOPPED, "狀態不可以被舊迴圈蓋掉");
+        assert_eq!(rt.detail, None);
+    }
+
+    /// detail 也在守門範圍內：只擋 status 不擋 detail 的話，
+    /// 出口會顯示 stopped 卻掛著上一輪的錯誤訊息
+    #[test]
+    fn a_stale_generation_does_not_touch_the_detail_either() {
+        let mut rt = ExitRuntime {
+            status: status::PORT_BUSY.into(),
+            detail: Some("Local port 1080 is already in use.".into()),
+            generation: 8,
+            ..Default::default()
+        };
+        assert!(!guarded_write_status(&mut rt, 7, status::ERROR, &Some("boom".into())));
+        assert_eq!(rt.status, status::PORT_BUSY);
+        assert_eq!(rt.detail.as_deref(), Some("Local port 1080 is already in use."));
+    }
+
+    /// 世代相符時照常寫進去——守門不能嚴到把當代的更新也擋掉
+    #[test]
+    fn the_current_generation_still_writes_through() {
+        let mut rt = halted(8, 1);
+        assert!(guarded_write_status(&mut rt, 8, status::CONNECTED, &None));
+        assert_eq!(rt.status, status::CONNECTED);
+    }
+
+    /// 世代相符但值沒變時回 false，走的是「不重推事件」那條規則，
+    /// 與守門擋下來是兩回事
+    #[test]
+    fn an_unchanged_status_reports_no_change_even_when_the_generation_matches() {
+        let mut rt = halted(8, 1);
+        assert!(!guarded_write_status(&mut rt, 8, status::STOPPED, &None));
+        assert_eq!(rt.status, status::STOPPED);
+    }
+
+    /// 自測寫入的守門同樣要零寫入：重接之後 last_test 是空的，
+    /// 舊探測的結果不可以把上一條連線的出口 IP 填回來
+    #[test]
+    fn a_stale_token_writes_no_test_result() {
+        let mut rt = halted(8, 2);
+        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4  Taipei, TW".into() };
+        assert!(!guarded_write_test(&mut rt, token(7, 2), &view), "世代不符要擋下");
+        assert_eq!(rt.last_test, None);
+        // 世代對、期號不對（ssh 自己掛掉後在同一代裡重連）一樣要擋下
+        assert!(!guarded_write_test(&mut rt, token(8, 1), &view), "期號不符要擋下");
+        assert_eq!(rt.last_test, None);
+    }
+
+    /// 舊憑證也不可以覆蓋掉當代已經寫進去的結果
+    #[test]
+    fn a_stale_token_cannot_overwrite_a_current_result() {
+        let mut rt = halted(8, 2);
+        let fresh = TestView { state: test_state::OK.into(), text: "5.6.7.8".into() };
+        assert!(guarded_write_test(&mut rt, token(8, 2), &fresh));
+        let stale = TestView { state: test_state::FAIL.into(), text: "no response".into() };
+        assert!(!guarded_write_test(&mut rt, token(8, 1), &stale));
+        assert_eq!(rt.last_test.as_ref(), Some(&fresh), "當代的結果要留著");
+    }
+
+    /// 憑證相符時照常寫進去
+    #[test]
+    fn a_current_token_writes_the_test_result_through() {
+        let mut rt = halted(8, 2);
+        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4".into() };
+        assert!(guarded_write_test(&mut rt, token(8, 2), &view));
+        assert_eq!(rt.last_test.as_ref(), Some(&view));
+    }
+
+    /// 同一輪連線裡重複按自測要擋下來，否則一個埠會同時飛出好幾份探測
+    #[test]
+    fn the_same_token_cannot_start_a_second_probe() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(!claim_test(&mut slots, 1080, token(1, 1)));
+    }
+
+    /// 重接之後憑證換了新的，這時位子上那份是註定被丟掉的舊探測——
+    /// 必須讓新的自測搶佔，不然這個出口在舊探測跑完之前都測不了
+    #[test]
+    fn a_newer_token_preempts_a_stale_probe() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(claim_test(&mut slots, 1080, token(2, 5)), "換了憑證要搶得到位子");
+        assert_eq!(slots.get(&1080), Some(&token(2, 5)));
+    }
+
+    /// ssh 自己掛掉、監看迴圈在同一代裡重跑一輪：世代沒變，只有自測期號變了，
+    /// 這一樣要算成新的一輪，舊探測不能擋著
+    #[test]
+    fn a_new_epoch_alone_is_enough_to_preempt() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(7, 1)));
+        assert!(claim_test(&mut slots, 1080, token(7, 2)));
+    }
+
+    /// 被搶佔的舊探測晚一步跑完，不可以把接手者的位子清掉
+    #[test]
+    fn a_preempted_probe_cannot_release_the_new_slot() {
+        let mut slots = HashMap::new();
+        claim_test(&mut slots, 1080, token(1, 1));
+        claim_test(&mut slots, 1080, token(2, 2));
+        release_test(&mut slots, 1080, token(1, 1));
+        assert_eq!(slots.get(&1080), Some(&token(2, 2)), "舊的還不掉新的位子");
+        release_test(&mut slots, 1080, token(2, 2));
+        assert!(!slots.contains_key(&1080), "自己那一張還得掉");
+    }
+
+    /// 位子是逐埠獨立的，一個出口在測不會擋到另一個
+    #[test]
+    fn test_slots_are_per_exit() {
+        let mut slots = HashMap::new();
+        assert!(claim_test(&mut slots, 1080, token(1, 1)));
+        assert!(claim_test(&mut slots, 1083, token(1, 1)));
+        release_test(&mut slots, 1080, token(1, 1));
+        assert_eq!(slots.get(&1083), Some(&token(1, 1)));
     }
 
     #[test]

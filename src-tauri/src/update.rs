@@ -51,6 +51,29 @@ const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/relea
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 安裝版查 latest.json 的逾時。
+///
+/// updater 外掛的 builder 預設是 `None`，也就是**完全沒有上限**：GitHub 那邊
+/// 一旦是半開的連線（封包進得去、回應永遠不來），這個 async 任務就再也不會回來。
+/// 背景檢查每 24 小時起一次，卡住的任務會一直累積；手動按下的那顆「Check now」
+/// 更糟，前端的 await 沒有逾時，按鈕會永遠停在轉圈。
+///
+/// 給得比可攜車道的 10 秒寬一些：這條路要拉的是完整的 latest.json 並驗簽章。
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 下載安裝檔的逾時。
+///
+/// 與 CHECK_TIMEOUT 分開設是因為兩段的性質完全不同：查版本只拉一份幾百位元組的
+/// JSON，超過半分鐘一定是卡住了；下載拉的是十幾 MB 的安裝檔，而 reqwest 的
+/// `timeout` 管的是**整個請求含讀完 body** 的總時間，設窄了會把慢速但正常的
+/// 下載一起砍掉（使用者看到的是「更新老是失敗」，而不是「網路慢」）。
+/// 因此這裡放寬到 10 分鐘：它要擋的是永遠不會結束的連線，不是慢的連線。
+///
+/// 這一段的值傳不進 builder——外掛建 `Update` 物件時把 timeout 寫死成 `None`
+/// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
+/// 所以只能在拿到 Update 物件之後對它的 pub 欄位直接賦值。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
 const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
@@ -175,8 +198,11 @@ async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
 ///
 /// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
+/// 這裡不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
+/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道 CHECK_TIMEOUT。
 async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater =
+        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
     let current = app.package_info().version.to_string();
     Ok(found.and_then(|u| accept_installed(&u.version, &current)))
@@ -292,8 +318,16 @@ fn open_page(st: &Shared, url: &str) {
 /// 一堆執行期狀態，存進共用狀態只是徒增麻煩，而使用者按下按鈕的當下重查一次，
 /// 拿到的也一定是最新的那一版。
 ///
-/// **下載完成之後才收隧道**：下載可能要幾十秒，這段時間沒有理由先把使用者的連線
-/// 斷掉；等真的要交棒給安裝程式了才 kill，安裝程式接手時不會有殘留的 ssh 子程序。
+/// **收隧道與標記退出全部搬進 `on_before_exit`**，那顆 hook 是外掛在
+/// `ShellExecuteW` 起安裝程式的前一刻同步呼叫的（見 2.10.1 updater.rs 的
+/// `install_inner`），是這條路上唯一「確定要交棒了」的時機。
+///
+/// 原本這兩件事寫在呼叫 `install` 之前，代價是 `install` 只要回 Err（解壓失敗、
+/// 起不了安裝程式……）程式就留在原地，而使用者的隧道已經全被殺光、`exiting`
+/// 也已經被拉起來：介面上每個出口還顯示連著，實際上一條都不通，而且按下關閉鈕
+/// 會直接退出程式而不是縮回系統匣（`CloseRequested` 那道判斷看的正是 `exiting`）。
+/// 沒有任何路徑會把這些收回來。下載那幾十秒同樣不該先斷線——這一點原本就對，
+/// 搬進 hook 之後依然成立，而且連「下載成功、安裝失敗」的縫也一起補上了。
 /// Windows 上 `install` 不會回來（它自己 `std::process::exit(0)`），
 /// 所以這個函式正常路徑上只會回 Err。
 ///
@@ -308,32 +342,39 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if !is_installed(&st.app) {
         return Err("This build cannot update itself".into());
     }
-    let handle = st.app.clone();
+    let hook = st.clone();
     let updater = st
         .app
         .updater_builder()
+        .timeout(CHECK_TIMEOUT)
         .on_before_exit(move || {
-            if let Err(e) = handle.save_window_state(crate::winstate::flags()) {
+            // hook 是同步的而且很短。kill_all_jobs 會取 exits 鎖，但它在自己
+            // 內部就放掉了，這個閉包裡其餘三個呼叫都不碰 AppState 的任何鎖
+            hook.mark_exiting();
+            hook.kill_all_jobs();
+            if let Err(e) = hook.app.save_window_state(crate::winstate::flags()) {
                 log::warn!(
                     "could not save window state before the update installer takes over: {e}"
                 );
             }
-            handle.cleanup_before_exit();
+            hook.app.cleanup_before_exit();
         })
         .build()
         .map_err(|e| e.to_string())?;
-    let update = updater
+    let mut update = updater
         .check()
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No update available".to_string())?;
+    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
+    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
 
     st.log(format!("downloading update v{}", update.version));
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
 
     st.log("update downloaded, handing over to the installer");
-    st.mark_exiting();
-    st.kill_all_jobs();
+    // 隧道與 exiting 旗標交給 on_before_exit 處理：安裝真的起得來才動它們
     update.install(bytes).map_err(|e| e.to_string())
 }
 
@@ -481,6 +522,53 @@ mod tests {
             normalized.contains("[hidden]{display:none!important;}"),
             "styles.css 必須有全域的 [hidden] 規則，否則 node.hidden 會被任何一條 display 規則蓋掉"
         );
+    }
+
+    /// release workflow 組出來的 latest.json 必須是 updater 外掛吃得下的形狀。
+    ///
+    /// 這條路上完全沒有型別把關：workflow 是一段 PowerShell，外掛是外部相依，
+    /// 中間只靠一份執行期才會下載的 JSON 對接。形狀一旦對不上，症狀是安裝版的
+    /// 更新從此靜默失效——檢查失敗只會在活動日誌留一行，沒有人會注意到。
+    ///
+    /// 最脆弱的是 `pub_date`：workflow 寫的是
+    /// `[System.DateTime]::UtcNow.ToString("o")`（7 位小數再接 Z），而外掛拿
+    /// RFC3339 去解析它，解不出來時是整份 release 反序列化失敗，不是忽略那個欄位。
+    /// 有人把它改成 `ToString()` 或別的格式，這裡就會紅。
+    #[test]
+    fn the_release_workflow_manifest_still_deserializes() {
+        let raw = r#"{
+            "version": "0.5.0",
+            "pub_date": "2026-08-22T09:41:07.1234567Z",
+            "platforms": {
+                "windows-x86_64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo=",
+                    "url": "https://github.com/hunandy14/traytunnel/releases/download/v0.5.0/traytunnel-0.5.0-setup.exe"
+                }
+            }
+        }"#;
+        let release: tauri_plugin_updater::RemoteRelease =
+            serde_json::from_str(raw).expect("release.yml 產出的 latest.json 必須解析得出來");
+
+        assert_eq!(release.version.to_string(), "0.5.0");
+        assert!(release.pub_date.is_some(), "pub_date 解析成功才代表格式對得上");
+        // 目標鍵要跟 tauri 對這個平台用的字串一致，否則會是 TargetNotFound
+        assert!(release.download_url("windows-x86_64").is_ok());
+        assert!(release.signature("windows-x86_64").is_ok());
+    }
+
+    /// 上面那條要能真的擋住格式改動，前提是外掛對 pub_date 嚴格。
+    /// 這裡釘住「非 RFC3339 會失敗」，免得有人以為那個欄位隨便寫都行。
+    #[test]
+    fn a_pub_date_that_is_not_rfc3339_is_rejected() {
+        let raw = r#"{
+            "version": "0.5.0",
+            "pub_date": "2026-08-22 09:41:07",
+            "platforms": {
+                "windows-x86_64": { "signature": "sig", "url": "https://example.com/a.exe" }
+            }
+        }"#;
+        let parsed = serde_json::from_str::<tauri_plugin_updater::RemoteRelease>(raw);
+        assert!(parsed.is_err(), "外掛對 pub_date 是嚴格的，這裡不該通過");
     }
 
     /// 機碼名跟著 productName 走，不是 identifier（實機上是 `...\Uninstall\traytunnel`）

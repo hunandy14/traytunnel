@@ -29,13 +29,24 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 組單一出口的 ssh 參數，每個 token 獨立傳遞，不做字串拼接。
 /// 連線參數一律取自這個出口所屬的源。
+///
+/// ServerAlive 這一對決定「多久才發現線斷了」：ssh 每 Interval 秒沒收到資料就
+/// 送一次探測，連續 CountMax 次沒回應才判定斷線。10 × 2 大約是 20-30 秒。
+///
+/// 這個值刻意壓得比常見的預設緊。Wi-Fi 斷掉、筆電休眠醒來這類情況下，TCP
+/// 本身不會馬上知道對面沒了，這條 ssh 會維持在「看起來還連著」的狀態；
+/// 本程式的連線判斷看的是本地埠有沒有在 listen，所以那段時間介面顯示 connected、
+/// 使用者的流量卻全部石沉大海。原本的 30 × 3 要 90-120 秒才會進重連，
+/// 那是使用者最容易誤以為「程式壞了」的一段。
+///
+/// 代價是每個出口每 10 秒多一個幾十位元組的探測封包，在這個用途上可以忽略。
 pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-N".into(),
         "-o".into(),
-        "ServerAliveInterval=30".into(),
+        "ServerAliveInterval=10".into(),
         "-o".into(),
-        "ServerAliveCountMax=3".into(),
+        "ServerAliveCountMax=2".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
@@ -268,6 +279,14 @@ async fn wait_alive(state: &Arc<AppState>, local: u16, generation: u64, total: D
     true
 }
 
+/// 單一出口的監看迴圈。
+///
+/// 這裡的每一次狀態寫入都走 `set_exit_status_of` 帶著自己那一代的號碼：迴圈算出
+/// 一個狀態到真正寫下去之間隔著埠掃描、spawn、搶 cfg 鎖的等待，halt 有足夠的時間
+/// 插進來換掉世代。沒有守門的話，這條已經作廢的迴圈會把 halt 剛壓下的 stopped
+/// 蓋回 connected，而且不會再有事件來糾正——迴圈下一圈就退出了。
+/// 迴圈中間那幾道 `generation_alive` 是提早收工用的，不是守門：真正的守門在寫入
+/// 那一刻、與寫入同一把鎖內完成。
 async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
     loop {
         if !state.generation_alive(local, generation) {
@@ -295,7 +314,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             busy = port_busy_detail(local, is_listening(local));
         }
         if let Some(detail) = busy {
-            state.set_exit_status(local, status::PORT_BUSY, Some(detail));
+            state.set_exit_status_of(local, generation, status::PORT_BUSY, Some(detail));
             state.log_from(sname, format!("{} : local port {local} busy, retrying in 5s", f.name));
             if !wait_alive(state, local, generation, RETRY).await {
                 return;
@@ -303,14 +322,14 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
             continue;
         }
 
-        state.set_exit_status(local, status::CONNECTING, None);
+        state.set_exit_status_of(local, generation, status::CONNECTING, None);
 
         // spawn 失敗的分支自己記下重試訊息，不再補一行「disconnected」
         let mut spawn_failed = false;
         match spawn_ssh(&src, &f) {
             Err(e) => {
                 spawn_failed = true;
-                state.set_exit_status(local, status::ERROR, Some(e.to_string()));
+                state.set_exit_status_of(local, generation, status::ERROR, Some(e.to_string()));
                 state.log_from(
                     sname,
                     format!("{} : failed to start ssh: {e}, retrying in 5s", f.name),
@@ -347,7 +366,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                         Ok(None) => {}
                     }
                     if !state.is_connected(local) && is_listening(local) {
-                        state.set_exit_status(local, status::CONNECTED, None);
+                        state.set_exit_status_of(local, generation, status::CONNECTED, None);
                         state.log_from(sname, format!("{} : up", f.name));
                         test_exit(state, local);
                     }
@@ -363,7 +382,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         state.clear_exit_test(local);
         if !spawn_failed {
             state.log_from(sname, format!("{} : disconnected, retrying in 5s", f.name));
-            state.set_exit_status(local, status::RECONNECTING, None);
+            state.set_exit_status_of(local, generation, status::RECONNECTING, None);
         }
         if !wait_alive(state, local, generation, RETRY).await {
             return;
@@ -373,22 +392,28 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
 
 /// 對單一出口做自測，只有連上的出口才測。
 pub fn test_exit(state: &Arc<AppState>, local: u16) {
+    // 憑證要在任何其他檢查之前先取。自測在背景非同步進行，探測期間使用者可能
+    // 已經中斷或重接了這個出口，晚到的結果靠憑證擋在門外——但號碼要是等到
+    // is_connected／begin_test 之後才讀，halt 剛好插在中間時讀到的就是 halt
+    // 換過的**新**號碼，之後那道檢查一路都會成立，守門形同虛設，
+    // 一份對舊連線做的探測結果就這樣寫進了新連線。
+    let token = state.test_token(local);
     if !state.is_connected(local) {
         state.log_exit(local, format!("port {local} : not connected, cannot test"));
         return;
     }
-    if !state.begin_test(local) {
-        return; // 同一個埠已經在測了
+    if !state.begin_test(local, token) {
+        return; // 同一輪連線已經在測了
     }
-    state.set_exit_test(local, test_state::TESTING, "testing...");
-    // 自測在背景非同步進行：探測期間使用者可能已經中斷或重接了這個出口，
-    // 那時 halt 早就把 last_test 清乾淨，晚到的結果不可以再寫回去
-    let generation = state.generation(local);
+    // 連「testing...」這個佔位也走憑證版：從取憑證到寫下去之間一樣有窗口，
+    // 沒守門的話 halt 剛清乾淨的自測欄會被這一手寫回一個永遠不會有結果的
+    // testing（它的結果稍後會被憑證擋掉），介面就這樣一直轉下去
+    state.set_exit_test_of(local, token, test_state::TESTING, "testing...");
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
-        st.end_test(local);
-        if !st.generation_alive(local, generation) {
+        st.end_test(local, token);
+        if !st.test_alive(local, token) {
             return;
         }
         let (state_name, text) = match result {
@@ -396,7 +421,7 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
             Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
             Err(_) => (test_state::FAIL, "no response".to_string()),
         };
-        st.set_exit_test(local, state_name, &text);
+        st.set_exit_test_of(local, token, state_name, &text);
         st.log_exit(local, format!("port {local} : {text}"));
     });
 }
@@ -493,9 +518,9 @@ mod tests {
             vec![
                 "-N",
                 "-o",
-                "ServerAliveInterval=30",
+                "ServerAliveInterval=10",
                 "-o",
-                "ServerAliveCountMax=3",
+                "ServerAliveCountMax=2",
                 "-o",
                 "ExitOnForwardFailure=yes",
                 "-o",
@@ -542,6 +567,27 @@ mod tests {
         let a = build_exit_args(s, &s.forwards[0]);
         assert!(!a.iter().any(|s| s.starts_with("ProxyCommand=")));
         assert_eq!(a.last().unwrap(), "bob@h.example.com");
+    }
+
+    /// 斷線偵測窗口是規格：Interval × CountMax 決定使用者要盯著一個假的
+    /// connected 多久。Wi-Fi 斷掉時 TCP 本身不會馬上知道，全靠這一對把時間壓下來，
+    /// 被放寬回去的話畫面又會停在「連著卻不通」好幾分鐘
+    #[test]
+    fn the_keepalive_window_stays_under_half_a_minute() {
+        let c = cfg();
+        let s = &c.sources[0];
+        let args = build_exit_args(s, &s.forwards[0]);
+        let value = |key: &str| {
+            args.iter()
+                .find_map(|a| a.strip_prefix(key))
+                .unwrap_or_else(|| panic!("少了 {key}"))
+                .parse::<u32>()
+                .expect("值要是數字")
+        };
+        let interval = value("ServerAliveInterval=");
+        let count = value("ServerAliveCountMax=");
+        assert!(interval * count <= 30, "偵測窗口 {interval}x{count} 秒太寬");
+        assert!(interval >= 5, "探測太密只是白費封包");
     }
 
     #[test]
