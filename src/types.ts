@@ -68,6 +68,16 @@ export interface ExitInfo {
    * 快照本身沒有這個欄位。
    */
   detailText?: string | null;
+  /**
+   * 只在前端用的暫存欄位：這條列**曾經**被識別出來的代理協定。
+   *
+   * lastTest.protocol 會隨著斷線／重測被清掉（自測結果只在 connected 時有效），
+   * 但「這個目的地是不是代理」這件事不會因為連線斷一下就變了。徽章若直接跟著
+   * lastTest 走，列每停一次就會從 SOCKS5 閃成「PROXY?」外加一句指責使用者設錯
+   * 的 tooltip。所以識別結果在這裡黏著記憶，跨 status／test 轉換保留，
+   * 只有使用者改掉這條列（換 remote／關掉 probeProxy）才會失去意義。
+   */
+  knownProtocol?: ProxyProtocol | null;
 }
 
 /** 一個 ssh 來源（一組 user@host + ProxyCommand），底下掛自己的出口 */
@@ -172,6 +182,15 @@ export type ConnKind = "ssh" | "wg";
  * 因此可以直接餵給吃 ConnTarget 的 openSourceSheet，不必再轉一手。
  */
 export type ConnTarget = { kind: "ssh"; data: SourceInfo } | { kind: "wg"; data: WgProxyInfo };
+
+/**
+ * ConnTarget 再帶上兩個便利欄位，是畫面邏輯眼中「一條連線」的形狀：不管底下
+ * 是 ssh 源還是 wg 引擎，要排列、要算彙總狀態都只需要 name 與 exits。
+ *
+ * 放在這裡而不是 main.ts，是因為 status.ts 的 connTone／connStatusText 也要
+ * 吃它——連線層的健康度計算是純函式，不該為了型別位置被迫留在 main.ts 裡。
+ */
+export type ConnRef = ConnTarget & { name: string; exits: ExitInfo[] };
 
 /**
  * upsert_forward 的輸入；originalLocal 為 null 代表新增。
