@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Wry};
 
-use crate::state::{status, ExitView, SourceView, TRAY_ID};
+use crate::state::{status, ExitView, SourceView, WgProxyView, TRAY_ID};
 
 /// 選單項目的 id，事件端靠這些字串路由
 pub const ID_STATUS: &str = "status";
@@ -25,6 +25,9 @@ pub const ID_RECONNECT_ALL: &str = "reconnect-all";
 pub const EXIT_PREFIX: &str = "exit:";
 /// 單一源的重接，後面接源名
 pub const SRC_RECONNECT_PREFIX: &str = "src-reconnect:";
+/// 單一 wg 連線的重接，後面接**連線名**——wg 連線沒有代表性的埠（§5.2）。
+/// 名稱與 ssh 源共用命名空間且已保證不撞名，前綴不同也已足以分流
+pub const WG_RECONNECT_PREFIX: &str = "wg-reconnect:";
 
 /// 出口少於這個數量而且只有一個源時，出口直接攤在根層；
 /// 再多就巢狀進子選單，免得整份選單長到蓋住半個螢幕。
@@ -58,24 +61,30 @@ fn item(id: impl Into<String>, label: impl Into<String>) -> Node {
     Node::Item { id: id.into(), label: label.into() }
 }
 
-/// 所有源底下的出口，攤平成一串
-fn all_exits(sources: &[SourceView]) -> impl Iterator<Item = &ExitView> {
-    sources.iter().flat_map(|s| s.exits.iter())
+/// 每一條列，ssh 的與 wg 的攤平成一串。
+///
+/// 分子分母都要涵蓋兩型連線——使用者看到的 `3/5 Connected` 講的是全部隧道，
+/// 少算一半的話 hover 與畫面會對不起來。
+fn all_exits<'a>(
+    sources: &'a [SourceView],
+    wg: &'a [WgProxyView],
+) -> impl Iterator<Item = &'a ExitView> {
+    sources.iter().flat_map(|s| s.exits.iter()).chain(wg.iter().flat_map(|p| p.exits.iter()))
 }
 
 /// 連線數與出口總數，跨源彙總。提示文字與狀態行共用這一組分數，
 /// hover 與右鍵才不會給出兩個不一樣的分母。
-fn totals(sources: &[SourceView]) -> (usize, usize) {
-    let connected = all_exits(sources).filter(|e| e.status == status::CONNECTED).count();
-    (connected, all_exits(sources).count())
+fn totals(sources: &[SourceView], wg: &[WgProxyView]) -> (usize, usize) {
+    let connected = all_exits(sources, wg).filter(|e| e.status == status::CONNECTED).count();
+    (connected, all_exits(sources, wg).count())
 }
 
 /// 狀態行：連線數／出口總數，跟主視窗的彙總列同一套算法
-fn status_line(sources: &[SourceView]) -> String {
-    if sources.is_empty() {
+fn status_line(sources: &[SourceView], wg: &[WgProxyView]) -> String {
+    if sources.is_empty() && wg.is_empty() {
         return "No connections".into();
     }
-    let (connected, total) = totals(sources);
+    let (connected, total) = totals(sources, wg);
     if total == 0 {
         return "No tunnels".into();
     }
@@ -83,8 +92,8 @@ fn status_line(sources: &[SourceView]) -> String {
 }
 
 /// 系統匣的 hover 提示，分數與狀態行同一份
-fn tooltip_text(sources: &[SourceView]) -> String {
-    let (connected, total) = totals(sources);
+fn tooltip_text(sources: &[SourceView], wg: &[WgProxyView]) -> String {
+    let (connected, total) = totals(sources, wg);
     if total == 0 {
         "Traytunnel - no tunnels".to_string()
     } else {
@@ -93,11 +102,21 @@ fn tooltip_text(sources: &[SourceView]) -> String {
 }
 
 /// 有任何出口 enabled 就給 Disconnect all，全停時給 Connect all
-fn toggle_label(sources: &[SourceView]) -> &'static str {
-    if all_exits(sources).any(|e| e.enabled) {
+fn toggle_label(sources: &[SourceView], wg: &[WgProxyView]) -> &'static str {
+    if all_exits(sources, wg).any(|e| e.enabled) {
         "Disconnect all"
     } else {
         "Connect all"
+    }
+}
+
+/// 一條列的選單標籤。`socks` 列沒有目的地可寫，改標示它提供的是什麼（§5.6）
+fn exit_label(exit: &ExitView) -> String {
+    let head = format!("{} ({})", exit.name, exit.local);
+    match (exit.kind.as_str(), exit.remote.as_deref()) {
+        ("socks", _) => format!("{head}  SOCKS5"),
+        (_, Some(remote)) => format!("{head} → {remote}"),
+        (_, None) => head,
     }
 }
 
@@ -107,6 +126,30 @@ fn exit_node(exit: &ExitView) -> Node {
         label: format!("{} ({})", exit.name, exit.local),
         checked: exit.enabled,
     }
+}
+
+/// wg 的列標籤多帶目的地／SOCKS5 標示：wg 的列可能是兩種機制，
+/// 光看名字與埠分不出這一條到底是自建代理還是轉發
+fn wg_exit_node(exit: &ExitView) -> Node {
+    Node::Check {
+        id: format!("{EXIT_PREFIX}{}", exit.local),
+        label: exit_label(exit),
+        checked: exit.enabled,
+    }
+}
+
+/// 一條 wg 連線一個子選單：各列 + 分隔線 + Reconnect。
+///
+/// 列的順序沿用 `WgProxyView.exits`（`socks` 已置頂，§5.3），系統匣與主視窗
+/// 因此排出同一種順序。系統匣**不畫區段標題**——選單太小放不下，
+/// 順序本身加上標籤已經足以分辨。
+fn wg_node(proxy: &WgProxyView) -> Node {
+    let mut items: Vec<Node> = proxy.exits.iter().map(wg_exit_node).collect();
+    if !items.is_empty() {
+        items.push(Node::Separator);
+    }
+    items.push(item(format!("{WG_RECONNECT_PREFIX}{}", proxy.name), "Reconnect"));
+    Node::Submenu { label: proxy.name.clone(), items }
 }
 
 /// 一個源一個子選單：出口 + 分隔線 + Reconnect。
@@ -120,9 +163,12 @@ fn source_node(src: &SourceView) -> Node {
     Node::Submenu { label: src.name.clone(), items }
 }
 
-/// 單一源而且出口不多時才攤平
-fn flattened(sources: &[SourceView]) -> bool {
-    matches!(sources, [only] if only.exits.len() < FLATTEN_LIMIT)
+/// 單一源、出口不多、**而且一條 wg 連線都沒有**時才攤平。
+///
+/// 有 wg 連線就一定要有子選單：wg 的 Reconnect 只存在於子選單裡，攤平會讓它
+/// 整個消失（§5.6）。
+fn flattened(sources: &[SourceView], wg: &[WgProxyView]) -> bool {
+    wg.is_empty() && matches!(sources, [only] if only.exits.len() < FLATTEN_LIMIT)
 }
 
 /// 把非空的區段用分隔線串起來，開頭結尾都不會多出分隔線
@@ -138,16 +184,16 @@ fn join(sections: Vec<Vec<Node>>) -> Vec<Node> {
 }
 
 /// 狀態快照 → 選單模型。這是版面規則的唯一出處。
-pub fn menu_model(sources: &[SourceView]) -> Vec<Node> {
-    let mut sections = vec![vec![Node::Status(status_line(sources))]];
-    if !sources.is_empty() {
-        sections.push(if flattened(sources) {
+pub fn menu_model(sources: &[SourceView], wg: &[WgProxyView]) -> Vec<Node> {
+    let mut sections = vec![vec![Node::Status(status_line(sources, wg))]];
+    if !sources.is_empty() || !wg.is_empty() {
+        sections.push(if flattened(sources, wg) {
             sources[0].exits.iter().map(exit_node).collect()
         } else {
-            sources.iter().map(source_node).collect()
+            sources.iter().map(source_node).chain(wg.iter().map(wg_node)).collect()
         });
         sections.push(vec![
-            item(ID_ALL_TOGGLE, toggle_label(sources)),
+            item(ID_ALL_TOGGLE, toggle_label(sources, wg)),
             item(ID_RECONNECT_ALL, "Reconnect all"),
         ]);
     }
@@ -163,8 +209,8 @@ pub struct TrayView {
     pub menu: Vec<Node>,
 }
 
-pub fn tray_view(sources: &[SourceView]) -> TrayView {
-    TrayView { tooltip: tooltip_text(sources), menu: menu_model(sources) }
+pub fn tray_view(sources: &[SourceView], wg: &[WgProxyView]) -> TrayView {
+    TrayView { tooltip: tooltip_text(sources, wg), menu: menu_model(sources, wg) }
 }
 
 // ---------------------------------------------------------------- 貼到系統匣
@@ -229,8 +275,8 @@ pub fn next_seq() -> u64 {
 /// 模型在呼叫端的執行緒上就算好（純函式，不碰鎖也不碰 tray），真正碰系統匣的
 /// 動作丟到背景執行：選單事件是在主執行緒上處理的，若在事件處理途中同步把選單
 /// 換掉，等於在自己的回呼裡抽掉正在用的那一份。
-pub fn refresh(app: &AppHandle, sources: &[SourceView], seq: u64) {
-    let view = tray_view(sources);
+pub fn refresh(app: &AppHandle, sources: &[SourceView], wg: &[WgProxyView], seq: u64) {
+    let view = tray_view(sources, wg);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = APPLY.lock().unwrap_or_else(|e| e.into_inner());
@@ -256,11 +302,33 @@ fn apply(app: &AppHandle, view: &TrayView) -> tauri::Result<()> {
 mod tests {
     use super::*;
 
+    /// `menu_model`／`tray_view`／`status_line`／`tooltip_text`／`toggle_label`
+    /// 的簽名依 §5.6 都多了一個 `&[WgProxyView]`。既有這一組測試講的是「只有
+    /// ssh 源時的版面」，**斷言一個字都沒改**，只是由這幾支薄墊片補上空陣列；
+    /// wg 那半邊由下面的專屬測試覆蓋。
+    fn menu_model(sources: &[SourceView]) -> Vec<Node> {
+        super::menu_model(sources, &[])
+    }
+    fn tray_view(sources: &[SourceView]) -> TrayView {
+        super::tray_view(sources, &[])
+    }
+    fn status_line(sources: &[SourceView]) -> String {
+        super::status_line(sources, &[])
+    }
+    fn tooltip_text(sources: &[SourceView]) -> String {
+        super::tooltip_text(sources, &[])
+    }
+    fn toggle_label(sources: &[SourceView]) -> &'static str {
+        super::toggle_label(sources, &[])
+    }
+
     fn exit(name: &str, local: u16, enabled: bool, st: &str) -> ExitView {
         ExitView {
             name: name.into(),
             local,
-            remote: format!("127.0.0.1:{local}"),
+            remote: Some(format!("127.0.0.1:{local}")),
+            kind: "forward".into(),
+            probe_proxy: false,
             enabled,
             status: st.into(),
             last_test: None,

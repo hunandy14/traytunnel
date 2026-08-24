@@ -22,6 +22,9 @@
   --accent: #2dd4a7;
   --accent-hover: #4adebb;
   --accent-ink: #0e2620;
+  /* --accent 的 RGB 分量，給需要調透明度的地方用 rgba(var(--accent-rgb), α)。
+     改品牌色時這兩行要一起改——CSS 沒辦法從 hex 變數裡把分量拆出來。 */
+  --accent-rgb: 45, 212, 167;
 
   --green: #22c55e;
   --amber: #f59e0b;
@@ -490,6 +493,10 @@ body {
   top: calc(100% + 6px);
   right: 0;
   z-index: 40;
+  /* 定位容器（.summary-more-wrap）只跟 ⋯ 鈕一樣寬，auto 寬度用 shrink-to-fit
+     算的話，可用寬度會被那顆小按鈕鉗死，選項一長就會被擠壓；改成明講
+     「按最寬的選項撐開」，min-width 當短選單的下限，兩個都不會互相打架 */
+  width: max-content;
   min-width: 180px;
   padding: 4px;
   background: var(--overlay);
@@ -660,14 +667,22 @@ body {
   color: var(--muted);
 }
 
-/* 外層只負責量出可用高度，捲動交給裡面的群組容器自己做，
-   這樣清單再長，外框與圓角都還留在畫面上 */
+/* 外層量出可用高度並負責整體捲動，各分組依自身內容高度排列（.cards.grouped
+   的 flex: none，見下面那條），這樣清單再長，外框與圓角都還留在畫面上。
+
+   曾經是外層 overflow: hidden、把捲動交給裡面單一的 .cards.grouped 自己做；
+   改雙區段（SOCKS5／PORT FORWARDS）之後兩個分組疊在一起，捲動收回外層才好
+   預期。 */
 .cards-scroll {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+}
+
+.cards-scroll .cards.grouped {
+  flex: none;
 }
 
 .cards {
@@ -752,7 +767,7 @@ body {
 }
 
 /* 自測結果字串「ip  city, country」中間是兩個空白，異常單行態
-   （testing…／no response）沿用同一格式，所以要 pre 不能塌掉 */
+   （Connecting…／no response）沿用同一格式，所以要 pre 不能塌掉 */
 .card-test {
   flex: 0 1 auto;
   min-width: 0;
@@ -1507,4 +1522,200 @@ body {
   .summary-title {
     font-size: 17px;
   }
+}
+
+/* ================================================================
+ * 以下是 WireGuard 連線支援新增的規則（wg-design.md）。SOCKS5 是連線層的
+ * 服務（不是轉發），WG 連線有自己的引擎狀態與總開關，跟 SSH 沿用既有的
+ * 彙總卡／轉發清單樣式並存。新 class 一律沿用既有命名慣例與設計語彙，
+ * 能重用既有 class 的地方（.dot／.toggle／.summary-sub／.card-test-place／
+ * .setting-hint／.field-error）就直接重用，不重造一套。
+ * ================================================================ */
+
+/* WG 節點：跟 SSH 節點共用同一個 .src-icon 容器（大小／圓角／hover／選中
+   指示條都不變），只換掉底色與內容——SSH 是「名稱雜湊色 + 首字」，WG 固定
+   用 --accent 這個品牌色 + 'WG' 兩字。 */
+.src-icon.type-wg {
+  background: rgba(var(--accent-rgb), 0.22);
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+}
+
+/* sheet 標題旁的唯讀徽章（連線 sheet 編輯模式用，取代可切換的分頁）：
+   類型建立後就固定、編輯時不可再切換，配色跟軌道上 WG 節點的底色公式
+   一致（同一組 rgba(var(--accent-rgb), α)）。 */
+.type-badge {
+  flex: none;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  line-height: 12px;
+}
+
+.type-badge.ssh {
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+}
+
+.type-badge.wg {
+  color: var(--accent);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+#src-type-badge {
+  flex: none;
+  margin-right: 8px;
+}
+
+/* 類型分頁（僅新增連線時顯示；編輯既有連線改用上面的唯讀徽章）：填色公式
+   直接借 .rail-btn.active／.btn.primary 那組「accent 底 + accent-ink 字」。 */
+.type-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.type-tab {
+  flex: 1;
+  height: 28px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 130ms var(--ease), color 130ms var(--ease);
+}
+
+.type-tab:hover {
+  color: var(--text);
+}
+
+.type-tab.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.type-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* conf 路徑欄位：在 .input 裡嵌一顆純 icon 鈕（右側），視覺語言完全沿用
+   .input（同樣的 --sunken 底、邊框、focus-within 發光），只多一個 modifier
+   讓 input 本身讓出右側空間。icon 鈕固定 24px，比 .input 本身的 28px 矮，
+   不會擐高整欄。 */
+.input.with-icon {
+  padding-right: 2px;
+}
+
+.input.with-icon input {
+  flex: 1;
+  min-width: 0;
+}
+
+.input-icon-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 130ms var(--ease), color 130ms var(--ease);
+}
+
+.input-icon-btn:hover {
+  background: var(--hover-strong);
+  color: var(--text);
+}
+
+/* 彙總卡標題那一行：WG 專用的引擎狀態點跟標題並排，SSH 不出現這個 dot
+   （JS 用 hidden 控制），所以外殼要能在有無 dot 兩種情況下都好看。 */
+.summary-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.summary-title-row .summary-title {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 總開關（WG 專用）跟 ⋯ 鈕並排在同一個 actions 欄，需要垂直置中對齊 */
+.summary-actions {
+  align-items: center;
+}
+
+/* SOCKS5 是連線底下的掛件，跟埠轉發並列在同一份清單裡（清單置頂），列名
+   旁掛一個小徽章跟一般轉發列略作區分——直接借軌道上 WG 節點／sheet 唯讀
+   徽章同一組 rgba(var(--accent-rgb), α) 配色，不是另外發明。 */
+.card-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 轉發列的「意圖」開關關閉時（WG 連線總開關關閉），整列變暗但保留使用者
+   設定的意圖，總開關開回來後每一列各自照自己的意圖恢復——這裡只需要一個
+   通用的「變暗」外殼，dot／文字／按鈕全部隨父層 opacity 一起變淡，不用
+   逐個元素分別處理。 */
+.card.disabled {
+  opacity: 0.45;
+}
+
+.toggle:disabled {
+  cursor: default;
+  pointer-events: none;
+}
+
+/* 表單裡開關列的標籤＋開關排版，跟舊版「WG 啟用開關」列共用同一套版式
+   （標題文字用一般字級，不是 edit-label 那種大寫小標）。 */
+.sheet-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.sheet-toggle-row .toggle-row-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 「目的地是代理」開關跟提示淡字要看起來從屬於上面的目的地欄，不是表單裡
+   平行的另一個欄位——組內用比 .sheet-body 的 10px 更緊的 6px 間距，開關
+   列與提示再各自淡淡縮排一點，兩種手法一起做，視覺上讀成同一組。 */
+.proxy-flag-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.proxy-flag-row {
+  padding-left: 4px;
+}
+
+.sheet-toggle-row.proxy-flag-row {
+  padding-top: 0;
+  padding-bottom: 0;
 }

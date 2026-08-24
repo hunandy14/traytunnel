@@ -1,14 +1,15 @@
 [package]
 name = "traytunnel"
-version = "0.5.5"
+version = "0.6.0"
 description = "Windows 系統匣 SSH 隧道管理工具"
 authors = ["Charlotte.HonG"]
 license = "MIT"
 edition = "2021"
 # 這份下限本來就隱性存在（相依樹裡有比這更新的要求），寫明是為了讓
 # 版本太舊時 cargo 直接給一句話，而不是丟一串看不出所以然的編譯錯誤。
-# 目前自家程式碼裡卡最緊的是 winsys 的 `as_chunks`（1.88 起穩定）。
-rust-version = "1.88"
+# 自家程式碼卡最緊的是 winsys 的 `as_chunks`（1.88 起穩定），但相依樹裡的
+# smoltcp 0.13 起 MSRV 是 1.91 且已是 edition 2024，因此下限抬到 1.91。
+rust-version = "1.91"
 
 [lib]
 # `_lib` 後綴避免在 Windows 上與 bin 目標同名衝突
@@ -23,12 +24,25 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
+# 原生檔案選擇器，只給 pick_wg_conf 用（wg-design.md Q3 裁決採用）。
+# 前端不開它的 JS 權限，一律走我們自己的指令
+tauri-plugin-dialog = "2"
 # 記住主視窗位置／大小；旗標只挑 POSITION|SIZE|MAXIMIZED，用法見 winstate 模組
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = { version = "0.25", features = ["serde"] }
-tokio = { version = "1", features = ["process", "time", "io-util", "rt"] }
+# net／sync／macros 是 wg 模組要的：TcpListener／UdpSocket、mpsc／oneshot、select!。
+# sync 目前是被 tauri 間接帶進來的，不可以繼續依賴那個巧合，這裡明寫。
+tokio = { version = "1", features = [
+  "process",
+  "time",
+  "io-util",
+  "rt",
+  "net",
+  "sync",
+  "macros",
+] }
 ureq = { version = "3", features = ["socks-proxy", "json"] }
 log = "0.4"
 # 系統匣圖示要照 SM_CXSMICON 從多層 ICO 挑層，得自己解 ICO
@@ -38,6 +52,39 @@ ico = "0.5"
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 # 可攜版車道自己比版本，用的就是 updater 外掛在用的那一顆，規則保證一致
 semver = "1"
+
+# ---- WireGuard → 本地 SOCKS5（wg 模組）----
+# 使用者態 WireGuard：只要 noise 那一層，不要它自己的 device（那是 Linux/macOS 的 TUN 實作）
+boringtun = { version = "0.7.1", default-features = false }
+# 使用者態 TCP/IP。medium-ip = 純 IP 介面（無乙太網標頭、無 ARP／鄰居探索）。
+# 釘 0.13.1 而不是 0.14：0.14 只多 TSO 與擁塞控制重整，對本設計沒有價值。
+smoltcp = { version = "0.13.1", default-features = false, features = [
+  "std",
+  "log",
+  "medium-ip",
+  "proto-ipv4",
+  "proto-ipv6",
+  "proto-dns",
+  "socket-tcp",
+  "socket-udp",
+  "socket-dns",
+  # 預設只有 2，一份 conf 同時給 v4+v6 多筆位址時會爆
+  "iface-max-addr-count-4",
+  # 預設只有 1：`[Interface] DNS` 常常寫兩筆，第二順位要進得了 socket 才有備援
+  "dns-max-server-count-4",
+  # 預設只有 1：一個名字回多筆 A 是常態，只收第一筆會白白丟掉備援位址
+  "dns-max-result-count-8",
+] }
+# CancellationToken（無需任何 feature）
+tokio-util = { version = "0.7", default-features = false }
+# StreamMap：把 N 條連線的上行通道合併進一個 select! 分支
+tokio-stream = "0.1"
+# 金鑰解碼（boringtun 內部有 base64，但沒有對外 re-export）
+base64 = "0.22"
+# 零複製切片，資料泵大量用到
+bytes = "1"
+# boringtun 用 tracing 記事件；"log" feature 把它們轉發到本專案的 log
+tracing = { version = "0.1", default-features = false, features = ["log"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
