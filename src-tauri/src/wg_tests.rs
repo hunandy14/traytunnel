@@ -251,35 +251,14 @@ fn turning_it_back_on_only_starts_the_rows_the_user_left_enabled() {
     assert_eq!(rows_to_start(&cfg, "ax4200"), vec![1085, 2280], "中間那條停用的仍是 stopped");
 }
 
-/// W6.12 對比：ssh 的 `set_source_enabled` 逐條把 forward 的 enabled 寫掉。
-///
-/// **行為刻意與 W6.10 不同**——這條測試存在的目的就是釘住這個不對稱，
-/// 避免日後有人「順手對齊」。理由見 §5.5 那張表。
-#[test]
-fn the_ssh_connection_switch_is_deliberately_asymmetric() {
-    let mut cfg = cfg_with_wg();
-    cfg.sources[0].forwards.push(Forward { enabled: false, ..fwd("db", 5432) });
-
-    assert!(apply_source_enabled(&mut cfg, "hk", false));
-    assert!(
-        cfg.sources[0].forwards.iter().all(|f| !f.enabled),
-        "ssh 沒有「連線」這個執行實體，要停就只能逐條停"
-    );
-
-    assert!(apply_source_enabled(&mut cfg, "hk", true));
-    assert!(
-        cfg.sources[0].forwards.iter().all(|f| f.enabled),
-        "重新打開時全部列都會起——因為剛剛全被寫成 true"
-    );
-}
-
 // ---------------------------------- SSH 主卡總開關（PM 裁決：與 WG 現行行為完全一致）
 //
-// 上面 `the_ssh_connection_switch_is_deliberately_asymmetric` 這條測試釘住的是
-// 舊語意（Disconnect 選單項在用），**這一輪的 PM 裁決推翻了它**：SSH 主卡的總
-// 開關要與 WG 的 `set_wg_enabled` 完全同步——只動 `Source.enabled`，底下列的
-// 逐列意圖一個都不碰。舊測試依規範保留、不改斷言（見任務指示），因此上面那條
-// 現在會是紅燈；這裡另外釘住新語意，兩條測試的斷言互斥正是這次行為變更的證據。
+// 這裡原本有一條 `the_ssh_connection_switch_is_deliberately_asymmetric`，釘住的
+// 是舊語意（Disconnect 選單項在用：逐條輾平覆寫每列的 enabled）。使用者
+// 2026-08-24 拍板的新規格推翻了它——SSH 主卡的總開關要與 WG 的
+// `set_wg_enabled` 完全同步：只動 `Source.enabled`，底下列的逐列意圖一個都
+// 不碰。舊測試守衛的設計已不成立，PM 裁決予以刪除，新語意改由下面這幾條
+// 測試接手釘住。
 
 /// W6.12（覆審後）`apply_source_enabled(name, false)`：只改 `Source.enabled`，
 /// 三條列（含中間那條本來就停用的）一個都不被動到。對照 W6.10 的 wg 版本。
