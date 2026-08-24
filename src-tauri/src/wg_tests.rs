@@ -377,3 +377,73 @@ fn an_override_may_equal_or_exceed_the_conf_value() {
     assert_eq!(effective_mtu(Some(1420), Some(1420)), 1420);
     assert_eq!(effective_mtu(Some(1500), Some(1280)), 1500);
 }
+
+// ------------------------------ 握手韌性三件套（PM 裁決 2026-08-24）
+
+/// W6.19 首次握手的寬限期是**獨立的一個值**，而且遠小於 `REJECT_AFTER`。
+///
+/// 這一條就是規格：以前「從來沒握上」借用 180 秒當耐心值，使用者要盯著三分鐘
+/// 的 connecting 才看得到 reconnecting，底下所有靠 reconnecting 觸發的自癒
+/// 也一起被押到三分鐘之後。
+#[test]
+fn the_first_handshake_grace_is_its_own_much_shorter_value() {
+    use std::time::Duration;
+    assert_eq!(device::FIRST_HANDSHAKE_GRACE, Duration::from_secs(15));
+    assert!(device::FIRST_HANDSHAKE_GRACE < device::REJECT_AFTER);
+    // 既有 session 的門檻一個字都沒動
+    assert_eq!(device::REJECT_AFTER, Duration::from_secs(180));
+}
+
+/// W6.20 狀態日誌：握手成功記耗時、進入 reconnecting 記一行，兩者都**只在
+/// 變化時**記一次
+#[test]
+fn the_watch_logs_each_handshake_transition_exactly_once() {
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let mut watch = HandshakeWatch::new(t0, RECONNECT_REBUILD_AFTER);
+
+    // 握上了：耗時從引擎啟動起算
+    let line = watch.on_status(status::CONNECTED, t0 + Duration::from_millis(420));
+    assert_eq!(line.as_deref(), Some("handshake ok in 420ms"));
+    // 同一個狀態再來一次不重複刷屏
+    assert!(watch.on_status(status::CONNECTED, t0 + Duration::from_millis(500)).is_none());
+
+    // 掉線：以前這條路徑是完全靜默的
+    let line = watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(10));
+    assert_eq!(line.as_deref(), Some(HANDSHAKE_RETRY_LOG));
+    assert!(watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(12)).is_none());
+
+    // 再握上：耗時從**掉線那一刻**起算，不是從引擎啟動起算
+    let line = watch.on_status(status::CONNECTED, t0 + Duration::from_secs(13));
+    assert_eq!(line.as_deref(), Some("handshake ok in 3000ms"));
+
+    // 其他狀態不歸這顆狀態機管
+    assert!(watch.on_status(status::PORT_BUSY, t0 + Duration::from_secs(14)).is_none());
+    assert!(watch.on_status(status::ERROR, t0 + Duration::from_secs(14)).is_none());
+}
+
+/// W6.21 DDNS 自癒：reconnecting 連續卡超過門檻就該重建引擎（重建＝重解析端點）
+#[test]
+fn a_stuck_reconnect_eventually_asks_for_a_rebuild() {
+    use std::time::Duration;
+    let t0 = Instant::now();
+    // 門檻可注入，正式路徑上傳的是 RECONNECT_REBUILD_AFTER
+    let mut watch = HandshakeWatch::new(t0, Duration::from_secs(30));
+
+    // 還沒 reconnecting 過：再久都不重建（隧道好好的，不可以自己斷線）
+    assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
+    watch.on_status(status::CONNECTED, t0);
+    assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
+
+    watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(10));
+    assert!(!watch.overdue(t0 + Duration::from_secs(39)), "只是抖一下就重建太吵");
+    assert!(watch.overdue(t0 + Duration::from_secs(40)), "門檻一到就重建");
+
+    // 中途自己好了就重新計時
+    watch.on_status(status::CONNECTED, t0 + Duration::from_secs(41));
+    assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
+
+    // 正式常數：60 秒，比重連間隔（5 秒）大一個數量級
+    assert_eq!(RECONNECT_REBUILD_AFTER, Duration::from_secs(60));
+    assert!(RECONNECT_REBUILD_AFTER > RETRY);
+}

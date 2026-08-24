@@ -15,7 +15,7 @@ pub mod socks5;
 pub mod stack;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +24,25 @@ use crate::winsys::is_listening;
 
 /// 引擎斷線後的重連間隔，與 `ssh::tunnel::RETRY` 同值同理由
 pub const RETRY: Duration = Duration::from_secs(5);
+
+/// reconnecting 連續卡這麼久，就把整顆引擎重建一次。
+///
+/// **動機是 DDNS**：`[Peer] Endpoint` 寫的是主機名時，`resolve_endpoint` 只在
+/// `engine::spawn` 那一刻跑一次。家裡的寬頻換了 IP（或對端的 DDNS 紀錄更新）
+/// 之後，引擎會抱著一個已經沒人在聽的舊位址一直重送握手，**永遠不會自己好**
+/// ——使用者掛機一整天回來看到的就是一條紅著的隧道，非得手動重連不可。
+/// 重建引擎是唯一會重跑端點解析的路徑（§5.2 的生命週期）。
+///
+/// 60 秒是「網路只是抖一下」與「端點真的搬家了」之間的分界：WireGuard 自己的
+/// 重試（`REKEY_TIMEOUT` 5 秒）在這段時間內已經試過十幾次，還沒起來就不是抖動。
+pub const RECONNECT_REBUILD_AFTER: Duration = Duration::from_secs(60);
+
+/// 進入 reconnecting 時記的那一行。stale 路徑以前是完全靜默的，
+/// 使用者只看得到一個變色的點，日誌裡卻查不到任何線索
+const HANDSHAKE_RETRY_LOG: &str = "handshake not completed, retrying";
+
+/// 卡在 reconnecting 太久、要重建引擎時記的那一行
+const REBUILD_LOG: &str = "rebuilding engine to re-resolve endpoint";
 
 /// 埠佔用預檢的複查間隔，與 `ssh::tunnel::PORT_GRACE` 同值同理由
 pub const PORT_GRACE: Duration = Duration::from_millis(500);
@@ -203,6 +222,7 @@ pub(crate) async fn test_conf_within(
             endpoint,
             bind: unspecified_bind(&endpoint),
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         },
         cancel.clone(),
     ) {
@@ -297,6 +317,69 @@ pub fn should_run_engine(cfg: &crate::config::Config, conn: &str) -> bool {
 /// 純函式，沒有 IO：這條優先序是規格本身，測試直接釘它而不必起一顆引擎。
 pub fn effective_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> usize {
     override_mtu.or(conf_mtu).unwrap_or(conf::APP_DEFAULT_MTU)
+}
+
+/// 這一輪引擎的握手觀測：狀態變化時該記哪一行日誌，以及 reconnecting
+/// 卡了多久該重建引擎（DDNS 自癒，見 [`RECONNECT_REBUILD_AFTER`]）。
+///
+/// 抽成一顆**不碰 IO、`now` 由呼叫端傳進來**的小狀態機，時間相關的規格因此
+/// 測得到而不必真的坐等 60 秒（W6.19～W6.21）。
+pub(crate) struct HandshakeWatch {
+    /// 「握手花了多久」的計時起點：引擎剛起來，或上一次翻進 reconnecting 的那一刻
+    round_started: Instant,
+    /// 目前這一段 reconnecting 從什麼時候開始；None 代表現在不在 reconnecting
+    reconnecting_since: Option<Instant>,
+    /// reconnecting 連續超過這麼久就該重建（production 是 [`RECONNECT_REBUILD_AFTER`]）
+    rebuild_after: Duration,
+    phase: Phase,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Phase {
+    /// 這一輪還沒有任何結論
+    Waiting,
+    Ok,
+    Reconnecting,
+}
+
+impl HandshakeWatch {
+    pub(crate) fn new(now: Instant, rebuild_after: Duration) -> Self {
+        HandshakeWatch {
+            round_started: now,
+            reconnecting_since: None,
+            rebuild_after,
+            phase: Phase::Waiting,
+        }
+    }
+
+    /// 吃一顆引擎狀態，回傳「要記的那一行日誌」（沒變化就回 None）。
+    ///
+    /// 只有**變化**才記：device 那一層已經去抖過（只在 `Reported` 改變時推事件），
+    /// 這裡再擋一次是為了 port_busy／error 之類的狀態夾在中間時不重複刷屏。
+    pub(crate) fn on_status(&mut self, st: &'static str, now: Instant) -> Option<String> {
+        match st {
+            status::CONNECTED if self.phase != Phase::Ok => {
+                self.phase = Phase::Ok;
+                self.reconnecting_since = None;
+                let ms = now.saturating_duration_since(self.round_started).as_millis();
+                Some(format!("handshake ok in {ms}ms"))
+            }
+            status::RECONNECTING if self.phase != Phase::Reconnecting => {
+                self.phase = Phase::Reconnecting;
+                self.reconnecting_since = Some(now);
+                // 下一次握手成功要從「掉線的這一刻」起算，而不是從引擎啟動起算
+                self.round_started = now;
+                Some(HANDSHAKE_RETRY_LOG.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// reconnecting 是不是已經卡超過門檻了
+    pub(crate) fn overdue(&self, now: Instant) -> bool {
+        self.reconnecting_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.rebuild_after)
+    }
 }
 
 /// 引擎狀態 → 底下各列的狀態（W6.9）。
@@ -518,7 +601,9 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
         // 世代不符時 worker 就在 store_worker 裡 drop，剛起來的任務樹當場收乾淨
         state.wg_store_worker(conn, generation, Worker::Wg(CancelGuard(cancel)));
 
-        let stopped_by_engine = consume(state, conn, generation, &plan, &busy, &mut events).await;
+        let stopped_by_engine =
+            consume(state, conn, generation, &plan, &busy, &mut events, RECONNECT_REBUILD_AFTER)
+                .await;
         state.wg_kill_worker_of(conn, generation);
         if !stopped_by_engine {
             return; // 世代已經被作廢，狀態由 halt 那一側負責
@@ -530,6 +615,9 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
 }
 
 /// 消費引擎事件直到它結束或世代作廢。回 true 代表「引擎自己停了，該重連」。
+///
+/// `rebuild_after` 就是 [`RECONNECT_REBUILD_AFTER`]，做成參數只為了測試檯注得進
+/// 一個短值（正式路徑上唯一的呼叫端傳的就是那個常數）。
 async fn consume(
     state: &Arc<AppState>,
     conn: &str,
@@ -537,8 +625,16 @@ async fn consume(
     plan: &Plan,
     busy: &[u16],
     events: &mut tokio::sync::mpsc::Receiver<engine::EngineEvent>,
+    rebuild_after: Duration,
 ) -> bool {
+    let mut watch = HandshakeWatch::new(Instant::now(), rebuild_after);
     loop {
+        // 卡在 reconnecting 太久：端點的位址可能已經漂走了（DDNS），而重解析
+        // 只發生在 engine::spawn，所以唯一的自癒手段就是把這一輪收掉重來
+        if watch.overdue(Instant::now()) {
+            state.log_from(conn, REBUILD_LOG);
+            return true;
+        }
         let event = tokio::select! {
             // 卡在 recv() 的時候也要定期醒來看一眼自己還算不算數
             _ = tokio::time::sleep(POLL) => {
@@ -564,6 +660,11 @@ async fn consume(
             }
             engine::EngineEvent::Engine(st, detail) => {
                 spread(state, generation, &plan.locals, busy, st, detail);
+                // 握手成功花了多久、什麼時候翻進 reconnecting：以前這兩件事在
+                // 日誌裡完全是空白的，使用者只看得到一個變色的點
+                if let Some(line) = watch.on_status(st, Instant::now()) {
+                    state.log_from(conn, line);
+                }
                 if st == status::CONNECTED {
                     // 只有 should_probe 為真的列才排自測（§5.2 的狀態機）
                     for local in probed_rows_of(state, conn) {

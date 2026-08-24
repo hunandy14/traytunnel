@@ -88,6 +88,7 @@ pub async fn spawn(
             endpoint,
             bind: bind_addr(&endpoint, conf.listen_port),
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         },
         cancel.clone(),
     )

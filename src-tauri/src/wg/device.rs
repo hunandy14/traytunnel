@@ -16,6 +16,19 @@ use tokio_util::sync::CancellationToken;
 /// WireGuard 的 `REJECT_AFTER_TIME`：握手超過這個歲數就不能再算 connected
 pub const REJECT_AFTER: Duration = Duration::from_secs(180);
 
+/// 首次握手的寬限期：device 起來之後**一次都還沒握上**時的耐心值。
+///
+/// 這裡刻意不沿用 [`REJECT_AFTER`]。那 180 秒是 WireGuard 對**既有 session**
+/// 的規定——握過一次之後，那把金鑰超過 180 秒就不准再用；「從頭到尾沒握上」
+/// 是完全不同的一件事：對端沒開機、端點的 IP 漂走了、UDP 被中間某一跳擋掉。
+/// 拿 180 秒當耐心值的話，使用者要盯著三分鐘的 connecting 才看得到
+/// reconnecting，而底下靠 reconnecting 觸發的自癒（重建引擎、重解析端點）
+/// 也一起被押到三分鐘之後。
+///
+/// 15 秒的來源是 boringtun 的 `REKEY_TIMEOUT`（5 秒）：足夠讓它重送兩次以上
+/// 握手，線路只是慢或掉了一兩顆封包不會被誤判成失敗。
+pub const FIRST_HANDSHAKE_GRACE: Duration = Duration::from_secs(15);
+
 /// 計時器 tick 間隔（onetun 是 1ms 空轉，這裡固定 250ms）
 pub const TIMER_TICK: Duration = Duration::from_millis(250);
 
@@ -47,11 +60,16 @@ pub struct DeviceConfig {
     pub endpoint: SocketAddr,
     /// `0.0.0.0:listen_port` 或 `[::]:listen_port`
     pub bind: SocketAddr,
-    /// 握手陳舊門檻。
+    /// 握手陳舊門檻。**只管已經握上過的那條 session**（`Some(age)` 那一支）。
     ///
     /// 設計書 §1.3 寫死 `REJECT_AFTER`，但 §5 W4.12 要求可注入，否則那條測試
     /// 就是一個 200 秒的測試。預設值仍是 [`REJECT_AFTER`]。
     pub stale_after: Duration,
+    /// 一次都還沒握上時的耐心值（`None` 那一支），預設 [`FIRST_HANDSHAKE_GRACE`]。
+    ///
+    /// 與 `stale_after` 分成兩個欄位而不是共用一個，理由見
+    /// [`FIRST_HANDSHAKE_GRACE`]：兩者量的是不同的事情，值也差一個數量級。
+    pub first_handshake_grace: Duration,
 }
 
 /// 起 device 任務。任務在 `cancel` 被取消或所有 sender 掉光時結束。
@@ -98,7 +116,13 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     let (ev_tx, ev_rx) = mpsc::channel::<DeviceEvent>(16);
 
     let join = tokio::spawn(pump(
-        PumpState { tunn, tx_buf, endpoint: cfg.endpoint, stale_after: cfg.stale_after },
+        PumpState {
+            tunn,
+            tx_buf,
+            endpoint: cfg.endpoint,
+            stale_after: cfg.stale_after,
+            first_handshake_grace: cfg.first_handshake_grace,
+        },
         udp,
         out_rx,
         in_tx,
@@ -138,6 +162,7 @@ struct PumpState {
     tx_buf: Vec<u8>,
     endpoint: SocketAddr,
     stale_after: Duration,
+    first_handshake_grace: Duration,
 }
 
 async fn pump(
@@ -148,7 +173,7 @@ async fn pump(
     events: mpsc::Sender<DeviceEvent>,
     cancel: CancellationToken,
 ) {
-    let PumpState { mut tunn, mut tx_buf, endpoint, stale_after } = state;
+    let PumpState { mut tunn, mut tx_buf, endpoint, stale_after, first_handshake_grace } = state;
     let mut rx_buf = vec![0u8; MAX_PACKET];
     // decapsulate 的「空轉續抽」要在前一顆封包還借著 tx_buf 的時候再寫一顆出去，
     // 因此需要第二塊。onetun 是在迴圈裡每一輪配置一塊新的，這裡改成重複使用。
@@ -233,7 +258,12 @@ async fn pump(
                     _ => {}
                 }
 
-                let next = classify(tunn.time_since_last_handshake(), started, stale_after);
+                let next = classify(
+                    tunn.time_since_last_handshake(),
+                    started,
+                    stale_after,
+                    first_handshake_grace,
+                );
                 if next != reported && next != Reported::Nothing {
                     reported = next;
                     let event = match next {
@@ -251,13 +281,20 @@ async fn pump(
 
 /// 握手歲數 → 要對外報的狀態。
 ///
-/// 從來沒握上（`None`）時，用「device 起來多久了」當歲數：對端從頭到尾沒回話
-/// 也必須在門檻之後翻成 stale，不可以永遠停在「還沒有結論」（W4.12／W4.16）。
-fn classify(age: Option<Duration>, started: Instant, stale_after: Duration) -> Reported {
+/// 從來沒握上（`None`）時，用「device 起來多久了」對照
+/// [`FIRST_HANDSHAKE_GRACE`]：對端從頭到尾沒回話也必須在寬限期之後翻成 stale，
+/// 不可以永遠停在「還沒有結論」（W4.12／W4.16／W4.17）。**這一支刻意不看
+/// `stale_after`**——那 180 秒量的是既有 session 的歲數，不是等待的耐心。
+fn classify(
+    age: Option<Duration>,
+    started: Instant,
+    stale_after: Duration,
+    first_handshake_grace: Duration,
+) -> Reported {
     match age {
         Some(age) if age < stale_after => Reported::Ok,
         Some(_) => Reported::Stale,
-        None if started.elapsed() >= stale_after => Reported::Stale,
+        None if started.elapsed() >= first_handshake_grace => Reported::Stale,
         None => Reported::Nothing,
     }
 }
@@ -277,6 +314,7 @@ async fn send_udp(udp: &tokio::net::UdpSocket, packet: &[u8], endpoint: SocketAd
 /// 之一，由 W1.31 的 grep 型測試釘住）：端點是隧道外的位址，本來就必須用系統
 /// 解析器，而且要每次重連前重解一次，動態 DNS 的端點才跟得上。
 pub async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
+    note_resolve();
     tokio::net::lookup_host(endpoint)
         .await
         .map_err(|e| format!("解析不到端點 {endpoint}：{e}"))?
@@ -292,6 +330,31 @@ fn note_udp_tx() {
 #[cfg(not(test))]
 #[inline]
 fn note_udp_tx() {}
+
+/// 測試觀測點：[`resolve_endpoint`] 被呼叫過幾次。
+///
+/// 「reconnecting 卡太久就重建引擎，重建會重新解析端點」（DDNS 自癒）這條性質
+/// 從外面看不出來——解析的結果多半還是同一個 IP。手法與 [`UDP_TX_COUNT`] 相同，
+/// 一樣是 thread-local（理由見那邊的說明）。
+#[cfg(test)]
+fn note_resolve() {
+    RESOLVE_LOCAL.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_resolve() {}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVE_LOCAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 這條執行緒上 [`resolve_endpoint`] 至今被呼叫的次數（測試用）
+#[cfg(test)]
+pub(crate) fn resolve_count() -> usize {
+    RESOLVE_LOCAL.with(|c| c.get())
+}
 
 /// 測試觀測點：送進 UDP socket 的封包數。
 ///

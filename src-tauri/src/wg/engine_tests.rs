@@ -67,6 +67,8 @@ struct SideSpec {
     peer_port: u16,
     allowed_ips: Vec<IpNet>,
     stale_after: Duration,
+    /// 一次都還沒握上時的耐心值（PM 裁決 2026-08-24：與 `stale_after` 分家）
+    first_handshake_grace: Duration,
 }
 
 impl SideSpec {
@@ -80,6 +82,7 @@ impl SideSpec {
             peer_port: pb,
             allowed_ips: vec![net(Ipv4Addr::UNSPECIFIED, 0)],
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         }
     }
 
@@ -93,6 +96,7 @@ impl SideSpec {
             peer_port: pa,
             allowed_ips: vec![net(Ipv4Addr::UNSPECIFIED, 0)],
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         }
     }
 }
@@ -107,6 +111,7 @@ fn spin_up(spec: &SideSpec, cancel: &tokio_util::sync::CancellationToken) -> Sid
             endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, spec.peer_port)),
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, spec.bind_port)),
             stale_after: spec.stale_after,
+            first_handshake_grace: spec.first_handshake_grace,
         },
         cancel.clone(),
     )
@@ -410,12 +415,17 @@ async fn a_restart_on_the_same_port_does_not_hit_addr_in_use() {
 }
 
 /// W4.12 對端靜默超過門檻：A 要推 HandshakeStale（門檻用注入的短值）
+///
+/// PM 裁決 2026-08-24：一次都沒握上的那一支現在看的是 `first_handshake_grace`
+/// 而不是 `stale_after`，所以這裡改注入前者（後者原樣留著，它管的是**握過之後**
+/// 那條 session 的歲數，與這條測試無關）。
 #[tokio::test]
 async fn a_silent_peer_eventually_goes_stale() {
     let (pa, pb) = two_free_udp_ports();
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut spec = SideSpec::a(pa, pb);
     spec.stale_after = Duration::from_millis(600);
+    spec.first_handshake_grace = Duration::from_millis(600);
     let mut a = spin_up(&spec, &cancel);
     let mut saw_stale = false;
     while let Some(ev) = deadline(a.device.events.recv()).await {
@@ -509,6 +519,9 @@ async fn a_mismatched_preshared_key_never_reports_connected() {
     let mut sa = SideSpec::a(pa, pb);
     sa.preshared = Some([0x07; 32]);
     sa.stale_after = Duration::from_millis(600);
+    // PSK 不一致＝從頭到尾握不上，走的是 first_handshake_grace 那一支
+    // （PM 裁決 2026-08-24，同 W4.12）
+    sa.first_handshake_grace = Duration::from_millis(600);
     let mut sb = SideSpec::b(pa, pb);
     sb.preshared = Some([0x08; 32]);
     let mut a = spin_up(&sa, &cancel);
@@ -624,4 +637,83 @@ async fn a_probed_forward_to_a_dead_backend_says_it_is_not_a_proxy() {
     assert_eq!(crate::exits::detect_message(&got), crate::exits::NOT_A_PROXY_TEXT);
     assert!(started.elapsed() < Duration::from_secs(7), "對面回 RST 就該立刻收手，不是等逾時");
     bench.cancel.cancel();
+}
+
+// ------------------- 握手韌性與 MTU 自動探測（PM 裁決 2026-08-24）
+
+use crate::wg::conf::{SecretKey, WgConf};
+use crate::wg::engine::{self, EngineSpec};
+
+/// W4.17 首次握手的寬限期**與 `stale_after` 分家**：對端從頭到尾沒回話時，
+/// 到期的是寬限期（這裡注入 600ms），不是那個 180 秒的 session 門檻。
+///
+/// 這條測試的存在就是為了擋住「順手把兩個值合回一個」——合回去的症狀是
+/// 使用者盯著三分鐘的 connecting，而重連與端點重解析全被押在後面。
+#[tokio::test]
+async fn the_first_handshake_grace_is_what_expires_when_nobody_answers() {
+    let (pa, pb) = two_free_udp_ports();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut spec = SideSpec::a(pa, pb);
+    // session 門檻留在 180 秒：它一秒都不該影響這條路徑
+    spec.stale_after = device::REJECT_AFTER;
+    spec.first_handshake_grace = Duration::from_millis(600);
+    let mut a = spin_up(&spec, &cancel);
+
+    let started = std::time::Instant::now();
+    let mut saw_stale = false;
+    while let Some(ev) = deadline(a.device.events.recv()).await {
+        if ev == DeviceEvent::HandshakeStale {
+            saw_stale = true;
+            break;
+        }
+    }
+    assert!(saw_stale, "寬限期一到就要翻成 stale，不可以等那 180 秒");
+    assert!(started.elapsed() < Duration::from_secs(5), "到期的顯然不是 stale_after");
+    cancel.cancel();
+}
+
+/// 測試檯用的 `WgConf`：金鑰是 A 側那一組，端點指到 `peer_port`。
+///
+/// `listen_port` 要給定值的場合只有一種——對端得知道要回哪裡（device 一律
+/// 把封包送往設定裡的 endpoint，不是回信給來源）
+fn test_conf_for(peer_port: u16, listen_port: u16, dns: Vec<IpAddr>) -> WgConf {
+    WgConf {
+        private_key: SecretKey(StaticSecret::from(A_PRIV)),
+        addresses: vec![net(A_ADDR, 32)],
+        dns,
+        mtu: None,
+        listen_port,
+        peer_public_key: *PublicKey::from(&StaticSecret::from(B_PRIV)).as_bytes(),
+        preshared_key: None,
+        endpoint: format!("127.0.0.1:{peer_port}"),
+        allowed_ips: vec![net(Ipv4Addr::UNSPECIFIED, 0)],
+        keepalive: Some(1),
+        warnings: vec![],
+    }
+}
+
+fn bare_spec(conf: WgConf) -> EngineSpec {
+    EngineSpec { name: "bench".into(), conf, mtu: crate::wg::conf::APP_DEFAULT_MTU, rows: vec![] }
+}
+
+/// W4.18 **每一次重建引擎都會重新解析端點**——DDNS 自癒能成立的全部理由。
+///
+/// 從外面看不出來（解析結果多半還是同一個 IP），所以靠 device.rs 那個
+/// thread-local 觀測點數次數，手法與 `UDP_TX_COUNT` 相同。
+#[tokio::test]
+async fn every_engine_build_resolves_the_endpoint_again() {
+    let (_pa, pb) = two_free_udp_ports();
+    let before = device::resolve_count();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    for round in 1..=2usize {
+        engine::spawn(bare_spec(test_conf_for(pb, 0, vec![])), cancel.clone())
+            .await
+            .expect("引擎起得來");
+        assert_eq!(
+            device::resolve_count() - before,
+            round,
+            "第 {round} 次重建也要重跑 resolve_endpoint，否則端點的 IP 漂走就再也回不來"
+        );
+    }
+    cancel.cancel();
 }
