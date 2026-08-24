@@ -146,7 +146,10 @@ fn whole_line_comments_and_blank_lines_are_skipped() {
 /// W1.7 行內註解是壞值，不是可以靜靜吃掉的東西——wg-quick 也不吃
 #[test]
 fn inline_comments_are_an_error_not_a_silent_trim() {
-    let raw = with_peer_line("").replace("Endpoint = h:51820", "Endpoint = h:51820 # 註解");
+    let raw = with_peer_line("").replace(
+        "Endpoint = vpn.example.com:51820",
+        "Endpoint = vpn.example.com:51820 # 註解",
+    );
     let err = parse(&raw).expect_err("行內註解要判壞值");
     assert!(err.to_ascii_lowercase().contains("endpoint"), "訊息要點名 Endpoint：{err}");
 }
