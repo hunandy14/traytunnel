@@ -148,15 +148,11 @@ pub async fn spawn(
                 e = device_events.recv() => match e { Some(e) => e, None => break },
             };
             let translated = match event {
-                device::DeviceEvent::HandshakeOk => {
-                    EngineEvent::Engine(status::CONNECTED, None)
-                }
+                device::DeviceEvent::HandshakeOk => EngineEvent::Engine(status::CONNECTED, None),
                 device::DeviceEvent::HandshakeStale => {
                     EngineEvent::Engine(status::RECONNECTING, None)
                 }
-                device::DeviceEvent::Fatal(msg) => {
-                    EngineEvent::Engine(status::ERROR, Some(msg))
-                }
+                device::DeviceEvent::Fatal(msg) => EngineEvent::Engine(status::ERROR, Some(msg)),
             };
             if events.send(translated).await.is_err() {
                 break;

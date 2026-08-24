@@ -63,14 +63,8 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     socket.set_nonblocking(true)?;
     let local_addr = socket.local_addr()?;
 
-    let mut tunn = Tunn::new(
-        cfg.private_key,
-        cfg.peer_public_key,
-        cfg.preshared_key,
-        cfg.keepalive,
-        0,
-        None,
-    );
+    let mut tunn =
+        Tunn::new(cfg.private_key, cfg.peer_public_key, cfg.preshared_key, cfg.keepalive, 0, None);
 
     // 啟動當下**就地**送一次握手，不等任務被排到，也不等第一個封包：
     //  * 使用者按下連線後幾百毫秒內就成立 `connected`，而不是等他開網頁；

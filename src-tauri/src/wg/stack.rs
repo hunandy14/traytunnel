@@ -265,11 +265,8 @@ async fn run(
     let mut iface = Interface::new(iface_cfg, &mut device, smoltcp::time::Instant::now());
 
     // D2：位址一律以 /32、/128 掛，路由**只靠一條 default route**
-    let addresses: Vec<IpCidr> = cfg
-        .addresses
-        .iter()
-        .map(|c| IpCidr::new(c.address(), host_prefix(&c.address())))
-        .collect();
+    let addresses: Vec<IpCidr> =
+        cfg.addresses.iter().map(|c| IpCidr::new(c.address(), host_prefix(&c.address()))).collect();
     iface.update_ip_addrs(|slots| {
         for cidr in &addresses {
             if slots.push(*cidr).is_err() {
@@ -436,11 +433,8 @@ impl PortAllocator {
         let span = (*VPORT_RANGE.end() - *VPORT_RANGE.start()) as usize + 1;
         for _ in 0..span {
             let candidate = self.next;
-            self.next = if candidate >= *VPORT_RANGE.end() {
-                *VPORT_RANGE.start()
-            } else {
-                candidate + 1
-            };
+            self.next =
+                if candidate >= *VPORT_RANGE.end() { *VPORT_RANGE.start() } else { candidate + 1 };
             if self.used.insert(candidate) {
                 return Some(VirtualPort(candidate));
             }
@@ -674,8 +668,10 @@ fn service_sockets(
         // 對面關了接收半邊且緩衝抽乾 → 丟掉下行 sender，呼叫端讀到 EOF。
         // 還在三向交握途中的 socket（被動監聽剛被接起來時是 SynReceived）
         // 也一樣答 may_recv() == false，要先排除掉，不然連線一成立就被判 EOF。
-        let handshaking =
-            matches!(socket.state(), tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived);
+        let handshaking = matches!(
+            socket.state(),
+            tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
+        );
         if !handshaking && !socket.may_recv() && !socket.can_recv() && entry.down.take().is_some() {
             out.progressed = true;
         }

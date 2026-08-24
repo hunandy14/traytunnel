@@ -225,11 +225,7 @@ fn exchange(addr: std::net::SocketAddr, request: &[u8], want: usize) -> Vec<u8> 
             Ok(0) => break,
             Ok(n) => {
                 reply.extend_from_slice(&chunk[..n]);
-                let enough = if want == 0 {
-                    reply.contains(&b'\n')
-                } else {
-                    reply.len() >= want
-                };
+                let enough = if want == 0 { reply.contains(&b'\n') } else { reply.len() >= want };
                 if enough {
                     break;
                 }
@@ -240,7 +236,6 @@ fn exchange(addr: std::net::SocketAddr, request: &[u8], want: usize) -> Vec<u8> 
     }
     reply
 }
-
 
 /// 測試觀測點：[`detect`] 實際被呼叫的次數。
 ///

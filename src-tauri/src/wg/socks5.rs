@@ -227,10 +227,8 @@ async fn resolve_target(
                 .send(stack::StackCmd::Resolve { name: name.clone(), reply: tx })
                 .await
                 .map_err(|_| Reply::GeneralFailure)?;
-            let ips = rx
-                .await
-                .map_err(|_| Reply::GeneralFailure)?
-                .map_err(|e| reply_for_resolve(&e))?;
+            let ips =
+                rx.await.map_err(|_| Reply::GeneralFailure)?.map_err(|e| reply_for_resolve(&e))?;
             let ip = ips.first().ok_or(Reply::HostUnreachable)?;
             Ok(smoltcp::wire::IpEndpoint::new(smoltcp::wire::IpAddress::from(*ip), *port))
         }

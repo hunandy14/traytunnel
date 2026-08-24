@@ -201,9 +201,7 @@ pub fn parse(raw: &str) -> Result<WgConf, String> {
                 "peer" => {
                     peers += 1;
                     if peers > 1 {
-                        return Err(
-                            "這份 .conf 有多個 [Peer] 區段：v1 只支援單一 peer".into()
-                        );
+                        return Err("這份 .conf 有多個 [Peer] 區段：v1 只支援單一 peer".into());
                     }
                     Section::Peer
                 }
@@ -354,8 +352,7 @@ fn decode_key(value: &str, key: &'static str) -> Result<[u8; 32], String> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(value.trim())
         .map_err(|_| format!("{key} 不是合法的 base64"))?;
-    <[u8; 32]>::try_from(raw.as_slice())
-        .map_err(|_| format!("{key} 解碼後不是 32 位元組"))
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| format!("{key} 解碼後不是 32 位元組"))
 }
 
 /// `Address`（前綴可省）與 `AllowedIPs`（前綴必填）共用的一支
@@ -364,9 +361,8 @@ fn parse_ip_net(item: &str, require_prefix: bool, key: &'static str) -> Result<I
         Some((addr, prefix)) => {
             let addr: IpAddr =
                 addr.parse().map_err(|_| format!("{key} 的 {item} 不是合法的位址"))?;
-            let prefix: u8 = prefix
-                .parse()
-                .map_err(|_| format!("{key} 的 {item} 前綴長度不是一個整數"))?;
+            let prefix: u8 =
+                prefix.parse().map_err(|_| format!("{key} 的 {item} 前綴長度不是一個整數"))?;
             if prefix > IpNet::host_prefix(&addr) {
                 return Err(format!("{key} 的 {item} 前綴長度超出範圍"));
             }
