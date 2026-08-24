@@ -493,6 +493,10 @@ body {
   top: calc(100% + 6px);
   right: 0;
   z-index: 40;
+  /* 定位容器（.summary-more-wrap）只跟 ⋯ 鈕一樣寬，auto 寬度用 shrink-to-fit
+     算的話，可用寬度會被那顆小按鈕鉗死，選項一長就會被擠壓；改成明講
+     「按最寬的選項撐開」，min-width 當短選單的下限，兩個都不會互相打架 */
+  width: max-content;
   min-width: 180px;
   padding: 4px;
   background: var(--overlay);
@@ -763,7 +767,7 @@ body {
 }
 
 /* 自測結果字串「ip  city, country」中間是兩個空白，異常單行態
-   （testing…／no response）沿用同一格式，所以要 pre 不能塌掉 */
+   （Connecting…／no response）沿用同一格式，所以要 pre 不能塌掉 */
 .card-test {
   flex: 0 1 auto;
   min-width: 0;

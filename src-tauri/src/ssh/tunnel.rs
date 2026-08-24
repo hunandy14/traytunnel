@@ -437,10 +437,10 @@ pub(crate) fn probe_exit(state: &Arc<AppState>, local: u16) {
     if !state.begin_test(local, token) {
         return; // 同一輪連線已經在測了
     }
-    // 連「testing...」這個佔位也走憑證版：從取憑證到寫下去之間一樣有窗口，
+    // 連「Connecting…」這個佔位也走憑證版：從取憑證到寫下去之間一樣有窗口，
     // 沒守門的話 halt 剛清乾淨的自測欄會被這一手寫回一個永遠不會有結果的
     // testing（它的結果稍後會被憑證擋掉），介面就這樣一直轉下去
-    state.set_exit_test_of(local, token, test_state::TESTING, "testing...");
+    state.set_exit_test_of(local, token, test_state::TESTING, "Connecting…");
     // 這一輪要用哪個協定：socks 列已知、快取命中直接用、其餘才跑一次 detect（W8.24）
     let resolution = state
         .with_config(|c| c.forward(local).map(|f| f.kind))

@@ -364,14 +364,13 @@ function renderSummary(conn: ConnRef | null) {
   num.className = `summary-score-num tone-${tone}`;
   el<HTMLDivElement>("summary-score-label").textContent = conn ? statusText : "no rows";
 
-  // 右段：⋯ 選單裡的連／斷那一項跟著整條連線的狀態換字。WG 跟的是引擎旗標而不是
-  // 列的執行狀態——它按下去呼叫的就是 setWgEnabled，跟旁邊的總開關同一件事，
-  // 兩個入口的字面與行為必須一致（引擎開著但列全部停用時，那一項要說 Disconnect）。
-  const toggleOn =
-    conn?.kind === "wg" ? conn.data.enabled : exits.some(isRunning);
+  // 右段：⋯ 選單裡的連／斷那一項只服務 SSH——WG 已經有總開關做同一件事，
+  // 選單裡再放一項會是重複入口，所以 WG 連線直接把這一項藏起來。
+  const toggleOn = exits.some(isRunning);
   setIcon(el<HTMLSpanElement>("menu-toggle-ico"), toggleOn ? "square" : "play", 14);
   el<HTMLSpanElement>("menu-toggle-text").textContent = toggleOn ? "Disconnect" : "Connect";
   const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
+  toggleItem.hidden = conn?.kind === "wg";
   toggleItem.classList.toggle("danger", toggleOn);
   toggleItem.classList.toggle("go", !toggleOn);
 
@@ -483,15 +482,12 @@ function initSummaryMenu() {
 
   menuItem("menu-add-exit", beginCreateForward);
   menuItem("menu-add-socks", beginCreateSocks);
+  // 這一項只服務 SSH（WG 選單已經藏起來，見 renderSummary）：SSH 沒有「連線」
+  // 這個執行實體，連斷只能靠 start_source／stop_source 逐條掃過去
+  // （那一層在後端，前端不重複做一次迴圈）
   menuItem("menu-toggle-source", () => {
     const conn = currentConn();
     if (!conn) return;
-    if (conn.kind === "wg") {
-      toggleWgEngine(conn);
-      return;
-    }
-    // SSH 沒有「連線」這個執行實體，連斷只能靠 start_source／stop_source
-    // 逐條掃過去（那一層在後端，前端不重複做一次迴圈）
     if (visibleExits(conn).some(isRunning)) void run(() => stopSource(conn.name), `stop ${conn.name}`);
     else void run(() => startSource(conn.name), `start ${conn.name}`);
   });
