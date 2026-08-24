@@ -999,24 +999,23 @@ fn the_mtu_override_is_range_checked_on_both_paths() {
 }
 
 // ------------------------------------------------- 新連線預設附贈 SOCKS5（W3.50）
-
-/// 執行期埠探測的樁：回一個固定答案。真去綁 1080 才測得到的東西在單元測試裡
-/// 沒辦法穩定重現，所以 `default_socks_row` 把它做成參數（production 綁
-/// `winsys::is_listening`）。
-fn probe(answer: bool) -> impl Fn(u16) -> bool {
-    move |_| answer
-}
+//
+// `default_socks_row` 管的是兩個條件（設定層淨空、執行期淨空）。第三個條件
+// 「編輯路徑永不附」**沒有對應的測試，因為它不是這個函式的行為**：
+// `upsert_wg_proxy` 只在新增那一條 match 臂上叫它，編輯那一臂結構上就走不到，
+// 函式本身也不再收 `original_name`。要讓那條規則失效得先改掉那個 match，
+// 而那是一眼看得出來的結構改動，不是一個布林會悄悄翻掉的判斷。
 
 /// W3.50 新建 ＋ 1080 兩層都淨空 → 附一條列，內容與手建的 socks 列逐欄位相同。
 #[test]
 fn a_brand_new_wg_connection_gets_a_default_socks_row_on_1080() {
-    // 1080 沒有人登記：ssh 那邊掛 2222，wg 那邊掛 1085
+    // 1080 沒有人登記：ssh 那邊掛 2222，另一條 wg 掛 1085
     let cfg = cfg_of(
         vec![src("hk", vec![fwd("db", 2222, "127.0.0.1:5432")])],
-        vec![proxy("ax4200", vec![socks("s", 1085)])],
+        vec![proxy("ax4200", vec![socks("s", 1085)]), proxy("new", vec![])],
     );
 
-    let row = default_socks_row(&cfg, None, probe(false)).expect("兩層都淨空就要附");
+    let row = default_socks_row(&cfg, "new", false).expect("兩層都淨空就要附");
     assert_eq!(row, socks(DEFAULT_SOCKS_NAME, DEFAULT_SOCKS_PORT), "與手建的 socks 列無異");
     assert_eq!(row.local, 1080);
     assert_eq!(row.name, "socks");
@@ -1029,8 +1028,11 @@ fn a_brand_new_wg_connection_gets_a_default_socks_row_on_1080() {
 /// W3.50 設定層被 SSH 的出口佔著 → 不附，而且**不找替代埠**。
 #[test]
 fn a_default_socks_row_is_skipped_when_an_ssh_exit_holds_1080() {
-    let cfg = cfg_of(vec![src("hk", vec![probed("exit-a", 1080, "127.0.0.1:1080")])], vec![]);
-    assert_eq!(default_socks_row(&cfg, None, probe(false)), None);
+    let cfg = cfg_of(
+        vec![src("hk", vec![probed("exit-a", 1080, "127.0.0.1:1080")])],
+        vec![proxy("new", vec![])],
+    );
+    assert_eq!(default_socks_row(&cfg, "new", false), None);
 }
 
 /// W3.50 設定層被**另一條 WG 連線**的列佔著 → 一樣不附。
@@ -1038,12 +1040,15 @@ fn a_default_socks_row_is_skipped_when_an_ssh_exit_holds_1080() {
 /// 本地埠是列的全域唯一鍵（D5），佔用者在哪一條連線、哪一型連線底下都不影響結論。
 #[test]
 fn a_default_socks_row_is_skipped_when_another_wg_row_holds_1080() {
-    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![socks("s", 1080)])]);
-    assert_eq!(default_socks_row(&cfg, None, probe(false)), None);
+    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![socks("s", 1080)]), proxy("new", vec![])]);
+    assert_eq!(default_socks_row(&cfg, "new", false), None);
 
     // 換成別條連線底下的 forward 列，結論不變
-    let cfg = cfg_of(vec![], vec![proxy("home", vec![fwd("web", 1080, "10.0.0.9:80")])]);
-    assert_eq!(default_socks_row(&cfg, None, probe(false)), None);
+    let cfg = cfg_of(
+        vec![],
+        vec![proxy("home", vec![fwd("web", 1080, "10.0.0.9:80")]), proxy("new", vec![])],
+    );
+    assert_eq!(default_socks_row(&cfg, "new", false), None);
 }
 
 /// W3.50 設定層淨空、但執行期探測說有人在聽 → 不附。
@@ -1051,38 +1056,37 @@ fn a_default_socks_row_is_skipped_when_another_wg_row_holds_1080() {
 /// 設定裡沒人登記不代表沒人在用：使用者本來就跑著一份別的代理是最常見的情況。
 #[test]
 fn a_default_socks_row_is_skipped_when_something_is_already_listening_on_1080() {
-    let cfg = cfg_of(vec![], vec![]);
-    assert_eq!(default_socks_row(&cfg, None, probe(true)), None);
+    let cfg = cfg_of(vec![], vec![proxy("new", vec![])]);
+    assert_eq!(default_socks_row(&cfg, "new", true), None);
     // 同一份設定，探測換成「沒人在聽」就附得出來——差別只在執行期那一層
-    assert!(default_socks_row(&cfg, None, probe(false)).is_some());
+    assert!(default_socks_row(&cfg, "new", false).is_some());
 }
 
-/// W3.50 編輯路徑永不附，即使 1080 兩層都淨空。
+/// W3.50 附贈走的是手建列同一條 `prepare_forward`，所以**連線必須先進設定**。
 ///
-/// 使用者早就看過這條連線底下有什麼了，改個 MTU 就長出一條列是驚嚇不是方便。
+/// 這一條釘的是呼叫端的順序契約（先 push `WgProxy` 再問附贈）：查不到所屬連線時
+/// `validate_forward` 會擋（W3.37），結論就是不附——反過來寫的話這個功能會安靜
+/// 地永遠不生效，而且哪一條測試都不會紅。
 #[test]
-fn editing_an_existing_wg_connection_never_adds_a_default_socks_row() {
-    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![socks("s", 1085)])]);
-    assert_eq!(default_socks_row(&cfg, Some("ax4200"), probe(false)), None);
-    // 指到一個不存在的連線名不算編輯（那一路會被 validate_wg_proxy 先擋掉），
-    // 規則本身仍照新建處理
-    assert!(default_socks_row(&cfg, Some("gone"), probe(false)).is_some());
+fn a_default_socks_row_needs_its_connection_to_be_in_the_config_already() {
+    let cfg = cfg_of(vec![], vec![]);
+    assert_eq!(default_socks_row(&cfg, "not-pushed-yet", false), None);
+
+    // 同一個名字，連線推進去之後就附得出來
+    let cfg = cfg_of(vec![], vec![proxy("not-pushed-yet", vec![])]);
+    assert!(default_socks_row(&cfg, "not-pushed-yet", false).is_some());
 }
 
-/// W3.50 附出來的那一筆真的存得進設定：走 `validate_forward` 同一條驗證。
+/// W3.50 兩端的常數不可以各走各的：dev-mock 裡那一份必須逐字對得上這裡。
+///
+/// 比照 W1.31 的 `include_str!` 手法。mock 是使用者在瀏覽器裡演練同一條規則的
+/// 地方，埠或名字漂掉的話畫面演的就不是產品的行為，而那種偏差沒有任何自動檢查
+/// 抓得到——除了這一條。
 #[test]
-fn the_default_socks_row_passes_the_normal_row_validation() {
-    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![])]);
-    let row = default_socks_row(&cfg, None, probe(false)).unwrap();
-    let checked = input(
-        "ax4200",
-        ConnKind::Wg,
-        None,
-        &row.name,
-        row.local,
-        row.remote.as_deref(),
-        row.kind,
-        row.probe_proxy,
-    );
-    assert_eq!(validate_forward(&cfg, &checked), None, "附贈的列必須是一條合法的 socks 列");
+fn the_dev_mock_pins_the_same_default_socks_constants() {
+    let mock = include_str!("../../src/dev-mock.ts");
+    let port = format!("DEFAULT_SOCKS_PORT = {DEFAULT_SOCKS_PORT}");
+    let name = format!("DEFAULT_SOCKS_NAME = \"{DEFAULT_SOCKS_NAME}\"");
+    assert!(mock.contains(&port), "dev-mock.ts 缺少或改掉了 `{port}`");
+    assert!(mock.contains(&name), "dev-mock.ts 缺少或改掉了 `{name}`");
 }
