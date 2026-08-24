@@ -67,6 +67,10 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
   "socket-dns",
   # 預設只有 2，一份 conf 同時給 v4+v6 多筆位址時會爆
   "iface-max-addr-count-4",
+  # 預設只有 1：`[Interface] DNS` 常常寫兩筆，第二順位要進得了 socket 才有備援
+  "dns-max-server-count-4",
+  # 預設只有 1：一個名字回多筆 A 是常態，只收第一筆會白白丟掉備援位址
+  "dns-max-result-count-8",
 ] }
 # CancellationToken（無需任何 feature）
 tokio-util = { version = "0.7", default-features = false }

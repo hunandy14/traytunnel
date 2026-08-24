@@ -171,6 +171,13 @@ impl Device for VirtualDevice {
         let mut cap = DeviceCapabilities::default();
         cap.medium = Medium::Ip;
         cap.max_transmission_unit = self.mtu;
+        // 送出時照算，收進來時不驗：這條「線」是 WireGuard，每一個位元組都已經
+        // 過了 AEAD 的驗證，IP／UDP 的 16 位元和再算一次買不到任何完整性，卻會
+        // 把對端偷懶沒填 checksum 的封包（測試檯的假 DNS 就是這樣送的）
+        // 靜默丟掉。TCP 維持預設的雙向，那一層的 checksum 由 smoltcp 自己
+        // 兩端一致地處理。
+        cap.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
+        cap.checksum.udp = smoltcp::phy::Checksum::Tx;
         cap
     }
 }
@@ -292,7 +299,9 @@ async fn run(
     let mut resolver = if cfg.dns_servers.is_empty() {
         None
     } else {
-        let (r, sock) = dns::Resolver::new(&cfg.dns_servers, dns::QUERY_SLOTS);
+        let have_v4 = addresses.iter().any(|c| matches!(c.address(), IpAddress::Ipv4(_)));
+        let (r, sock) =
+            dns::Resolver::new(&cfg.dns_servers, dns::QUERY_SLOTS, cfg.dns_timeout, have_v4);
         let handle = sockets.add(sock);
         Some((r, handle))
     };
@@ -351,7 +360,7 @@ async fn run(
         if let Some((resolver, handle)) = resolver.as_mut() {
             let sock = sockets.get_mut::<smoltcp::socket::dns::Socket>(*handle);
             resolver.drain(sock);
-            resolver.expire(Instant::now());
+            resolver.expire(sock, Instant::now());
         }
         let service = service_sockets(
             &mut sockets,
