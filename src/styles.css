@@ -495,9 +495,14 @@ body {
   z-index: 40;
   /* 定位容器（.summary-more-wrap）只跟 ⋯ 鈕一樣寬，auto 寬度用 shrink-to-fit
      算的話，可用寬度會被那顆小按鈕鉗死，選項一長就會被擠壓；改成明講
-     「按最寬的選項撐開」，min-width 當短選單的下限，兩個都不會互相打架 */
+     「按最寬的選項撐開」，min-width 當短選單的下限，兩個都不會互相打架。
+     這個下限本身要貼著目前選單實際內容的下緣：實測「Edit connection」這
+     行（最寬項）連 icon／padding 一起量出來的自然寬度約 133px，180px 是
+     舊版還沒有 width: max-content、選單被固定卡在這個數字時代留下的舊值，
+     現在反而變成撐出一大截空白的元兇——縮到 120px（比 133px 的自然寬度
+     還窄，實際上幾乎不會被吃到），純粹留給極端短內容的安全下限用。 */
   width: max-content;
-  min-width: 180px;
+  min-width: 120px;
   padding: 4px;
   background: var(--overlay);
   border: 1px solid rgba(255, 255, 255, 0.1);
