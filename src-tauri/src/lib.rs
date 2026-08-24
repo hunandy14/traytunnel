@@ -7,9 +7,8 @@ mod ssh;
 mod state;
 mod traymenu;
 mod update;
-// WireGuard → 本地 SOCKS5。目前整個模組是骨架，還沒有任何呼叫端，
-// 掛成 pub 只是為了讓「尚未接線」不變成一整面 dead_code 警告。
-pub mod wg;
+// WireGuard → 本地 SOCKS5（行程內使用者態隧道）
+mod wg;
 mod winstate;
 mod winsys;
 
@@ -135,6 +134,8 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        // 原生檔案選擇器，只給 pick_wg_conf 用（Q3 裁決採用）
+        .plugin(tauri_plugin_dialog::init())
         // 記住主視窗位置／大小，重啟不歸零置中。旗標不含 VISIBLE，
         // 還原完全不碰顯示狀態，理由見 winstate 模組開頭的說明
         .plugin(tauri_plugin_window_state::Builder::new().with_state_flags(winstate::flags()).build())
@@ -154,6 +155,13 @@ pub fn run() {
             commands::delete_source,
             commands::upsert_forward,
             commands::delete_forward,
+            commands::upsert_wg_proxy,
+            commands::delete_wg_proxy,
+            commands::set_wg_enabled,
+            commands::upsert_wg_socks,
+            commands::inspect_conf,
+            commands::test_wg_conf,
+            commands::pick_wg_conf,
             commands::test_exit,
             commands::test_connection,
             commands::set_close_to_tray,
@@ -279,8 +287,9 @@ pub fn run() {
                 show_main(&handle);
             }
 
-            // enabled 的出口開機就自己連
+            // enabled 的出口開機就自己連，兩型連線都算
             tunnel::start_enabled(&shared);
+            wg::start_enabled(&shared);
             // 更新檢查排在最後：它自己先睡幾秒，啟動路徑上不佔任何時間
             update::spawn_checker(&shared);
             Ok(())
@@ -296,7 +305,10 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
         // 系統匣的 Exit 一律真的退出
         traymenu::ID_EXIT => do_exit(st),
         traymenu::ID_ALL_TOGGLE => toggle_all(st),
-        traymenu::ID_RECONNECT_ALL => tunnel::reconnect_all(st),
+        traymenu::ID_RECONNECT_ALL => {
+            tunnel::reconnect_all(st);
+            wg::reconnect_running(st);
+        }
         // 狀態行是停用的，照理點不到，真收到也是什麼都不做
         traymenu::ID_STATUS => {}
         _ => {
@@ -306,6 +318,16 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
             } else if let Some(name) = id.strip_prefix(traymenu::SRC_RECONNECT_PREFIX) {
                 if commands::require_source(st, name) {
                     tunnel::reconnect_source(st, name);
+                }
+            } else if let Some(name) = id.strip_prefix(traymenu::WG_RECONNECT_PREFIX) {
+                // wg 連線沒有代表性的埠，選單 id 帶的是連線名（§5.6）
+                if st.with_config(|c| c.wg_proxy(name).is_some()) {
+                    st.log_from(name, "reconnecting...");
+                    st.reload_wg_confs();
+                    wg::restart(st, name);
+                } else {
+                    st.log(format!("no such WireGuard connection: {name}"));
+                    st.refresh_tray();
                 }
             } else {
                 log::warn!("unhandled tray menu id: {id}");
@@ -333,7 +355,8 @@ fn toggle_all(st: &Shared) {
 }
 
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
-    let menu = traymenu::build(app, &traymenu::menu_model(&shared.source_views()))?;
+    let model = traymenu::menu_model(&shared.source_views(), &shared.wg_views());
+    let menu = traymenu::build(app, &model)?;
 
     // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來
     // 也不要讓整支程式 panic，圖示之後照樣可以補

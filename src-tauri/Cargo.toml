@@ -24,6 +24,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
+# 原生檔案選擇器，只給 pick_wg_conf 用（wg-design.md Q3 裁決採用）。
+# 前端不開它的 JS 權限，一律走我們自己的指令
+tauri-plugin-dialog = "2"
 # 記住主視窗位置／大小；旗標只挑 POSITION|SIZE|MAXIMIZED，用法見 winstate 模組
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
