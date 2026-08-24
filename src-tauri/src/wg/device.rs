@@ -62,7 +62,6 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     let socket = std::net::UdpSocket::bind(cfg.bind)?;
     socket.set_nonblocking(true)?;
     let local_addr = socket.local_addr()?;
-    let udp = tokio::net::UdpSocket::from_std(socket)?;
 
     let mut tunn = Tunn::new(
         cfg.private_key,
@@ -77,14 +76,22 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     //  * 使用者按下連線後幾百毫秒內就成立 `connected`，而不是等他開網頁；
     //  * 「這一段之間有沒有封包出去」那類斷言（W4.8）才有一個確定的起點——
     //    握手排在任務裡送的話，它會落在測試讀計數器之前或之後全憑排程。
+    //
+    // **這一送必須走 std 的 socket，在交給 tokio 之前**：`try_send_to` 只在
+    // tokio 已經從 I/O driver 收過一次「可寫」事件之後才會真的下系統呼叫，
+    // 剛註冊的 socket 那份快取是空的，於是它一律回 `WouldBlock`，封包被靜靜
+    // 丟掉——症狀是握手要拖到 boringtun 的 REKEY_TIMEOUT（5 秒）重試才成立，
+    // 隧道看起來「就是慢五秒」。std 的 socket 沒有這層快取，直接下系統呼叫。
     let mut tx_buf = vec![0u8; MAX_PACKET];
     if let TunnResult::WriteToNetwork(packet) = tunn.format_handshake_initiation(&mut tx_buf, false)
     {
-        match udp.try_send_to(packet, cfg.endpoint) {
+        match socket.send_to(packet, cfg.endpoint) {
             Ok(_) => note_udp_tx(),
             Err(e) => log::debug!("wg device: initial handshake not sent: {e}"),
         }
     }
+
+    let udp = tokio::net::UdpSocket::from_std(socket)?;
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(PACKET_CHANNEL_DEPTH);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(PACKET_CHANNEL_DEPTH);
