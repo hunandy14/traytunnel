@@ -823,3 +823,60 @@ fn the_writer_omits_the_keys_that_carry_their_default() {
     assert!(!fwd_table.contains("probeProxy"), "probe_proxy == false 不寫：{fwd_table}");
     assert!(fwd_table.contains("remote = \"10.0.0.5:22\""), "{fwd_table}");
 }
+
+/// W3.44 **關掉 switch 的來回**（W3.28 的端到端版）：一列 `probeProxy = true`
+/// 改成 false → 存檔 → 重新讀檔，讀回來仍然是 false。
+///
+/// 擋的是「規格上說得通、實作卻在存檔那一步把標記弄丟」：`probeProxy = false`
+/// 是省略不寫的，所以檔案上「使用者把 switch 關了」與「這是一份還沒被新版寫過
+/// 的舊檔」長得一模一樣。分辨兩者的是 `kind` 鍵（§1.7）——存檔那一側漏寫它，
+/// 遷移掃描下一次讀檔就會把旗標又補成 true，使用者怎麼關都關不掉。
+#[test]
+fn turning_probe_proxy_off_survives_a_save_and_reload() {
+    let dir = tmp_dir("wg-probe-off-roundtrip");
+    let path = dir.join(TOML_NAME);
+    let raw = "closeToTray = true\n\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\n\n\
+               [[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nprobeProxy = true\n";
+    std::fs::write(&path, raw).unwrap();
+
+    let mut cfg = parse_config(raw).unwrap();
+    assert!(cfg.forward(1080).unwrap().probe_proxy, "前提：這一列本來是開著的");
+
+    // 使用者把那顆 switch 關掉
+    cfg.forward_mut(1080).unwrap().probe_proxy = false;
+    write_config_at(&path, &cfg).unwrap();
+
+    let reread = parse_config(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!reread.forward(1080).unwrap().probe_proxy, "關掉的檢測不可以自己又亮起來");
+    assert_eq!(reread, cfg, "整份設定要一字不差地回來");
+}
+
+/// W3.45 舊格式檔的 idempotency：讀 → 存 → 再讀 → 再存，第二次的輸出與第一次
+/// 逐位元組相同。
+///
+/// 第一次存檔會補上 `kind`（遷移標記）與遷移出來的 `probeProxy = true`，之後就
+/// 穩定了——不會每次開程式都改一次使用者的檔案，也不會讓備份工具每天看到 diff。
+#[test]
+fn saving_an_old_format_file_settles_after_the_first_pass() {
+    let dir = tmp_dir("wg-idempotent");
+    let path = dir.join(TOML_NAME);
+    let raw = "closeToTray = true\n\n# 香港那台\n[[sources]]\nname = \"hk\"\nhost = \"h\"\nuser = \"u\"\n\n\
+               # A 出口\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\n";
+    std::fs::write(&path, raw).unwrap();
+
+    let first = {
+        let cfg = parse_config(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cfg.forward(1080).unwrap().probe_proxy, "舊格式列要被遷移成 true");
+        write_config_at(&path, &cfg).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    };
+    assert!(first.contains("kind = \"forward\""), "第一次存檔要補上遷移標記：{first}");
+    assert!(first.contains("# 香港那台") && first.contains("# A 出口"), "註解要留著：{first}");
+
+    let second = {
+        let cfg = parse_config(&first).unwrap();
+        write_config_at(&path, &cfg).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    };
+    assert_eq!(second, first, "第二次存檔不可以再動檔案一個位元組");
+}
