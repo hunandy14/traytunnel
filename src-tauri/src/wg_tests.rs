@@ -8,8 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 use crate::config::{
-    apply_source_enabled, apply_wg_enabled, row_source_enabled, should_probe, Config, Forward,
-    RowKind, Source, WgProxy,
+    apply_source_enabled, apply_wg_enabled, should_probe, Config, Forward, RowKind, Source, WgProxy,
 };
 use crate::state::{self, status, TestView, Worker};
 
@@ -297,19 +296,9 @@ fn apply_source_enabled_on_an_unknown_name_is_a_no_op() {
     assert_eq!(cfg, before, "不可以憑空長出一條連線");
 }
 
-/// `row_source_enabled`：源關著就擋下每一條列，不管列自己的 enabled 是不是
-/// true；源開著時完全不影響列自己的判斷（那是 `enabled_locals_of` 的事）。
-#[test]
-fn row_source_enabled_gates_every_row_under_a_disabled_source() {
-    let mut cfg = cfg_with_wg();
-    assert!(row_source_enabled(&cfg, 1080));
-
-    cfg.sources[0].enabled = false;
-    assert!(!row_source_enabled(&cfg, 1080), "源關著，列自己是 true 也不該放行");
-    // wg 的列不歸這支管（它問的只有 ssh 源），也不該 panic
-    assert!(!row_source_enabled(&cfg, 1085));
-    assert!(!row_source_enabled(&cfg, 9999), "不存在的埠一律 false");
-}
+// `row_source_enabled` 的守門測試搬到 config_tests.rs 去了（那裡跟
+// apply_source_enabled／enabled_locals 同屬 config.rs 的純函式測試群；
+// 這裡原本與 ssh/tunnel.rs 各留一份幾乎相同的版本，PR #44 覆審要求只留一條）。
 
 /// W6.13 落檔順序：先存檔成功才動引擎；存檔失敗時引擎維持原狀，
 /// 並推一次 `emit_config_changed` 把樂觀翻過去的開關拉回真值

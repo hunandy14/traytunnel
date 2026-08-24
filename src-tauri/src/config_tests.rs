@@ -505,6 +505,53 @@ fn apply_all_enabled_also_flips_the_source_flag_not_just_its_rows() {
     );
 }
 
+/// `row_source_enabled`（W6.12）：源關著就擋下底下每一條列，不管列自己的
+/// enabled 是不是 true；源開著時完全不受列自己的 enabled 影響（那是
+/// `enabled_locals_of` 的事）。跨源、跨連線型都不誤傷：別的 ssh 源不受影響，
+/// wg 的列一律不歸這支管（它只問 ssh 源）。
+///
+/// 這條測試原本在 ssh/tunnel.rs 與 wg_tests.rs 各留一份幾乎相同的版本，
+/// PR #44 覆審要求併成一條，放在 `row_source_enabled` 本身所在的 config.rs
+/// 這一側最合適。
+#[test]
+fn row_source_enabled_gates_every_row_under_a_disabled_source() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: vec![
+            src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
+            src("tw", vec![fwd("c", 1090)]),
+        ],
+        wg_proxies: vec![WgProxy {
+            name: "wg1".into(),
+            conf_path: "wg1.conf".into(),
+            enabled: true,
+            mtu: None,
+            forwards: vec![Forward {
+                name: "d".into(),
+                local: 1085,
+                remote: None,
+                kind: RowKind::Socks,
+                probe_proxy: false,
+                enabled: true,
+            }],
+        }],
+    };
+
+    // hk 源開著：兩條列（不論列自己 enabled 與否）都算「源允許它跑」
+    assert!(row_source_enabled(&cfg, 1080));
+    assert!(row_source_enabled(&cfg, 1083), "列自己 enabled=false 不影響這一關要問的事");
+
+    cfg.sources[0].enabled = false;
+    assert!(!row_source_enabled(&cfg, 1080), "源關著，列自己是 true 也不該放行");
+    assert!(!row_source_enabled(&cfg, 1083));
+    assert!(row_source_enabled(&cfg, 1090), "別的源不受影響");
+    // wg 的列一律不歸這支管（它只問 ssh 源），不管源自己的 enabled 是不是 true
+    assert!(!row_source_enabled(&cfg, 1085));
+
+    assert!(!row_source_enabled(&cfg, 9999), "不存在的埠一律 false，不 panic");
+}
+
 #[test]
 fn missing_fields_fall_back_to_defaults() {
     let cfg = parse_config("[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n").unwrap();

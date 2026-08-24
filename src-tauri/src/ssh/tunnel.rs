@@ -206,8 +206,17 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
 /// 還佔著的埠，誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
-    if !state.with_config(|c| crate::config::row_source_enabled(c, local)) {
-        return;
+    match state.with_config(|c| c.locate(local).map(|(s, _)| s.enabled)) {
+        Some(true) => {}
+        // 列存在，但所屬的源被總開關關著：這是這一關真正要擋的情況，值得留一行
+        // 診斷——否則系統匣直接勾選單一列、或 restart_exit 這類繞過主視窗總
+        // 開關的路徑會靜靜地什麼都不發生，使用者查不出「怎麼按了沒反應」。
+        Some(false) => {
+            state.log_exit(local, format!("port {local} : source is switched off, not starting"));
+            return;
+        }
+        // 列根本不在設定裡：既有行為就是安靜跳過（例如刪除競態），不必額外記一行
+        None => return,
     }
     let Some(seat) = crate::state::claim_exit_seat(state, local) else {
         return; // 已經有一條線在跑
@@ -700,25 +709,9 @@ mod tests {
         assert!(interval >= 5, "探測太密只是白費封包");
     }
 
-    /// 源的總開關關掉時，`start()` 靠 `row_source_enabled` 擋下底下每一條列——
-    /// 不管那條列自己的 `enabled` 是不是 true。源開著時才照列自己的 enabled 走。
-    #[test]
-    fn row_source_enabled_follows_the_owning_source_switch() {
-        use crate::config::row_source_enabled;
-        let mut c = cfg();
-        // hk 源開著：兩條列（不論列自己 enabled 與否）都算「源允許它跑」
-        assert!(row_source_enabled(&c, 1080));
-        assert!(row_source_enabled(&c, 1083), "列自己 enabled=false 不影響這一關要問的事");
-
-        c.sources[0].enabled = false;
-        assert!(!row_source_enabled(&c, 1080), "源關著，列自己是 true 也不該放行");
-        assert!(!row_source_enabled(&c, 1083));
-        // 別的源不受影響
-        assert!(row_source_enabled(&c, 1090));
-
-        // 不存在的埠一律 false，不 panic
-        assert!(!row_source_enabled(&c, 9999));
-    }
+    // `row_source_enabled` 的守門測試併到 config_tests.rs 去了（它跟
+    // apply_source_enabled／enabled_locals 那組同屬 config.rs 的純函式，
+    // 這裡與 wg_tests.rs 原本各留一份幾乎相同的版本，PR #44 覆審要求只留一條）。
 
     #[test]
     fn port_busy_only_when_something_is_listening() {

@@ -158,10 +158,23 @@ pub fn stop_exit(state: State<'_, Shared>, local: u16) {
 
 /// 重接單一出口：halt 後立刻 start，套用最新設定。
 /// 停用中的出口按重接視同要它連起來，順手把 enabled 補成 true。
+///
+/// **ssh 列的例外**：來源被主卡總開關關著時不補這個 true。那條列本來就連
+/// 不上（`tunnel::start` 會被 `row_source_enabled` 擋下），若照樣把 enabled
+/// 悄悄改成 true，使用者其實想留著停用的一條列會在來源重新打開的那一刻
+/// 憑空復活——這是在改寫使用者的逐列意圖，不是「重接」該做的事。直接跳過、
+/// 記一行日誌交代原因。**wg 的列不受影響**：wg 連線本身就有
+/// `should_run_engine` 那一關，補 true 是既有且刻意的行為，這裡不去動它。
 #[tauri::command]
 pub fn restart_exit(state: State<'_, Shared>, local: u16) {
     let st = state.inner();
     if !require_exit(st, local) {
+        return;
+    }
+    if matches!(row_conn_kind(st, local), Some(ConnKind::Ssh))
+        && !st.with_config(|c| config::row_source_enabled(c, local))
+    {
+        st.log_exit(local, format!("port {local} : source is switched off, not restarting"));
         return;
     }
     let enabled = st.with_config(|c| c.forward(local).is_some_and(|f| f.enabled));
