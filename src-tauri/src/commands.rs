@@ -7,9 +7,9 @@
 
 use tauri::{AppHandle, Manager, State};
 
-use crate::config::{self, Config, Source};
+use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
 use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
-use crate::{close_main, do_exit, tunnel, update, winsys, Shared};
+use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
 const SAVE_FAILED: &str = "Failed to save settings";
@@ -70,6 +70,32 @@ fn require_exit(st: &Shared, local: u16) -> bool {
     true
 }
 
+/// 這條列該由 ssh 還是 wg 那一套動詞去啟停。
+///
+/// `local` 是全域唯一鍵，IPC 那一層不必（也不該）知道機制——路由集中在這裡，
+/// 免得每一支指令各自判斷一次還判得不一樣。
+fn row_conn_kind(st: &Shared, local: u16) -> Option<ConnKind> {
+    st.with_config(|c| c.row(local).map(|(conn, _)| conn.kind()))
+}
+
+/// 起單一列，依它所屬連線的型別分流
+fn start_row(st: &Shared, local: u16) {
+    match row_conn_kind(st, local) {
+        Some(ConnKind::Wg) => wg::start_row(st, local),
+        Some(ConnKind::Ssh) => tunnel::start(st, local),
+        None => {}
+    }
+}
+
+/// 停單一列，依它所屬連線的型別分流
+fn halt_row(st: &Shared, local: u16) {
+    match row_conn_kind(st, local) {
+        Some(ConnKind::Wg) => wg::halt_row(st, local),
+        Some(ConnKind::Ssh) => tunnel::halt(st, local),
+        None => {}
+    }
+}
+
 /// 源不存在時記一行就回
 pub fn require_source(st: &Shared, name: &str) -> bool {
     if st.with_config(|c| c.source(name).is_none()) {
@@ -97,7 +123,7 @@ pub fn set_exit_enabled(st: &Shared, local: u16, on: bool) {
         st.emit_config_changed();
         return;
     }
-    apply_enabled(st, on, || tunnel::start(st, local), || tunnel::halt(st, local));
+    apply_enabled(st, on, || start_row(st, local), || halt_row(st, local));
 }
 
 #[tauri::command]
@@ -130,7 +156,12 @@ pub fn restart_exit(state: State<'_, Shared>, local: u16) {
         st.emit_config_changed();
     }
     st.log_exit(local, format!("port {local} : restarting"));
-    tunnel::restart(st, local);
+    match row_conn_kind(st, local) {
+        // wg 的一條列不能單獨重接：它的監聽器是引擎那棵任務樹的一部分（§5.2）
+        Some(ConnKind::Wg) => wg::start_row(st, local),
+        Some(ConnKind::Ssh) => tunnel::restart(st, local),
+        None => {}
+    }
 }
 
 /// 連接一個源底下全部的出口
@@ -151,11 +182,7 @@ fn set_source_enabled(st: &Shared, name: &str, on: bool) {
         return;
     }
     if !save(st, |c| {
-        if let Some(s) = c.source_mut(name) {
-            for f in s.forwards.iter_mut() {
-                f.enabled = on;
-            }
-        }
+        config::apply_source_enabled(c, name, on);
     }) {
         // 同 set_exit_enabled：設定沒改成，但介面的開關已經被樂觀翻過去了，
         // 全量推一次把它們拉回設定裡的真值
@@ -165,11 +192,21 @@ fn set_source_enabled(st: &Shared, name: &str, on: bool) {
     apply_enabled(st, on, || tunnel::start_source(st, name), || tunnel::halt_source(st, name));
 }
 
-/// 全部連接／全部中斷：跨源把 enabled 一起翻過去
+/// 全部連接／全部中斷：跨連線、跨連線型把 enabled 一起翻過去。
+///
+/// 這一支**刻意比 `set_wg_enabled` 粗**：使用者按的是「全部」，那就是所有列
+/// 加所有連線一起翻，不保留任何逐列意圖。`set_wg_enabled` 那條「不碰列的
+/// enabled」的規則管的是單一連線的總開關，兩者要的是不同的東西。
 pub fn set_all_enabled(st: &Shared, on: bool) {
     if !save(st, |c| {
         for s in c.sources.iter_mut() {
             for f in s.forwards.iter_mut() {
+                f.enabled = on;
+            }
+        }
+        for p in c.wg_proxies.iter_mut() {
+            p.enabled = on;
+            for f in p.forwards.iter_mut() {
                 f.enabled = on;
             }
         }
@@ -179,7 +216,18 @@ pub fn set_all_enabled(st: &Shared, on: bool) {
         st.emit_config_changed();
         return;
     }
-    apply_enabled(st, on, || tunnel::start_enabled(st), || tunnel::halt_all(st));
+    apply_enabled(
+        st,
+        on,
+        || {
+            tunnel::start_enabled(st);
+            wg::start_enabled(st);
+        },
+        || {
+            tunnel::halt_all(st);
+            wg::halt_all(st);
+        },
+    );
 }
 
 #[tauri::command]
@@ -293,59 +341,269 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
     st.log(format!("source {name} deleted"));
 }
 
-/// 新增或編輯出口，originalLocal 為 None 代表新增；回傳 None 代表成功。
-/// source 是這個出口要掛進去的源，編輯時也可以藉此把出口搬到別的源。
-#[tauri::command]
-pub fn upsert_forward(
-    state: State<'_, Shared>,
-    source: String,
-    original_local: Option<u16>,
-    name: String,
-    local: u16,
-    remote: String,
-) -> Option<String> {
-    let st = state.inner();
-    // 查源、抄原本的 enabled、正規化與驗證，全部看同一份設定
-    let prepared = st.with_config(|c| {
-        if c.source(&source).is_none() {
-            return Err(format!("no such connection: {source}"));
+/// 從設定裡的所有連線（兩型都算）拔掉這個本地埠的列。
+///
+/// `local` 是全域唯一鍵，所以刪一條列不需要知道它是什麼機制、掛在哪一型連線
+/// 底下（W6.21）——掃過去、拔掉、結束。
+pub(crate) fn detach_row(c: &mut Config, local: u16) {
+    for s in c.sources.iter_mut() {
+        s.forwards.retain(|f| f.local != local);
+    }
+    for p in c.wg_proxies.iter_mut() {
+        p.forwards.retain(|f| f.local != local);
+    }
+}
+
+/// 把一筆準備好的列掛進指定連線
+fn attach_row(c: &mut Config, connection: &str, kind: ConnKind, row: config::Forward) {
+    match kind {
+        ConnKind::Ssh => {
+            if let Some(s) = c.source_mut(connection) {
+                s.forwards.push(row);
+            }
         }
-        // 新增的出口比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
+        ConnKind::Wg => {
+            if let Some(p) = c.wg_proxy_mut(connection) {
+                p.forwards.push(row);
+            }
+        }
+    }
+}
+
+/// 呼叫端說的連線型別；沒說時由連線名自己問出來。
+///
+/// **相容期**：前端過渡墊片同時送 `source` 與 `connection` 兩個鍵、而且可能
+/// 還沒帶 `connectionKind`，這裡把兩種形狀都接住。前端拆掉墊片之後，
+/// `source` 與這段推斷可以一起移除。
+fn resolve_conn_kind(st: &Shared, declared: Option<&str>, connection: &str) -> ConnKind {
+    match declared {
+        Some("wg") => ConnKind::Wg,
+        Some("ssh") => ConnKind::Ssh,
+        _ if st.with_config(|c| c.wg_proxy(connection).is_some()) => ConnKind::Wg,
+        _ => ConnKind::Ssh,
+    }
+}
+
+/// 兩支 upsert（`upsertForward`／`upsertWgSocks`）共用的落地流程。
+///
+/// 差別只在各自帶入固定的 `kind` 與各自的必填欄位，驗證與唯一性檢查因此
+/// 只有一份實作（§5.5）。
+///
+/// 參數多是因為它就是 [`config::RowInput`] 的那一組欄位再加一個 `st`；
+/// 收成結構只是把同一串欄位換個地方寫，不會少掉任何一個。
+#[allow(clippy::too_many_arguments)]
+fn upsert_row(
+    st: &Shared,
+    connection: &str,
+    conn_kind: ConnKind,
+    original_local: Option<u16>,
+    name: &str,
+    local: u16,
+    remote: Option<&str>,
+    kind: RowKind,
+    probe_proxy: bool,
+) -> Option<String> {
+    // 值本身之外的欄位每次都一樣，只有 name／remote 會在正規化後換一份字串
+    let base = config::RowInput {
+        connection,
+        conn_kind,
+        original_local,
+        name,
+        local,
+        remote,
+        kind,
+        probe_proxy,
+    };
+    // 抄原本的 enabled、正規化與驗證，全部看同一份設定
+    let prepared = st.with_config(|c| {
+        // 新增的列比照設定檔缺省值視為 enabled，加完就直接連；編輯則沿用原本的選擇
         let was_enabled = match original_local {
             Some(orig) => c.forward(orig).is_some_and(|f| f.enabled),
             None => true,
         };
-        // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去
-        config::prepare_forward(&c.sources, original_local, &name, local, &remote, was_enabled)
+        config::prepare_forward(c, &base, was_enabled)
     });
-    let forward = match prepared {
+    let row = match prepared {
         Ok(f) => f,
         Err(err) => return Some(err),
     };
-    let was_enabled = forward.enabled;
-    let name = forward.name.clone();
+    let was_enabled = row.enabled;
+    let row_name = row.name.clone();
 
     let written = st.update_config_checked(|c| {
         // 同 upsert_source 的理由：驗證與寫入之間 cfg 鎖是放開的，兩個同時進來的
-        // 新增可以雙雙通過驗證，再一前一後 push 進兩筆佔著同一個本地埠的出口。
+        // 新增可以雙雙通過驗證，再一前一後 push 進兩筆佔著同一個本地埠的列。
         // 這裡只重驗唯一性那一段（值本身已經正規化過了），成本是幾個整數比較
-        if let Some(err) = config::validate_forward(
-            &c.sources,
-            original_local,
-            &forward.name,
-            forward.local,
-            &forward.remote,
-        ) {
+        let recheck = config::RowInput { name: &row.name, remote: row.remote.as_deref(), ..base };
+        if let Some(err) = config::validate_forward(c, &recheck) {
             return Err(err);
         }
         if let Some(orig) = original_local {
-            // 先從原本的源拔掉，再掛進目標源，同源編輯也走同一條路
-            for s in c.sources.iter_mut() {
-                s.forwards.retain(|f| f.local != orig);
-            }
+            // 先從原本的連線拔掉，再掛進目標連線，同連線編輯也走同一條路
+            detach_row(c, orig);
         }
-        if let Some(s) = c.source_mut(&source) {
-            s.forwards.push(forward.clone());
+        attach_row(c, connection, conn_kind, row.clone());
+        Ok(())
+    });
+    match written {
+        Err(e) => return Some(save_error_message(st, e)),
+        Ok(Err(err)) => return Some(err),
+        Ok(Ok(())) => {}
+    }
+
+    // 存檔成功之後才停掉舊的那條線（換埠或換連線時舊埠也才會放掉）。存檔失敗時
+    // 什麼都還沒動，隧道照舊跑著，不會出現「線停了、設定沒改成」的錯位。
+    if let Some(orig) = original_local {
+        if orig != local {
+            tunnel::halt(st, orig);
+        }
+    }
+
+    st.emit_config_changed();
+    st.log_from(
+        connection,
+        match original_local {
+            Some(_) => format!("{row_name} updated"),
+            None => format!("{row_name} added"),
+        },
+    );
+    if was_enabled {
+        start_row(st, local);
+    }
+    None
+}
+
+/// 新增或編輯 `forward` 列（SSH 與 WG 共用），originalLocal 為 None 代表新增；
+/// 回傳 None 代表成功。
+///
+/// `source` 是相容期的舊鍵名，與 `connection` 同義（見 [`resolve_conn_kind`]）。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_forward(
+    state: State<'_, Shared>,
+    source: Option<String>,
+    connection: Option<String>,
+    connection_kind: Option<String>,
+    original_local: Option<u16>,
+    name: String,
+    local: u16,
+    remote: String,
+    probe_proxy: Option<bool>,
+) -> Option<String> {
+    let st = state.inner();
+    let connection = connection.or(source).unwrap_or_default();
+    let conn_kind = resolve_conn_kind(st, connection_kind.as_deref(), &connection);
+    upsert_row(
+        st,
+        &connection,
+        conn_kind,
+        original_local,
+        &name,
+        local,
+        Some(remote.as_str()),
+        RowKind::Forward,
+        probe_proxy.unwrap_or(false),
+    )
+}
+
+/// 新增或編輯 `socks` 列（WG 專屬——後端會拒絕 ssh 連線名，W3.38）
+#[tauri::command]
+pub fn upsert_wg_socks(
+    state: State<'_, Shared>,
+    connection: String,
+    original_local: Option<u16>,
+    name: String,
+    local: u16,
+) -> Option<String> {
+    upsert_row(
+        state.inner(),
+        &connection,
+        ConnKind::Wg,
+        original_local,
+        &name,
+        local,
+        // socks 列沒有目的地，也不帶 probeProxy（它恆測）
+        None,
+        RowKind::Socks,
+        false,
+    )
+}
+
+/// 刪任何一種列，運行中的先停掉。
+///
+/// `local` 是全域唯一鍵，**同一支指令不必指明機制或連線型**（W6.21）。
+#[tauri::command]
+pub fn delete_forward(state: State<'_, Shared>, local: u16) {
+    let st = state.inner();
+    let names =
+        st.with_config(|c| c.row(local).map(|(conn, f)| (conn.name().to_string(), f.name.clone())));
+    let Some((cname, fname)) = names else {
+        // 不存在的 local：記一行就退，不 panic（W6.23）
+        st.log(format!("port {local} : no such exit"));
+        return;
+    };
+    let kind = row_conn_kind(st, local);
+    // 同 delete_source：先存檔成功才停線，存檔失敗時隧道維持原狀
+    if !save(st, |c| detach_row(c, local)) {
+        return;
+    }
+    match kind {
+        // 列已經不在設定裡了，`wg::halt_row` 查不到所屬連線，得直接對連線動手：
+        // 引擎要用新的列清單重建，而剩下零條啟用的列時它會依 §5.2 收掉（W6.22）。
+        //
+        // 這裡**不必**、也沒辦法再對 `local` 寫一次 stopped：`save` 成功時
+        // `sync_exits` 已經連同它的 `ExitRuntime` 一起清掉了，`set_exit_status`
+        // 只改既存項，寫下去是 no-op。介面那一側由下面的 `emit_config_changed`
+        // 負責——快照裡本來就沒有這一條列了。
+        Some(ConnKind::Wg) => wg::restart(st, &cname),
+        _ => tunnel::halt(st, local),
+    }
+    st.emit_config_changed();
+    st.log_from(&cname, format!("{fname} deleted"));
+}
+
+// ------------------------------------------------------- WireGuard 連線層（§5.5）
+
+/// 新增或編輯 WG 連線，originalName 為 None 代表新增；回傳 None 代表成功。
+///
+/// 注意：**沒有 socksPort**——SOCKS5 埠是底下的一條 `socks` 列（§1.3）。
+#[tauri::command]
+pub fn upsert_wg_proxy(
+    state: State<'_, Shared>,
+    original_name: Option<String>,
+    name: String,
+    conf_path: String,
+) -> Option<String> {
+    let st = state.inner();
+    let name = name.trim().to_string();
+    let conf_path = conf_path.trim().to_string();
+    if let Some(err) = st
+        .with_config(|c| config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path))
+    {
+        return Some(err);
+    }
+
+    let written = st.update_config_checked(|c| {
+        // 便宜的重驗，理由同 upsert_source：這一次是在 cfg 鎖裡做的
+        if let Some(err) = config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path)
+        {
+            return Err(err);
+        }
+        match original_name.as_deref() {
+            Some(orig) => {
+                if let Some(p) = c.wg_proxy_mut(orig) {
+                    p.name = name.clone();
+                    p.conf_path = conf_path.clone();
+                }
+            }
+            // 新連線底下還沒有任何列，所以也還沒有東西要跑；enabled 沿用預設的
+            // true，使用者按下總開關（或加了第一條列）時才真的起引擎
+            None => c.wg_proxies.push(WgProxy {
+                name: name.clone(),
+                conf_path: conf_path.clone(),
+                enabled: true,
+                forwards: Vec::new(),
+            }),
         }
         Ok(())
     });
@@ -355,46 +613,137 @@ pub fn upsert_forward(
         Ok(Ok(())) => {}
     }
 
-    // 存檔成功之後才停掉舊的那條線（換埠或換源時舊埠也才會放掉）。存檔失敗時
-    // 什麼都還沒動，隧道照舊跑著，不會出現「線停了、設定沒改成」的錯位。
-    if let Some(orig) = original_local {
-        tunnel::halt(st, orig);
-    }
-
     st.emit_config_changed();
     st.log_from(
-        &source,
-        match original_local {
-            Some(_) => format!("{name} updated"),
-            None => format!("{name} added"),
+        &name,
+        match original_name.as_deref() {
+            Some(_) => "connection updated",
+            None => "WireGuard connection added",
         },
     );
-    if was_enabled {
-        tunnel::start(st, local);
+    // 改名之後舊名的引擎已經被 sync_exits 收掉了；換了 conf 就要用新的那一份重來
+    if original_name.is_some() {
+        wg::restart(st, &name);
     }
     None
 }
 
-/// 刪出口，運行中的先停掉
+/// 刪 WG 連線，底下所有列一併刪掉，運行中的先停（W6.17～W6.20）
 #[tauri::command]
-pub fn delete_forward(state: State<'_, Shared>, local: u16) {
+pub fn delete_wg_proxy(state: State<'_, Shared>, name: String) {
     let st = state.inner();
-    let names = st.with_config(|c| c.locate(local).map(|(s, f)| (s.name.clone(), f.name.clone())));
-    let Some((sname, fname)) = names else {
-        st.log(format!("port {local} : no such exit"));
-        return;
-    };
-    // 同 delete_source：先存檔成功才停線，存檔失敗時隧道維持原狀
-    if !save(st, |c| {
-        for s in c.sources.iter_mut() {
-            s.forwards.retain(|f| f.local != local);
-        }
-    }) {
+    if st.with_config(|c| c.wg_proxy(&name).is_none()) {
+        st.log(format!("no such WireGuard connection: {name}")); // W6.19
         return;
     }
-    tunnel::halt(st, local);
+    // 先存檔成功才停線（W6.18）：反過來做的話，存檔失敗就會留下「引擎停了、
+    // 設定還在而且是 enabled」的錯位狀態
+    if !save(st, |c| c.wg_proxies.retain(|p| p.name != name)) {
+        return;
+    }
+    // 存檔成功那一刻 `sync_exits` 就把這條連線的引擎（連同 `CancelGuard`，
+    // 於是整棵任務樹與所有列的監聽器）與各列的 `ExitRuntime` 一起丟掉了，
+    // 這裡不必再逐列停一次——那些項目已經不在，寫什麼都是 no-op。
+    // 介面與系統匣由下面這一手全量重建（W6.17／W6.20）
     st.emit_config_changed();
-    st.log_from(&sname, format!("{fname} deleted"));
+    st.log(format!("WireGuard connection {name} deleted"));
+}
+
+/// 連線層的引擎總開關（§5.5 第 3 支）。
+///
+/// 與 ssh 的 `set_source_enabled` **刻意不對稱**：只改連線自己的 `enabled`，
+/// 底下各列的意圖一個都不碰。存檔成功才動引擎，步驟由
+/// [`wg::wg_enabled_steps`] 決定（那一串抽出來才測得到，W6.13／W6.14）。
+#[tauri::command]
+pub fn set_wg_enabled(state: State<'_, Shared>, name: String, on: bool) {
+    let st = state.inner();
+    if st.with_config(|c| c.wg_proxy(&name).is_none()) {
+        st.log(format!("no such WireGuard connection: {name}")); // W6.15
+        return;
+    }
+    // 無條件落檔並推 config-changed，就算值沒變也一樣：介面的開關已經被樂觀
+    // 翻過去了，不推的話它會停在一個設定裡沒有的狀態
+    let saved = save(st, |c| {
+        config::apply_wg_enabled(c, &name, on);
+    });
+    let has_enabled_row = st.with_config(|c| wg::should_run_engine(c, &name));
+    for step in wg::wg_enabled_steps(&name, on, saved, has_enabled_row) {
+        match step {
+            wg::WgEnabledStep::EmitConfigChanged => st.emit_config_changed(),
+            wg::WgEnabledStep::StartEngine(conn) => wg::start(st, &conn),
+            wg::WgEnabledStep::HaltEngine(conn) => wg::halt(st, &conn),
+        }
+    }
+    if saved {
+        st.log_from(&name, if on { "engine started" } else { "engine stopped" });
+    }
+}
+
+/// 輕量 conf 解析，**不握手、不連外、不起引擎**（§5.5 第 4 支）。
+///
+/// 給編輯面板在「選檔當下」即時顯示這份 conf 裡有什麼；解析失敗時回 Err(訊息)，
+/// 面板就地把錯誤掛在 confPath 欄位上。金鑰一概不在回傳值裡。
+#[tauri::command]
+pub fn inspect_conf(
+    state: State<'_, Shared>,
+    conf_path: String,
+) -> Result<wg::conf::ConfSummary, String> {
+    let st = state.inner();
+    let dir = st.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    wg::inspect_conf(&config::resolve_conf_path(&dir, &conf_path))
+}
+
+/// 存檔前的 .conf 測試：解析 + 真握手，15 秒上限（§5.5 第 5 支）。
+///
+/// 與 `inspect_conf` 並存、各司其職：那一支是選檔當下的即時回饋（毫秒級、
+/// 純本機），這一支是使用者主動按下的完整驗證（會連外、會等握手）。
+/// 回傳型別直接沿用 ssh 的 `TestConnectionResult`。
+#[tauri::command]
+pub async fn test_wg_conf(
+    state: State<'_, Shared>,
+    conf_path: String,
+) -> Result<tunnel::TestConnectionResult, ()> {
+    let dir =
+        state.inner().path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    Ok(wg::test_conf(&config::resolve_conf_path(&dir, &conf_path)).await)
+}
+
+/// 原生檔案選擇器，選 `.conf`；取消時回 null（§5.5 第 6 支）。
+///
+/// 副檔名過濾器只是**提示**，不強制：使用者選了別的副檔名一樣照收，
+/// 內容合不合格由 `inspect_conf` 去判（W9.9）。
+#[tauri::command]
+pub async fn pick_wg_conf(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter(CONF_FILTER_LABEL, &CONF_FILTER_EXTENSIONS)
+        .set_title("Select a WireGuard .conf")
+        .pick_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    // 對話框開不起來（沒有 dialog 能力、沒有視窗）時 sender 會被丟掉：
+    // 回 Err 而不是 panic，前端就退回純文字路徑輸入（W9.10／Q3 的退路）
+    let picked = rx.await.map_err(|_| DIALOG_UNAVAILABLE.to_string())?;
+    Ok(picked_conf_path(picked.and_then(|p| p.into_path().ok())))
+}
+
+/// 檔案對話框的副檔名過濾器。**只是提示，不強制**：使用者選了別的副檔名一樣
+/// 照收，內容合不合格由 `inspect_conf` 去判（W9.9）。
+pub(crate) const CONF_FILTER_LABEL: &str = "WireGuard configuration";
+pub(crate) const CONF_FILTER_EXTENSIONS: [&str; 1] = ["conf"];
+
+/// 對話框叫不起來時交回前端的訊息（W9.10）
+pub(crate) const DIALOG_UNAVAILABLE: &str = "file dialog is unavailable";
+
+/// 對話框選到的東西 → IPC 的回傳值。
+///
+/// 取消時是 `None`，**不是空字串**：前端拿到空字串會把它當成「使用者選了一個
+/// 空路徑」而清掉既有的 `confPath`（W9.7）。
+pub(crate) fn picked_conf_path(picked: Option<std::path::PathBuf>) -> Option<String> {
+    picked.map(|p| p.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
