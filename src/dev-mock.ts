@@ -114,6 +114,9 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       name: "home-relay",
       confPath: "C:\\Users\\browser-mock\\wg\\home-relay.conf",
       enabled: true,
+      // 一條有覆寫、一條沒有：編輯面板「帶回現值」與「留空顯示 Auto」兩條
+      // 路徑在瀏覽器模式下都調得到
+      mtu: 1400,
       confError: null,
       endpoint: "vpn.example.com:51820",
       addresses: ["10.9.0.2/32"],
@@ -161,6 +164,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       name: "office-wg",
       confPath: "C:\\Users\\browser-mock\\wg\\office.conf",
       enabled: false,
+      mtu: null,
       confError: "office.conf: missing PrivateKey in [Interface] (line 3)",
       endpoint: "",
       addresses: [],
@@ -561,15 +565,32 @@ function validateSource(input: {
   return null;
 }
 
+/**
+ * MTU 覆寫的合法範圍與訊息，與 Rust 的 `wg::conf::MTU_RANGE`／
+ * `config::mtu_range_error()` 以及 sheet.ts 的本地檢查逐字相同——三份實作講的
+ * 必須是同一句話，否則瀏覽器模式演出來的錯誤跟真後端不一樣就沒有參考價值。
+ */
+const MTU_MIN = 576;
+const MTU_MAX = 9000;
+const MTU_ERROR = `mtu: must be a whole number between ${MTU_MIN} and ${MTU_MAX}`;
+
 /** WG 連線的驗證：名稱與 ssh 源共用同一個命名空間；U1——不可把 ssh 源改成 wg 連線 */
 function validateWgProxy(input: {
   originalName: string | null;
   name: string;
   confPath: string;
+  mtu: number | null;
 }): string | null {
   const common = validateConnCommon(input, "wg");
   if (common) return common;
   if (!input.confPath.trim()) return "confPath: path is required";
+  // null＝不覆寫＝合法（真後端的 validate_wg_proxy 也是這樣：只有真的填了值
+  // 才檢查範圍）
+  if (input.mtu !== null) {
+    if (!Number.isInteger(input.mtu) || input.mtu < MTU_MIN || input.mtu > MTU_MAX) {
+      return MTU_ERROR;
+    }
+  }
   return null;
 }
 
@@ -625,6 +646,7 @@ interface Args {
   remote?: string;
   probeProxy?: boolean;
   confPath?: string;
+  mtu?: number | null;
   version?: string | null;
 }
 
@@ -748,6 +770,7 @@ function handle(cmd: string, args: Args): unknown {
         originalName: args.originalName ?? null,
         name: (args.name ?? "").trim(),
         confPath: (args.confPath ?? "").trim(),
+        mtu: args.mtu ?? null,
       };
       const err = validateWgProxy(input);
       if (err) return err;
@@ -761,6 +784,8 @@ function handle(cmd: string, args: Args): unknown {
         if (existing.confPath !== input.confPath) existing.confError = null;
         existing.name = input.name;
         existing.confPath = input.confPath;
+        // 清空欄位＝把覆寫拿掉，所以無條件指派（真後端 upsert_wg_proxy 同一條規則）
+        existing.mtu = input.mtu;
         pushConfig();
         log(input.name, `connection updated (${input.confPath})`);
       } else {
@@ -768,6 +793,7 @@ function handle(cmd: string, args: Args): unknown {
           name: input.name,
           confPath: input.confPath,
           enabled: false,
+          mtu: input.mtu,
           confError: null,
           endpoint: "",
           addresses: [],

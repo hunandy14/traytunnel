@@ -7,8 +7,20 @@
 use std::net::IpAddr;
 use std::path::Path;
 
-/// `[Interface] MTU` 省略時的預設值
-pub const DEFAULT_MTU: usize = 1420;
+/// 應用層的 MTU 預設值：**`.conf` 沒寫 MTU、使用者也沒在介面上覆寫**時才輪到它。
+///
+/// 這裡刻意**不是** wg-quick 的 1420。1420 是「以太網 1500 減掉 WireGuard 表頭」
+/// 算出來的理想值，只在整條路徑都跑得動 1500 位元組時成立；一旦中間有 PPPoE、
+/// 隧道套隧道或某一跳把 ICMP「需要分片」丟掉，大封包就會靜默黑洞——網頁載一半、
+/// 連線卡住，而握手與小封包全都正常，最難查的那一類故障。
+///
+/// 1280 是 Tailscale 與 Mullvad 這類量產客戶端共同採用的保守值（也是 IPv6 規範
+/// 要求每一條鏈路都必須通過的最小 MTU），拿它當「什麼都不知道時的預設」，代價是
+/// 大流量下多一點分包開銷，換來的是預設組態不會黑洞。要吞吐量的人可以在連線
+/// 表單的 MTU 欄位往上調。
+///
+/// PM 裁決 2026-08-24：預設值從解析器移到應用層，並由 1420 降為 1280。
+pub const APP_DEFAULT_MTU: usize = 1280;
 
 /// MTU 的合法範圍（W1.18）
 pub const MTU_RANGE: std::ops::RangeInclusive<usize> = 576..=9000;
@@ -89,8 +101,12 @@ pub struct WgConf {
     pub addresses: Vec<IpNet>,
     /// `[Interface] DNS`，只收得下 IP 字面值，其餘（搜尋網域）跳過並警告
     pub dns: Vec<IpAddr>,
-    /// `[Interface] MTU`，省略時 [`DEFAULT_MTU`]
-    pub mtu: usize,
+    /// `[Interface] MTU`，**省略時 None**。
+    ///
+    /// 這裡不在解析階段補預設：`.conf` 到底有沒有明寫 MTU 是上層要用到的資訊
+    /// （優先序是「介面覆寫 ＞ conf 明寫 ＞ [`APP_DEFAULT_MTU`]」，見
+    /// `wg::effective_mtu`），一補預設就把「明寫 1280」與「沒寫」黏成同一件事。
+    pub mtu: Option<usize>,
     /// `[Interface] ListenPort`，省略時 0（讓 OS 配）
     pub listen_port: u16,
     /// `[Peer] PublicKey`
@@ -115,7 +131,8 @@ pub struct ConfSummary {
     pub addresses: Vec<String>,
     pub dns: Vec<String>,
     pub allowed_ips: Vec<String>,
-    pub mtu: usize,
+    /// `.conf` 明寫的 MTU；沒寫就是 None（**不代入應用層預設**，同 [`WgConf::mtu`]）
+    pub mtu: Option<usize>,
     pub keepalive: Option<u16>,
     pub warnings: Vec<String>,
 }
@@ -315,7 +332,8 @@ pub fn parse(raw: &str) -> Result<WgConf, String> {
         private_key: SecretKey(private_key),
         addresses,
         dns,
-        mtu: mtu.unwrap_or(DEFAULT_MTU),
+        // 沒寫就是 None：預設值由 `wg::effective_mtu` 在組引擎時才決定
+        mtu,
         listen_port,
         peer_public_key,
         preshared_key,

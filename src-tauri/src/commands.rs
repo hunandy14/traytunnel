@@ -567,25 +567,29 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
 /// 新增或編輯 WG 連線，originalName 為 None 代表新增；回傳 None 代表成功。
 ///
 /// 注意：**沒有 socksPort**——SOCKS5 埠是底下的一條 `socks` 列（§1.3）。
+///
+/// `mtu` 是選填的隧道 MTU 覆寫（省略／null＝照 `.conf`，見 `wg::effective_mtu`）。
 #[tauri::command]
 pub fn upsert_wg_proxy(
     state: State<'_, Shared>,
     original_name: Option<String>,
     name: String,
     conf_path: String,
+    mtu: Option<usize>,
 ) -> Option<String> {
     let st = state.inner();
     let name = name.trim().to_string();
     let conf_path = conf_path.trim().to_string();
-    if let Some(err) = st
-        .with_config(|c| config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path))
-    {
+    if let Some(err) = st.with_config(|c| {
+        config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path, mtu)
+    }) {
         return Some(err);
     }
 
     let written = st.update_config_checked(|c| {
         // 便宜的重驗，理由同 upsert_source：這一次是在 cfg 鎖裡做的
-        if let Some(err) = config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path)
+        if let Some(err) =
+            config::validate_wg_proxy(c, original_name.as_deref(), &name, &conf_path, mtu)
         {
             return Err(err);
         }
@@ -594,6 +598,9 @@ pub fn upsert_wg_proxy(
                 if let Some(p) = c.wg_proxy_mut(orig) {
                     p.name = name.clone();
                     p.conf_path = conf_path.clone();
+                    // 清空欄位就是把覆寫拿掉，回去照 .conf——所以這裡是無條件
+                    // 指派而不是 `if let Some`
+                    p.mtu = mtu;
                 }
             }
             // 新連線底下還沒有任何列，所以也還沒有東西要跑；enabled 沿用預設的
@@ -602,6 +609,7 @@ pub fn upsert_wg_proxy(
                 name: name.clone(),
                 conf_path: conf_path.clone(),
                 enabled: true,
+                mtu,
                 forwards: Vec::new(),
             }),
         }

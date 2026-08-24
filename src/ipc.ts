@@ -60,6 +60,8 @@ function normalizeSnapshot(raw: Snapshot): Snapshot {
   // wgProxies 在舊後端根本不存在，直接 .map 會讓 UI 在第一次取狀態就整個掛掉
   const wgProxies: WgProxyInfo[] = (raw.wgProxies ?? []).map((p) => ({
     ...p,
+    // 沒有覆寫時後端連鍵都不送，undefined 會讓編輯面板把 value 印成 "undefined"
+    mtu: p.mtu ?? null,
     exits: (p.exits ?? []).map(normalizeExit),
   }));
   return { ...raw, sources, wgProxies, logs: raw.logs ?? [], update: raw.update ?? null };

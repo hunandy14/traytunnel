@@ -123,7 +123,7 @@ fn spin_up(spec: &SideSpec, cancel: &tokio_util::sync::CancellationToken) -> Sid
                 32,
             )],
             dns_servers: vec![],
-            mtu: crate::wg::conf::DEFAULT_MTU,
+            mtu: crate::wg::conf::APP_DEFAULT_MTU,
             allowed_ips: spec.allowed_ips.clone(),
             max_connections: stack::DEFAULT_MAX_CONNECTIONS,
             dns_timeout: crate::wg::dns::DEFAULT_TIMEOUT,

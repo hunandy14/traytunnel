@@ -284,6 +284,21 @@ pub fn should_run_engine(cfg: &crate::config::Config, conn: &str) -> bool {
     !rows_to_start(cfg, conn).is_empty()
 }
 
+/// 這條連線這一輪要用的隧道 MTU：**介面覆寫 ＞ `.conf` 明寫 ＞ 應用層預設**。
+///
+/// 三態各有各的理由，缺一不可：
+///
+/// * `override_mtu`（`WgProxy.mtu`）是使用者在連線表單上填的值。他之所以會去填，
+///   通常正是因為 conf 給的（或預設的）那個值在他的線路上會黑洞，所以它最大。
+///   **這不會改寫 `.conf` 檔**——那份檔案是別的工具產出的，我們只讀不寫。
+/// * `conf_mtu` 是 `.conf` 明寫的 `[Interface] MTU`。對端管理員特意寫了值就照做。
+/// * 兩者都沒有才輪到 [`conf::APP_DEFAULT_MTU`]。
+///
+/// 純函式，沒有 IO：這條優先序是規格本身，測試直接釘它而不必起一顆引擎。
+pub fn effective_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> usize {
+    override_mtu.or(conf_mtu).unwrap_or(conf::APP_DEFAULT_MTU)
+}
+
 /// 引擎狀態 → 底下各列的狀態（W6.9）。
 ///
 /// 「埠被佔住只影響那一條列」是與 ssh 不同的地方，而且是刻意的：ssh 一個出口
@@ -337,6 +352,8 @@ pub fn wg_enabled_steps(
 /// 這一輪引擎要跑的東西。設定被改掉時整輪重來，不做增量更新
 struct Plan {
     conf_path: std::path::PathBuf,
+    /// 使用者在連線表單上填的 MTU 覆寫值，沒填就是 None（見 [`effective_mtu`]）
+    mtu: Option<usize>,
     /// 只含 enabled 的列，`socks` 已排在前（§5.3）
     rows: Vec<(String, engine::RowSpec)>,
     locals: Vec<u16>,
@@ -365,7 +382,12 @@ fn plan(state: &Arc<AppState>, conn: &str) -> Option<Plan> {
             })
             .collect();
         let locals = rows.iter().map(|(_, r)| r.local()).collect();
-        Some(Plan { conf_path: crate::config::resolve_conf_path(&dir, &p.conf_path), rows, locals })
+        Some(Plan {
+            conf_path: crate::config::resolve_conf_path(&dir, &p.conf_path),
+            mtu: p.mtu,
+            rows,
+            locals,
+        })
     })
 }
 
@@ -469,9 +491,16 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
         spread(state, generation, &plan.locals, &busy, status_for_handshake(None), None);
 
         let cancel = CancellationToken::new();
+        let mtu = effective_mtu(plan.mtu, conf.mtu);
+        // 只有真的覆寫了才留一行：這正是「我設了 1400，它到底有沒有生效」那個
+        // 問題的答案，而 MTU 黑洞的症狀（網頁載一半）本來就很難自己看出來
+        if plan.mtu.is_some() {
+            state.log_from(conn, format!("MTU overridden to {mtu}"));
+        }
         let spec = engine::EngineSpec {
             name: conn.to_string(),
             conf,
+            mtu,
             rows: plan.rows.iter().filter(|(_, r)| !busy.contains(&r.local())).cloned().collect(),
         };
         let mut events = match engine::spawn(spec, cancel.clone()).await {

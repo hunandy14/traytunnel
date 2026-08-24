@@ -120,10 +120,10 @@ function hideSheet(node: HTMLElement, stillClosed: () => boolean) {
 // ---------------------------------------------------------------- 連線 sheet（SSH／WireGuard 共用）
 
 type SshField = "name" | "host" | "user" | "proxyCommand";
-type WgField = "wgName" | "conf";
+type WgField = "wgName" | "conf" | "mtu";
 
 const SSH_FIELDS: SshField[] = ["name", "host", "user", "proxyCommand"];
-const WG_FIELDS: WgField[] = ["wgName", "conf"];
+const WG_FIELDS: WgField[] = ["wgName", "conf", "mtu"];
 
 const SSH_INPUT_ID: Record<SshField, string> = {
   name: "src-name",
@@ -135,7 +135,35 @@ const SSH_INPUT_ID: Record<SshField, string> = {
 const WG_INPUT_ID: Record<WgField, string> = {
   wgName: "wg-name",
   conf: "wg-conf",
+  mtu: "wg-mtu",
 };
+
+/**
+ * MTU 覆寫欄位的合法範圍，與 Rust 的 `wg::conf::MTU_RANGE` 是同一組數字。
+ *
+ * 訊息也逐字對齊後端的 `config::mtu_range_error()`（以及 dev-mock 的那一份）：
+ * 本地檢查與後端檢查講的必須是同一句，不然同一個輸入在按 Save 前後會看到兩種
+ * 說法。後端回的字串帶著 `mtu: ` 前綴，applyFieldError 會把前綴剝掉再顯示，
+ * 所以這裡存的是剝掉之後的那一半。
+ */
+const MTU_MIN = 576;
+const MTU_MAX = 9000;
+const MTU_ERROR = `must be a whole number between ${MTU_MIN} and ${MTU_MAX}`;
+
+/**
+ * MTU 欄位的三種結果：空白＝不覆寫（null）、合法整數＝覆寫、其餘＝錯誤。
+ *
+ * 「空白是合法的」是這個欄位的重點——它是選填的覆寫，不是必填的設定。
+ * `Number()` 而不是 `parseInt()`：後者會把 `1400abc` 讀成 1400，使用者打錯字
+ * 反而拿到一個他沒打算設定的值。
+ */
+function parseMtu(raw: string): { value: number | null } | { error: string } {
+  const text = raw.trim();
+  if (!text) return { value: null };
+  const n = Number(text);
+  if (!Number.isInteger(n) || n < MTU_MIN || n > MTU_MAX) return { error: MTU_ERROR };
+  return { value: n };
+}
 
 const backdrop = () => el<HTMLDivElement>("src-backdrop");
 const sshInput = (f: SshField) => el<HTMLInputElement>(SSH_INPUT_ID[f]);
@@ -165,6 +193,9 @@ let busy = false;
 function setBusy(next: boolean) {
   busy = next;
   wgInput("conf").readOnly = next;
+  // MTU 欄位同理：值在按下 Save 的當下就讀走了，送出期間還能改的話畫面會跟
+  // 送出去的內容對不起來
+  wgInput("mtu").readOnly = next;
 }
 
 /** null 代表這是「新增」 */
@@ -235,6 +266,7 @@ const SSH_ERROR_KEYS: Record<string, SshField> = {
 const WG_ERROR_KEYS: Record<string, WgField> = {
   name: "wgName",
   confpath: "conf",
+  mtu: "mtu",
 };
 
 /**
@@ -271,6 +303,8 @@ function localValidateWg(): Partial<Record<WgField, string>> {
   const nameErr = validateConnName(wgInput("wgName").value.trim());
   if (nameErr) errors.wgName = nameErr;
   if (!wgInput("conf").value.trim()) errors.conf = ".conf path is required";
+  const mtu = parseMtu(wgInput("mtu").value);
+  if ("error" in mtu) errors.mtu = mtu.error;
   return errors;
 }
 
@@ -343,6 +377,9 @@ export function openSourceSheet(target: ConnTarget | null) {
     setTab("wg");
     wgInput("wgName").value = target.data.name;
     wgInput("conf").value = target.data.confPath;
+    // 沒有覆寫時留空，讓 placeholder 說「Auto」——不要把算出來的生效值填進去，
+    // 那會讓使用者一存檔就把「照 .conf」變成一個寫死的覆寫
+    wgInput("mtu").value = target.data.mtu === null ? "" : String(target.data.mtu);
   } else {
     setTab("ssh");
     for (const f of SSH_FIELDS) sshInput(f).value = "";
@@ -414,12 +451,15 @@ async function saveWg() {
   }
 
   const name = wgInput("wgName").value.trim();
+  // localValidateWg 已經確認過它解析得過，這裡只是把值取出來
+  const mtu = parseMtu(wgInput("mtu").value);
   setBusy(true);
   try {
     const err = await upsertWgProxy({
       originalName: originalKind === "wg" ? originalName : null,
       name,
       confPath: wgInput("conf").value.trim(),
+      mtu: "error" in mtu ? null : mtu.value,
     });
     setBusy(false);
     if (err) {

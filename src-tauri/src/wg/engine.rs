@@ -42,6 +42,12 @@ pub struct EngineSpec {
     /// 連線名，同時是引擎的身分與日誌前綴
     pub name: String,
     pub conf: conf::WgConf,
+    /// 這顆引擎實際要用的隧道 MTU，**已經定案的那一個值**。
+    ///
+    /// 刻意不讓引擎自己去讀 `conf.mtu`：生效優先序（介面覆寫 ＞ conf 明寫 ＞
+    /// [`conf::APP_DEFAULT_MTU`]）是設定層的事，由 `wg::effective_mtu` 算完再
+    /// 傳進來，引擎這一層只負責照著設。
+    pub mtu: usize,
     /// 0..N 條列。零條時 supervise 根本不會呼叫 [`spawn`]（§5.2）
     pub rows: Vec<(String, RowSpec)>,
 }
@@ -67,7 +73,7 @@ pub async fn spawn(
     cancel: CancellationToken,
 ) -> Result<mpsc::Receiver<EngineEvent>, String> {
     let (events, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
-    let EngineSpec { name, conf, rows } = spec;
+    let EngineSpec { name, conf, mtu, rows } = spec;
 
     // 端點每次重連前重解一次，動態 DNS 的端點才跟得上。這是整個 wg/ 底下
     // 唯一一處會用到系統解析器的地方，而且它解的是隧道**外**的位址。
@@ -101,7 +107,7 @@ pub async fn spawn(
                 })
                 .collect(),
             dns_servers: conf.dns.iter().map(|ip| smoltcp::wire::IpAddress::from(*ip)).collect(),
-            mtu: conf.mtu,
+            mtu,
             allowed_ips: conf.allowed_ips.clone(),
             max_connections: stack::DEFAULT_MAX_CONNECTIONS,
             dns_timeout: super::dns::DEFAULT_TIMEOUT,
