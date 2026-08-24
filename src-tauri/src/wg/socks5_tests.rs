@@ -510,3 +510,54 @@ async fn a_static_forward_pumps_without_any_negotiation() {
     cancel.cancel();
     deadline(server).await.unwrap();
 }
+
+// ---------------------------------------------------------------- 回歸（審查補列）
+
+/// `greeting_len` 認得 greeting 到哪裡為止，後面的位元組屬於下一段訊息
+#[test]
+fn the_greeting_length_marks_where_the_next_message_starts() {
+    assert_eq!(greeting_len(&[0x05, 0x01, 0x00]), 3);
+    assert_eq!(greeting_len(&[0x05, 0x03, 0x00, 0x01, 0x02]), 5);
+    // 後面跟著一份 CONNECT：greeting 只佔前三個位元組
+    let mut pipelined = vec![0x05, 0x01, 0x00];
+    pipelined.extend_from_slice(&connect_v4(Ipv4Addr::new(10, 9, 0, 2), 7));
+    assert_eq!(greeting_len(&pipelined), 3);
+}
+
+/// 回歸：客戶端把 greeting、CONNECT **與第一段酬載**貼在同一個 TCP 段裡送出來。
+///
+/// 協商那一段是「讀到夠為止」，所以它很可能把後面那兩樣也一起讀進緩衝。丟掉
+/// 那些位元組的話，接下來的 `read_exact` 會去等一份**已經到了**的請求——
+/// 連線就這樣卡到逾時，而且伺服器這一側看起來完全正常。
+///
+/// 這條測試刻意只寫一次 `write_all`：拆成三次就分成三個段，緩衝裡剛好只有
+/// greeting，那正是這個 bug 躲過所有既有測試的原因。
+#[tokio::test]
+async fn a_client_that_pipelines_everything_into_one_segment_is_served() {
+    let (addr, _obs, cancel, _tasks) = serve(Script::Echo).await;
+    let mut sock = deadline(TcpStream::connect(addr)).await.unwrap();
+
+    let payload = b"pipelined payload";
+    let mut all = vec![0x05, 0x01, 0x00];
+    all.extend_from_slice(&connect_v4(Ipv4Addr::new(10, 9, 0, 2), 7));
+    all.extend_from_slice(payload);
+    deadline(sock.write_all(&all)).await.unwrap();
+
+    // 協商回覆
+    let mut hello = [0u8; 2];
+    deadline(sock.read_exact(&mut hello)).await.unwrap();
+    assert_eq!(hello, [0x05, 0x00]);
+    // CONNECT 回覆（ATYP=01 → 4 + 2）
+    let mut reply = [0u8; 4];
+    deadline(sock.read_exact(&mut reply)).await.unwrap();
+    assert_eq!(reply[1], Reply::Success as u8, "貼在同一段裡的 CONNECT 也要被讀到");
+    let mut bound = [0u8; 6];
+    deadline(sock.read_exact(&mut bound)).await.unwrap();
+
+    // 貼在 CONNECT 後面的酬載也不可以掉，而且要排在後續位元組之前
+    deadline(sock.write_all(b" and more")).await.unwrap();
+    let mut echoed = vec![0u8; payload.len() + b" and more".len()];
+    deadline(sock.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"pipelined payload and more", "順序與內容都要原封不動");
+    cancel.cancel();
+}

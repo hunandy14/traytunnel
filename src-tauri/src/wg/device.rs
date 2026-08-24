@@ -60,7 +60,6 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     // 不該變成任務內部一個只有日誌看得到的事件），而且 `local_addr` 要在
     // 回傳 handle 之前就知道（`ListenPort = 0` 時測試檯靠它互連）。
     let socket = std::net::UdpSocket::bind(cfg.bind)?;
-    socket.set_nonblocking(true)?;
     let local_addr = socket.local_addr()?;
 
     let mut tunn =
@@ -71,11 +70,16 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
     //  * 「這一段之間有沒有封包出去」那類斷言（W4.8）才有一個確定的起點——
     //    握手排在任務裡送的話，它會落在測試讀計數器之前或之後全憑排程。
     //
-    // **這一送必須走 std 的 socket，在交給 tokio 之前**：`try_send_to` 只在
-    // tokio 已經從 I/O driver 收過一次「可寫」事件之後才會真的下系統呼叫，
-    // 剛註冊的 socket 那份快取是空的，於是它一律回 `WouldBlock`，封包被靜靜
-    // 丟掉——症狀是握手要拖到 boringtun 的 REKEY_TIMEOUT（5 秒）重試才成立，
-    // 隧道看起來「就是慢五秒」。std 的 socket 沒有這層快取，直接下系統呼叫。
+    // **這一送必須走 std 的 socket，而且要在它被切成 non-blocking、交給 tokio
+    // 之前**。兩層理由，少哪一層都會退化成同一個症狀：
+    //  * `try_send_to` 只在 tokio 已經從 I/O driver 收過一次「可寫」事件之後才會
+    //    真的下系統呼叫，剛註冊的 socket 那份快取是空的，於是它一律回
+    //    `WouldBlock`；
+    //  * 就算不經 tokio，non-blocking 的 `send_to` 在送出佇列滿的時候一樣會回
+    //    `WouldBlock`，而下面這一手只會記一行 debug 就算了。
+    // 兩種情況下封包都被靜靜丟掉，握手要拖到 boringtun 的 REKEY_TIMEOUT（5 秒）
+    // 重試才成立——隧道看起來「就是慢五秒」，而且沒有任何錯誤訊息。
+    // 阻塞式的 socket 沒有這個問題，而這一送是行程剛開始、佇列必定是空的那一刻。
     let mut tx_buf = vec![0u8; MAX_PACKET];
     if let TunnResult::WriteToNetwork(packet) = tunn.format_handshake_initiation(&mut tx_buf, false)
     {
@@ -85,6 +89,8 @@ pub fn spawn(cfg: DeviceConfig, cancel: CancellationToken) -> std::io::Result<De
         }
     }
 
+    // 交給 tokio 之前才切 non-blocking——`from_std` 要求它是 non-blocking 的
+    socket.set_nonblocking(true)?;
     let udp = tokio::net::UdpSocket::from_std(socket)?;
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(PACKET_CHANNEL_DEPTH);

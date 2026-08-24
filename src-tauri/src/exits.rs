@@ -198,9 +198,6 @@ pub fn detect(port: u16) -> Detected {
 /// ——回空片段交給 sniff 判，錯誤本身不需要分類。
 ///
 /// `want` 是「讀到幾個位元組就夠了」；`0` 代表讀到第一個換行（HTTP 起始行）。
-// 只被 `detect` 用，而 `detect` 要等 W6 把排程接上去才有非測試的呼叫端；
-// 那一輪落地之後這行 allow 可以拿掉。
-#[allow(dead_code)]
 fn exchange(addr: std::net::SocketAddr, request: &[u8], want: usize) -> Vec<u8> {
     use std::io::{Read, Write};
 

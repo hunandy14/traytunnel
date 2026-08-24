@@ -63,7 +63,8 @@ pub async fn serve_forward(
                 return None;
             };
             let conn = connect(&stack, endpoint).await.ok()?;
-            pump(sock, conn, cancel).await;
+            // 轉發沒有協商，不可能有多讀進來的位元組
+            pump(sock, conn, Vec::new(), cancel).await;
             Some(())
         }
     })
@@ -103,12 +104,18 @@ async fn handle_socks5(
     cancel: CancellationToken,
 ) -> Option<()> {
     // ---- 協商
+    //
+    // 協商是「讀到夠為止」，所以最後那一次 read 很可能把客戶端**貼在同一個 TCP
+    // 段裡的下一段訊息**也一起讀進來了（激進的 pipelining 客戶端會把 greeting
+    // 與 CONNECT 一次送出）。那些位元組存進 `pending`，後面每一次讀取都先從它
+    // 拿——丟掉的話下一手 `read_exact` 會去等一份**已經到了**的請求，
+    // 一路等到逾時才斷線。
     let mut buf = Vec::with_capacity(64);
-    loop {
+    let mut pending: Vec<u8> = loop {
         match parse_greeting(&buf) {
             Ok(Greeting::Method(method)) => {
                 sock.write_all(&[VERSION, method]).await.ok()?;
-                break;
+                break buf.split_off(greeting_len(&buf));
             }
             Ok(Greeting::NoAcceptable) => {
                 let _ = sock.write_all(&[VERSION, METHOD_NONE]).await;
@@ -125,12 +132,11 @@ async fn handle_socks5(
                 buf.extend_from_slice(&chunk[..n]);
             }
         }
-    }
+    };
 
     // ---- 請求。逐段讀「剛好那麼多」位元組，讓 parse_request 拿到的是一份完整
     // 且不多不少的請求（W2.18 靠長度不符擋掉編不出來的超長網域名）
-    let mut req = vec![0u8; 4];
-    sock.read_exact(&mut req).await.ok()?;
+    let mut req = read_exactly(&mut sock, &mut pending, 4).await?;
     let want = match request_len(&req) {
         Ok(n) => n,
         Err(reply) => {
@@ -139,14 +145,11 @@ async fn handle_socks5(
         }
     };
     if want > req.len() {
-        let mut rest = vec![0u8; want - req.len()];
-        sock.read_exact(&mut rest).await.ok()?;
-        req.extend_from_slice(&rest);
+        req.extend_from_slice(&read_exactly(&mut sock, &mut pending, want - req.len()).await?);
         // ATYP=03 的長度要等讀到 DOMAIN LEN 才算得出來，因此可能要再補一次
         if let Ok(total) = request_len(&req) {
             if total > req.len() {
-                let mut more = vec![0u8; total - req.len()];
-                sock.read_exact(&mut more).await.ok()?;
+                let more = read_exactly(&mut sock, &mut pending, total - req.len()).await?;
                 req.extend_from_slice(&more);
             }
         }
@@ -182,8 +185,25 @@ async fn handle_socks5(
     let bound = std::net::SocketAddr::new(to_std_ip(&endpoint.addr), conn.port.num());
     sock.write_all(&encode_reply(Reply::Success, bound)).await.ok()?;
 
-    pump(sock, conn, cancel).await;
+    // `pending` 到這裡若還有剩，那是客戶端連酬載都一起 pipeline 過來了。
+    // 它排在 socket 之後續讀的所有位元組**之前**，順序才不會亂掉
+    pump(sock, conn, pending, cancel).await;
     Some(())
+}
+
+/// 讀滿 `want` 個位元組：先吃掉前一階段多讀進來的那幾個，不夠再向 socket 補。
+///
+/// 這一支存在的唯一理由就是「協商可能已經把後面的東西讀進來了」。少了它，
+/// pipelining 的客戶端會卡在一個永遠等不到的 `read_exact` 上直到逾時。
+async fn read_exactly(sock: &mut TcpStream, pending: &mut Vec<u8>, want: usize) -> Option<Vec<u8>> {
+    let take = want.min(pending.len());
+    let mut out: Vec<u8> = pending.drain(..take).collect();
+    if out.len() < want {
+        let mut rest = vec![0u8; want - out.len()];
+        sock.read_exact(&mut rest).await.ok()?;
+        out.extend_from_slice(&rest);
+    }
+    Some(out)
 }
 
 fn unspecified() -> std::net::SocketAddr {
@@ -260,12 +280,17 @@ impl Drop for AbortOnDrop {
 ///
 /// 上行 EOF 時對隧道側的 socket 做**半關**（丟掉 `Conn::tx`，stack 會在把剩餘
 /// 位元組灌完之後才 `close()`），不是直接 abort——否則對端會少收最後一段資料。
-async fn pump(sock: TcpStream, conn: stack::Conn, cancel: CancellationToken) {
+/// `head` 是協商／請求那兩段多讀進來、屬於酬載的位元組（`serve_forward` 沒有
+/// 協商，一律是空的）。它要在任何從 socket 續讀的位元組之前送出去。
+async fn pump(sock: TcpStream, conn: stack::Conn, head: Vec<u8>, cancel: CancellationToken) {
     let stack::Conn { tx, mut rx, .. } = conn;
     let (mut reader, mut writer) = sock.into_split();
 
     let up_cancel = cancel.clone();
     let up = tokio::spawn(async move {
+        if !head.is_empty() && tx.send(Bytes::from(head)).await.is_err() {
+            return;
+        }
         let mut buf = vec![0u8; PUMP_CHUNK];
         loop {
             let read = tokio::select! {
@@ -348,6 +373,14 @@ pub enum GreetingError {
     NotSocks5,
     /// `NMETHODS == 0` 之類的壞格式
     Malformed,
+}
+
+/// greeting 佔掉的位元組數：`VER + NMETHODS + METHODS`。
+///
+/// 只在 [`parse_greeting`] 已經回 [`Greeting::Method`] 之後叫得成立——那時
+/// `buf.len() >= 2 + NMETHODS` 是保證的，後面多出來的都是下一段訊息。
+pub fn greeting_len(buf: &[u8]) -> usize {
+    2 + buf.get(1).copied().unwrap_or(0) as usize
 }
 
 /// 解析 greeting（VER/NMETHODS/METHODS）

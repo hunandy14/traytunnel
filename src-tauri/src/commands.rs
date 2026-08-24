@@ -549,11 +549,13 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
     }
     match kind {
         // 列已經不在設定裡了，`wg::halt_row` 查不到所屬連線，得直接對連線動手：
-        // 引擎要用新的列清單重建，而剩下零條啟用的列時它會依 §5.2 收掉（W6.22）
-        Some(ConnKind::Wg) => {
-            st.set_exit_status(local, crate::state::status::STOPPED, None);
-            wg::restart(st, &cname);
-        }
+        // 引擎要用新的列清單重建，而剩下零條啟用的列時它會依 §5.2 收掉（W6.22）。
+        //
+        // 這裡**不必**、也沒辦法再對 `local` 寫一次 stopped：`save` 成功時
+        // `sync_exits` 已經連同它的 `ExitRuntime` 一起清掉了，`set_exit_status`
+        // 只改既存項，寫下去是 no-op。介面那一側由下面的 `emit_config_changed`
+        // 負責——快照裡本來就沒有這一條列了。
+        Some(ConnKind::Wg) => wg::restart(st, &cname),
         _ => tunnel::halt(st, local),
     }
     st.emit_config_changed();
@@ -634,18 +636,15 @@ pub fn delete_wg_proxy(state: State<'_, Shared>, name: String) {
         st.log(format!("no such WireGuard connection: {name}")); // W6.19
         return;
     }
-    // 要停的埠得在刪掉之前先抄下來，刪完就查不到了
-    let ports = st.with_config(|c| wg::halted_locals(c, &name));
     // 先存檔成功才停線（W6.18）：反過來做的話，存檔失敗就會留下「引擎停了、
     // 設定還在而且是 enabled」的錯位狀態
     if !save(st, |c| c.wg_proxies.retain(|p| p.name != name)) {
         return;
     }
-    // 引擎那一份執行期狀態已經被 sync_exits 連同 CancelGuard 一起丟掉了；
-    // 這裡只補推各列的 stopped，讓介面與系統匣立刻跟上（W6.17）
-    for local in ports {
-        st.set_exit_status(local, crate::state::status::STOPPED, None);
-    }
+    // 存檔成功那一刻 `sync_exits` 就把這條連線的引擎（連同 `CancelGuard`，
+    // 於是整棵任務樹與所有列的監聽器）與各列的 `ExitRuntime` 一起丟掉了，
+    // 這裡不必再逐列停一次——那些項目已經不在，寫什麼都是 no-op。
+    // 介面與系統匣由下面這一手全量重建（W6.17／W6.20）
     st.emit_config_changed();
     st.log(format!("WireGuard connection {name} deleted"));
 }

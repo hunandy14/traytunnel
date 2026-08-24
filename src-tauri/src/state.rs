@@ -546,6 +546,8 @@ impl AppState {
     pub fn new(app: AppHandle, path: PathBuf, portable: bool, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         let wg_confs = read_wg_confs(&cfg, config_dir(&path));
+        let wg_engines: HashMap<String, WgEngineRuntime> =
+            cfg.wg_proxies.iter().map(|p| (p.name.clone(), WgEngineRuntime::default())).collect();
         AppState {
             app,
             path,
@@ -553,7 +555,7 @@ impl AppState {
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
-            wg_engines: Mutex::new(HashMap::new()),
+            wg_engines: Mutex::new(wg_engines),
             wg_confs: Mutex::new(wg_confs),
             testing: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
@@ -658,7 +660,13 @@ impl AppState {
     fn sync_wg_engines(&self) {
         let names =
             self.with_config(|c| c.wg_proxies.iter().map(|p| p.name.clone()).collect::<Vec<_>>());
-        self.wg_engines.lock().unwrap().retain(|name, _| names.contains(name));
+        let mut engines = self.wg_engines.lock().unwrap();
+        engines.retain(|name, _| names.contains(name));
+        // 補齊，與 `sync_exits` 一樣：項目的生死只由這一支決定，其他地方一律
+        // 只改既存項（見 `with_engine_mut`）
+        for name in names {
+            engines.entry(name).or_default();
+        }
     }
 
     /// 重讀每條 wg 連線的 `.conf` 摘要。設定一變就跑一次（改了 confPath、
@@ -975,8 +983,17 @@ impl AppState {
     /// 整份重建，逐埠各刷一次只是白做工。
     pub fn kill_all_jobs(&self) {
         // wg 的引擎不住在 exits 裡（它的身分是連線名），要另外收一次；
-        // 各列的監聽器是那棵任務樹的一部分，跟著 CancelGuard 一起走
-        self.wg_engines.lock().unwrap().clear();
+        // 各列的監聽器是那棵任務樹的一部分，跟著 CancelGuard 一起走。
+        // **只收 worker、不刪項目**：這一支也跑在「交棒給安裝程式之前」那條路上，
+        // 安裝失敗時程式還留在原地，項目被刪掉的話之後就再也 claim 不到位子了
+        {
+            let mut engines = self.wg_engines.lock().unwrap();
+            for rt in engines.values_mut() {
+                rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                rt.supervisor = None;
+                rt.worker.take();
+            }
+        }
         let mut stopped = Vec::new();
         {
             let mut exits = self.exits.lock().unwrap();
@@ -1012,12 +1029,20 @@ impl AppState {
     // 與 ssh 出口那一組（claim_supervisor／next_generation／store_job）逐點對稱，
     // 只是鍵從 u16 換成連線名——引擎的身分是連線，不是某個埠（§5.2）。
 
-    fn with_engine_mut<T>(&self, conn: &str, f: impl FnOnce(&mut WgEngineRuntime) -> T) -> T {
-        let mut map = self.wg_engines.lock().unwrap();
-        f(map.entry(conn.to_string()).or_default())
+    /// 對既存的那一份引擎狀態就地改一筆，回傳 None 代表這條連線已經不在了。
+    ///
+    /// 與 `with_exit_mut` 同一條紀律：項目**只由 `sync_wg_engines` 依設定建立**，
+    /// 其餘地方一律只改既存項。晚到的更新若順手把項目補回來，就會生出一條設定
+    /// 裡根本不存在的幽靈連線，而它要撐到下一次設定變動才會被清掉。
+    fn with_engine_mut<T>(
+        &self,
+        conn: &str,
+        f: impl FnOnce(&mut WgEngineRuntime) -> T,
+    ) -> Option<T> {
+        self.wg_engines.lock().unwrap().get_mut(conn).map(f)
     }
 
-    /// 搶下這條連線的監看位子，回傳 None 代表已經有一顆引擎在跑
+    /// 搶下這條連線的監看位子，回傳 None 代表已經有一顆引擎在跑（或連線不在了）
     pub fn wg_claim_supervisor(&self, conn: &str) -> Option<u64> {
         let counter = &self.generation;
         self.with_engine_mut(conn, |rt| {
@@ -1028,6 +1053,7 @@ impl AppState {
             }
             claimed
         })
+        .flatten()
     }
 
     pub fn wg_release_supervisor(&self, conn: &str, generation: u64) {
