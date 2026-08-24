@@ -1006,12 +1006,17 @@ mod tests {
     /// `the_shipped_updater_config_parses` 同一套做法）。
     const THIS_FILE: &str = include_str!("update.rs");
 
-    /// 取出某一支函式的本體（從簽名那一行到下一個頂層 `}`）
-    fn body_of(name: &str) -> &'static str {
-        let start = THIS_FILE.find(name).unwrap_or_else(|| panic!("找不到 {name}"));
-        let rest = &THIS_FILE[start..];
+    /// 取出某一支函式的本體（從簽名那一行到下一個頂層 `}`）。
+    ///
+    /// **一定要先正規化換行**：這個 repo 的工作區是 LF，而 CI 檢出時 git 會把它
+    /// 換成 CRLF，於是寫死的 `"\n}\n"` 在 CI 上永遠找不到——症狀是「本機全綠、
+    /// CI 紅」，而且紅的原因跟被測的東西一點關係都沒有。
+    fn body_of(name: &str) -> String {
+        let src = THIS_FILE.replace("\r\n", "\n");
+        let start = src.find(name).unwrap_or_else(|| panic!("找不到 {name}"));
+        let rest = &src[start..];
         let end = rest.find("\n}\n").unwrap_or_else(|| panic!("{name} 沒有結尾"));
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     /// 下載途中把開關關掉，那份下載**不可以**還是落地成標記。
