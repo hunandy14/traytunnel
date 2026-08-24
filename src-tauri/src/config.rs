@@ -846,11 +846,12 @@ pub fn parse_config(raw: &str) -> Result<Config, String> {
 /// 撞埠訊息裡的佔用者描述：說得出是哪一條連線的**哪一種列**（W3.12）。
 ///
 /// `socks` 列與 `forward` 列在使用者眼裡是兩種東西，訊息分不出來的話，
-/// 他只會看到一個查不出原因的撞埠。
+/// 他只會看到一個查不出原因的撞埠。轉發列不加限定詞——那是預設的那一種，
+/// 而且既有的 `local: port X already used by <這一段>` 訊息一字未改。
 fn describe_row(conn: &str, f: &Forward) -> String {
     match f.kind {
-        RowKind::Socks => format!("連線 {conn} 的 socks 列 {}", f.name),
-        RowKind::Forward => format!("連線 {conn} 的轉發列 {}", f.name),
+        RowKind::Socks => format!("socks row {} in {conn}", f.name),
+        RowKind::Forward => format!("{} in {conn}", f.name),
     }
 }
 
@@ -860,20 +861,23 @@ fn check_row(conn: &str, f: &Forward) -> Result<(), String> {
         RowKind::Socks => {
             if f.remote.is_some() {
                 return Err(format!(
-                    "{}：socks 列沒有目的地，不可以寫 remote",
-                    describe_row(conn, f)
+                    "連線 {conn} 的 socks 列 {} 不可以有 remote（引擎自建的 listener 沒有目的地）",
+                    f.name
                 ));
             }
             if f.probe_proxy {
                 return Err(format!(
-                    "{}：socks 列恆測，不可以帶 probeProxy",
-                    describe_row(conn, f)
+                    "連線 {conn} 的 socks 列 {} 不可以有 probeProxy（它恆測）",
+                    f.name
                 ));
             }
         }
         RowKind::Forward => {
             if f.remote.is_none() {
-                return Err(format!("{}：kind = forward 的列必須有 remote", describe_row(conn, f)));
+                return Err(format!(
+                    "連線 {conn} 的轉發列 {} 缺 remote（kind = forward 時必填）",
+                    f.name
+                ));
             }
         }
     }
@@ -913,7 +917,7 @@ fn claim_local(seen: &mut Vec<(u16, String)>, conn: &str, f: &Forward) -> Result
 fn validate_config(cfg: &Config) -> Result<(), String> {
     // 兩型連線共用同一個命名空間：日誌前綴是 `[名字]`，撞名就分不出誰是誰（§5.1）
     let mut seen_names: Vec<&str> = Vec::new();
-    // (本地埠, 佔用者描述)
+    // （本地埠，佔用者描述）
     let mut seen_locals: Vec<(u16, String)> = Vec::new();
 
     for s in &cfg.sources {
@@ -1388,13 +1392,8 @@ pub fn validate_forward(cfg: &Config, input: &RowInput<'_>) -> Option<String> {
     }
     // 本地埠是列的全域唯一鍵：停用中的、別條連線底下的、別一型連線底下的都算佔用
     if Some(input.local) != input.original_local {
-        if let Some((owner, f)) = cfg.row(input.local) {
-            return Some(format!(
-                "local: port {} already used by {} in {}",
-                input.local,
-                f.name,
-                owner.name()
-            ));
+        if let Some(owner) = port_owner(cfg, input.local) {
+            return Some(format!("local: port {} already used by {owner}", input.local));
         }
     }
     None

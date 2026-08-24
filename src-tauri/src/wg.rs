@@ -170,6 +170,17 @@ fn connection_names(state: &Arc<AppState>) -> Vec<String> {
 ///   OS 配埠，不用 `.conf` 裡的 `ListenPort`——那是正式連線要用的埠，
 ///   測試不可以把它搶走。
 pub async fn test_conf(conf_path: &std::path::Path) -> crate::ssh::tunnel::TestConnectionResult {
+    test_conf_within(conf_path, TEST_TIMEOUT).await
+}
+
+/// [`test_conf`] 的可注入逾時版。
+///
+/// 上限是規格的一部分（15 秒），但「逾時會失敗而不是誤報成功」這條性質不該
+/// 要一個 15 秒的測試才驗得到（W9.2／W9.4），因此門檻做成參數。
+pub(crate) async fn test_conf_within(
+    conf_path: &std::path::Path,
+    timeout: Duration,
+) -> crate::ssh::tunnel::TestConnectionResult {
     use crate::ssh::tunnel::TestConnectionResult as R;
 
     let conf = match conf::load(conf_path) {
@@ -200,7 +211,7 @@ pub async fn test_conf(conf_path: &std::path::Path) -> crate::ssh::tunnel::TestC
     };
 
     let mut events = handle.events;
-    let waited = tokio::time::timeout(TEST_TIMEOUT, async {
+    let waited = tokio::time::timeout(timeout, async {
         loop {
             match events.recv().await {
                 Some(device::DeviceEvent::HandshakeOk) => return Some(true),
@@ -560,6 +571,13 @@ fn probed_rows_of(state: &Arc<AppState>, conn: &str) -> Vec<u16> {
 #[cfg(test)]
 #[path = "wg_tests.rs"]
 mod tests;
+
+/// 刪除流程與 `.conf` 驗證／選檔 IPC 的測試——§6 的 W6.17～W6.23 與 W9 系列。
+///
+/// 與 `wg_tests.rs` 分開掛：那一份是前一棒的紅燈存證，這一輪一個字都沒動。
+#[cfg(test)]
+#[path = "wg_ipc_tests.rs"]
+mod ipc_tests;
 
 #[cfg(test)]
 #[path = "wg_live_tests.rs"]

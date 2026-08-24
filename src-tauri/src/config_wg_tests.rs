@@ -73,6 +73,7 @@ fn cfg_of(sources: Vec<Source>, wg_proxies: Vec<WgProxy>) -> Config {
 }
 
 /// 一列 upsert 的輸入
+#[allow(clippy::too_many_arguments)]
 fn input<'a>(
     connection: &'a str,
     conn_kind: ConnKind,

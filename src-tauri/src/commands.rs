@@ -341,8 +341,11 @@ pub fn delete_source(state: State<'_, Shared>, name: String) {
     st.log(format!("source {name} deleted"));
 }
 
-/// 從設定裡的所有連線（兩型都算）拔掉這個本地埠的列
-fn detach_row(c: &mut Config, local: u16) {
+/// 從設定裡的所有連線（兩型都算）拔掉這個本地埠的列。
+///
+/// `local` 是全域唯一鍵，所以刪一條列不需要知道它是什麼機制、掛在哪一型連線
+/// 底下（W6.21）——掃過去、拔掉、結束。
+pub(crate) fn detach_row(c: &mut Config, local: u16) {
     for s in c.sources.iter_mut() {
         s.forwards.retain(|f| f.local != local);
     }
@@ -717,15 +720,31 @@ pub async fn pick_wg_conf(app: AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter("WireGuard configuration", &["conf"])
+        .add_filter(CONF_FILTER_LABEL, &CONF_FILTER_EXTENSIONS)
         .set_title("Select a WireGuard .conf")
         .pick_file(move |picked| {
             let _ = tx.send(picked);
         });
     // 對話框開不起來（沒有 dialog 能力、沒有視窗）時 sender 會被丟掉：
     // 回 Err 而不是 panic，前端就退回純文字路徑輸入（W9.10／Q3 的退路）
-    let picked = rx.await.map_err(|_| "file dialog is unavailable".to_string())?;
-    Ok(picked.map(|p| p.to_string()))
+    let picked = rx.await.map_err(|_| DIALOG_UNAVAILABLE.to_string())?;
+    Ok(picked_conf_path(picked.and_then(|p| p.into_path().ok())))
+}
+
+/// 檔案對話框的副檔名過濾器。**只是提示，不強制**：使用者選了別的副檔名一樣
+/// 照收，內容合不合格由 `inspect_conf` 去判（W9.9）。
+pub(crate) const CONF_FILTER_LABEL: &str = "WireGuard configuration";
+pub(crate) const CONF_FILTER_EXTENSIONS: [&str; 1] = ["conf"];
+
+/// 對話框叫不起來時交回前端的訊息（W9.10）
+pub(crate) const DIALOG_UNAVAILABLE: &str = "file dialog is unavailable";
+
+/// 對話框選到的東西 → IPC 的回傳值。
+///
+/// 取消時是 `None`，**不是空字串**：前端拿到空字串會把它當成「使用者選了一個
+/// 空路徑」而清掉既有的 `confPath`（W9.7）。
+pub(crate) fn picked_conf_path(picked: Option<std::path::PathBuf>) -> Option<String> {
+    picked.map(|p| p.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
