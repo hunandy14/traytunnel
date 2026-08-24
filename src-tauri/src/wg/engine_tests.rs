@@ -219,23 +219,34 @@ async fn both_engines_complete_a_handshake() {
     bench.cancel.cancel();
 }
 
-/// W4.2 default route 的回歸測試（D2／R11）。
+/// W4.2 引擎起來的當下，**第一個握手發起封包就已經送出去了**。
 ///
-/// 拿掉 `add_default_ipv4_route` 之後，`Medium::Ip` 的 `has_neighbor()` 一律
-/// 是 false，TCP 的 SYN 會**靜默地**送不出去——沒有錯誤、沒有日誌，只是不動。
-/// 這條測試存在的唯一意義就是釘住那一行。
+/// PM 裁決：原本這一條寫的是「拿掉 default route 之後 SYN 送不出去」，用一個
+/// 測試專用的旗標把 `add_default_ipv4_route` 關掉再斷言「兩秒內沒有回覆」。那個
+/// 性質**測不出來**——`Medium::Ip` 的 smoltcp 根本不查路由表（`has_neighbor()`
+/// 在這個 medium 下恆真），所以旗標開不開都一樣，那條測試從頭到尾是假綠。
+/// `stack.rs` 的觀測用 shim 一併拆掉，`add_default_ipv4_route` 那一行留著。
+///
+/// 換上來的是一條真的測得到、而且真的會壞的性質：`device::spawn` 必須在**還
+/// 拿著 std socket 的時候**就地把握手送出去。改成排進 tokio 任務裡送的話，
+/// `try_send_to` 會因為 I/O driver 那份「可寫」快取還是空的而一律回 WouldBlock，
+/// 封包被靜靜丟掉，隧道要拖到 boringtun 的 REKEY_TIMEOUT（5 秒）重試才接得起來
+/// ——症狀是「每次連線就是慢五秒」，而且沒有任何錯誤訊息。
+///
+/// 斷言窗口刻意極短：`spin_up` 回來之後**一個 await 都不插**就讀計數器，
+/// 中間沒有任何排程點，所以「有沒有出去」講的就是同步那一送。
 #[tokio::test]
-async fn without_a_default_route_the_syn_never_leaves() {
-    stack::SKIP_DEFAULT_ROUTE.store(true, std::sync::atomic::Ordering::SeqCst);
-    let outcome = tokio::time::timeout(Duration::from_secs(2), async {
-        let bench = bench().await;
-        let r = socks5_connect(bench.socks, B_ADDR, ECHO_PORT).await;
-        bench.cancel.cancel();
-        r
-    })
-    .await;
-    stack::SKIP_DEFAULT_ROUTE.store(false, std::sync::atomic::Ordering::SeqCst);
-    assert!(outcome.is_err(), "沒有 default route 就該完全沒有回覆——這正是它難以察覺的地方");
+async fn the_first_handshake_packet_leaves_immediately() {
+    let (pa, pb) = two_free_udp_ports();
+    let cancel = CancellationToken::new();
+
+    let before = device::UDP_TX_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+    let a = spin_up(&SideSpec::a(pa, pb), &cancel);
+    let after = device::UDP_TX_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(after, before + 1, "spawn 回來時握手發起封包就該已經在線上了");
+    cancel.cancel();
+    drop(a);
 }
 
 /// W4.3 SOCKS5 CONNECT 到 echo，送一個位元組

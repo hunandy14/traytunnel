@@ -285,16 +285,16 @@ async fn run(
     // 入站封包本來就是寄給我們的位址，開著 any_ip 只會多收垃圾
     iface.set_any_ip(false);
 
-    if !skip_default_route() {
-        // R11／D2：`Medium::Ip` 下 `has_neighbor()` 等同「`route()` 有回值」，
-        // 而 `route()` 只在 `in_same_network()` 或路由表命中時有回值。沒有這一行，
-        // TCP 的 SYN 會**靜默地**送不出去——沒有錯誤、沒有日誌，只是不動。
-        // 閘道位址本身在 `Medium::Ip` 下不會被使用（沒有鄰居探索），它存在的
-        // 唯一意義就是讓 `route()` 回 Some。W4.2 專門釘這一行。
-        let routes = iface.routes_mut();
-        let _ = routes.add_default_ipv4_route(std::net::Ipv4Addr::new(0, 0, 0, 1));
-        let _ = routes.add_default_ipv6_route(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
-    }
+    // R11／D2：路由表要有一條預設路由，`route()` 才回得出下一跳。閘道位址本身在
+    // `Medium::Ip` 下不會被使用（這個 medium 沒有鄰居探索），它存在的唯一意義
+    // 就是讓路由查詢有結果。
+    //
+    // 註：原本這裡有一個測試專用的旗標，讓 W4.2 可以把這兩行關掉再斷言「SYN
+    // 送不出去」。那條斷言是假綠——`Medium::Ip` 下 smoltcp 不查路由表，關不關
+    // 都一樣——已由 PM 裁決作廢，shim 隨之拆除，這兩行保留。
+    let routes = iface.routes_mut();
+    let _ = routes.add_default_ipv4_route(std::net::Ipv4Addr::new(0, 0, 0, 1));
+    let _ = routes.add_default_ipv6_route(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
 
     let mut sockets = SocketSet::new(Vec::new());
 
@@ -750,40 +750,3 @@ fn service_sockets(
 }
 
 // ---------------------------------------------------------------- 測試開關
-
-/// W4.2 專用的回歸開關：把 D2 的 default route 關掉。
-///
-/// `Medium::Ip` 下 `has_neighbor()` 等同「`route()` 有回值」，沒有 default route
-/// 的話 TCP 的 SYN 會**靜默地**送不出去。那一行是整份設計最容易被順手「簡化」
-/// 掉又不會馬上壞的一行，因此把它做成測試可切換的旗標來釘住。
-///
-/// 旗標本身是 **thread-local** 的：`cargo test` 預設平行跑，而 `#[tokio::test]`
-/// 用的是 current-thread runtime——換成全域旗標的話，W4.2 一翻開關就會同時把
-/// 其他正在跑的 W4 測試的路由拔掉。對呼叫端而言介面不變（`.store(值, 順序)`）。
-#[cfg(test)]
-pub(crate) struct SkipDefaultRoute;
-
-#[cfg(test)]
-impl SkipDefaultRoute {
-    pub(crate) fn store(&self, value: bool, _order: std::sync::atomic::Ordering) {
-        SKIP_DEFAULT_ROUTE_LOCAL.with(|c| c.set(value));
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static SKIP_DEFAULT_ROUTE_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) static SKIP_DEFAULT_ROUTE: SkipDefaultRoute = SkipDefaultRoute;
-
-#[cfg(test)]
-fn skip_default_route() -> bool {
-    SKIP_DEFAULT_ROUTE_LOCAL.with(|c| c.get())
-}
-
-#[cfg(not(test))]
-fn skip_default_route() -> bool {
-    false
-}
