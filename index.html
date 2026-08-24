@@ -63,8 +63,10 @@
                   </button>
                   <!-- WG 專屬：引擎自建 SOCKS5 代理，SSH 連線不顯示這一項 -->
                   <button class="summary-menu-item" id="menu-add-socks" role="menuitem" hidden>
-                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add proxy…
+                    <span class="ico" data-icon="plus" data-icon-size="14"></span>Add SOCKS5…
                   </button>
+                  <!-- 只服務 SSH：WG 已經有總開關做同一件事，這一項會跟它重複，
+                       WG 連線時由 main.ts 隱藏 -->
                   <button class="summary-menu-item" id="menu-toggle-source" role="menuitem">
                     <span class="ico" id="menu-toggle-ico"></span>
                     <span id="menu-toggle-text">Disconnect</span>

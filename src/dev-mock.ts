@@ -361,7 +361,7 @@ function later(local: number, ms: number, fn: () => void) {
 function runTest(exit: ExitInfo, source: string) {
   if (exit.status !== "connected") return;
   if (!shouldProbe(exit)) return;
-  setTest(exit, "testing", "testing…");
+  setTest(exit, "testing", "Connecting…");
   window.setTimeout(
     () => {
       if (exit.status !== "connected") return;

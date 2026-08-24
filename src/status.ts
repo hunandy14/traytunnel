@@ -130,7 +130,7 @@ export function connStatusText(conn: ConnRef, exits: ExitInfo[]): string {
 export function testLine(exit: ExitInfo): { text: string; tone: string } {
   const t = exit.lastTest;
   if (!t) return { text: "", tone: "muted" };
-  if (t.state === "testing") return { text: t.text || "testing…", tone: "muted" };
+  if (t.state === "testing") return { text: t.text || "Connecting…", tone: "muted" };
   if (t.state === "fail") return { text: t.text || "no response", tone: "red" };
   return { text: t.text, tone: "text" };
 }
