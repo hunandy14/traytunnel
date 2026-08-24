@@ -119,11 +119,51 @@ pub fn broken_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// 一條列的**機制**（設計書 §1.2）。`Socks` 只允許出現在 WG 連線底下。
+///
+/// 只分兩種，而且分的是「它在技術上怎麼運作」——「後端是不是代理服務」是另一件
+/// 正交的事，由 [`Forward::probe_proxy`] 表示。先前那個「`remote=None` ＋
+/// `kind=proxy` ＝ 引擎自建」的編碼已作廢（§1.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowKind {
+    /// 本地埠 → 一個固定目的地，位元組原樣搬運。`remote` 必填。
+    ///
+    /// 舊檔缺 `kind` 鍵時就是它——舊檔裡的每一筆本來就都是轉發，不需要遷移邏輯（§1.7）
+    #[default]
+    Forward,
+    /// 引擎在這個埠上自建一個 SOCKS5 伺服器，目的地由使用它的應用逐次指定。
+    /// 沒有 `remote`，也不得帶 `probeProxy`（恆測、協定已知）
+    Socks,
+}
+
+/// 連線的型別（設計書 §1.1）：只決定流量怎麼被運送。建立後不可變（U1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnKind {
+    Ssh,
+    Wg,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Forward {
     pub name: String,
     pub local: u16,
-    pub remote: String,
+    /// `socks` 列沒有目的地（引擎內建 listener），`forward` 列必填（§1.3）。
+    ///
+    /// `skip_serializing_if` 讓 None 不會在 toml 裡寫出一個空字串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// 機制（§1.2）。省略即 [`RowKind::Forward`]
+    #[serde(default)]
+    pub kind: RowKind,
+    /// 後端是代理服務 ⇒ 做出口檢測並自動識別協定（§1.2）。
+    ///
+    /// 只對 `kind = Forward` 有意義；`Socks` 列恆測，這個欄位不得出現。
+    /// serde 預設 false，**讀檔後的遷移掃描會把舊檔缺鍵的補成 true**（§1.7）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe_proxy: bool,
     /// 使用者是否要這個出口保持連線；設定檔沒有這個欄位時視為 true
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -142,8 +182,10 @@ pub struct Source {
     pub forwards: Vec<Forward>,
 }
 
-/// 一顆使用者態 WireGuard 代理：對外表現成一個本地 SOCKS5 埠，
-/// 底下可以再掛靜態埠轉發（設計書 §4.1）。
+/// 一條使用者態 WireGuard 連線：底下掛 0..N 條列（設計書 §5.1）。
+///
+/// **沒有 `socksPort` 頂層欄位**——SOCKS5 埠是它底下某一條 `kind = "socks"` 列的
+/// `local`，而且可以有 0..N 條（§1.3 與 U4）。連線的身分鍵是 `name`，它自己沒有埠。
 ///
 /// 私鑰留在 `conf_path` 指的那份外部 `.conf` 裡，`traytunnel.toml` 只存路徑，
 /// 永遠不複製金鑰進來。
@@ -153,12 +195,9 @@ pub struct WgProxy {
     pub name: String,
     /// 指向外部的標準 wg `.conf`；相對路徑以設定檔所在資料夾為基準（W3.19）
     pub conf_path: String,
-    /// 本地 SOCKS5 監聽埠，與所有 ssh 出口的 local、所有 wg 轉發的 local
-    /// 共用同一個唯一鍵空間，跨種類也不可以重複
-    pub socks_port: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 直接沿用既有的 [`Forward`]，欄位完全相同
+    /// 0..N 條列，與 [`Source::forwards`] 是同一個型別
     #[serde(default)]
     pub forwards: Vec<Forward>,
 }
@@ -280,22 +319,119 @@ impl Config {
             .unwrap_or_default()
     }
 
-    // ---- wg 代理（骨架，行為由 W3 系列的測試定義）----
+    // ---- wg 連線（骨架，行為由 W3 系列的測試定義）----
 
-    /// 依 socksPort 找代理
-    pub fn wg_proxy(&self, _socks_port: u16) -> Option<&WgProxy> {
-        todo!("W3.*：依 socksPort 找 wg 代理")
+    /// 依連線名找 wg 連線。身分鍵是 `name`，wg 連線自己沒有埠（§5.2）
+    pub fn wg_proxy(&self, _name: &str) -> Option<&WgProxy> {
+        todo!("W3.*：依 name 找 wg 連線")
     }
 
-    /// 依本地埠找 wg 轉發（只查 wg，ssh 那邊仍走 [`Config::forward`]）
-    pub fn wg_forward(&self, _local: u16) -> Option<&Forward> {
-        todo!("W3.*：依 local 找 wg 轉發")
+    pub fn wg_proxy_mut(&mut self, _name: &str) -> Option<&mut WgProxy> {
+        todo!("W6.10：set_wg_enabled 要就地改連線自己的 enabled")
     }
 
-    /// 這個本地埠（socksPort 或轉發的 local）屬於哪一顆代理
+    /// 依本地埠找 wg 的列（只查 wg，ssh 那邊仍走 [`Config::forward`]）
+    pub fn wg_row(&self, _local: u16) -> Option<&Forward> {
+        todo!("W3.*：依 local 找 wg 的列")
+    }
+
+    /// 跨兩型連線的統一查詢：這個本地埠是哪一條連線底下的哪一條列。
+    ///
+    /// 指令層與監看迴圈都用它——`local` 是全域唯一鍵（D5），問到連線本身才知道
+    /// 日誌前綴要寫誰、以及這一條列該由 ssh 還是 wg 那一套動詞去啟停。
+    pub fn row(&self, _local: u16) -> Option<(ConnRef<'_>, &Forward)> {
+        todo!("W3.18／§5.1：跨兩型連線的列查詢")
+    }
+
+    /// 這個本地埠屬於哪一條 wg 連線
     pub fn wg_proxy_of(&self, _local: u16) -> Option<&WgProxy> {
-        todo!("W3.18：wg 埠的所屬代理，日誌前綴要靠它")
+        todo!("W3.18：wg 埠的所屬連線，日誌前綴要靠它")
     }
+
+    /// 所有 `kind == Socks` 的列（UI 分組要，§1.4）。跨兩型連線——雖然
+    /// SSH 連線帶 socks 列是錯誤（W3.23），這一支仍照定義掃全部，
+    /// 讓「合法設定裡只有 wg 有 socks 列」由驗證那一關保證，不是靠這裡少掃一半
+    pub fn socks_rows(&self) -> Vec<&Forward> {
+        todo!("W3.39")
+    }
+
+    /// 要被探測的列＝`should_probe` 為真的列（自測排程要，§5.4）
+    pub fn probed_rows(&self) -> Vec<&Forward> {
+        todo!("W3.39")
+    }
+}
+
+/// 一條列所屬的連線。兩型連線在「列」這一層是對稱的，只有運送方式不同（§1.1）
+#[derive(Debug, Clone, Copy)]
+pub enum ConnRef<'a> {
+    Ssh(&'a Source),
+    Wg(&'a WgProxy),
+}
+
+impl ConnRef<'_> {
+    pub fn name(&self) -> &str {
+        match self {
+            ConnRef::Ssh(s) => &s.name,
+            ConnRef::Wg(p) => &p.name,
+        }
+    }
+
+    pub fn kind(&self) -> ConnKind {
+        match self {
+            ConnRef::Ssh(_) => ConnKind::Ssh,
+            ConnRef::Wg(_) => ConnKind::Wg,
+        }
+    }
+}
+
+/// 這一條列要不要被探測。**§1.3 那張表的唯一實作**（W3.25）。
+///
+/// ①③（純轉發）為 false——它們指向任意 TCP 服務，拿代理協定去打必定失敗，
+/// 只會製造一個永遠亮著的假紅點；②④（`probeProxy`）與 ⑤（`socks`）為 true。
+pub fn should_probe(_kind: RowKind, _probe_proxy: bool) -> bool {
+    todo!("W3.25")
+}
+
+/// 要探測的列裡，哪些還需要先識別協定（W3.26）。
+///
+/// `socks` 列的 listener 是引擎自己起的，協定已知，免識別（§1.5）。
+pub fn needs_detect(_kind: RowKind) -> bool {
+    todo!("W3.26")
+}
+
+/// 快照與系統匣看到的列順序：`socks` 列一律排在 `forward` 列之前，
+/// 同 kind 內維持設定檔順序（§5.3／W3.40）。
+///
+/// 由後端保證順序、前端只在交界處插區段標題——不交給前端各自排，
+/// 否則系統匣與主視窗會排出兩種順序。SSH 連線只會有 `forward` 列，這條是恆等式。
+pub fn ordered_rows(_forwards: &[Forward]) -> Vec<&Forward> {
+    todo!("W3.40")
+}
+
+/// ssh 的連線總開關：**逐條改寫每個 forward 的 `enabled`**（W6.12 的對照組）。
+///
+/// 與 [`apply_wg_enabled`] 刻意不對稱，實作時別「順手對齊」——理由見 §5.5 那張表。
+/// 回傳 false 代表沒有這條連線。
+pub fn apply_source_enabled(_cfg: &mut Config, _name: &str, _on: bool) -> bool {
+    todo!("W6.12")
+}
+
+/// wg 的連線總開關：**只改連線自己的 `enabled`**，列的 `enabled` 一個都不碰
+/// （§5.5／W6.10）。回傳 false 代表沒有這條連線（W6.15）。
+pub fn apply_wg_enabled(_cfg: &mut Config, _name: &str, _on: bool) -> bool {
+    todo!("W6.10／W6.15")
+}
+
+/// 讀檔後的 `probeProxy` 遷移掃描（§1.7／W3.27）。
+///
+/// serde 的 `default` 分不出「舊檔缺欄位」與「新建」，所以掃的是**文件**而不是
+/// 設定物件：`kind = forward` 的列缺 `probeProxy` 鍵時補成 `true`，保住現役
+/// 使用者的出口 IP 顯示；`socks` 列不碰（它不得有這個欄位）。
+///
+/// 這**不改變 `LoadOutcome`**、不算 `Migrated`（W3.30）——檔案結構沒變，
+/// 只是補了一個有預設值的欄位。
+pub fn backfill_probe_proxy(_doc: &DocumentMut, _cfg: &mut Config) {
+    todo!("W3.27／W3.28／W3.29／W3.30")
 }
 
 impl Default for Config {
@@ -313,13 +449,17 @@ impl Default for Config {
                     Forward {
                         name: "exit-a".into(),
                         local: 1080,
-                        remote: "127.0.0.1:1080".into(),
+                        remote: Some("127.0.0.1:1080".into()),
+                        kind: RowKind::Forward,
+                        probe_proxy: true,
                         enabled: true,
                     },
                     Forward {
                         name: "exit-b".into(),
                         local: 1083,
-                        remote: "127.0.0.1:1083".into(),
+                        remote: Some("127.0.0.1:1083".into()),
+                        kind: RowKind::Forward,
+                        probe_proxy: true,
                         enabled: true,
                     },
                 ],
@@ -392,16 +532,20 @@ pub fn default_document() -> String {
          # 每個 [[sources.forwards]] 是一組本地埠轉發，各自跑一條獨立的 ssh 連線。\n\
          # local 是出口的唯一鍵，跨源也不可以重複。\n\
          # enabled 記錄使用者最後一次的連線／中斷選擇，省略時視為 true。\n\
+         # probeProxy = true 代表這條轉發的目的地是一個代理服務，會定期檢測並顯示出口 IP；\n\
+         # 目的地是一般 TCP 服務（資料庫、ssh…）時省略不寫即可。\n\
          [[sources.forwards]]\n\
          name = \"{fa}\"\n\
          local = {la}\n\
          remote = \"{ra}\"\n\
+         probeProxy = true\n\
          enabled = true\n\
          \n\
          [[sources.forwards]]\n\
          name = \"{fb}\"\n\
          local = {lb}\n\
          remote = \"{rb}\"\n\
+         probeProxy = true\n\
          enabled = true\n",
         close = c.close_to_tray,
         sname = s.name,
@@ -410,10 +554,10 @@ pub fn default_document() -> String {
         proxy = s.proxy_command,
         fa = s.forwards[0].name,
         la = s.forwards[0].local,
-        ra = s.forwards[0].remote,
+        ra = s.forwards[0].remote.as_deref().unwrap_or_default(),
         fb = s.forwards[1].name,
         lb = s.forwards[1].local,
-        rb = s.forwards[1].remote,
+        rb = s.forwards[1].remote.as_deref().unwrap_or_default(),
     )
 }
 
@@ -579,8 +723,13 @@ fn trim_config(cfg: &mut Config) {
 /// 補在解析的出口處，程式其他地方（ssh 參數、介面顯示、下次存檔）拿到的就永遠是
 /// `host:port`，不必各自再判斷一次；下次存檔時檔案裡那個 `8080` 也會被寫成完整形式。
 fn normalize_remotes(cfg: &mut Config) {
-    for f in cfg.sources.iter_mut().flat_map(|s| s.forwards.iter_mut()) {
-        f.remote = normalize_remote(&f.remote);
+    let ssh = cfg.sources.iter_mut().flat_map(|s| s.forwards.iter_mut());
+    let wg = cfg.wg_proxies.iter_mut().flat_map(|p| p.forwards.iter_mut());
+    // `socks` 列沒有目的地（remote 是 None），跳過而不是補一個空字串
+    for f in ssh.chain(wg) {
+        if let Some(remote) = f.remote.as_deref() {
+            f.remote = Some(normalize_remote(remote));
+        }
     }
 }
 
@@ -636,7 +785,7 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
         for f in &s.forwards {
             // 欄位規則與介面輸入共用同一個 check_forward_fields，兩條路才不會分岔。
             // 壞值放行的話會一路餵進 ssh -L，換來的是每 5 秒重連一次卻永遠接不起來
-            match check_forward_fields(&f.name, f.local, &f.remote) {
+            match check_forward_fields(&f.name, f.local, f.remote.as_deref().unwrap_or_default()) {
                 Some(ForwardIssue::Name) => {
                     return Err(format!(
                         "[[sources.forwards]] 的 name 不可為空，也不可含空白（連線 {}）",
@@ -649,7 +798,8 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
                 Some(ForwardIssue::Remote) => {
                     return Err(format!(
                         "出口 {} 的 remote 不合法：{}（要寫成 host:port，例如 127.0.0.1:1080，或只填埠號）",
-                        f.name, f.remote
+                        f.name,
+                        f.remote.as_deref().unwrap_or_default()
                     ))
                 }
                 None => {}
@@ -763,10 +913,35 @@ fn sync_forwards(tables: &mut ArrayOfTables, forwards: &[Forward]) {
         |t, f| {
             t["name"] = value(f.name.as_str());
             t["local"] = value(f.local as i64);
-            t["remote"] = value(f.remote.as_str());
+            // 鍵省略規則（§5.1／W3.43）：舊檔改一個欄位不會突然長出三個新鍵。
+            // `remote = None` 是移除該鍵而不是寫一個空字串——「沒有目的地」與
+            // 「目的地是空字串」在型別上分得開，落檔也要分得開
+            match f.remote.as_deref() {
+                Some(r) => t["remote"] = value(r),
+                None => {
+                    t.remove("remote");
+                }
+            }
+            match f.kind {
+                RowKind::Forward => {
+                    t.remove("kind");
+                }
+                RowKind::Socks => t["kind"] = value("socks"),
+            }
+            if f.probe_proxy {
+                t["probeProxy"] = value(true);
+            } else {
+                t.remove("probeProxy");
+            }
             t["enabled"] = value(f.enabled);
         },
     );
+}
+
+/// 頂層的 `[[wgProxies]]`：認 name，順手把自己底下的列也同步掉（W3.13～W3.16）
+#[allow(dead_code)]
+fn sync_wg_proxies(_tables: &mut ArrayOfTables, _proxies: &[WgProxy]) {
+    todo!("W3.13～W3.16：比照 sync_sources，認 name／巢狀認 local")
 }
 
 /// 頂層的 `[[sources]]`：認 name，順手把自己底下的 forwards 也同步掉
@@ -925,20 +1100,53 @@ pub fn valid_source_name(s: &str) -> bool {
 ///
 /// `remote` 先過一次 [`normalize_remote`]，只填埠號的寫法才會被放行；
 /// 呼叫端存檔時也要存正規化後的值，驗證與落檔看的才是同一個字串。
-pub fn validate_forward(
-    sources: &[Source],
-    original_local: Option<u16>,
-    name: &str,
-    local: u16,
-    remote: &str,
-) -> Option<String> {
-    if let Some(orig) = original_local {
+/// 一次列 upsert 的輸入（§5.1／§5.5）。
+///
+/// §5.1 說 `validate_forward` 的簽名要加 `conn_kind`、`kind`、`probe_proxy`，
+/// 連同原本的四個就是七個位置參數——收成一個結構才叫得出是誰對誰，
+/// 也才擋得住「兩個 bool 互換」那種編譯得過的錯。
+///
+/// 兩支 IPC upsert（`upsertForward`／`upsertWgSocks`）都組出這個結構再走
+/// [`prepare_forward`]，各自帶入固定的 `kind`——驗證與唯一性檢查只有一份實作。
+#[derive(Debug, Clone, Copy)]
+pub struct RowInput<'a> {
+    /// 這一條列要掛進哪一條連線
+    pub connection: &'a str,
+    /// 那條連線是 ssh 還是 wg（§5.5 的 `connectionKind`）。與 `connection`
+    /// 指到的實際型別不符時要回 `Err`（W3.37）
+    pub conn_kind: ConnKind,
+    /// 編輯前的本地埠，None 代表新增
+    pub original_local: Option<u16>,
+    pub name: &'a str,
+    pub local: u16,
+    /// `forward` 列必填、`socks` 列必須為 None（§1.3 的兩條驗證規則）
+    pub remote: Option<&'a str>,
+    /// 機制。**建立後不可變**（U1）：與既有列不符一律回 `Err`（W3.32／W3.33）
+    pub kind: RowKind,
+    /// **不在不可變之列**，隨時可改（W3.34）
+    pub probe_proxy: bool,
+}
+
+/// 新增／編輯列的欄位驗證，回傳 Some(訊息) 代表不通過。
+///
+/// 本地埠是列的**全域唯一鍵**（D5），因此連停用中的、別條連線底下的、
+/// 別一型連線底下的列也算佔用——撞埠訊息要能指出佔用者是哪一條連線的哪一種列
+/// （W3.12，實作走 [`port_owner`]）。
+///
+/// 訊息一律以欄位名開頭（`name: `／`local: `／`remote: `／`kind: `），
+/// 前端才能把錯誤掛回對應的欄位上。
+///
+/// `remote` 先過一次 [`normalize_remote`]，只填埠號的寫法才會被放行；
+/// 呼叫端存檔時也要存正規化後的值，驗證與落檔看的才是同一個字串。
+pub fn validate_forward(cfg: &Config, input: &RowInput<'_>) -> Option<String> {
+    let sources = &cfg.sources;
+    if let Some(orig) = input.original_local {
         if !sources.iter().any(|s| s.forward(orig).is_some()) {
             return Some(format!("local: no tunnel with port {orig}, it may have been deleted"));
         }
     }
     // 欄位規則與讀檔共用（見 check_forward_fields），這裡只負責翻成前端要的訊息
-    match check_forward_fields(name, local, remote) {
+    match check_forward_fields(input.name, input.local, input.remote.unwrap_or_default()) {
         Some(ForwardIssue::Name) => {
             return Some("name: required, and must not contain spaces".into())
         }
@@ -954,9 +1162,12 @@ pub fn validate_forward(
     let clash = sources
         .iter()
         .flat_map(|s| s.forwards.iter().map(move |f| (s, f)))
-        .find(|(_, f)| f.local == local && Some(local) != original_local);
+        .find(|(_, f)| f.local == input.local && Some(input.local) != input.original_local);
     if let Some((s, f)) = clash {
-        return Some(format!("local: port {local} already used by {} in {}", f.name, s.name));
+        return Some(format!(
+            "local: port {} already used by {} in {}",
+            input.local, f.name, s.name
+        ));
     }
     None
 }
@@ -967,16 +1178,20 @@ pub fn validate_forward(
 /// 呼叫端也只准把回傳的這一筆原封不動存下去，「驗過的字串」與「落檔的字串」
 /// 才不可能各走各的——remote 的埠號糖也只在這裡加一次。
 pub fn prepare_forward(
-    sources: &[Source],
-    original_local: Option<u16>,
-    name: &str,
-    local: u16,
-    remote: &str,
+    cfg: &Config,
+    input: &RowInput<'_>,
     enabled: bool,
 ) -> Result<Forward, String> {
-    let f =
-        Forward { name: name.trim().to_string(), local, remote: normalize_remote(remote), enabled };
-    match validate_forward(sources, original_local, &f.name, f.local, &f.remote) {
+    let f = Forward {
+        name: input.name.trim().to_string(),
+        local: input.local,
+        remote: input.remote.map(normalize_remote),
+        kind: input.kind,
+        probe_proxy: input.probe_proxy,
+        enabled,
+    };
+    let checked = RowInput { name: &f.name, remote: f.remote.as_deref(), ..*input };
+    match validate_forward(cfg, &checked) {
         Some(err) => Err(err),
         None => Ok(f),
     }
@@ -1019,25 +1234,27 @@ pub fn resolve_conf_path(_config_dir: &Path, _conf_path: &str) -> PathBuf {
     todo!("W3.19")
 }
 
-/// 撞埠時的佔用者描述，跨 ssh 出口／wg 代理／wg 轉發都認得（W3.12）。
+/// 撞埠時的佔用者描述，跨 ssh 的列與 wg 的列都認得（W3.12）。
 ///
-/// 既有的 [`validate_forward`] 只吃 `&[Source]`，看不見 wg 的埠，而它的簽名
-/// 被一整組既有測試釘著不能動。折衷是把「誰佔了這個埠」抽成這一支，
-/// 由 `validate_forward` 與 wg 那一側共用，訊息才分辨得出佔用者的種類。
+/// 描述要分辨得出佔用者是哪一條連線的**哪一種列**——`socks` 列與 `forward` 列
+/// 在使用者眼裡是兩種東西，訊息說不清楚的話，他只會看到一個查不出原因的撞埠。
 pub fn port_owner(_cfg: &Config, _local: u16) -> Option<String> {
     todo!("W3.12")
 }
 
-/// 新增／編輯 wg 代理的欄位驗證，回傳掛回欄位的訊息（前綴 `name:`／`confPath:`／
-/// `socksPort:`），沒問題時 None（W3.9～W3.11）。
+/// 新增／編輯 wg 連線的欄位驗證，回傳掛回欄位的訊息（前綴 `name:`／`confPath:`），
+/// 沒問題時 None（W3.9／W3.10）。
+///
+/// `original_name` 是編輯前的連線名，None 代表新增。**連線型別建立後不可變**
+/// （U1）：`original_name` 指向一個 ssh 源名時一律回 `Err`，不得把 ssh 源
+/// 改寫成 wg 連線（W3.36）。
 pub fn validate_wg_proxy(
     _cfg: &Config,
-    _original_socks_port: Option<u16>,
+    _original_name: Option<&str>,
     _name: &str,
     _conf_path: &str,
-    _socks_port: u16,
 ) -> Option<String> {
-    todo!("W3.9／W3.10／W3.11／U1 跨類型 upsert 被拒")
+    todo!("W3.9／W3.10／W3.36")
 }
 
 #[cfg(test)]

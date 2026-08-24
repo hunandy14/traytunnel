@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::wg::conf::IpNet;
 use crate::wg::device::{self, DeviceConfig, DeviceEvent, DeviceHandle};
@@ -377,8 +378,7 @@ async fn cancelling_tears_the_whole_tree_down_and_frees_the_ports() {
             .unwrap_or_else(|_| panic!("{what} 任務 500ms 內沒收工"))
             .unwrap();
     }
-    std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, pa)))
-        .expect("UDP 埠要被釋放");
+    std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, pa))).expect("UDP 埠要被釋放");
     tokio::net::TcpListener::bind(socks).await.expect("SOCKS5 監聽埠要被釋放");
 }
 
@@ -512,4 +512,105 @@ async fn a_mismatched_preshared_key_never_reports_connected() {
     }
     assert!(saw_stale);
     cancel.cancel();
+}
+
+// ---------------------------------- W8.28～W8.30：④ 型的經隧道協定識別（S）
+//
+// 這三條掛在同一個雙引擎測試檯上，證的是 §5.4 那個「探測零改動」的結論：
+// 識別器照舊連 `127.0.0.1:{local}`，而 `serve_forward` 就站在那個埠上當入口
+// 匝道，封包經 smoltcp → boringtun → UDP 走一趟隧道到對面的代理。
+
+/// B 側：在隧道內的 `10.9.0.2:port` 上跑一個假伺服器，對每條連線回一段固定位元組
+fn spawn_fake_backend(b: &Side, port: u16, reply: &'static [u8], cancel: CancellationToken) {
+    let (accept_tx, mut accept_rx) = tokio::sync::mpsc::channel(8);
+    let cmd = b.stack.cmd.clone();
+    tokio::spawn(async move {
+        let _ = cmd
+            .send(StackCmd::Listen {
+                endpoint: smoltcp::wire::IpEndpoint::new(
+                    smoltcp::wire::IpAddress::from(B_ADDR),
+                    port,
+                ),
+                accept: accept_tx,
+            })
+            .await;
+        loop {
+            let conn = tokio::select! {
+                _ = cancel.cancelled() => break,
+                c = accept_rx.recv() => match c { Some(c) => c, None => break },
+            };
+            tokio::spawn(async move {
+                let mut conn = conn;
+                // 先收下對方的招呼／CONNECT，再回固定答案
+                let _ = conn.rx.recv().await;
+                let _ = conn.tx.send(bytes::Bytes::from_static(reply)).await;
+            });
+        }
+    });
+}
+
+/// A 側：綁一條 ④ 型列（`kind = forward`、`probeProxy = true`），回傳它的本地埠
+async fn spawn_probed_forward(a: &Side, dst: String, cancel: CancellationToken) -> u16 {
+    let listener = tokio::net::TcpListener::bind((crate::wg::socks5::BIND_ADDR, 0)).await.unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let cmd = a.stack.cmd.clone();
+    tokio::spawn(async move { crate::wg::socks5::serve_forward(listener, cmd, dst, cancel).await });
+    local
+}
+
+/// 在 blocking 執行緒上跑識別器——它是阻塞式的，直接在 async 任務裡呼叫會卡住 runtime
+async fn detect_off_thread(port: u16) -> crate::exits::Detected {
+    tokio::task::spawn_blocking(move || crate::exits::detect(port)).await.unwrap()
+}
+
+/// W8.28 隧道對面跑著 SOCKS5 代理的 ④ 型列：識別得出來，
+/// **而且識別封包確實經過了 UDP socket**——這是「探測零改動」那個結論的實證
+#[tokio::test]
+async fn a_probed_forward_detects_socks5_through_the_tunnel() {
+    let bench = bench().await;
+    spawn_fake_backend(&bench.b, 1080, &[0x05, 0x00], bench.cancel.clone());
+    let local =
+        spawn_probed_forward(&bench.a, format!("{B_ADDR}:1080"), bench.cancel.clone()).await;
+
+    let before = device::UDP_TX_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+    let got = detect_off_thread(local).await;
+    assert_eq!(got, crate::exits::Detected::Ok(crate::exits::ProxyProtocol::Socks5));
+    assert!(
+        device::UDP_TX_COUNT.load(std::sync::atomic::Ordering::SeqCst) > before,
+        "識別封包必須真的走過隧道，不是在本機被誰短路掉"
+    );
+    bench.cancel.cancel();
+}
+
+/// W8.29 同上，但對面是 HTTP CONNECT 代理
+#[tokio::test]
+async fn a_probed_forward_detects_http_through_the_tunnel() {
+    let bench = bench().await;
+    spawn_fake_backend(
+        &bench.b,
+        3128,
+        b"HTTP/1.1 200 Connection established\r\n\r\n",
+        bench.cancel.clone(),
+    );
+    let local =
+        spawn_probed_forward(&bench.a, format!("{B_ADDR}:3128"), bench.cancel.clone()).await;
+    assert_eq!(
+        detect_off_thread(local).await,
+        crate::exits::Detected::Ok(crate::exits::ProxyProtocol::Http)
+    );
+    bench.cancel.cancel();
+}
+
+/// W8.30 對面那個埠沒人聽：回 NotAProxy 並顯示那一句固定的中文，不可以卡到逾時
+#[tokio::test]
+async fn a_probed_forward_to_a_dead_backend_says_it_is_not_a_proxy() {
+    let bench = bench().await;
+    // 9 號埠沒人 Listen，B 側的 smoltcp 會回 RST
+    let local = spawn_probed_forward(&bench.a, format!("{B_ADDR}:9"), bench.cancel.clone()).await;
+    let started = std::time::Instant::now();
+    let got = detect_off_thread(local).await;
+    assert_eq!(got, crate::exits::Detected::NotAProxy);
+    assert_eq!(crate::exits::detect_message(&got), crate::exits::NOT_A_PROXY_TEXT);
+    assert!(started.elapsed() < Duration::from_secs(7), "對面回 RST 就該立刻收手，不是等逾時");
+    bench.cancel.cancel();
 }

@@ -64,6 +64,19 @@ pub struct ExitTestPayload {
 pub struct TestView {
     pub state: String,
     pub text: String,
+    /// 識別出的代理協定，給 UI 徽章用（`"socks5"`／`"http"`）。
+    ///
+    /// 識別不出來時是 None，而且**該鍵整個不出現**——送一個空字串等於叫前端
+    /// 畫一顆空白徽章（W8.27）。舊的讀取端讀到 undefined 不受影響（§5.3）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+impl TestView {
+    /// 沒有協定資訊的自測結果——ssh 那條既有路徑與所有「還沒識別」的情況都用它
+    pub fn plain(state: impl Into<String>, text: impl Into<String>) -> Self {
+        TestView { state: state.into(), text: text.into(), protocol: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,10 +84,38 @@ pub struct TestView {
 pub struct ExitView {
     pub name: String,
     pub local: u16,
-    pub remote: String,
+    /// `socks` 列沒有目的地（§1.3 ⑤）
+    pub remote: Option<String>,
+    /// `"forward"` | `"socks"`——前端據此在兩段的交界處插區段標題（§1.4）
+    pub kind: String,
+    /// 前端據此決定要不要留徽章／出口 IP 的位置（§5.3）
+    pub probe_proxy: bool,
     pub enabled: bool,
     pub status: String,
     pub last_test: Option<TestView>,
+}
+
+/// 一條 wg 連線在快照裡的樣貌（§5.3）。
+///
+/// 機密邊界：`endpoint`／`addresses`／`dns`／`allowed_ips` **不是機密**（在任何
+/// WireGuard 客戶端的介面上都看得到，而且使用者需要它們才知道轉發的 `remote`
+/// 該怎麼寫）。**唯一的機密是 `PrivateKey` 與 `PresharedKey`**，它們不進
+/// `Config`、不進 `Snapshot`、不進任何 `Serialize`、不進任何日誌。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WgProxyView {
+    pub name: String,
+    pub conf_path: String,
+    pub enabled: bool,
+    /// `.conf` 讀不到／解析不過時的訊息，讀得到就是 None
+    pub conf_error: Option<String>,
+    /// 卡片副標要顯示的東西（U4）
+    pub endpoint: String,
+    pub addresses: Vec<String>,
+    pub dns: Vec<String>,
+    pub allowed_ips: Vec<String>,
+    /// 這條連線底下的列，`socks` 列已排在前（§1.4：「SOCKS5」區段在上）
+    pub exits: Vec<ExitView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +147,8 @@ pub struct Snapshot {
     /// 實際生效的值（設定檔沒寫時已經照模式決定好了），設定頁的開關直接吃它
     pub check_for_updates: bool,
     pub sources: Vec<SourceView>,
+    /// wg 連線。對舊前端是相容的加法：沒有就是空陣列
+    pub wg_proxies: Vec<WgProxyView>,
     /// 活動日誌回放，順序由舊到新，內容與 log 事件的整行一致
     pub logs: Vec<String>,
     /// 背景檢查發現的新版，沒有就是 null（介面靠它決定要不要顯示更新列）
@@ -184,6 +227,18 @@ pub(crate) fn visible_test(status: &str, last_test: Option<TestView>) -> Option<
     }
 }
 
+/// `clear_exit_test` 的完整作用：自測顯示與**協定識別快取**一起清掉（W8.25）。
+///
+/// 兩者的作廢時機完全一致（§1.5）：斷線、停用、重接都會經過這裡。分開清的話，
+/// 遲早會出現「線斷了、徽章還掛著上一輪識別出來的協定」那種畫面。
+#[allow(dead_code)]
+pub(crate) fn cleared_test_state(
+    _last_test: Option<TestView>,
+    _detected: Option<crate::exits::ProxyProtocol>,
+) -> (Option<TestView>, Option<crate::exits::ProxyProtocol>) {
+    todo!("W8.25")
+}
+
 /// 設定 + 執行期狀態 → 每個源與其出口的當下樣貌。
 /// 兩把鎖都由呼叫端持著，這裡只做純粹的組裝。
 fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceView> {
@@ -205,6 +260,11 @@ fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceVi
                         name: f.name.clone(),
                         local: f.local,
                         remote: f.remote.clone(),
+                        kind: match f.kind {
+                            crate::config::RowKind::Forward => "forward".into(),
+                            crate::config::RowKind::Socks => "socks".into(),
+                        },
+                        probe_proxy: f.probe_proxy,
                         enabled: f.enabled,
                         last_test: visible_test(&status, rt.and_then(|r| r.last_test.clone())),
                         status,
@@ -592,7 +652,7 @@ impl AppState {
     /// 中途被 halt／restart／斷線重連換掉憑證的探測寫不進去。順帶保留原本
     /// 「只更新既存的出口」的性質，已刪掉的埠不會靠一次晚到的自測結果復活。
     pub fn set_exit_test_of(&self, local: u16, token: TestToken, state: &str, text: &str) {
-        let view = TestView { state: state.into(), text: text.into() };
+        let view = TestView::plain(state, text);
         let written = {
             let mut exits = self.exits.lock().unwrap();
             exits.get_mut(&local).is_some_and(|rt| guarded_write_test(rt, token, &view))
@@ -831,6 +891,9 @@ impl AppState {
             autostart: self.autostart(),
             check_for_updates: self.checks_for_updates(),
             sources,
+            // 骨架階段一律是空的：wg 的檢視組裝（含 .conf 摘要與列排序）由
+            // 實作車道補上，形狀已經由 §5.3 定死
+            wg_proxies: Vec::new(),
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
             update: self.update_info(),
         }
@@ -948,10 +1011,7 @@ mod tests {
     fn a_test_result_still_goes_out_flat() {
         let payload = ExitTestPayload {
             local: 1080,
-            result: Some(TestView {
-                state: test_state::OK.into(),
-                text: "1.2.3.4  Taipei, TW".into(),
-            }),
+            result: Some(TestView::plain(test_state::OK, "1.2.3.4  Taipei, TW")),
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["local"], 1080);
@@ -972,7 +1032,7 @@ mod tests {
     /// 都會把前端剛清掉的舊出口 IP 回灌回畫面上
     #[test]
     fn a_snapshot_only_carries_the_test_while_connected() {
-        let view = || Some(TestView { state: test_state::OK.into(), text: "1.2.3.4".into() });
+        let view = || Some(TestView::plain(test_state::OK, "1.2.3.4"));
         assert!(visible_test(status::CONNECTED, view()).is_some());
         for s in [
             status::STOPPED,
@@ -1054,7 +1114,7 @@ mod tests {
     #[test]
     fn a_stale_token_writes_no_test_result() {
         let mut rt = halted(8, 2);
-        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4  Taipei, TW".into() };
+        let view = TestView::plain(test_state::OK, "1.2.3.4  Taipei, TW");
         assert!(!guarded_write_test(&mut rt, token(7, 2), &view), "世代不符要擋下");
         assert_eq!(rt.last_test, None);
         // 世代對、期號不對（ssh 自己掛掉後在同一代裡重連）一樣要擋下
@@ -1066,9 +1126,9 @@ mod tests {
     #[test]
     fn a_stale_token_cannot_overwrite_a_current_result() {
         let mut rt = halted(8, 2);
-        let fresh = TestView { state: test_state::OK.into(), text: "5.6.7.8".into() };
+        let fresh = TestView::plain(test_state::OK, "5.6.7.8");
         assert!(guarded_write_test(&mut rt, token(8, 2), &fresh));
-        let stale = TestView { state: test_state::FAIL.into(), text: "no response".into() };
+        let stale = TestView::plain(test_state::FAIL, "no response");
         assert!(!guarded_write_test(&mut rt, token(8, 1), &stale));
         assert_eq!(rt.last_test.as_ref(), Some(&fresh), "當代的結果要留著");
     }
@@ -1077,7 +1137,7 @@ mod tests {
     #[test]
     fn a_current_token_writes_the_test_result_through() {
         let mut rt = halted(8, 2);
-        let view = TestView { state: test_state::OK.into(), text: "1.2.3.4".into() };
+        let view = TestView::plain(test_state::OK, "1.2.3.4");
         assert!(guarded_write_test(&mut rt, token(8, 2), &view));
         assert_eq!(rt.last_test.as_ref(), Some(&view));
     }

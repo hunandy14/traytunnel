@@ -1,4 +1,7 @@
-//! `wg::conf` 的測試——設計書 §5 的 W1 系列（31 條，全部 F）。
+//! `wg::conf` 的測試——設計書 §6 的 W1 系列（37 條，全部 F）。
+//!
+//! W1.1～W1.31 是 `.conf` 解析本身，W1.32～W1.37 是 `wg::inspect_conf`
+//! （IPC `inspectConf`，§5.5 第 4 支）——同一份解析器的另一個入口。
 //!
 //! 用 `#[path]` 掛回 conf.rs，慣例與 `config_tests.rs` 相同：生產碼與測試各佔
 //! 一個檔案，模組路徑仍是 `conf::tests`，`use super::*;` 拿得到私有項。
@@ -151,18 +154,14 @@ fn inline_comments_are_an_error_not_a_silent_trim() {
 /// W1.8 缺 `[Interface]`／缺 `[Peer]`／兩個 `[Peer]`
 #[test]
 fn interface_and_peer_must_appear_exactly_once() {
-    let no_iface =
-        format!("[Peer]\nPublicKey = {}\nEndpoint = h:51820\n", b64(PUB));
+    let no_iface = format!("[Peer]\nPublicKey = {}\nEndpoint = h:51820\n", b64(PUB));
     assert!(parse(&no_iface).is_err(), "缺 [Interface] 要錯");
 
     let no_peer = format!("[Interface]\nPrivateKey = {}\nAddress = 10.9.0.1/32\n", b64(PRIV));
     assert!(parse(&no_peer).is_err(), "缺 [Peer] 要錯");
 
-    let two_peers = format!(
-        "{}\n[Peer]\nPublicKey = {}\nEndpoint = h2:51820\n",
-        minimal(),
-        b64([0x04; 32])
-    );
+    let two_peers =
+        format!("{}\n[Peer]\nPublicKey = {}\nEndpoint = h2:51820\n", minimal(), b64([0x04; 32]));
     let err = parse(&two_peers).expect_err("兩個 [Peer] 要錯");
     assert!(err.contains("peer"), "訊息要說明 v1 只支援單一 peer：{err}");
 }
@@ -328,8 +327,15 @@ fn wireproxy_socks5_section_is_skipped_with_an_explicit_warning() {
 /// W1.24 其餘 wireproxy 擴充段各自跳過並警告
 #[test]
 fn every_other_wireproxy_section_is_skipped_with_a_warning() {
-    let sections =
-        ["TCPClientTunnel", "TCPServerTunnel", "STDIOTunnel", "http", "SNI", "Resolve", "UDPProxyTunnel"];
+    let sections = [
+        "TCPClientTunnel",
+        "TCPServerTunnel",
+        "STDIOTunnel",
+        "http",
+        "SNI",
+        "Resolve",
+        "UDPProxyTunnel",
+    ];
     let mut raw = minimal();
     for s in sections {
         raw.push_str(&format!("\n[{s}]\nWhatever = 1\n"));
@@ -426,4 +432,106 @@ fn no_system_resolver_anywhere_but_device_resolve_endpoint() {
             );
         }
     }
+}
+
+// ------------------------------------------ inspect_conf（IPC inspectConf）
+
+use crate::wg::inspect_conf;
+
+/// 把一段 conf 內容寫進暫存檔，回傳路徑（測試不碰任何真實的 `.conf`）
+fn write_conf(tag: &str, raw: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("traytunnel-w1-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.conf");
+    std::fs::write(&path, raw).unwrap();
+    path
+}
+
+/// W1.32 對一份合法 conf 呼叫 `inspect_conf`，摘要與 `parse` 的結果一致
+#[test]
+fn inspect_conf_reports_the_same_fields_as_parse() {
+    let raw = format!(
+        "[Interface]\nPrivateKey = {}\nAddress = 10.9.0.2/24\nDNS = 10.9.0.1\n\n\
+         [Peer]\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0, ::/0\n\
+         Endpoint = gw.example.net:51820\nPersistentKeepalive = 25\n",
+        b64(PRIV),
+        b64(PUB)
+    );
+    let path = write_conf("ok", &raw);
+    let summary = inspect_conf(&path).expect("合法的 conf 要看得出內容");
+    let parsed = parse(&raw).unwrap().summary();
+    assert_eq!(summary.endpoint, parsed.endpoint);
+    assert_eq!(summary.addresses, parsed.addresses);
+    assert_eq!(summary.dns, parsed.dns);
+    assert_eq!(summary.allowed_ips, parsed.allowed_ips);
+    assert_eq!(summary.mtu, parsed.mtu);
+    assert_eq!(summary.keepalive, parsed.keepalive);
+}
+
+/// W1.33 `inspect_conf` **不連外**：端點寫一個不可能解析的主機名也照樣成功
+#[test]
+fn inspect_conf_never_resolves_the_endpoint() {
+    let raw = minimal().replace("vpn.example.com:51820", "nonexistent.invalid:51820");
+    let path = write_conf("noresolve", &raw);
+    let summary = inspect_conf(&path).expect("它只解析不握手");
+    assert_eq!(summary.endpoint, "nonexistent.invalid:51820", "主機名要原樣留在字串裡");
+}
+
+/// W1.34 對壞檔：訊息與 `parse` 的一致，且**不含任何金鑰片段**
+#[test]
+fn inspect_conf_reports_parse_errors_without_echoing_keys() {
+    // 缺 PrivateKey
+    let raw = minimal().replace(&format!("PrivateKey = {}\n", b64(PRIV)), "");
+    let path = write_conf("nokey", &raw);
+    let err = inspect_conf(&path).expect_err("缺 PrivateKey 要錯");
+    assert_eq!(err, parse(&raw).unwrap_err(), "兩個入口的訊息要是同一句");
+
+    // 金鑰長度不對
+    let short = base64::engine::general_purpose::STANDARD.encode([0x01u8; 16]);
+    let raw = minimal().replace(&b64(PRIV), &short);
+    let path = write_conf("shortkey", &raw);
+    let err = inspect_conf(&path).expect_err("長度不對要錯");
+    assert!(!err.contains(&short), "錯誤訊息不得回放輸入：{err}");
+
+    // 兩個 [Peer]
+    let raw =
+        format!("{}\n[Peer]\nPublicKey = {}\nEndpoint = h2:51820\n", minimal(), b64([0x04; 32]));
+    let path = write_conf("twopeers", &raw);
+    assert!(inspect_conf(&path).is_err());
+}
+
+/// W1.35 對不存在的路徑：回 Err 且訊息點名讀不到檔案，不 panic
+#[test]
+fn inspect_conf_on_a_missing_file_is_an_error_not_a_panic() {
+    let dir = std::env::temp_dir().join(format!("traytunnel-w135-{}", std::process::id()));
+    let err = inspect_conf(&dir.join("definitely-not-here.conf")).expect_err("讀不到檔案要錯");
+    assert!(!err.is_empty(), "訊息不可以是空的");
+}
+
+/// W1.36 摘要要帶著解析 warning，面板才顯示得出「這些東西被忽略了」
+#[test]
+fn inspect_conf_carries_the_warnings_through() {
+    let raw = format!(
+        "{}\n[Socks5]\nBindAddress = 127.0.0.1:25344\n",
+        with_interface_line("PostUp = echo hi")
+    );
+    let path = write_conf("warnings", &raw);
+    let summary = inspect_conf(&path).expect("這些都是容忍跳過，不是錯誤");
+    let joined = summary.warnings.join("\n");
+    assert!(joined.contains("PostUp"), "{joined}");
+    assert!(joined.contains("Socks5"), "{joined}");
+}
+
+/// W1.37 `inspect_conf` 回傳值的 serde 輸出沒有金鑰欄位
+/// （與 W1.30 同一道防線，但走的是 IPC 這一側）
+#[test]
+fn the_ipc_summary_never_serialises_a_key() {
+    let path = write_conf("ipc-secrets", &minimal());
+    let summary = inspect_conf(&path).unwrap();
+    let v = serde_json::to_value(&summary).unwrap();
+    let obj = v.as_object().expect("摘要要是一個物件");
+    assert!(!obj.contains_key("privateKey"));
+    assert!(!obj.contains_key("presharedKey"));
+    assert!(!v.to_string().contains(&b64(PRIV)), "連值都不可以夾帶");
 }

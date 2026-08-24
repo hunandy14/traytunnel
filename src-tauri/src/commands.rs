@@ -315,8 +315,20 @@ pub fn upsert_forward(
             Some(orig) => c.forward(orig).is_some_and(|f| f.enabled),
             None => true,
         };
-        // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去
-        config::prepare_forward(&c.sources, original_local, &name, local, &remote, was_enabled)
+        // 正規化與驗證都在 config 那邊做完，這裡只負責把它給的那一筆原樣存下去。
+        // 這一支目前只服務 ssh 源；WG 那一側的 connectionKind／probeProxy 由
+        // 實作車道接上去（§5.5），骨架階段先固定成既有行為
+        let input = config::RowInput {
+            connection: &source,
+            conn_kind: config::ConnKind::Ssh,
+            original_local,
+            name: &name,
+            local,
+            remote: Some(remote.as_str()),
+            kind: config::RowKind::Forward,
+            probe_proxy: false,
+        };
+        config::prepare_forward(c, &input, was_enabled)
     });
     let forward = match prepared {
         Ok(f) => f,
@@ -329,13 +341,17 @@ pub fn upsert_forward(
         // 同 upsert_source 的理由：驗證與寫入之間 cfg 鎖是放開的，兩個同時進來的
         // 新增可以雙雙通過驗證，再一前一後 push 進兩筆佔著同一個本地埠的出口。
         // 這裡只重驗唯一性那一段（值本身已經正規化過了），成本是幾個整數比較
-        if let Some(err) = config::validate_forward(
-            &c.sources,
+        let recheck = config::RowInput {
+            connection: &source,
+            conn_kind: config::ConnKind::Ssh,
             original_local,
-            &forward.name,
-            forward.local,
-            &forward.remote,
-        ) {
+            name: &forward.name,
+            local: forward.local,
+            remote: forward.remote.as_deref(),
+            kind: forward.kind,
+            probe_proxy: forward.probe_proxy,
+        };
+        if let Some(err) = config::validate_forward(c, &recheck) {
             return Err(err);
         }
         if let Some(orig) = original_local {

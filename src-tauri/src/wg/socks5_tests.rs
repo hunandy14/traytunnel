@@ -229,10 +229,12 @@ fn fake_stack(
                             let _ = reply.send(Err(e));
                         }
                         Ok(()) => {
-                            let (up_tx, mut up_rx) =
-                                tokio::sync::mpsc::channel::<bytes::Bytes>(crate::wg::stack::CONN_CHANNEL_DEPTH);
-                            let (down_tx, down_rx) =
-                                tokio::sync::mpsc::channel::<bytes::Bytes>(crate::wg::stack::CONN_CHANNEL_DEPTH);
+                            let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
+                                crate::wg::stack::CONN_CHANNEL_DEPTH,
+                            );
+                            let (down_tx, down_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
+                                crate::wg::stack::CONN_CHANNEL_DEPTH,
+                            );
                             let conn = Conn {
                                 port: VirtualPort(41000 + n as u16),
                                 tx: up_tx,
@@ -271,8 +273,12 @@ fn fake_stack(
 /// 綁一個 loopback 監聽埠並把 serve_socks5 起起來
 async fn serve(
     script: Script,
-) -> (SocketAddr, Arc<Observed>, tokio_util::sync::CancellationToken, Vec<tokio::task::JoinHandle<()>>)
-{
+) -> (
+    SocketAddr,
+    Arc<Observed>,
+    tokio_util::sync::CancellationToken,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
     let listener = TcpListener::bind((BIND_ADDR, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();

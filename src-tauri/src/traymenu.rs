@@ -260,7 +260,9 @@ mod tests {
         ExitView {
             name: name.into(),
             local,
-            remote: format!("127.0.0.1:{local}"),
+            remote: Some(format!("127.0.0.1:{local}")),
+            kind: "forward".into(),
+            probe_proxy: false,
             enabled,
             status: st.into(),
             last_test: None,

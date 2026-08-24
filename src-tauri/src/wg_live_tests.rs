@@ -1,5 +1,5 @@
-//! 實機測試——設計書 §5 的 W7 系列（3 條），比照 `exits::live_probe` 一律
-//! `#[ignore]`，只有手動指定才會跑：
+//! 實機測試——設計書 §6 的 W7 系列（4 條：守門的 W7.0 是 F 且照跑，
+//! W7.1～W7.3 比照 `exits::live_probe` 一律 `#[ignore]`），只有手動指定才會跑：
 //!
 //! ```text
 //! cargo test --lib -- --ignored --nocapture live_wg
@@ -12,7 +12,7 @@
 //! - **嚴禁連使用者內網的任何位址**：不得對 `[Interface] Address` 所在網段、
 //!   `AllowedIPs` 涵蓋的私有網段，或任何 RFC1918／ULA 位址發起連線測試，
 //!   也不得掃描、探測或列舉隧道內的主機與服務。這道限制由
-//!   [`assert_outside_the_tunnel`] 在程式碼裡擋住，不靠寫測試的人自律。
+//!   [`assert_public_destination`] 在程式碼裡擋住，不靠寫測試的人自律。
 //! - **輸出一律不得包含 `.conf` 的任何內容**：端點主機名、位址、DNS 位址皆不印。
 //!
 //! conf 路徑一律從環境變數 `TRAYTUNNEL_TEST_WG_CONF` 讀，測試碼裡不寫死任何
@@ -42,7 +42,7 @@ fn conf_path() -> Option<PathBuf> {
 ///
 /// 私有位址（RFC1918／ULA／loopback／link-local／CGNAT）一律當場 panic，
 /// 任何人日後想在這一組測試裡「順手驗一下內網服務」都會直接撞上這道牆。
-fn assert_outside_the_tunnel(ip: IpAddr) {
+fn assert_public_destination(ip: IpAddr) {
     let banned = match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -68,6 +68,40 @@ fn assert_outside_the_tunnel(ip: IpAddr) {
     assert!(!banned, "實機測試禁止連隧道內／私有網段的位址（決策紀錄 U2）");
 }
 
+/// W7.0 **守門函式本身**（這一條是 F，而且是 W7.1～W7.3 的前置）。
+///
+/// 紅線靠程式碼擋，不靠寫測試的人自律——所以這道牆自己也要有測試。
+/// 它預設不被 `#[ignore]`：守門壞掉的話，整組實機測試的安全前提就沒了，
+/// 那不是「手動才跑」該承擔的風險。
+#[test]
+fn the_destination_guard_rejects_every_private_range() {
+    // 允許的：公網位址
+    for ok in ["1.1.1.1", "8.8.8.8", "203.0.113.7", "2001:4860:4860::8888"] {
+        assert_public_destination(ok.parse::<IpAddr>().unwrap());
+    }
+    // 一律擋下的：RFC1918、CGNAT、loopback、link-local、ULA
+    let banned = [
+        "10.0.0.1",        // RFC1918 10/8
+        "172.16.0.1",      // RFC1918 172.16/12
+        "172.31.255.254",  // RFC1918 上界
+        "192.168.1.1",     // RFC1918 192.168/16
+        "100.64.0.1",      // CGNAT 100.64/10
+        "100.127.255.254", // CGNAT 上界
+        "127.0.0.1",       // loopback
+        "169.254.1.1",     // link-local
+        "0.0.0.0",         // unspecified
+        "::1",             // v6 loopback
+        "fd00::1",         // ULA
+        "fc00::1",         // ULA
+        "fe80::1",         // v6 link-local
+    ];
+    for bad in banned {
+        let ip: IpAddr = bad.parse().unwrap();
+        let hit = std::panic::catch_unwind(|| assert_public_destination(ip));
+        assert!(hit.is_err(), "{bad} 必須被守門擋下（決策紀錄 U2）");
+    }
+}
+
 /// W7.1 握手驗證：與 `.conf` 指定的端點握一次手，只輸出成功／失敗與耗時。
 ///
 /// **不印任何 conf 內容**——端點主機名、位址、DNS 位址皆不出現在輸出裡。
@@ -87,7 +121,7 @@ fn live_wg_handshake() {
 /// W7.2 經真隧道的 SOCKS5 埠跑一次 `exits::probe`，印出出口 IP。
 ///
 /// 這是唯一允許的對外連線：ipinfo.io 是公網的 IP 檢測站，
-/// 目的地在 [`assert_outside_the_tunnel`] 那一關已經被限死。
+/// 目的地在 [`assert_public_destination`] 那一關已經被限死。
 #[test]
 #[ignore]
 fn live_wg_probe() {
@@ -96,12 +130,12 @@ fn live_wg_probe() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1085);
-    match crate::exits::probe(port) {
+    match crate::exits::probe(port, crate::exits::ProxyProtocol::Socks5) {
         crate::exits::ExitTest::Ok(text) => {
             // 回來的第一段是出口 IP，先過紅線檢查再印
             if let Some(ip) = text.split_whitespace().next().and_then(|s| s.parse::<IpAddr>().ok())
             {
-                assert_outside_the_tunnel(ip);
+                assert_public_destination(ip);
             }
             println!("exit: {text}");
         }
@@ -129,12 +163,12 @@ fn live_wg_soak() {
     let mut last_exit: Option<String> = None;
     let mut exit_changes = 0u32;
     for _ in 0..minutes {
-        match crate::exits::probe(port) {
+        match crate::exits::probe(port, crate::exits::ProxyProtocol::Socks5) {
             crate::exits::ExitTest::Ok(text) => {
                 if let Some(ip) =
                     text.split_whitespace().next().and_then(|s| s.parse::<IpAddr>().ok())
                 {
-                    assert_outside_the_tunnel(ip);
+                    assert_public_destination(ip);
                 }
                 if last_exit.as_deref().is_some_and(|p| p != text) {
                     exit_changes += 1;
@@ -147,7 +181,9 @@ fn live_wg_soak() {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
     let total = ok + fail;
-    println!("soak {minutes}m: ok={ok} fail={fail} failure_rate={:.2}% exit_changes={exit_changes}",
-        if total == 0 { 0.0 } else { fail as f64 * 100.0 / total as f64 });
+    println!(
+        "soak {minutes}m: ok={ok} fail={fail} failure_rate={:.2}% exit_changes={exit_changes}",
+        if total == 0 { 0.0 } else { fail as f64 * 100.0 / total as f64 }
+    );
     assert_eq!(fail, 0, "長跑期間出現失敗");
 }

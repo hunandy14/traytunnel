@@ -112,7 +112,14 @@ fn parse_query(msg: &[u8]) -> Option<(u16, String, u16)> {
 }
 
 /// 組一份 DNS 回應。`rcode = 3` 就是 NXDOMAIN。
-fn build_response(query: &[u8], id: u16, qname: &str, qtype: u16, addrs: &[IpAddr], rcode: u8) -> Vec<u8> {
+fn build_response(
+    query: &[u8],
+    id: u16,
+    qname: &str,
+    qtype: u16,
+    addrs: &[IpAddr],
+    rcode: u8,
+) -> Vec<u8> {
     let answers: Vec<&IpAddr> = addrs
         .iter()
         .filter(|a| (qtype == 1 && a.is_ipv4()) || (qtype == 28 && a.is_ipv6()))
@@ -124,7 +131,7 @@ fn build_response(query: &[u8], id: u16, qname: &str, qtype: u16, addrs: &[IpAdd
     m.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
     m.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     m.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-    // 問題段原樣抄回
+                                              // 問題段原樣抄回
     m.extend_from_slice(&query[12..]);
     for a in answers {
         m.extend_from_slice(&[0xC0, 0x0C]); // 指回問題段的名字
@@ -213,14 +220,8 @@ fn spin_up_client(
     let inbound = std::mem::replace(&mut device.inbound, dummy_rx);
     let stack = stack::spawn(
         StackConfig {
-            addresses: vec![smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::from(A_ADDR),
-                32,
-            )],
-            dns_servers: dns_servers
-                .into_iter()
-                .map(smoltcp::wire::IpAddress::from)
-                .collect(),
+            addresses: vec![smoltcp::wire::IpCidr::new(smoltcp::wire::IpAddress::from(A_ADDR), 32)],
+            dns_servers: dns_servers.into_iter().map(smoltcp::wire::IpAddress::from).collect(),
             mtu: crate::wg::conf::DEFAULT_MTU,
             allowed_ips: vec![crate::wg::conf::IpNet {
                 addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -267,10 +268,7 @@ fn two_free_udp_ports() -> (u16, u16) {
     (a.local_addr().unwrap().port(), b.local_addr().unwrap().port())
 }
 
-async fn resolve(
-    client: &Client,
-    name: &str,
-) -> Result<Vec<IpAddr>, ResolveError> {
+async fn resolve(client: &Client, name: &str) -> Result<Vec<IpAddr>, ResolveError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     client
         .stack
@@ -411,12 +409,10 @@ async fn the_seventeenth_query_fails_fast_instead_of_blocking() {
             .unwrap();
         pending.push(rx);
     }
-    let extra = tokio::time::timeout(
-        Duration::from_secs(1),
-        resolve(&bench.client, "slot16.test.invalid"),
-    )
-    .await
-    .expect("用罄時要立刻回，不可以卡住");
+    let extra =
+        tokio::time::timeout(Duration::from_secs(1), resolve(&bench.client, "slot16.test.invalid"))
+            .await
+            .expect("用罄時要立刻回，不可以卡住");
     assert_eq!(extra, Err(ResolveError::Timeout));
     bench.cancel.cancel();
 }

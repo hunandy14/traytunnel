@@ -18,7 +18,14 @@ fn tmp_dir(tag: &str) -> PathBuf {
 }
 
 fn fwd(name: &str, local: u16) -> Forward {
-    Forward { name: name.into(), local, remote: "127.0.0.1:1080".into(), enabled: true }
+    Forward {
+        name: name.into(),
+        local,
+        remote: Some("127.0.0.1:1080".into()),
+        kind: RowKind::Forward,
+        probe_proxy: false,
+        enabled: true,
+    }
 }
 
 fn src(name: &str, forwards: Vec<Forward>) -> Source {
@@ -29,6 +36,58 @@ fn src(name: &str, forwards: Vec<Forward>) -> Source {
         proxy_command: String::new(),
         forwards,
     }
+}
+
+/// 只有 ssh 源的設定，給那些原本吃 `&[Source]` 的驗證測試用
+fn ssh_only(sources: Vec<Source>) -> Config {
+    Config { close_to_tray: true, check_for_updates: None, sources, wg_proxies: Vec::new() }
+}
+
+/// ssh 的一列 upsert 輸入。`validate_forward`／`prepare_forward` 的簽名依 §5.1
+/// 收成了 [`RowInput`]（多了 `conn_kind`／`kind`／`probe_proxy`），既有這一組
+/// 測試的**斷言一個字都沒改**，只是輸入改由這支組出來。
+fn ssh_input<'a>(
+    sources: &'a [Source],
+    orig: Option<u16>,
+    name: &'a str,
+    local: u16,
+    remote: &'a str,
+) -> RowInput<'a> {
+    RowInput {
+        connection: sources.first().map(|s| s.name.as_str()).unwrap_or(""),
+        conn_kind: ConnKind::Ssh,
+        original_local: orig,
+        name,
+        local,
+        remote: Some(remote),
+        kind: RowKind::Forward,
+        probe_proxy: false,
+    }
+}
+
+/// `validate_forward` 的舊呼叫形狀，內容原樣轉給新簽名
+fn vf(
+    sources: &[Source],
+    orig: Option<u16>,
+    name: &str,
+    local: u16,
+    remote: &str,
+) -> Option<String> {
+    let cfg = ssh_only(sources.to_vec());
+    validate_forward(&cfg, &ssh_input(sources, orig, name, local, remote))
+}
+
+/// `prepare_forward` 的舊呼叫形狀
+fn pf(
+    sources: &[Source],
+    orig: Option<u16>,
+    name: &str,
+    local: u16,
+    remote: &str,
+    enabled: bool,
+) -> Result<Forward, String> {
+    let cfg = ssh_only(sources.to_vec());
+    prepare_forward(&cfg, &ssh_input(sources, orig, name, local, remote), enabled)
 }
 
 // ------------------------------------------------------------ 路徑優先序
@@ -475,7 +534,7 @@ fn forward_names_are_trimmed_on_load() {
     assert_eq!(cfg.forward(1080).unwrap().name, "a");
     // 介面那條路對同一個值的判定：兩邊要同進同出
     let list = vec![src("hk", vec![])];
-    assert!(prepare_forward(&list, None, " a ", 1080, "127.0.0.1:1080", true).is_ok());
+    assert!(pf(&list, None, " a ", 1080, "127.0.0.1:1080", true).is_ok());
     // 剃完還是空的、或中間有空白的，照樣是壞檔
     assert!(parse_config(
         "[[sources]]\nname=\"hk\"\nhost=\"h\"\nuser=\"u\"\n\
@@ -561,7 +620,7 @@ fn the_file_and_the_ui_agree_on_forward_fields() {
         ("a", 1080, "8080"),
     ];
     for (name, local, remote) in cases {
-        let ui_ok = validate_forward(&list, None, name, local, remote).is_none();
+        let ui_ok = vf(&list, None, name, local, remote).is_none();
         let raw = format!(
             "[[sources]]\nname=\"s\"\nhost=\"h\"\nuser=\"u\"\n\
              [[sources.forwards]]\nname=\"{name}\"\nlocal={local}\nremote=\"{remote}\"\n"
@@ -1026,7 +1085,9 @@ fn write_preserves_comments() {
     cfg.sources[0].forwards = vec![Forward {
         name: "x".into(),
         local: 1090,
-        remote: "127.0.0.1:9".into(),
+        remote: Some("127.0.0.1:9".into()),
+        kind: RowKind::Forward,
+        probe_proxy: false,
         enabled: true,
     }];
     write_config(&dir, &cfg).unwrap();
@@ -1196,7 +1257,7 @@ fn bare_port_normalizes_to_loopback() {
     assert_eq!(normalize_remote("000001080"), "127.0.0.1:1080");
     // 補完的形式本身就是合法 remote，接得上既有驗證
     let list = vec![src("hk", vec![fwd("a", 1080)])];
-    assert!(validate_forward(&list, None, "ok", 1090, "1080").is_none());
+    assert!(vf(&list, None, "ok", 1090, "1080").is_none());
 }
 
 /// 純數字的守衛是必要的：`parse::<u16>()` 自己會放行 `+80`，
@@ -1235,7 +1296,7 @@ fn host_port_remotes_pass_through_untouched() {
     assert_eq!(normalize_remote("nope"), "nope");
     assert_eq!(normalize_remote("127.0.0.1"), "127.0.0.1");
     let list = vec![src("hk", vec![fwd("a", 1080)])];
-    assert!(validate_forward(&list, None, "ok", 1090, "example.com:22").is_none());
+    assert!(vf(&list, None, "ok", 1090, "example.com:22").is_none());
     assert!(err(&list, None, "ok", 1090, "127.0.0.1").starts_with("remote: "));
 }
 
@@ -1246,12 +1307,19 @@ fn host_port_remotes_pass_through_untouched() {
 #[test]
 fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
     let list = vec![src("hk", vec![fwd("a", 1080)])];
-    let made = prepare_forward(&list, None, "  web  ", 1090, "8080", true)
-        .expect("補完的形式是合法 remote，應該過");
+    let made =
+        pf(&list, None, "  web  ", 1090, "8080", true).expect("補完的形式是合法 remote，應該過");
     // 產出：名字經過 trim，remote 是完整形式
     assert_eq!(
         made,
-        Forward { name: "web".into(), local: 1090, remote: "127.0.0.1:8080".into(), enabled: true }
+        Forward {
+            name: "web".into(),
+            local: 1090,
+            remote: Some("127.0.0.1:8080".into()),
+            kind: RowKind::Forward,
+            probe_proxy: false,
+            enabled: true
+        }
     );
 
     // 落檔：command 端就是把這一筆原樣塞進設定再存，這裡照做一次
@@ -1268,7 +1336,10 @@ fn a_bare_port_from_the_ui_lands_in_the_file_as_the_full_form() {
     assert!(saved.contains("remote = \"127.0.0.1:8080\""), "實際存成：{saved}");
     // 再讀回來還是同一筆，不會因為存檔或讀檔又變形
     assert_eq!(parse_config(&saved).unwrap(), cfg);
-    assert_eq!(parse_config(&saved).unwrap().forward(1090).unwrap().remote, "127.0.0.1:8080");
+    assert_eq!(
+        parse_config(&saved).unwrap().forward(1090).unwrap().remote.as_deref(),
+        Some("127.0.0.1:8080")
+    );
 }
 
 /// 驗證不過時不給出半成品：呼叫端沒有東西可以誤存
@@ -1277,13 +1348,13 @@ fn prepare_forward_hands_back_the_error_instead_of_a_forward() {
     let list = vec![src("hk", vec![fwd("a", 1080)])];
     // 撞埠、壞名字、壞 remote 都走同一個回傳
     let bad = |name: &str, local: u16, remote: &str| {
-        prepare_forward(&list, None, name, local, remote, true).expect_err("這組輸入應該要被擋下來")
+        pf(&list, None, name, local, remote, true).expect_err("這組輸入應該要被擋下來")
     };
     assert!(bad("b", 1080, "8080").starts_with("local: "));
     assert!(bad("", 1090, "8080").starts_with("name: "));
     assert!(bad("b", 1090, "70000").starts_with("remote: "));
     // enabled 原樣帶過去，前處理不擅自改使用者的連線選擇
-    assert!(!prepare_forward(&list, None, "b", 1090, "8080", false).unwrap().enabled);
+    assert!(!pf(&list, None, "b", 1090, "8080", false).unwrap().enabled);
 }
 
 /// 檔案裡手寫 `remote = "8080"` 也算數：讀進來就是完整形式
@@ -1294,7 +1365,7 @@ fn a_hand_written_bare_port_loads_as_the_full_form() {
          [[sources.forwards]]\nname=\"a\"\nlocal=1080\nremote=\"8080\"\n",
     )
     .expect("手寫純埠號是合法設定");
-    assert_eq!(cfg.forward(1080).unwrap().remote, "127.0.0.1:8080");
+    assert_eq!(cfg.forward(1080).unwrap().remote.as_deref(), Some("127.0.0.1:8080"));
 }
 
 /// 手寫純埠號的檔案：載入正常，重存之後檔案裡就變成完整形式
@@ -1311,7 +1382,7 @@ fn rewriting_a_hand_written_bare_port_file_lands_the_full_form() {
     let out = load_from_dir(&dir);
     assert!(matches!(out, LoadOutcome::Loaded(_)), "純埠號不該被當成壞檔");
     let cfg = out.config().clone();
-    assert_eq!(cfg.forward(1080).unwrap().remote, "127.0.0.1:8080");
+    assert_eq!(cfg.forward(1080).unwrap().remote.as_deref(), Some("127.0.0.1:8080"));
 
     write_config(&dir, &cfg).unwrap();
     let saved = std::fs::read_to_string(dir.join(TOML_NAME)).unwrap();
@@ -1322,7 +1393,7 @@ fn rewriting_a_hand_written_bare_port_file_lands_the_full_form() {
 
 /// 驗證訊息要能被前端逐欄掛回去，格式固定是「欄位: 說明」
 fn err(list: &[Source], orig: Option<u16>, name: &str, local: u16, remote: &str) -> String {
-    validate_forward(list, orig, name, local, remote).expect("這組輸入應該要被擋下來")
+    vf(list, orig, name, local, remote).expect("這組輸入應該要被擋下來")
 }
 
 #[test]
@@ -1337,9 +1408,9 @@ fn upsert_rejects_duplicate_local_port() {
     // 連停用中的出口也算佔用
     assert!(err(&list, None, "c", 1083, "127.0.0.1:1").starts_with("local: "));
     // 沒撞到就過
-    assert!(validate_forward(&list, None, "c", 1090, "127.0.0.1:1").is_none());
+    assert!(vf(&list, None, "c", 1090, "127.0.0.1:1").is_none());
     // 編輯自己時維持原埠不算重複
-    assert!(validate_forward(&list, Some(1080), "a2", 1080, "127.0.0.1:1").is_none());
+    assert!(vf(&list, Some(1080), "a2", 1080, "127.0.0.1:1").is_none());
     // 編輯時改成別人的埠要擋
     assert!(err(&list, Some(1080), "a2", 1083, "127.0.0.1:1").starts_with("local: "));
 }

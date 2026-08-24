@@ -57,7 +57,10 @@ pub fn build_exit_args(src: &Source, f: &Forward) -> Vec<String> {
         args.push(format!("ProxyCommand={}", src.proxy_command));
     }
     args.push("-L".into());
-    args.push(format!("{}:{}", f.local, f.remote));
+    // ssh 這條路上的列一律是 `kind = forward`，`remote` 必填（§1.3 ①②），
+    // 驗證（validate_config／validate_forward）已經保證它不是 None；真的漏進來
+    // 也不可以組出半截的 `-L 1080:` 去餵 ssh，寧可留一個看得懂的空字串
+    args.push(format!("{}:{}", f.local, f.remote.as_deref().unwrap_or_default()));
     args.push(format!("{}@{}", src.user, src.host));
     args
 }
@@ -411,7 +414,12 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
     state.set_exit_test_of(local, token, test_state::TESTING, "testing...");
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(move || probe(local)).await;
+        // 骨架階段仍固定用 SOCKS5：兩段式（先 detect 再 probe）與 should_probe
+        // 的排程由實作車道接上（§5.4），這裡先維持既有行為不變
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            probe(local, crate::exits::ProxyProtocol::Socks5)
+        })
+        .await;
         st.end_test(local, token);
         if !st.test_alive(local, token) {
             return;
@@ -481,13 +489,17 @@ mod tests {
                         Forward {
                             name: "a".into(),
                             local: 1080,
-                            remote: "127.0.0.1:1080".into(),
+                            remote: Some("127.0.0.1:1080".into()),
+                            kind: crate::config::RowKind::Forward,
+                            probe_proxy: false,
                             enabled: true,
                         },
                         Forward {
                             name: "b".into(),
                             local: 1083,
-                            remote: "127.0.0.1:1083".into(),
+                            remote: Some("127.0.0.1:1083".into()),
+                            kind: crate::config::RowKind::Forward,
+                            probe_proxy: false,
                             enabled: false,
                         },
                     ],
@@ -500,7 +512,9 @@ mod tests {
                     forwards: vec![Forward {
                         name: "c".into(),
                         local: 1090,
-                        remote: "127.0.0.1:1090".into(),
+                        remote: Some("127.0.0.1:1090".into()),
+                        kind: crate::config::RowKind::Forward,
+                        probe_proxy: false,
                         enabled: true,
                     }],
                 },
