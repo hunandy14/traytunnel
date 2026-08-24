@@ -10,8 +10,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::config::{Forward, Source};
-use crate::exits::{probe, ExitTest};
-use crate::state::{status, test_state, AppState};
+use crate::exits::{probe, Detected, ExitTest, Resolution};
+use crate::state::{status, test_state, AppState, TestView};
 use crate::winsys::{is_listening, Job};
 
 /// CREATE_NO_WINDOW，避免主控台視窗一閃而過
@@ -119,11 +119,11 @@ pub struct TestConnectionResult {
 }
 
 impl TestConnectionResult {
-    fn ok() -> Self {
+    pub(crate) fn ok() -> Self {
         TestConnectionResult { ok: true, message: "Connected".into() }
     }
 
-    fn fail(message: impl Into<String>) -> Self {
+    pub(crate) fn fail(message: impl Into<String>) -> Self {
         TestConnectionResult { ok: false, message: message.into() }
     }
 }
@@ -339,7 +339,7 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                 );
             }
             Ok((mut child, job, pid)) => {
-                state.store_job(local, generation, job);
+                state.store_job(local, generation, crate::state::Worker::Ssh(job));
                 state.log_from(sname, format!("{} : ssh starting (pid {pid})", f.name));
                 if let Some(stderr) = child.stderr.take() {
                     // ssh stderr 噪音大，只寫進檔案日誌，不進活動區——
@@ -371,7 +371,10 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
                     if !state.is_connected(local) && is_listening(local) {
                         state.set_exit_status_of(local, generation, status::CONNECTED, None);
                         state.log_from(sname, format!("{} : up", f.name));
-                        test_exit(state, local);
+                        // 只有「要被探測」的列才排自測（§5.4 第 1 點）
+                        if crate::config::should_probe(f.kind, f.probe_proxy) {
+                            probe_exit(state, local);
+                        }
                     }
                 }
                 // ssh 退了，順手把 ProxyCommand 生出來的子程序一起收掉
@@ -393,8 +396,34 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
     }
 }
 
-/// 對單一出口做自測，只有連上的出口才測。
+/// 對單一列做自測，只有**連上而且要被探測**的列才測（§5.4 的排程條件）。
+///
+/// ①③（純轉發）連排程都不進：它們指向任意 TCP 服務，拿代理協定去打必定失敗，
+/// 只會製造一個永遠亮著的假紅點。
 pub fn test_exit(state: &Arc<AppState>, local: u16) {
+    let probed = state.with_config(|c| {
+        c.forward(local).map(|f| crate::config::should_probe(f.kind, f.probe_proxy))
+    });
+    match probed {
+        Some(true) => {}
+        Some(false) => {
+            state.log_exit(local, format!("port {local} : not a proxy exit, nothing to test"));
+            return;
+        }
+        None => {
+            state.log(format!("port {local} : no such exit"));
+            return;
+        }
+    }
+    probe_exit(state, local);
+}
+
+/// 真正發一份探測。呼叫端已經確認過這一條列該被探測。
+///
+/// 監看迴圈（ssh 與 wg 兩邊）走這一支而不是 `test_exit`：它們自己已經挑好了
+/// 要探測的列，再走一次 `should_probe` 只會在每一次連上時，替每一條純轉發列
+/// 各記一行「不是代理」的日誌。
+pub(crate) fn probe_exit(state: &Arc<AppState>, local: u16) {
     // 憑證要在任何其他檢查之前先取。自測在背景非同步進行，探測期間使用者可能
     // 已經中斷或重接了這個出口，晚到的結果靠憑證擋在門外——但號碼要是等到
     // is_connected／begin_test 之後才讀，halt 剛好插在中間時讀到的就是 halt
@@ -412,14 +441,61 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
     // 沒守門的話 halt 剛清乾淨的自測欄會被這一手寫回一個永遠不會有結果的
     // testing（它的結果稍後會被憑證擋掉），介面就這樣一直轉下去
     state.set_exit_test_of(local, token, test_state::TESTING, "testing...");
+    // 這一輪要用哪個協定：socks 列已知、快取命中直接用、其餘才跑一次 detect（W8.24）
+    let resolution = state
+        .with_config(|c| c.forward(local).map(|f| f.kind))
+        .map(|kind| crate::exits::resolve_protocol(kind, state.detected_protocol(local)));
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
-        // 骨架階段仍固定用 SOCKS5：兩段式（先 detect 再 probe）與 should_probe
-        // 的排程由實作車道接上（§5.4），這裡先維持既有行為不變
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            probe(local, crate::exits::ProxyProtocol::Socks5)
-        })
-        .await;
+        let protocol = match resolution {
+            // socks 列的 listener 是引擎自己起的，協定已知；快取命中就不再 detect
+            Some(Resolution::Known(p) | Resolution::Cached(p)) => p,
+            Some(Resolution::MustDetect) | None => {
+                let detected =
+                    tauri::async_runtime::spawn_blocking(move || crate::exits::detect(local))
+                        .await
+                        .unwrap_or(Detected::NotAProxy);
+                if !st.test_alive(local, token) {
+                    st.end_test(local, token);
+                    return;
+                }
+                // NeedsAuth／BadStatus 都算識別成功（代理就在那裡，只是這一次用
+                // 不了），協定要進快取；只有 NotAProxy 不進（§5.4 第 7 點）
+                if let Detected::Ok(p) | Detected::NeedsAuth(p) | Detected::BadStatus(p, _) =
+                    detected
+                {
+                    st.set_detected_protocol(local, token, p);
+                }
+                match detected {
+                    Detected::Ok(p) => p,
+                    // 這一輪走不下去了，就地把結果寫回去。徽章只在識別成功時給：
+                    // NotAProxy 掛一顆徽章等於指著使用者說他設錯了（§5.4 第 4～6 點）
+                    other => {
+                        let text = crate::exits::detect_message(&other);
+                        let badge = match other {
+                            Detected::NeedsAuth(p) | Detected::BadStatus(p, _) => {
+                                Some(p.as_str().to_string())
+                            }
+                            _ => None,
+                        };
+                        st.end_test(local, token);
+                        st.set_exit_test_view_of(
+                            local,
+                            token,
+                            TestView {
+                                state: test_state::FAIL.into(),
+                                text: text.clone(),
+                                protocol: badge,
+                            },
+                        );
+                        st.log_exit(local, format!("port {local} : {text}"));
+                        return;
+                    }
+                }
+            }
+        };
+
+        let result = tauri::async_runtime::spawn_blocking(move || probe(local, protocol)).await;
         st.end_test(local, token);
         if !st.test_alive(local, token) {
             return;
@@ -429,7 +505,15 @@ pub fn test_exit(state: &Arc<AppState>, local: u16) {
             Ok(ExitTest::Fail(msg)) => (test_state::FAIL, msg.to_string()),
             Err(_) => (test_state::FAIL, "no response".to_string()),
         };
-        st.set_exit_test_of(local, token, state_name, &text);
+        st.set_exit_test_view_of(
+            local,
+            token,
+            TestView {
+                state: state_name.into(),
+                text: text.clone(),
+                protocol: Some(protocol.as_str().to_string()),
+            },
+        );
         st.log_exit(local, format!("port {local} : {text}"));
     });
 }

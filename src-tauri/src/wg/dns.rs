@@ -217,6 +217,10 @@ fn start_error(err: StartQueryError, name: &str) -> ResolveError {
 }
 
 /// A 與 AAAA 各查一次時的挑選規則：預設 v4 優先，隧道沒有 v4 位址時才用 v6。
+///
+/// 正式路徑走的是清單版 [`ordered`]（第一個連不上時還留得住備援位址）；
+/// 這一支是同一條規則的單值版，由 W5.9 直接釘住。
+#[allow(dead_code)]
 pub fn pick(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>, have_v4: bool) -> Option<IpAddr> {
     ordered(v4, v6, have_v4).into_iter().next()
 }

@@ -315,6 +315,9 @@ pub enum Reply {
     NetworkUnreachable = 0x03,
     HostUnreachable = 0x04,
     ConnectionRefused = 0x05,
+    /// RFC 1928 的完整回覆碼表。這一顆我們自己不會產生（沒有 TTL 概念），
+    /// 但列進來才是完整的協定實作，也才不會有人日後拿 0x06 去表達別的意思
+    #[allow(dead_code)]
     TtlExpired = 0x06,
     CommandNotSupported = 0x07,
     AddressTypeNotSupported = 0x08,

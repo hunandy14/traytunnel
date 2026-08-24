@@ -85,11 +85,16 @@ pub enum StackCmd {
         name: String,
         reply: oneshot::Sender<Result<Vec<std::net::IpAddr>, dns::ResolveError>>,
     },
-    /// 測試用（並為未來的反向轉發預留）：在隧道內位址上開一個被動監聽
+    /// 測試用（並為未來的反向轉發預留）：在隧道內位址上開一個被動監聽。
+    /// 正式路徑目前只送 Connect／Resolve
+    #[allow(dead_code)]
     Listen {
         endpoint: IpEndpoint,
         accept: mpsc::Sender<Conn>,
     },
+    /// 主動收掉一個虛擬埠。目前連線是靠 `Conn` 被 drop 收的，這一支留給
+    /// 「拿得到埠號、卻拿不到 Conn」的呼叫端（反向轉發要用）
+    #[allow(dead_code)]
     Close {
         port: VirtualPort,
     },
@@ -120,6 +125,9 @@ pub fn spawn(
 
 pub struct StackHandle {
     pub cmd: mpsc::Sender<StackCmd>,
+    /// 同 `DeviceHandle::join`：正式路徑靠取消權杖收尾，這個 handle 只給
+    /// 測試檯等待任務真的結束
+    #[allow(dead_code)]
     pub join: tokio::task::JoinHandle<()>,
 }
 

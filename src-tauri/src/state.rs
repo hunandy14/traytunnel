@@ -231,7 +231,6 @@ pub(crate) fn visible_test(status: &str, last_test: Option<TestView>) -> Option<
 ///
 /// 兩者的作廢時機完全一致（§1.5）：斷線、停用、重接都會經過這裡。分開清的話，
 /// 遲早會出現「線斷了、徽章還掛著上一輪識別出來的協定」那種畫面。
-#[allow(dead_code)]
 pub(crate) fn cleared_test_state(
     _last_test: Option<TestView>,
     _detected: Option<crate::exits::ProxyProtocol>,
@@ -240,6 +239,36 @@ pub(crate) fn cleared_test_state(
     // 型別上就交不出「只清一個」的寫法——`clear_exit_test` 的兩行賦值改成
     // 一次解構，就不會有人日後只更新其中一行。
     (None, None)
+}
+
+/// 一條列 + 它的執行期狀態 → 一筆 `ExitView`。ssh 與 wg 共用同一份組裝。
+fn exit_view(f: &crate::config::Forward, exits: &BTreeMap<u16, ExitRuntime>) -> ExitView {
+    let rt = exits.get(&f.local);
+    let status = rt.map(|r| r.status.clone()).unwrap_or_else(|| status::STOPPED.to_string());
+    ExitView {
+        name: f.name.clone(),
+        local: f.local,
+        remote: f.remote.clone(),
+        kind: match f.kind {
+            crate::config::RowKind::Forward => "forward".into(),
+            crate::config::RowKind::Socks => "socks".into(),
+        },
+        probe_proxy: f.probe_proxy,
+        enabled: f.enabled,
+        last_test: visible_test(&status, rt.and_then(|r| r.last_test.clone())),
+        status,
+    }
+}
+
+/// 一條連線底下的列，**`socks` 列一律排在 `forward` 列之前**（§5.3／W3.40）。
+///
+/// 順序由後端保證、前端只在交界處插區段標題——不交給前端各自排，否則系統匣與
+/// 主視窗會排出兩種順序。SSH 連線只會有 `forward` 列，這條排序對它是恆等式。
+fn row_views(
+    forwards: &[crate::config::Forward],
+    exits: &BTreeMap<u16, ExitRuntime>,
+) -> Vec<ExitView> {
+    crate::config::ordered_rows(forwards).into_iter().map(|f| exit_view(f, exits)).collect()
 }
 
 /// 設定 + 執行期狀態 → 每個源與其出口的當下樣貌。
@@ -252,28 +281,39 @@ fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceVi
             host: s.host.clone(),
             user: s.user.clone(),
             proxy_command: s.proxy_command.clone(),
-            exits: s
-                .forwards
-                .iter()
-                .map(|f| {
-                    let rt = exits.get(&f.local);
-                    let status =
-                        rt.map(|r| r.status.clone()).unwrap_or_else(|| status::STOPPED.to_string());
-                    ExitView {
-                        name: f.name.clone(),
-                        local: f.local,
-                        remote: f.remote.clone(),
-                        kind: match f.kind {
-                            crate::config::RowKind::Forward => "forward".into(),
-                            crate::config::RowKind::Socks => "socks".into(),
-                        },
-                        probe_proxy: f.probe_proxy,
-                        enabled: f.enabled,
-                        last_test: visible_test(&status, rt.and_then(|r| r.last_test.clone())),
-                        status,
-                    }
-                })
-                .collect(),
+            exits: row_views(&s.forwards, exits),
+        })
+        .collect()
+}
+
+/// 設定 + 執行期狀態 + `.conf` 摘要快取 → 每條 wg 連線的當下樣貌（§5.3）。
+///
+/// `.conf` 的內容從快取拿而不是當場讀檔：這一支跟著每一次狀態變化跑（系統匣
+/// 也吃同一份），連線一多就會變成每秒好幾次的磁碟讀取。快取由 `sync_wg_confs`
+/// 在設定變動時重整。
+fn build_wg_views(
+    cfg: &Config,
+    exits: &BTreeMap<u16, ExitRuntime>,
+    confs: &HashMap<String, Result<crate::wg::conf::ConfSummary, String>>,
+) -> Vec<WgProxyView> {
+    cfg.wg_proxies
+        .iter()
+        .map(|p| {
+            let summary = confs.get(&p.name);
+            let ok = summary.and_then(|r| r.as_ref().ok());
+            WgProxyView {
+                name: p.name.clone(),
+                conf_path: p.conf_path.clone(),
+                enabled: p.enabled,
+                conf_error: summary.and_then(|r| r.as_ref().err()).cloned(),
+                // 這四項在任何 WireGuard 客戶端的介面上都看得到，而且使用者需要
+                // 它們才知道轉發列的 remote 該怎麼寫——不是機密（§5.3）
+                endpoint: ok.map(|c| c.endpoint.clone()).unwrap_or_default(),
+                addresses: ok.map(|c| c.addresses.clone()).unwrap_or_default(),
+                dns: ok.map(|c| c.dns.clone()).unwrap_or_default(),
+                allowed_ips: ok.map(|c| c.allowed_ips.clone()).unwrap_or_default(),
+                exits: row_views(&p.forwards, exits),
+            }
         })
         .collect()
 }
@@ -341,11 +381,13 @@ fn push_log_line(logs: &mut VecDeque<String>, line: String) {
 }
 
 /// 單一出口的執行期狀態
-#[derive(Debug)]
 struct ExitRuntime {
     status: String,
     detail: Option<String>,
     last_test: Option<TestView>,
+    /// 協定識別的結果快取（§1.5）。**執行期，不落設定檔**：設定檔只記使用者填的
+    /// 東西，協定是觀察到的事實。作廢時機與自測憑證完全一致（見 `clear_exit_test`）
+    detected: Option<crate::exits::ProxyProtocol>,
     /// 目前有效的世代序號，換號即代表舊的監看迴圈作廢；
     /// 號碼取自全域計數器，出口被刪掉又重建也不會撞號
     generation: u64,
@@ -354,7 +396,9 @@ struct ExitRuntime {
     test_epoch: u64,
     /// 目前活著的監看迴圈是哪一代，None 代表這個出口沒人在跑
     supervisor: Option<u64>,
-    job: Option<(u64, Job)>,
+    /// 這一輪連線持有的「殺得掉的東西」。型別是 [`Worker`] 而不是 `Job`，
+    /// 於是 `rt.job.take()`（拿走即殺掉）同時涵蓋 ssh 的程序樹與 wg 的任務樹
+    job: Option<(u64, Worker)>,
 }
 
 /// 一輪連線持有的「殺得掉的東西」（設計書 §4.2）。
@@ -364,33 +408,49 @@ struct ExitRuntime {
 /// 一字不改就同時涵蓋兩種，`store_job`／`kill_job_of`／`kill_all_jobs`
 /// 的世代守門與那幾條競態論證也完全不用重寫。
 ///
-/// 骨架階段只把型別與守門的純函式立起來，`ExitRuntime.job` 的換型別留給
-/// 實作車道——先換型別會動到既有那條全綠的路徑，紅燈存證會混進雜訊。
-#[allow(dead_code)]
 pub(crate) enum Worker {
-    Ssh(Job),
-    Wg(crate::wg::CancelGuard),
+    // 兩個欄位都**只為了 Drop 而持有**，沒有讀取端是刻意的：handle 一關，
+    // 整棵 ssh 程序樹（含 ProxyCommand 的孫程序）就結束；權杖一取消，
+    // 整棵 wg 任務樹（引擎 + 所有列的監聽器）就結束
+    Ssh(#[allow(dead_code)] Job),
+    Wg(#[allow(dead_code)] crate::wg::CancelGuard),
 }
 
 /// `store_job` 的世代守門，抽成純函式才測得到（W6.2）。
 ///
 /// 世代相符才收下並回 true；不符時 `worker` 就在這裡 drop——那條剛 spawn 出來、
 /// 已經沒有人要的連線（ssh 程序樹或 wg 任務樹）當場被收乾淨。
-#[allow(dead_code)]
+///
+/// 「不符時不可以蓋掉既有的那一份」也是契約的一部分：新世代的 worker 可能已經
+/// 就位，舊迴圈晚到的這一手若照存，被蓋掉的那個 handle 一 drop，剛接起來的連線
+/// 當場被殺，留下的反而是舊世代那條沒人管的。
 pub(crate) fn store_worker(
-    _slot: &mut Option<(u64, Worker)>,
-    _rt_generation: u64,
-    _generation: u64,
-    _worker: Worker,
+    slot: &mut Option<(u64, Worker)>,
+    rt_generation: u64,
+    generation: u64,
+    worker: Worker,
 ) -> bool {
-    todo!("W6.2")
+    if rt_generation != generation {
+        // worker 在這一行結束時 drop：Job handle 關閉／CancellationToken 取消
+        drop(worker);
+        return false;
+    }
+    *slot = Some((generation, worker));
+    true
 }
 
 /// `kill_all_jobs` 的核心：收掉所有 worker，回報要寫成 stopped 的埠（W6.3）。
-#[allow(dead_code)]
+///
+/// 本來就沒人在跑的那些埠不回報——呼叫端據此決定要不要推事件，沒有這道閘就會
+/// 對著一整排早就 stopped 的出口再推一次一模一樣的事件。
 pub(crate) fn drain_workers(slots: &mut BTreeMap<u16, Option<(u64, Worker)>>) -> Vec<u16> {
-    let _ = slots;
-    todo!("W6.3")
+    let mut stopped = Vec::new();
+    for (local, slot) in slots.iter_mut() {
+        if slot.take().is_some() {
+            stopped.push(*local);
+        }
+    }
+    stopped
 }
 
 impl ExitRuntime {
@@ -409,12 +469,47 @@ impl Default for ExitRuntime {
             status: status::STOPPED.into(),
             detail: None,
             last_test: None,
+            detected: None,
             generation: 0,
             test_epoch: 0,
             supervisor: None,
             job: None,
         }
     }
+}
+
+/// 一條 wg 連線的執行期狀態。
+///
+/// 引擎的身分是**連線的 name**（§5.2）：一條連線有 0..N 條列，沒有哪一個埠有
+/// 資格代表整條隧道。各列自己的執行期狀態仍住在以 u16 為鍵的 `exits` 裡，D5 不變。
+#[derive(Default)]
+struct WgEngineRuntime {
+    generation: u64,
+    supervisor: Option<u64>,
+    /// 引擎那棵任務樹的取消權杖，拿走即收掉（含所有列的監聽器）
+    worker: Option<(u64, Worker)>,
+}
+
+/// 設定檔所在資料夾，`wgProxies.confPath` 的相對路徑基準（W3.19）
+fn config_dir(path: &std::path::Path) -> &std::path::Path {
+    path.parent().unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// 把每條 wg 連線的 `.conf` 讀一遍，成功存摘要、失敗存訊息。
+///
+/// **不握手、不解析主機名**——這是給編輯面板與卡片副標看的唯讀摘要，
+/// 金鑰一個位元組都不在其中（`ConfSummary` 的欄位就那幾個）。
+fn read_wg_confs(
+    cfg: &Config,
+    dir: &std::path::Path,
+) -> HashMap<String, Result<crate::wg::conf::ConfSummary, String>> {
+    cfg.wg_proxies
+        .iter()
+        .map(|p| {
+            let path = crate::config::resolve_conf_path(dir, &p.conf_path);
+            (p.name.clone(), crate::wg::inspect_conf(&path))
+        })
+        .collect()
 }
 
 pub struct AppState {
@@ -429,6 +524,11 @@ pub struct AppState {
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
     exits: Mutex<BTreeMap<u16, ExitRuntime>>,
+    /// 每條 wg 連線一份引擎執行期狀態，鍵是連線名（§5.2）
+    wg_engines: Mutex<HashMap<String, WgEngineRuntime>>,
+    /// 每條 wg 連線的 `.conf` 摘要，讀不到／解析不過時存錯誤訊息。
+    /// 設定一變就重整（見 `sync_wg_confs`），快照與系統匣都吃它，不各自讀檔
+    wg_confs: Mutex<HashMap<String, Result<crate::wg::conf::ConfSummary, String>>>,
     /// 正在自測的埠，值是那份探測拿在手上的憑證。互斥比的是憑證而不只是埠，
     /// 舊連線留下的在途探測才擋不住新一輪的自測
     testing: Mutex<HashMap<u16, TestToken>>,
@@ -445,6 +545,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(app: AppHandle, path: PathBuf, portable: bool, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
+        let wg_confs = read_wg_confs(&cfg, config_dir(&path));
         AppState {
             app,
             path,
@@ -452,6 +553,8 @@ impl AppState {
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
+            wg_engines: Mutex::new(HashMap::new()),
+            wg_confs: Mutex::new(wg_confs),
             testing: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             tray_hint_shown: AtomicBool::new(false),
@@ -536,11 +639,45 @@ impl AppState {
     /// 不必為了收程序而搶在存檔之前 halt。
     fn sync_exits(&self) {
         let ports = self.with_config(|c| c.locals());
-        let mut exits = self.exits.lock().unwrap();
-        exits.retain(|p, _| ports.contains(p));
-        for p in ports {
-            exits.entry(p).or_default();
+        {
+            let mut exits = self.exits.lock().unwrap();
+            exits.retain(|p, _| ports.contains(p));
+            for p in ports {
+                exits.entry(p).or_default();
+            }
         }
+        self.sync_wg_engines();
+        self.sync_wg_confs();
+    }
+
+    /// 設定裡刪掉一條 wg 連線後，把它的引擎執行期狀態一併清掉。
+    ///
+    /// 丟掉的那份 `WgEngineRuntime` 會連同 `CancelGuard` 一起 drop，那顆引擎的
+    /// 整棵任務樹（含所有列的監聽器）當場收掉——與 `sync_exits` 對 ssh 那條
+    /// 「刪掉出口就等於收掉程序樹」的性質一致，刪除流程因此可以先存檔再停線。
+    fn sync_wg_engines(&self) {
+        let names =
+            self.with_config(|c| c.wg_proxies.iter().map(|p| p.name.clone()).collect::<Vec<_>>());
+        self.wg_engines.lock().unwrap().retain(|name, _| names.contains(name));
+    }
+
+    /// 重讀每條 wg 連線的 `.conf` 摘要。設定一變就跑一次（改了 confPath、
+    /// 新增／刪除連線都算），快照與系統匣之後都只讀快取，不再碰磁碟。
+    fn sync_wg_confs(&self) {
+        let fresh = self.with_config(|c| read_wg_confs(c, config_dir(&self.path)));
+        *self.wg_confs.lock().unwrap() = fresh;
+    }
+
+    /// 從磁碟重讀 `.conf` 摘要並全量推一次——外部檔案被改過（或使用者按下重新
+    /// 連線）時，畫面上那幾行唯讀資訊才跟得上
+    pub fn reload_wg_confs(&self) {
+        self.sync_wg_confs();
+    }
+
+    /// 這條 wg 連線的 `.conf` 解析錯誤，讀得過就是 None。
+    /// **壞 conf 的連線不准啟動**——引擎沒有東西可以拿去建隧道。
+    pub fn wg_conf_error(&self, conn: &str) -> Option<String> {
+        self.wg_confs.lock().unwrap().get(conn).and_then(|r| r.as_ref().err()).cloned()
     }
 
     /// app 級事件的日誌，不帶源名
@@ -655,7 +792,16 @@ impl AppState {
     /// 中途被 halt／restart／斷線重連換掉憑證的探測寫不進去。順帶保留原本
     /// 「只更新既存的出口」的性質，已刪掉的埠不會靠一次晚到的自測結果復活。
     pub fn set_exit_test_of(&self, local: u16, token: TestToken, state: &str, text: &str) {
-        let view = TestView::plain(state, text);
+        self.write_exit_test_of(local, token, TestView::plain(state, text));
+    }
+
+    /// 帶協定徽章的版本（§5.3 的 `TestView.protocol`）。識別不出來時 `protocol`
+    /// 是 None，序列化後那個鍵整個不出現——送空字串等於叫前端畫一顆空白徽章。
+    pub fn set_exit_test_view_of(&self, local: u16, token: TestToken, view: TestView) {
+        self.write_exit_test_of(local, token, view);
+    }
+
+    fn write_exit_test_of(&self, local: u16, token: TestToken, view: TestView) {
         let written = {
             let mut exits = self.exits.lock().unwrap();
             exits.get_mut(&local).is_some_and(|rt| guarded_write_test(rt, token, &view))
@@ -663,6 +809,26 @@ impl AppState {
         if written {
             let _ = self.app.emit("exit-test", ExitTestPayload { local, result: Some(view) });
         }
+    }
+
+    /// 這條列的協定識別快取（§1.5）。命中就不必再跑一次 `detect`（W8.24）
+    pub fn detected_protocol(&self, local: u16) -> Option<crate::exits::ProxyProtocol> {
+        self.exits.lock().unwrap().get(&local).and_then(|rt| rt.detected)
+    }
+
+    /// 記下識別結果，但**只在憑證還算數時**——不然一份對舊連線做的識別會被寫進
+    /// 新連線的快取，徽章就一直掛著另一台伺服器的協定
+    pub fn set_detected_protocol(
+        &self,
+        local: u16,
+        token: TestToken,
+        protocol: crate::exits::ProxyProtocol,
+    ) {
+        self.with_exit_mut(local, |rt| {
+            if rt.token() == token {
+                rt.detected = Some(protocol);
+            }
+        });
     }
 
     /// 出口斷線或停掉時把舊的自測結果清乾淨，並讓在途的探測就地作廢。
@@ -674,7 +840,11 @@ impl AppState {
         let counter = &self.generation;
         let had = self.with_exit_mut(local, |rt| {
             rt.test_epoch = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            rt.last_test.take().is_some()
+            let had = rt.last_test.is_some();
+            // 自測顯示與協定識別快取一起歸零（§1.5／W8.25）。一次解構而不是兩行
+            // 賦值，日後就不會有人只更新其中一行
+            (rt.last_test, rt.detected) = cleared_test_state(rt.last_test.take(), rt.detected);
+            had
         });
         // 本來就沒有結果可清就不推事件：斷線重連每 5 秒會走一次這裡，
         // 沒有這道閘的話會一直送出內容相同的空事件
@@ -733,6 +903,20 @@ impl AppState {
         .flatten()
     }
 
+    /// 讓這幾條列跟著引擎的世代走。
+    ///
+    /// wg 沒有「每條列一個監看迴圈」——底下所有列的狀態都由引擎那一條迴圈代寫，
+    /// 所以 `set_exit_status_of` 要比對的自然是**引擎的世代**。每一輪開頭發一次
+    /// 號碼，halt 換掉引擎世代之後，舊迴圈晚到的那一手就寫不進去了。
+    pub fn adopt_rows(&self, locals: &[u16], generation: u64) {
+        let mut exits = self.exits.lock().unwrap();
+        for local in locals {
+            if let Some(rt) = exits.get_mut(local) {
+                rt.generation = generation;
+            }
+        }
+    }
+
     /// 監看迴圈結束時歸還位子
     pub fn release_supervisor(&self, local: u16, generation: u64) {
         self.with_exit_mut(local, |rt| release_slot(&mut rt.supervisor, generation));
@@ -756,11 +940,10 @@ impl AppState {
     ///
     /// 世代不符（或出口已經被刪掉）時 job 就在這裡 drop：handle 關閉，
     /// 那條剛 spawn 出來、已經沒有人要的 ssh 連同 ProxyCommand 的孫程序一起收乾淨。
-    pub fn store_job(&self, local: u16, generation: u64, job: Job) {
+    pub(crate) fn store_job(&self, local: u16, generation: u64, worker: Worker) {
         self.with_exit_mut(local, |rt| {
-            if rt.generation == generation {
-                rt.job = Some((generation, job));
-            }
+            let rt_generation = rt.generation;
+            store_worker(&mut rt.job, rt_generation, generation, worker);
         });
     }
 
@@ -791,13 +974,22 @@ impl AppState {
     /// （它會取 cfg 與 exits 兩把鎖），而且整批只重算一次——系統匣本來就是
     /// 整份重建，逐埠各刷一次只是白做工。
     pub fn kill_all_jobs(&self) {
+        // wg 的引擎不住在 exits 裡（它的身分是連線名），要另外收一次；
+        // 各列的監聽器是那棵任務樹的一部分，跟著 CancelGuard 一起走
+        self.wg_engines.lock().unwrap().clear();
         let mut stopped = Vec::new();
         {
             let mut exits = self.exits.lock().unwrap();
+            // 先把每個出口的 worker 摘出來交給 drain_workers 統一收掉：「拿走即
+            // 殺掉」那條語意只有一份實作，ssh 的程序樹與 wg 的任務樹都涵蓋（W6.3）。
+            // 它回報的是「真的收掉了東西」的埠，這裡用不到——底下要把**每一個**
+            // 出口都壓成 stopped，不只是有 worker 的那些
+            let mut slots: BTreeMap<u16, Option<(u64, Worker)>> =
+                exits.iter_mut().map(|(local, rt)| (*local, rt.job.take())).collect();
+            drop(drain_workers(&mut slots));
             for (local, rt) in exits.iter_mut() {
                 rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 rt.supervisor = None;
-                let _ = rt.job.take();
                 if write_status(rt, status::STOPPED, &None) {
                     stopped.push(*local);
                 }
@@ -813,6 +1005,65 @@ impl AppState {
             );
         }
         self.refresh_tray();
+    }
+
+    // ------------------------------------------------------------ wg 引擎的世代守門
+    //
+    // 與 ssh 出口那一組（claim_supervisor／next_generation／store_job）逐點對稱，
+    // 只是鍵從 u16 換成連線名——引擎的身分是連線，不是某個埠（§5.2）。
+
+    fn with_engine_mut<T>(&self, conn: &str, f: impl FnOnce(&mut WgEngineRuntime) -> T) -> T {
+        let mut map = self.wg_engines.lock().unwrap();
+        f(map.entry(conn.to_string()).or_default())
+    }
+
+    /// 搶下這條連線的監看位子，回傳 None 代表已經有一顆引擎在跑
+    pub fn wg_claim_supervisor(&self, conn: &str) -> Option<u64> {
+        let counter = &self.generation;
+        self.with_engine_mut(conn, |rt| {
+            let claimed =
+                claim_slot(&mut rt.supervisor, || counter.fetch_add(1, Ordering::SeqCst) + 1);
+            if let Some(generation) = claimed {
+                rt.generation = generation;
+            }
+            claimed
+        })
+    }
+
+    pub fn wg_release_supervisor(&self, conn: &str, generation: u64) {
+        self.with_engine_mut(conn, |rt| release_slot(&mut rt.supervisor, generation));
+    }
+
+    /// 換世代並當場騰出位子，順手收掉那棵任務樹。
+    /// 緊接著的 start 不必等舊迴圈醒來就能接手（與 ssh 的 halt 同一套）
+    pub fn wg_next_generation(&self, conn: &str) {
+        let counter = &self.generation;
+        self.with_engine_mut(conn, |rt| {
+            rt.generation = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            rt.supervisor = None;
+            rt.worker.take();
+        });
+    }
+
+    pub fn wg_generation_alive(&self, conn: &str, generation: u64) -> bool {
+        self.wg_engines.lock().unwrap().get(conn).map(|rt| rt.generation) == Some(generation)
+    }
+
+    /// 記下這一輪引擎的任務樹，只在世代還是自己那一代時才收下（W6.2 的守門）
+    pub(crate) fn wg_store_worker(&self, conn: &str, generation: u64, worker: Worker) {
+        self.with_engine_mut(conn, |rt| {
+            let rt_generation = rt.generation;
+            store_worker(&mut rt.worker, rt_generation, generation, worker);
+        });
+    }
+
+    /// 只在世代相符時收掉任務樹，避免誤殺新的一輪
+    pub fn wg_kill_worker_of(&self, conn: &str, generation: u64) {
+        self.with_engine_mut(conn, |rt| {
+            if rt.worker.as_ref().map(|(g, _)| *g) == Some(generation) {
+                rt.worker.take();
+            }
+        });
     }
 
     /// 領取「關到系統匣」那顆一次性提示：第一次呼叫回 true 並就地作廢，
@@ -868,6 +1119,13 @@ impl AppState {
         self.with_config(|cfg| build_views(cfg, &self.exits.lock().unwrap()))
     }
 
+    /// 每條 wg 連線與其列的當下樣貌，Snapshot 與系統匣選單共用這一份算法
+    pub fn wg_views(&self) -> Vec<WgProxyView> {
+        self.with_config(|cfg| {
+            build_wg_views(cfg, &self.exits.lock().unwrap(), &self.wg_confs.lock().unwrap())
+        })
+    }
+
     /// 取快照的同時配一張系統匣套用號碼牌，兩者在**同一次 exits 鎖內**完成。
     ///
     /// 號碼牌的用途是讓晚算出來的快照永遠贏過早算出來的（`traymenu::refresh`
@@ -875,28 +1133,27 @@ impl AppState {
     /// 這個保證就不成立：兩條執行緒可以在「A 取完快照、還沒配號」時交錯，
     /// 讓 A 拿到比較大的號碼卻載著比較舊的快照，於是 B 那份新的先被貼上去、
     /// 又被 A 那份舊的蓋掉，系統匣就這樣停在過期的狀態直到下一次狀態變化。
-    fn views_with_seq(&self) -> (Vec<SourceView>, u64) {
+    fn views_with_seq(&self) -> (Vec<SourceView>, Vec<WgProxyView>, u64) {
         self.with_config(|cfg| {
             let exits = self.exits.lock().unwrap();
             let views = build_views(cfg, &exits);
-            (views, crate::traymenu::next_seq())
+            let wg = build_wg_views(cfg, &exits, &self.wg_confs.lock().unwrap());
+            (views, wg, crate::traymenu::next_seq())
         })
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot_with(self.source_views())
+        self.snapshot_with(self.source_views(), self.wg_views())
     }
 
-    /// 已經算好 `source_views` 的呼叫端走這裡，不要再算一次
-    fn snapshot_with(&self, sources: Vec<SourceView>) -> Snapshot {
+    /// 已經算好那兩份檢視的呼叫端走這裡，不要再算一次
+    fn snapshot_with(&self, sources: Vec<SourceView>, wg_proxies: Vec<WgProxyView>) -> Snapshot {
         Snapshot {
             close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
             check_for_updates: self.checks_for_updates(),
             sources,
-            // 骨架階段一律是空的：wg 的檢視組裝（含 .conf 摘要與列排序）由
-            // 實作車道補上，形狀已經由 §5.3 定死
-            wg_proxies: Vec::new(),
+            wg_proxies,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
             update: self.update_info(),
         }
@@ -908,9 +1165,9 @@ impl AppState {
     /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
     /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let (sources, seq) = self.views_with_seq();
-        crate::traymenu::refresh(&self.app, &sources, seq);
-        let _ = self.app.emit("config-changed", self.snapshot_with(sources));
+        let (sources, wg, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, &wg, seq);
+        let _ = self.app.emit("config-changed", self.snapshot_with(sources, wg));
     }
 
     /// 系統匣的提示文字與右鍵選單都跟著狀態走，狀態一變就整份重算。
@@ -918,8 +1175,8 @@ impl AppState {
     /// 鎖紀律：先取快照與號碼牌（鎖在 `views_with_seq` 裡取完就放掉），之後只碰
     /// 快照，真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     pub fn refresh_tray(&self) {
-        let (sources, seq) = self.views_with_seq();
-        crate::traymenu::refresh(&self.app, &sources, seq);
+        let (sources, wg, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, &wg, seq);
     }
 }
 
@@ -1060,6 +1317,7 @@ mod tests {
             status: status::STOPPED.into(),
             detail: None,
             last_test: None,
+            detected: None,
             generation,
             test_epoch: epoch,
             supervisor: None,

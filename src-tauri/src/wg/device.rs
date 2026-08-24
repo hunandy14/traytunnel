@@ -109,8 +109,12 @@ pub struct DeviceHandle {
     /// device → stack：已解密的 IP 封包
     pub inbound: mpsc::Receiver<Vec<u8>>,
     pub events: mpsc::Receiver<DeviceEvent>,
+    /// 泵任務本身。正式路徑不讀它（收尾一律靠 `CancellationToken`），
+    /// 留著是為了讓測試檯等得到「任務真的結束了」（W4.10）
+    #[allow(dead_code)]
     pub join: tokio::task::JoinHandle<()>,
     /// 綁定完成後 UDP socket 的實際本地位址（`listen_port = 0` 時測試檯要靠它互連）
+    #[allow(dead_code)]
     pub local_addr: SocketAddr,
 }
 
@@ -171,9 +175,14 @@ async fn pump(
                     // 下一次 recv_from 會回 WSAECONNRESET。把它當致命錯誤會讓
                     // 隧道在對端還沒起來時直接死掉（W4.9）。
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    // 其餘的錯誤是這個 socket 真的壞了（介面被拔掉、handle 被關）。
+                    // 照舊 `continue` 的話迴圈會用 100% CPU 空轉並且再也收不到東西，
+                    // 而且畫面會一直停在 connected——推 Fatal 讓 supervise 收掉這一輪，
+                    // 5 秒後整組重起才是對的
                     Err(e) => {
                         log::warn!("wg device: udp recv failed: {e}");
-                        continue;
+                        let _ = events.send(DeviceEvent::Fatal(e.to_string())).await;
+                        break;
                     }
                 };
                 // 借用檢查：decapsulate 同時要 rx_buf 的唯讀切片與 tx_buf 的可變
