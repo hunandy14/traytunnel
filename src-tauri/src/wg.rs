@@ -92,8 +92,12 @@ pub async fn test_conf(_conf_path: &std::path::Path) -> crate::ssh::tunnel::Test
 }
 
 /// 只解析不連線，給編輯面板顯示「這份 conf 裡有什麼」。
-pub fn inspect_conf(_conf_path: &std::path::Path) -> Result<conf::ConfSummary, String> {
-    todo!()
+///
+/// **不握手、不解析主機名**（W1.33）：端點寫一個解不出來的名字也照樣回摘要，
+/// 那是重連時才要做的事。錯誤訊息與 [`conf::parse`] 是同一句（W1.34），金鑰
+/// 一個位元組都不會出現在裡面。
+pub fn inspect_conf(conf_path: &std::path::Path) -> Result<conf::ConfSummary, String> {
+    conf::load(conf_path).map(|c| c.summary())
 }
 
 /// 握手歲數 → exit-status 字彙的映射（設計書 §4.2 的門檻表，W6.4）。
