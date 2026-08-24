@@ -597,6 +597,8 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
 /// 注意：**沒有 socksPort**——SOCKS5 埠是底下的一條 `socks` 列（§1.3）。
 ///
 /// `mtu` 是選填的隧道 MTU 覆寫（省略／null＝照 `.conf`，見 `wg::effective_mtu`）。
+///
+/// **新建**時可能順手附一條預設的 SOCKS5 列，規則見 [`config::default_socks_row`]。
 #[tauri::command]
 pub fn upsert_wg_proxy(
     state: State<'_, Shared>,
@@ -614,6 +616,20 @@ pub fn upsert_wg_proxy(
         return Some(err);
     }
 
+    // 附贈預設 SOCKS5 列的執行期條件，**在 cfg 鎖外先問完**：`is_listening` 是一次
+    // `GetExtendedTcpTable` 全表列舉，沒有理由讓設定鎖撐在那裡等一趟系統呼叫。
+    // 編輯路徑永不附贈，所以那一路連問都不問。
+    //
+    // 這個答案有兩處刻意記在這裡的不精確，都是**保守**方向、都不改行為：
+    //   * `is_listening` 掃的是全介面（含 0.0.0.0 與 ::），而我們的監聽器只綁
+    //     127.0.0.1。別人綁在某張外部網卡的 1080 會被算成「忙」而讓我們不附贈——
+    //     寧可少送一條列，也不要附一條起不來的。
+    //   * `GetExtendedTcpTable` 失敗時回 false（＝當作沒人在聽）。那是查不到答案，
+    //     不是查到「空」；真撞上了會在附贈的列上以 port_busy 現形，那條路徑本來
+    //     就有完整的錯誤顯示。
+    let socks_port_listening =
+        original_name.is_none() && winsys::is_listening(config::DEFAULT_SOCKS_PORT);
+
     let written = st.update_config_checked(|c| {
         // 便宜的重驗，理由同 upsert_source：這一次是在 cfg 鎖裡做的
         if let Some(err) =
@@ -621,7 +637,9 @@ pub fn upsert_wg_proxy(
         {
             return Err(err);
         }
-        match original_name.as_deref() {
+        // 兩條臂各自算出「這一次有沒有附贈預設 SOCKS5 列」，match 當運算式用，
+        // 閉包只有這一個出口
+        let added_default = match original_name.as_deref() {
             Some(orig) => {
                 if let Some(p) = c.wg_proxy_mut(orig) {
                     p.name = name.clone();
@@ -630,24 +648,39 @@ pub fn upsert_wg_proxy(
                     // 指派而不是 `if let Some`
                     p.mtu = mtu;
                 }
+                // 編輯永不附贈：這一臂結構上就沒有那條路，規則不必再寫一次
+                false
             }
-            // 新連線底下還沒有任何列，所以也還沒有東西要跑；enabled 沿用預設的
-            // true，使用者按下總開關（或加了第一條列）時才真的起引擎
-            None => c.wg_proxies.push(WgProxy {
-                name: name.clone(),
-                conf_path: conf_path.clone(),
-                enabled: true,
-                mtu,
-                forwards: Vec::new(),
-            }),
-        }
-        Ok(())
+            // 新連線的 enabled 沿用預設的 true。底下有沒有東西要跑，看 1080 淨不
+            // 淨空——淨空就附一條預設 SOCKS5 列，否則連線底下一條列都沒有，
+            // 使用者加了第一條列時才真的起引擎
+            None => {
+                c.wg_proxies.push(WgProxy {
+                    name: name.clone(),
+                    conf_path: conf_path.clone(),
+                    enabled: true,
+                    mtu,
+                    forwards: Vec::new(),
+                });
+                // 先推連線再問附贈：那一筆是用手建列同一條 prepare_forward 造的，
+                // 而它要查得到所屬連線才驗得過（W3.37）
+                match config::default_socks_row(c, &name, socks_port_listening) {
+                    Some(row) => {
+                        // 上一行才推進去的那一條，查不到是不可能的
+                        c.wg_proxy_mut(&name).expect("剛推進去的連線一定找得到").forwards.push(row);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
+        Ok(added_default)
     });
-    match written {
+    let added_default = match written {
         Err(e) => return Some(save_error_message(st, e)),
         Ok(Err(err)) => return Some(err),
-        Ok(Ok(())) => {}
-    }
+        Ok(Ok(added)) => added,
+    };
 
     st.emit_config_changed();
     st.log_from(
@@ -657,9 +690,32 @@ pub fn upsert_wg_proxy(
             None => "WireGuard connection added",
         },
     );
+    if added_default {
+        st.log_from(
+            &name,
+            format!("default SOCKS5 proxy added on port {}", config::DEFAULT_SOCKS_PORT),
+        );
+    } else if socks_port_listening {
+        // 沒附贈而且原因是執行期探測時**一定要留一行**：那是三個條件裡唯一一個
+        // 事後看不出痕跡的。設定層撞埠使用者在列表上就看得到佔用者，但「剛剛
+        // 刪掉的那條連線的監聽器還沒放掉 1080」只在這一瞬間為真，下一秒再建一次
+        // 就成功了——沒有這一行，同樣的操作兩次不同結果會完全無跡可循。
+        st.log_from(
+            &name,
+            format!("skipped default SOCKS5: port {} is in use", config::DEFAULT_SOCKS_PORT),
+        );
+    }
     // 改名之後舊名的引擎已經被 sync_exits 收掉了；換了 conf 就要用新的那一份重來
     if original_name.is_some() {
         wg::restart(st, &name);
+    } else if added_default && st.wg_conf_error(&name).is_none() {
+        // 附上的列與手建列無異，起線就走手建列同一條路（`start_row` 依連線型別
+        // 分流），不直接戳 wg::start——今天兩者等價，但這條路徑不該自己長一份。
+        //
+        // `.conf` 壞掉時**不起**：`wg::start` 會擋下來並記一行 `cannot start: …`，
+        // 而使用者這一步只是新增了一條連線、根本沒要求連線，替他生一則他沒要求的
+        // 錯誤只是噪音。列照樣附著，等他把 conf 修好、按下總開關由既有流程接手。
+        start_row(st, config::DEFAULT_SOCKS_PORT);
     }
     None
 }

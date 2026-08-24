@@ -554,6 +554,22 @@ function rememberProtocol(exit: ExitInfo) {
 }
 
 /**
+ * 該不該對這條列說 NOT_A_PROXY_HINT——徽章的問號與底下的檢測行都問這裡，
+ * 不各自再算一次：兩處講的是同一件事，判準分兩份遲早會分岔。
+ *
+ * 只有在**真的測過、而且測出「不像代理」**時才為真。曾經識別出協定的列偶爾測
+ * 失敗一次是連線問題，不是使用者把旗標設錯了。
+ *
+ * socks 列一律為 false：那句話講的是「把『目的地是代理』的旗標關掉」，而引擎
+ * 自建的列根本沒有那個旗標可以關，對它說等於叫使用者去做一件做不到的事。
+ */
+function showsNotAProxyHint(exit: ExitInfo): boolean {
+  if (exit.kind === "socks") return false;
+  if (exit.knownProtocol) return false;
+  return exit.lastTest?.state === "fail";
+}
+
+/**
  * 徽章的三態，關鍵在於把「還不知道」與「確定不是」分開：
  *
  *   已知協定（含記憶）  SOCKS5／HTTP，accent 樣式，沒有 tooltip
@@ -562,15 +578,14 @@ function rememberProtocol(exit: ExitInfo) {
  *   還沒測／測試中      PROXY，淡樣式，不掛 tooltip。中性陳述「這條列被標成
  *                       代理」，不對還沒發生的事下結論、更不指責使用者
  *
- * `hint` 是「該不該說那句話」的**唯一**判準，徽章與底下的檢測行都引用它，
- * 不各自再算一次——兩處講的是同一件事，判準分兩份遲早會分岔。
+ * **只服務真的有徽章的列**（見 buildCard 的 showBadge），所以這裡不再有
+ * socks 那一支——引擎自建的列不畫徽章，問不到這裡來。
  */
-function badgeLook(exit: ExitInfo): { text: string; accent: boolean; hint: boolean } {
-  if (exit.kind === "socks") return { text: "SOCKS5", accent: true, hint: false };
+function badgeLook(exit: ExitInfo): { text: string; accent: boolean } {
   const known = exit.knownProtocol;
-  if (known) return { text: known.toUpperCase(), accent: true, hint: false };
-  if (exit.lastTest?.state === "fail") return { text: "PROXY?", accent: false, hint: true };
-  return { text: "PROXY", accent: false, hint: false };
+  if (known) return { text: known.toUpperCase(), accent: true };
+  // 問號與那句話是同一個判準，不自己再判一次
+  return { text: showsNotAProxyHint(exit) ? "PROXY?" : "PROXY", accent: false };
 }
 
 function paintCard(exit: ExitInfo) {
@@ -579,15 +594,17 @@ function paintCard(exit: ExitInfo) {
 
   const refs = cardRefs.get(exit.local);
   if (!refs) return;
-  const look = badgeLook(exit);
+  const hint = showsNotAProxyHint(exit);
 
   refs.dot.className = `dot tone-${statusTone(exit.status)}`;
   refs.dot.title = exit.status;
 
+  // refs.badge 只有在這條列真的畫得出徽章時才存在，badgeLook 也才問得到
   if (refs.badge) {
+    const look = badgeLook(exit);
     refs.badge.textContent = look.text;
     refs.badge.className = `type-badge ${look.accent ? "wg" : "ssh"}`;
-    if (look.hint) refs.badge.title = NOT_A_PROXY_HINT;
+    if (hint) refs.badge.title = NOT_A_PROXY_HINT;
     else refs.badge.removeAttribute("title");
   }
 
@@ -601,10 +618,9 @@ function paintCard(exit: ExitInfo) {
       refs.test.appendChild(h("div", { class: "card-test-place", text: two.place }));
       refs.test.appendChild(h("div", { class: "card-test-ip mono", text: two.ip }));
     } else {
-      // 直接引用徽章算好的 hint，不自己再判一次：曾經識別出協定的列偶爾測
-      // 失敗一次，那是連線問題而不是使用者把旗標設錯了，兩處必須同一個答案
+      // 與徽章的問號共用同一個判準（showsNotAProxyHint），不自己再判一次
       refs.test.className = `card-test tone-text-${t.tone}`;
-      refs.test.title = look.hint ? NOT_A_PROXY_HINT : "";
+      refs.test.title = hint ? NOT_A_PROXY_HINT : "";
       refs.test.textContent = t.text;
     }
   }
@@ -659,7 +675,12 @@ function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement 
   // 徽章：舊後端那個 true 是為了相容假設出來的，不足以拿來宣稱「這條列是代理」。
   // PR 之前這個位置本來就沒有徽章，憑空長出一排 PROXY／PROXY? 只會讓人以為設定
   // 被改過。後端補上 kind／probeProxy 後 legacy 不再成立，徽章自然回來。
-  const showBadge = !exit.legacy && showTest;
+  //
+  // 引擎自建的列（kind === "socks"）不畫徽章：它只會出現在「SOCKS5」區段裡，
+  // 在區段標題底下再掛一個寫著 SOCKS5 的徽章是零資訊的重複。PORT FORWARDS 那邊
+  // 勾了「目的地是代理」的轉發列不同——那個區段裡的列協定各異，徽章是唯一的
+  // 識別，原樣保留。
+  const showBadge = !exit.legacy && showTest && exit.kind !== "socks";
   let badge: HTMLElement | null = null;
   let nameEl: HTMLElement;
   if (showBadge) {

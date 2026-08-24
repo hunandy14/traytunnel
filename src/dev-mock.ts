@@ -38,6 +38,30 @@ const ownerName = (owner: ConnTarget): string => owner.data.name;
 /** 這條連線底下的列。兩種連線的欄位名現在一樣，收窄之後直接取 */
 const ownerRows = (owner: ConnTarget): ExitInfo[] => owner.data.exits;
 
+/**
+ * ⑤ socks 列：引擎自建的 SOCKS5 listener，沒有目的地。
+ *
+ * 種子資料、`upsert_wg_socks` 手建的列、新連線附贈的預設列**三處共用這一份**。
+ * 它們在真後端本來就是同一種列（同一條 `prepare_forward` 造出來的），分三份
+ * 字面值寫遲早會分岔——實際上就分岔過。
+ *
+ * `probeProxy: false` 是後端的真相（`Forward.probe_proxy` 對 socks 列恆為
+ * false）。socks 列**恆測**沒錯，但那件事是 `kind` 決定的（見 status.ts 的
+ * `shouldProbe`），旗標本身只對 forward 列有意義，socks 列不得帶。
+ */
+function socksExit(name: string, local: number): ExitInfo {
+  return {
+    name,
+    local,
+    remote: null,
+    kind: "socks",
+    probeProxy: false,
+    enabled: true,
+    status: "stopped",
+    lastTest: null,
+  };
+}
+
 const DEFAULT_SNAPSHOT: Snapshot = {
   closeToTray: true,
   autostart: false,
@@ -124,16 +148,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       allowedIps: ["0.0.0.0/0", "::/0"],
       exits: [
         // ⑤ socks 列：引擎自建 SOCKS5，恆測、協定已知，排在最前（SOCKS5 區段）
-        {
-          name: "proxy",
-          local: 1085,
-          remote: null,
-          kind: "socks",
-          probeProxy: true,
-          enabled: true,
-          status: "stopped",
-          lastTest: null,
-        },
+        socksExit("proxy", 1085),
         // ④ forward + probeProxy=true：接隧道對面已經在跑的代理服務
         {
           name: "corp",
@@ -201,6 +216,13 @@ const FAKE_TEST: Record<number, { text: string; protocol?: ProxyProtocol }> = {
 
 /** 這些埠一啟動就會撞埠，讓 port_busy 這條路徑在瀏覽器也演練得到 */
 const BUSY_PORTS = new Set([1084]);
+
+/**
+ * 新建 WG 連線時預設附贈的 SOCKS5 列（與 config.rs 的 `DEFAULT_SOCKS_PORT`／
+ * `DEFAULT_SOCKS_NAME` 是同一組值，兩邊必須一致）。
+ */
+const DEFAULT_SOCKS_PORT = 1080;
+const DEFAULT_SOCKS_NAME = "socks";
 
 const state: Snapshot = load();
 const timers = new Map<number, number>();
@@ -333,6 +355,28 @@ function find(local: number): { exit: ExitInfo; owner: ConnTarget } | undefined 
 function ownerOf(local: number): string {
   const hit = find(local);
   return hit ? ownerName(hit.owner) : "";
+}
+
+/**
+ * 新建一條 WG 連線時要不要順手附一條 SOCKS5 列——要的話回傳那一筆
+ * （真後端 `config::default_socks_row`，規則逐條對齊）：
+ *
+ *   1. **新建路徑**才附，編輯永不附（呼叫端只在新建那一支路上問）
+ *   2. **設定層淨空**：1080 在整個埠鍵空間（ssh 的列 ＋ 所有 wg 連線的列）沒有
+ *      登記者，也就是 `find` 找不到
+ *   3. **執行期淨空**：本機沒有別的程式在聽 1080。mock 沒有真的 OS，用
+ *      `BUSY_PORTS`（本來就代表「這個埠被別人佔著」）當那一層
+ *
+ * 任一條不成立就什麼都不附，**不找替代埠**。
+ *
+ * 注意種子資料的 1080 本來就掛著一條 ssh 出口，所以在瀏覽器裡直接新增一條 WG
+ * 連線走到的是條件 2 那條路；要演練「附得成」，先把那條 1080 的出口刪掉。
+ */
+function defaultSocksRow(): ExitInfo | null {
+  if (find(DEFAULT_SOCKS_PORT)) return null;
+  if (BUSY_PORTS.has(DEFAULT_SOCKS_PORT)) return null;
+  // 與手建的 socks 列同一個建構子——真後端那邊也是同一條 prepare_forward
+  return socksExit(DEFAULT_SOCKS_NAME, DEFAULT_SOCKS_PORT);
 }
 
 /**
@@ -806,20 +850,34 @@ function handle(cmd: string, args: Args): unknown {
         pushConfig();
         log(input.name, `connection updated (${input.confPath})`);
       } else {
+        // 1080 兩層都淨空時附一條預設 SOCKS5 列（規則見 defaultSocksRow）
+        const defaultRow = defaultSocksRow();
         state.wgProxies.push({
+          // 真後端新建的連線 enabled 就是 true（commands.rs 的 upsert_wg_proxy），
+          // 附贈的列才有辦法立刻跑起來
           name: input.name,
           confPath: input.confPath,
-          enabled: false,
+          enabled: true,
           mtu: input.mtu,
           confError: null,
           endpoint: "",
           addresses: [],
           dns: [],
           allowedIps: [],
-          exits: [],
+          exits: defaultRow ? [defaultRow] : [],
         });
         pushConfig();
         log(input.name, `WireGuard connection added (${input.confPath})`);
+        // 起線放在 pushConfig 與這兩行之後，順序才跟真後端一致：先落檔推快照、
+        // 再記這一次操作做了什麼，最後才是 starting tunnel 那一串執行期的事。
+        // 新連線的 confError 恆為 null（mock 沒有真的解析器），所以真後端那條
+        // 「conf 壞掉就不起線」的岔路在這裡走不到。
+        if (defaultRow) {
+          log(input.name, `default SOCKS5 proxy added on port ${DEFAULT_SOCKS_PORT}`);
+          // 附贈的列與手建列無異，手建一條 enabled 的列存完就直接起線。
+          // setIntent = false：它的 enabled 已經是 true，不必也不該再寫一次
+          start(defaultRow, input.name, false);
+        }
       }
       return null;
     }
@@ -948,16 +1006,7 @@ function handle(cmd: string, args: Args): unknown {
         });
         log(owner.data.name, `${input.name}: updated`);
       } else {
-        owner.data.exits.unshift({
-          name: input.name,
-          local: input.local,
-          remote: null,
-          kind: "socks",
-          probeProxy: true,
-          enabled: true,
-          status: "stopped",
-          lastTest: null,
-        });
+        owner.data.exits.unshift(socksExit(input.name, input.local));
         pushConfig();
         log(owner.data.name, `${input.name}: added`);
       }
