@@ -16,6 +16,14 @@ use tokio_util::sync::CancellationToken;
 /// WireGuard 的 `REJECT_AFTER_TIME`：握手超過這個歲數就不能再算 connected
 pub const REJECT_AFTER: Duration = Duration::from_secs(180);
 
+/// boringtun 的 `REKEY_TIMEOUT`：一次握手沒有回應之後，它隔多久重送一次。
+///
+/// boringtun 沒有把這個值 `pub` 出來，所以這裡是一顆**鏡射常數**。它與
+/// [`REJECT_AFTER`] 同住不是為了整齊：兩者都是「WireGuard 協定說了算」的
+/// 時間，而本模組的耐心值是照著它們推導出來的（見 [`FIRST_HANDSHAKE_GRACE`]），
+/// 散在各處會變成一組互相不知道對方存在的魔數。
+pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 首次握手的寬限期：device 起來之後**一次都還沒握上**時的耐心值。
 ///
 /// 這裡刻意不沿用 [`REJECT_AFTER`]。那 180 秒是 WireGuard 對**既有 session**
@@ -25,9 +33,10 @@ pub const REJECT_AFTER: Duration = Duration::from_secs(180);
 /// reconnecting，而底下靠 reconnecting 觸發的自癒（重建引擎、重解析端點）
 /// 也一起被押到三分鐘之後。
 ///
-/// 15 秒的來源是 boringtun 的 `REKEY_TIMEOUT`（5 秒）：足夠讓它重送兩次以上
-/// 握手，線路只是慢或掉了一兩顆封包不會被誤判成失敗。
-pub const FIRST_HANDSHAKE_GRACE: Duration = Duration::from_secs(15);
+/// 值是 **3 × [`REKEY_TIMEOUT`]**（15 秒）：容得下兩次重送還有餘裕，線路只是
+/// 慢、或掉了一兩顆握手封包不會被誤判成失敗。寫成推導而不是寫死 15，是因為
+/// 「要撐過幾次重送」才是這個值的意義所在。
+pub const FIRST_HANDSHAKE_GRACE: Duration = Duration::from_secs(REKEY_TIMEOUT.as_secs() * 3);
 
 /// 計時器 tick 間隔（onetun 是 1ms 空轉，這裡固定 250ms）
 pub const TIMER_TICK: Duration = Duration::from_millis(250);
@@ -314,12 +323,28 @@ async fn send_udp(udp: &tokio::net::UdpSocket, packet: &[u8], endpoint: SocketAd
 /// 之一，由 W1.31 的 grep 型測試釘住）：端點是隧道外的位址，本來就必須用系統
 /// 解析器，而且要每次重連前重解一次，動態 DNS 的端點才跟得上。
 pub async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
-    note_resolve();
-    tokio::net::lookup_host(endpoint)
-        .await
-        .map_err(|e| format!("解析不到端點 {endpoint}：{e}"))?
+    resolve_endpoint_all(endpoint)
+        .await?
+        .into_iter()
         .next()
         .ok_or_else(|| format!("解析不到端點 {endpoint}"))
+}
+
+/// 同上，但回傳**這個名字現在解得出來的全部位址**。
+///
+/// DDNS 自癒要比對「端點搬家了沒」，而一個名字回多筆 A 是常態（負載平衡、
+/// 多線路）。只看第一筆的話，解析器每次輪轉順序都會被誤判成「IP 變了」，
+/// 於是引擎被反覆重建——所以比對的是**集合包不包含目前這一個**。
+pub async fn resolve_endpoint_all(endpoint: &str) -> Result<Vec<SocketAddr>, String> {
+    note_resolve();
+    let all: Vec<SocketAddr> = tokio::net::lookup_host(endpoint)
+        .await
+        .map_err(|e| format!("解析不到端點 {endpoint}：{e}"))?
+        .collect();
+    if all.is_empty() {
+        return Err(format!("解析不到端點 {endpoint}"));
+    }
+    Ok(all)
 }
 
 #[cfg(test)]

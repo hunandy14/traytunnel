@@ -11,7 +11,6 @@ pub mod conf;
 pub mod device;
 pub mod dns;
 pub mod engine;
-pub mod mtu;
 pub mod socks5;
 pub mod stack;
 
@@ -52,7 +51,19 @@ pub const RECONNECT_REBUILD_AFTER: Duration = Duration::from_secs(60);
 ///
 /// 計數在復原（connected）時歸零；重建之後整顆 `HandshakeWatch` 會跟著
 /// 那一輪引擎重新建立，自然也是零。
+///
+/// **解析失敗不算一次**（見 [`StuckAction::Unresolved`]）：那是本機的網路斷了，
+/// 不是「位址沒變而隧道卡死」的證據，拿它去燒保險絲等於在筆電剛連上 Wi-Fi 的
+/// 那幾分鐘裡毫無理由地重建引擎。
 pub const STUCK_RECHECK_FUSE: u32 = 5;
+
+/// 複查端點時，那一次名字解析最多等多久。
+///
+/// 這段解析跑在 `consume` 的事件迴圈上，沒有上限的話，一次卡住的 DNS 查詢
+/// 會讓整條監看迴圈跟著卡住——期間收不到引擎事件、也看不見自己的世代已經
+/// 被 halt 作廢（使用者按了中斷卻要等 DNS 慢慢逾時）。5 秒到就當這一次
+/// 解析失敗，走「不計數、繼續等」那一支。
+const RECHECK_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 進入 reconnecting 時記的那一行。stale 路徑以前是完全靜默的，
 /// 使用者只看得到一個變色的點，日誌裡卻查不到任何線索
@@ -60,6 +71,10 @@ const HANDSHAKE_RETRY_LOG: &str = "handshake not completed, retrying";
 
 /// 複查過端點、位址沒變時記的那一行（同一段掉線只記一次，不刷屏）
 const ENDPOINT_UNCHANGED_LOG: &str = "still reconnecting, endpoint address unchanged";
+
+/// 複查時連解析都失敗（本機網路斷了、DNS 逾時）記的那一行。
+/// 與上面那一行分開，是因為兩者要使用者去看的地方完全不同
+const ENDPOINT_UNRESOLVED_LOG: &str = "still reconnecting, cannot resolve the endpoint right now";
 
 /// 端點的位址真的變了、要重建引擎時記的那一行
 const REBUILD_LOG: &str = "endpoint address changed, rebuilding engine";
@@ -247,7 +262,7 @@ pub(crate) async fn test_conf_within(
             preshared_key: conf.preshared_key,
             keepalive: conf.keepalive,
             endpoint,
-            bind: unspecified_bind(&endpoint),
+            bind: engine::bind_addr(&endpoint, 0),
             stale_after: device::REJECT_AFTER,
             first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         },
@@ -274,15 +289,6 @@ pub(crate) async fn test_conf_within(
         Ok(Some(true)) => R::ok(),
         Ok(Some(false)) | Ok(None) => R::fail(DEVICE_STOPPED),
         Err(_) => R::fail(HANDSHAKE_TIMEOUT),
-    }
-}
-
-/// 臨時測試用的 UDP 本地位址：版本跟著端點走，埠一律交給 OS 配
-fn unspecified_bind(endpoint: &std::net::SocketAddr) -> std::net::SocketAddr {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    match endpoint {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
 }
 
@@ -331,40 +337,24 @@ pub fn should_run_engine(cfg: &crate::config::Config, conn: &str) -> bool {
     !rows_to_start(cfg, conn).is_empty()
 }
 
-/// 這一輪引擎的 MTU 決策：**介面覆寫 ＞ `.conf` 明寫 ＞ 自動探測**。
+/// 這條連線這一輪要用的隧道 MTU：**介面覆寫 ＞ `.conf` 明寫 ＞ 應用層預設**。
 ///
-/// 這是整支程式裡唯一一個 MTU 決策點（覆審打回 2026-08-24：原本
-/// `effective_mtu` 與 `should_probe_mtu` 兩支各說一半，湊得出
-/// 「要探測、但同時又指定了 1400」這種說不通的組合）。三個來源各有各的理由：
+/// 三態各有各的理由，缺一不可：
 ///
 /// * `override_mtu`（`WgProxy.mtu`）是使用者在連線表單上填的值。他之所以會去填，
 ///   通常正是因為 conf 給的（或預設的）那個值在他的線路上會黑洞，所以它最大。
 ///   **這不會改寫 `.conf` 檔**——那份檔案是別的工具產出的，我們只讀不寫。
 /// * `conf_mtu` 是 `.conf` 明寫的 `[Interface] MTU`。對端管理員特意寫了值就照做。
-/// * 兩者都沒有才輪到自動探測（[`mtu`]），探不出來時它自己會落回
-///   [`conf::APP_DEFAULT_MTU`]。
+/// * 兩者都沒有才輪到 [`conf::APP_DEFAULT_MTU`]（1280，保守到不會黑洞的值）。
+///
+/// 這三態就是最終方案。曾經評估過「連上之後自動探一次路徑 MTU」，結論是**取消**
+/// ——它要在引擎組裝的正中間插一段等握手、等回音的非同步流程，把事件順序、
+/// 啟動時序與埠的可用性全部攪進同一個窗口裡，而它買到的只是「1280 或 1420」
+/// 這一個二選一；同樣的結果，使用者在表單上填一個數字就拿得到。
 ///
 /// 純函式，沒有 IO：這條優先序是規格本身，測試直接釘它而不必起一顆引擎。
-pub fn plan_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> mtu::Plan {
-    match override_mtu.or(conf_mtu) {
-        Some(fixed) => mtu::Plan::Fixed(fixed),
-        None => mtu::Plan::Probe,
-    }
-}
-
-/// 套上本連線的探測快取：**上一輪探過就沿用，這一輪不再探**。
-///
-/// 探測要等握手、要一個 RTT，而重連（每 5 秒一輪）與重建在一條不穩的線路上
-/// 可能發生很多次。沒有快取的話，一個離線的端點會每 80 秒刷一次探測日誌，
-/// 而且每一輪都白等一次握手逾時（覆審打回 2026-08-24）。
-///
-/// 快取只活在**執行期**（supervise 的區域變數，每連線一份），不落設定檔：
-/// 換了網路重新連線時本來就該重探。
-pub(crate) fn mtu_for_round(planned: mtu::Plan, memo: Option<&mtu::Probe>) -> mtu::Plan {
-    match (planned, memo) {
-        (mtu::Plan::Probe, Some(previous)) => mtu::Plan::Fixed(previous.mtu()),
-        (planned, _) => planned,
-    }
+pub fn effective_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> usize {
+    override_mtu.or(conf_mtu).unwrap_or(conf::APP_DEFAULT_MTU)
 }
 
 /// 這一輪引擎的握手觀測：狀態變化時該記哪一行日誌，以及 reconnecting
@@ -376,17 +366,24 @@ pub(crate) fn mtu_for_round(planned: mtu::Plan, memo: Option<&mtu::Probe>) -> mt
 /// 吃的是 [`engine::EngineEvent`] 而不是 UI 狀態字串（覆審打回 2026-08-24）：
 /// 狀態是個 enum，match 才有完備性可言。
 pub(crate) struct HandshakeWatch {
-    /// 這一段的起點：引擎啟動、上一次狀態變化、或上一次端點複查。
-    ///
-    /// 「握手花了多久」與「卡了多久」共用同一個錨點，因為兩者問的是同一件事
-    /// ——距離上一次「情況有變」過了多久。
-    since: Instant,
+    /// **這個 phase 是什麼時候開始的**，只服務一件事：「handshake ok in Xms」
+    /// 要報的那個耗時。端點複查不會動它——複查跟「隧道斷了多久」是兩回事，
+    /// 動了它就會把一段 10 分鐘的斷線報成「handshake ok in 60000ms」。
+    phase_since: Instant,
+    /// **上一次複查端點是什麼時候**，只服務 [`Self::overdue`]。每複查一次
+    /// 就往前推一格，下一次複查因此落在一個門檻之後
+    recheck_since: Instant,
     /// reconnecting 連續超過這麼久就該去複查端點
     /// （production 是 [`RECONNECT_REBUILD_AFTER`]）
     rebuild_after: Duration,
-    /// 這一段掉線裡，複查端點得到「位址沒變」的次數（保險絲的計數器，
-    /// 見 [`STUCK_RECHECK_FUSE`]）。復原成 connected 時歸零
+    /// 這一段掉線裡，複查端點得到「位址沒變」的次數。
+    ///
+    /// 兩個用途：等於 1 時記那一行（同一段只記第一次），累積到
+    /// [`STUCK_RECHECK_FUSE`] 時燒保險絲。解析失敗**不**計入這裡。
     unchanged_checks: u32,
+    /// 這一段掉線裡，複查端點連解析都失敗的次數。**只用來去抖日誌**，
+    /// 一次都不會讓保險絲往前走（R1）
+    unresolved_checks: u32,
     phase: Phase,
 }
 
@@ -395,24 +392,29 @@ enum Phase {
     /// 這一輪還沒有任何結論
     Waiting,
     Ok,
-    /// 掉線了，還沒去複查過端點
+    /// 掉線了。「複查過幾次了」由 `unchanged_checks` / `unresolved_checks` 說了算，
+    /// 不必再多一個 phase 去記同一件事
     Reconnecting,
-    /// 掉線了，而且已經複查過端點（同一段掉線只記一次日誌，不刷屏）
-    Rechecked,
 }
 
 impl HandshakeWatch {
     /// `now` 就是引擎啟動的那一刻——`spawn` 之前建好，「握手花了多久」量的
-    /// 才是真的耗時（覆審打回 2026-08-24：原本建在 spawn 之後，探測路徑上
-    /// 事件早就在佇列裡等著，量出來恆為 0ms）
+    /// 才是真的耗時（覆審打回 2026-08-24：原本建在 spawn 之後，量出來恆為 0ms）
     pub(crate) fn new(now: Instant, rebuild_after: Duration) -> Self {
-        HandshakeWatch { since: now, rebuild_after, unchanged_checks: 0, phase: Phase::Waiting }
+        HandshakeWatch {
+            phase_since: now,
+            recheck_since: now,
+            rebuild_after,
+            unchanged_checks: 0,
+            unresolved_checks: 0,
+            phase: Phase::Waiting,
+        }
     }
 
     /// 吃一顆引擎事件，回傳「要記的那一行日誌」（沒變化就回 None）。
     ///
     /// 只有**變化**才記：device 那一層已經去抖過（只在 `Reported` 改變時推事件），
-    /// 這裡再擋一次是為了列狀態或 MTU 事件夾在中間時不重複刷屏。
+    /// 這裡再擋一次是為了列狀態之類的事件夾在中間時不重複刷屏。
     pub(crate) fn on_event(&mut self, event: &engine::EngineEvent, now: Instant) -> Option<String> {
         let engine::EngineEvent::Engine(health, _) = event else {
             return None;
@@ -420,17 +422,15 @@ impl HandshakeWatch {
         match (health, self.phase) {
             (engine::EngineHealth::Connected, Phase::Ok) => None,
             (engine::EngineHealth::Connected, _) => {
-                let ms = now.saturating_duration_since(self.since).as_millis();
-                self.phase = Phase::Ok;
-                self.since = now;
-                // 自己好起來了：保險絲的計數歸零，下一次掉線重新數
-                self.unchanged_checks = 0;
+                // 這裡報的是**斷了多久**（或啟動到握上花了多久），所以錨點是
+                // phase_since；中間複查過幾次端點與這個數字無關
+                let ms = now.saturating_duration_since(self.phase_since).as_millis();
+                self.enter(Phase::Ok, now);
                 Some(format!("handshake ok in {ms}ms"))
             }
-            (engine::EngineHealth::Reconnecting, Phase::Reconnecting | Phase::Rechecked) => None,
+            (engine::EngineHealth::Reconnecting, Phase::Reconnecting) => None,
             (engine::EngineHealth::Reconnecting, _) => {
-                self.phase = Phase::Reconnecting;
-                self.since = now;
+                self.enter(Phase::Reconnecting, now);
                 Some(HANDSHAKE_RETRY_LOG.to_string())
             }
             // Fatal 走 supervise 既有的錯誤路徑（收掉這一輪、5 秒後重來），
@@ -439,30 +439,46 @@ impl HandshakeWatch {
         }
     }
 
+    /// 換一個 phase：兩個錨點一起重設，複查的計數全部歸零
+    fn enter(&mut self, phase: Phase, now: Instant) {
+        self.phase = phase;
+        self.phase_since = now;
+        self.recheck_since = now;
+        self.unchanged_checks = 0;
+        self.unresolved_checks = 0;
+    }
+
     /// 掉線是不是已經卡超過門檻，該去複查端點了
     pub(crate) fn overdue(&self, now: Instant) -> bool {
-        matches!(self.phase, Phase::Reconnecting | Phase::Rechecked)
-            && now.saturating_duration_since(self.since) >= self.rebuild_after
+        self.phase == Phase::Reconnecting
+            && now.saturating_duration_since(self.recheck_since) >= self.rebuild_after
     }
 
     /// 複查過了、端點沒變。重新計時（下一次複查在一個門檻之後），
     /// 並決定這一次要不要燒保險絲。
     pub(crate) fn note_endpoint_unchanged(&mut self, now: Instant) -> AfterRecheck {
-        self.since = now;
+        self.recheck_since = now;
         self.unchanged_checks += 1;
         // 保險絲：位址從頭到尾沒變，但隧道就是不會好——引擎自身卡死這類**未知
         // 故障**不該完全沒有自癒手段（見 [`STUCK_RECHECK_FUSE`]）
         if self.unchanged_checks >= STUCK_RECHECK_FUSE {
             return AfterRecheck::BlowFuse;
         }
-        match self.phase {
-            Phase::Reconnecting => {
-                self.phase = Phase::Rechecked;
-                AfterRecheck::KeepWaiting(Some(ENDPOINT_UNCHANGED_LOG.to_string()))
-            }
-            // 同一段掉線只記第一次，不刷屏
-            _ => AfterRecheck::KeepWaiting(None),
-        }
+        // 同一段掉線只記第一次，不刷屏
+        AfterRecheck::KeepWaiting(
+            (self.unchanged_checks == 1).then(|| ENDPOINT_UNCHANGED_LOG.to_string()),
+        )
+    }
+
+    /// 複查時連解析都失敗（本機網路斷了、DNS 逾時）。
+    ///
+    /// **一律不計入保險絲**（R1）：解析失敗不是「位址沒變而隧道卡死」的證據，
+    /// 拿它去燒保險絲的話，筆電剛連上 Wi-Fi 那幾分鐘會被反覆重建引擎。
+    /// 一樣重新計時，一樣只記第一次。
+    pub(crate) fn note_endpoint_unresolved(&mut self, now: Instant) -> Option<String> {
+        self.recheck_since = now;
+        self.unresolved_checks += 1;
+        (self.unresolved_checks == 1).then(|| ENDPOINT_UNRESOLVED_LOG.to_string())
     }
 }
 
@@ -508,31 +524,38 @@ pub(crate) fn next_step(
     }
 }
 
-/// 卡太久時複查端點的裁決（DDNS 自癒的核心，覆審打回 2026-08-24 改成
-/// 「先解析、後決定」）。
+/// 卡太久時複查端點的裁決（DDNS 自癒的核心）。
 ///
-/// 以前是「卡了 60 秒就無條件重建」，那在端點根本沒搬家的情況下是一個
-/// **無限重建迴圈**：每 60 秒把一條只是暫時連不上的隧道整個拆掉重蓋，
-/// 期間所有列都被打回 connecting。重新解析一次名字很便宜，先問清楚再動手。
+/// 「卡了 60 秒就無條件重建」在端點根本沒搬家的情況下是一個**無限重建迴圈**：
+/// 每 60 秒把一條只是暫時連不上的隧道整個拆掉重蓋，期間所有列都被打回
+/// connecting。重新解析一次名字很便宜，先問清楚再動手。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StuckAction {
-    /// 端點的位址變了：只有重建引擎才會拿新位址重連
+    /// 端點搬家了：目前這個位址已經不在解析結果裡，只有重建引擎才拿得到新的
     Rebuild,
-    /// 位址沒變，或這一刻解析不出來：繼續等，不要拆掉正在重試的隧道
+    /// 位址還在解析結果裡：繼續等（計入保險絲）
     KeepWaiting,
+    /// 這一刻解析不出來：繼續等，而且**不計入保險絲**（R1）
+    Unresolved,
 }
 
-/// `current` 是這一輪引擎正在用的位址，`fresh` 是剛剛重新解析的結果。
+/// `current` 是這一輪引擎正在用的位址，`fresh` 是剛剛重新解析的**全部**結果。
 ///
-/// 解析失敗一律 `KeepWaiting`：那多半是本機的網路整個斷了，這種時候重建
-/// 引擎一樣連不上，只是把畫面洗一遍。
+/// 比對的是「集合包不包含 current」，不是「第一筆等不等於 current」：一個名字
+/// 回多筆 A 是常態，解析器每次輪轉順序都會被誤判成搬家，於是引擎被反覆重建
+/// （R2）。
+///
+/// 解析失敗一律 [`StuckAction::Unresolved`]：那多半是本機的網路整個斷了，
+/// 這種時候重建引擎一樣連不上，只是把畫面洗一遍。
 pub(crate) fn stuck_action(
     current: std::net::SocketAddr,
-    fresh: Result<std::net::SocketAddr, String>,
+    fresh: Result<Vec<std::net::SocketAddr>, String>,
 ) -> StuckAction {
     match fresh {
-        Ok(fresh) if fresh != current => StuckAction::Rebuild,
-        _ => StuckAction::KeepWaiting,
+        Err(_) => StuckAction::Unresolved,
+        Ok(all) if all.is_empty() => StuckAction::Unresolved,
+        Ok(all) if all.contains(&current) => StuckAction::KeepWaiting,
+        Ok(_) => StuckAction::Rebuild,
     }
 }
 
@@ -589,7 +612,7 @@ pub fn wg_enabled_steps(
 /// 這一輪引擎要跑的東西。設定被改掉時整輪重來，不做增量更新
 struct Plan {
     conf_path: std::path::PathBuf,
-    /// 使用者在連線表單上填的 MTU 覆寫值，沒填就是 None（見 [`plan_mtu`]）
+    /// 使用者在連線表單上填的 MTU 覆寫值，沒填就是 None（見 [`effective_mtu`]）
     mtu: Option<usize>,
     /// 只含 enabled 的列，`socks` 已排在前（§5.3）
     rows: Vec<(String, engine::RowSpec)>,
@@ -679,9 +702,6 @@ async fn busy_rows(locals: &[u16]) -> Vec<u16> {
 /// 「每條列一個監看迴圈」，各列的狀態都是由這一條迴圈代寫的，守門要比的自然是
 /// 引擎的世代，所以每一輪開頭先用 `adopt_rows` 把號碼發給底下每一條列。
 async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
-    // 本連線這一次執行期的 MTU 探測結果。重連／重建沿用，不重探（見
-    // `mtu_for_round`）；整條連線停掉再起才會歸零
-    let mut mtu_memo: Option<mtu::Probe> = None;
     loop {
         if !state.wg_generation_alive(conn, generation) {
             return;
@@ -754,17 +774,17 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
         spread(state, generation, &plan.locals, &busy, status_for_handshake(None), None);
 
         let cancel = CancellationToken::new();
-        let planned = plan_mtu(plan.mtu, conf.mtu);
+        let mtu = effective_mtu(plan.mtu, conf.mtu);
         // 只有真的覆寫了才留一行：這正是「我設了 1400，它到底有沒有生效」那個
         // 問題的答案，而 MTU 黑洞的症狀（網頁載一半）本來就很難自己看出來
-        if let (Some(_), mtu::Plan::Fixed(fixed)) = (plan.mtu, planned) {
-            state.log_from(conn, format!("MTU overridden to {fixed}"));
+        if plan.mtu.is_some() {
+            state.log_from(conn, format!("MTU overridden to {mtu}"));
         }
         let endpoint_name = conf.endpoint.clone();
         let spec = engine::EngineSpec {
             name: conn.to_string(),
             endpoint,
-            mtu: mtu_for_round(planned, mtu_memo.as_ref()),
+            mtu,
             conf,
             rows: plan.rows.iter().filter(|(_, r)| !busy.contains(&r.local())).cloned().collect(),
         };
@@ -787,7 +807,7 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
 
         let round = Round { plan: &plan, busy: &busy, endpoint, endpoint_name };
         let stopped_by_engine =
-            consume(state, conn, generation, &round, &mut events, &mut watch, &mut mtu_memo).await;
+            consume(state, conn, generation, &round, &mut events, &mut watch).await;
         state.wg_kill_worker_of(conn, generation);
         if !stopped_by_engine {
             return; // 世代已經被作廢，狀態由 halt 那一側負責
@@ -816,7 +836,6 @@ async fn consume(
     round: &Round<'_>,
     events: &mut tokio::sync::mpsc::Receiver<engine::EngineEvent>,
     watch: &mut HandshakeWatch,
-    mtu_memo: &mut Option<mtu::Probe>,
 ) -> bool {
     loop {
         // 次序是規格：佇列裡還有事件就先吃完，吃完了才輪到「卡太久」的判定
@@ -859,15 +878,6 @@ async fn consume(
             engine::EngineEvent::Row(local, st, detail) => {
                 state.set_exit_status_of(local, generation, st, detail);
             }
-            engine::EngineEvent::Mtu(outcome) => {
-                // 只有「真的量到路徑吃不下 1420」才是警告；沒探成不是（§mtu）
-                if outcome.is_warning() {
-                    log::warn!("[{conn}] {}", outcome.log());
-                }
-                state.log_from(conn, outcome.log());
-                // 記在本連線的執行期快取裡：重連／重建沿用，不再白探一次
-                *mtu_memo = Some(outcome);
-            }
             engine::EngineEvent::Engine(health, detail) => {
                 spread(state, generation, &round.plan.locals, round.busy, health.status(), detail);
                 if health == engine::EngineHealth::Connected {
@@ -896,17 +906,35 @@ async fn consume(
 ///
 /// 但也不能永遠不重建：連續 [`STUCK_RECHECK_FUSE`] 次都說「位址沒變」而隧道
 /// 就是不會好的時候，保險絲會燒斷，還是重建一次（見那個常數的說明）。
+///
+/// 解析本身包一層 [`RECHECK_RESOLVE_TIMEOUT`]：這段跑在事件迴圈上，一次卡住的
+/// DNS 查詢會讓整條監看迴圈連帶失聰（R4）。
 async fn recheck_endpoint(
     state: &Arc<AppState>,
     conn: &str,
     round: &Round<'_>,
     watch: &mut HandshakeWatch,
 ) -> bool {
-    let fresh = device::resolve_endpoint(&round.endpoint_name).await;
+    let fresh = match tokio::time::timeout(
+        RECHECK_RESOLVE_TIMEOUT,
+        device::resolve_endpoint_all(&round.endpoint_name),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        // 逾時＝這一刻解析不出來，與解析失敗同一支（不計入保險絲）
+        Err(_) => Err(String::new()),
+    };
     match stuck_action(round.endpoint, fresh) {
         StuckAction::Rebuild => {
             state.log_from(conn, REBUILD_LOG);
             true
+        }
+        StuckAction::Unresolved => {
+            if let Some(line) = watch.note_endpoint_unresolved(Instant::now()) {
+                state.log_from(conn, line);
+            }
+            false
         }
         StuckAction::KeepWaiting => match watch.note_endpoint_unchanged(Instant::now()) {
             AfterRecheck::BlowFuse => {

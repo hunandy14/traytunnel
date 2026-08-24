@@ -59,7 +59,7 @@ fn with_peer_line(line: &str) -> String {
 fn minimal_conf_fills_every_default() {
     let c = parse(&minimal()).expect("最小合法檔要解析得過");
     // PM 裁決 2026-08-24：解析器不再代入預設 MTU，「conf 沒寫」保留成 None，
-    // 預設值移到應用層（`conf::APP_DEFAULT_MTU`，由 `wg::plan_mtu` 套用）
+    // 預設值移到應用層（`conf::APP_DEFAULT_MTU`，由 `wg::effective_mtu` 套用）
     assert_eq!(c.mtu, None);
     assert_eq!(c.listen_port, 0);
     assert_eq!(c.keepalive, None);
@@ -419,12 +419,10 @@ fn conf_summary_never_serialises_a_key() {
 /// 之外，資料路徑上不得出現對系統解析器的呼叫（設計書 §2.2 防線一）
 #[test]
 fn no_system_resolver_anywhere_but_device_resolve_endpoint() {
-    const SOURCES: [(&str, &str); 6] = [
+    const SOURCES: [(&str, &str); 5] = [
         ("conf.rs", include_str!("conf.rs")),
         ("dns.rs", include_str!("dns.rs")),
         ("engine.rs", include_str!("engine.rs")),
-        // MTU 探測也在資料路徑上：它自己組封包送進隧道，一樣不准碰系統解析器
-        ("mtu.rs", include_str!("mtu.rs")),
         ("socks5.rs", include_str!("socks5.rs")),
         ("stack.rs", include_str!("stack.rs")),
     ];

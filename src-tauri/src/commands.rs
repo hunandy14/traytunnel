@@ -568,7 +568,7 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
 ///
 /// 注意：**沒有 socksPort**——SOCKS5 埠是底下的一條 `socks` 列（§1.3）。
 ///
-/// `mtu` 是選填的隧道 MTU 覆寫（省略／null＝照 `.conf`，見 `wg::plan_mtu`）。
+/// `mtu` 是選填的隧道 MTU 覆寫（省略／null＝照 `.conf`，見 `wg::effective_mtu`）。
 #[tauri::command]
 pub fn upsert_wg_proxy(
     state: State<'_, Shared>,

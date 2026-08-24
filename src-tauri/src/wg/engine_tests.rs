@@ -180,7 +180,7 @@ async fn spawn_socks5(a: &Side, cancel: tokio_util::sync::CancellationToken) -> 
     addr
 }
 
-/// 走 SOCKS5 連到隧道內的 `ip:port`，回傳 (連線, 回覆碼)
+/// 走 SOCKS5 連到隧道內的 `ip:port`，回傳（連線，回覆碼）
 async fn socks5_connect(proxy: SocketAddr, ip: Ipv4Addr, port: u16) -> (TcpStream, u8) {
     let mut s = deadline(TcpStream::connect(proxy)).await.unwrap();
     deadline(s.write_all(&[0x05, 0x01, 0x00])).await.unwrap();
@@ -639,12 +639,10 @@ async fn a_probed_forward_to_a_dead_backend_says_it_is_not_a_proxy() {
     bench.cancel.cancel();
 }
 
-// ------------------- 握手韌性與 MTU 自動探測（PM 裁決 2026-08-24）
+// --------------------------------- 握手韌性（PM 裁決 2026-08-24）
 
 use crate::wg::conf::{SecretKey, WgConf};
 use crate::wg::engine::{self, EngineEvent, EngineHealth, EngineSpec, RowSpec};
-use crate::wg::mtu::{Plan as MtuPlan, Probe};
-use tokio::sync::mpsc;
 
 /// W4.17 首次握手的寬限期**與 `stale_after` 分家**：對端從頭到尾沒回話時，
 /// 到期的是寬限期（這裡注入 600ms），不是那個 180 秒的 session 門檻。
@@ -674,15 +672,15 @@ async fn the_first_handshake_grace_is_what_expires_when_nobody_answers() {
     cancel.cancel();
 }
 
-/// 測試檯用的 `WgConf`：金鑰是 A 側那一組，端點指到 `peer_port`。
+/// 測試檯用的 `WgConf`：金鑰是 A 側那一組。
 ///
 /// `listen_port` 要給定值的場合只有一種——對端得知道要回哪裡（device 一律
 /// 把封包送往設定裡的 endpoint，不是回信給來源）
-fn test_conf_for(listen_port: u16, dns: Vec<IpAddr>) -> WgConf {
+fn test_conf_for(listen_port: u16) -> WgConf {
     WgConf {
         private_key: SecretKey(StaticSecret::from(A_PRIV)),
         addresses: vec![net(A_ADDR, 32)],
-        dns,
+        dns: vec![],
         mtu: None,
         listen_port,
         peer_public_key: *PublicKey::from(&StaticSecret::from(B_PRIV)).as_bytes(),
@@ -695,17 +693,12 @@ fn test_conf_for(listen_port: u16, dns: Vec<IpAddr>) -> WgConf {
     }
 }
 
-fn engine_spec(
-    conf: WgConf,
-    peer_port: u16,
-    mtu: MtuPlan,
-    rows: Vec<(String, RowSpec)>,
-) -> EngineSpec {
+fn engine_spec(conf: WgConf, peer_port: u16, rows: Vec<(String, RowSpec)>) -> EngineSpec {
     EngineSpec {
         name: "bench".into(),
         conf,
         endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, peer_port)),
-        mtu,
+        mtu: crate::wg::conf::APP_DEFAULT_MTU,
         rows,
     }
 }
@@ -718,18 +711,19 @@ async fn one_free_socks_row() -> (u16, Vec<(String, RowSpec)>) {
     (local, vec![("socks".to_string(), RowSpec::Socks { local })])
 }
 
-/// W4.18 **引擎自己不再解析端點**（覆審打回 2026-08-24）。
+/// W4.18 **引擎自己不解析端點**。
 ///
-/// 位址改由 supervise 每一輪解析好再傳進來，因為「卡住了要不要重建」得先比對
-/// 新舊位址（`wg::stuck_action`）才決定得了。這條測試釘住那個新的分工：
-/// 引擎這一層一次系統解析都不做，DDNS 的重解析點因此只有一個。
+/// 位址由 supervise 每一輪解析好再傳進來，因為「卡住了要不要重建」得先比對
+/// 新舊位址（`wg::stuck_action`）才決定得了。這條測試釘住那個分工：引擎這一層
+/// 一次系統解析都不做，DDNS 的重解析點因此只有一個。
 #[tokio::test]
 async fn the_engine_never_resolves_the_endpoint_itself() {
     let (pa, pb) = two_free_udp_ports();
     let before = device::resolve_count();
     let cancel = tokio_util::sync::CancellationToken::new();
-    let spec = engine_spec(test_conf_for(pa, vec![]), pb, MtuPlan::Fixed(1280), vec![]);
-    let _rx = engine::spawn(spec, cancel.clone()).await.expect("引擎起得來");
+    let _rx = engine::spawn(engine_spec(test_conf_for(pa), pb, vec![]), cancel.clone())
+        .await
+        .expect("引擎起得來");
     assert_eq!(
         device::resolve_count(),
         before,
@@ -738,37 +732,13 @@ async fn the_engine_never_resolves_the_endpoint_itself() {
     cancel.cancel();
 }
 
-/// W4.19 `.conf` 沒有 DNS 伺服器：跳過探測、用安全值，而且**留一行說明**。
-///
-/// 「為什麼我的隧道只有 1280」必須在日誌裡答得出來。
-#[tokio::test]
-async fn a_conf_without_dns_skips_the_probe_and_says_so() {
-    let (pa, pb) = two_free_udp_ports();
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let spec = engine_spec(test_conf_for(pa, vec![]), pb, MtuPlan::Probe, vec![]);
-    let mut rx = engine::spawn(spec, cancel.clone()).await.expect("引擎起得來");
-    let mut outcome = None;
-    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-        if let EngineEvent::Mtu(probe) = ev {
-            outcome = Some(probe);
-            break;
-        }
-    }
-    let outcome = outcome.expect("跳過探測也要回報結果，不可以靜悄悄地退回 1280");
-    assert!(matches!(outcome, Probe::Skipped(_)));
-    assert!(outcome.log().contains("no IPv4 DNS server"), "原因要寫在日誌裡");
-    assert!(!outcome.is_warning(), "沒得探不是降級");
-    cancel.cancel();
-}
-
 /// W4.20 快樂路徑的**事件順序**：`Row(connecting)` 一定排在
-/// `Engine(connected)` 前面，而且最終每一條列都是 connected。
+/// `Engine(connected)` 前面。
 ///
-/// 覆審打回 2026-08-24 的那條致命 bug 就在這裡：舊版把探測排在綁列之前，
-/// 於是 `Engine(connected)` 先進佇列、被 supervise 攤成「每一條列 connected」，
-/// 緊接著晚到的 `Row(connecting)` 又把它們壓回 connecting——而 device 只在
-/// **變化時**推事件，不會再有第二顆 connected 來救。快樂路徑上每一條列
-/// 就這樣永遠卡在 connecting。舊版那條測試用的是空列，測不到這件事。
+/// 這條順序若反過來，`Engine(connected)` 會先被 supervise 攤成「每一條列
+/// connected」，緊接著晚到的 `Row(connecting)` 又把它們壓回 connecting——而
+/// device 只在**變化時**推事件，不會再有第二顆 connected 來救，快樂路徑上
+/// 每一條列就這樣永遠卡在 connecting。用空列測不到這件事，所以這裡是非空列。
 #[tokio::test]
 async fn rows_are_announced_before_the_engine_reports_connected() {
     let (pa, pb) = two_free_udp_ports();
@@ -777,9 +747,8 @@ async fn rows_are_announced_before_the_engine_reports_connected() {
     let _b = spin_up(&SideSpec::b(pa, pb), &cancel);
 
     let (local, rows) = one_free_socks_row().await;
-    let conf = test_conf_for(pa, vec![IpAddr::V4(B_ADDR)]);
     let mut rx =
-        engine::spawn(engine_spec(conf, pb, MtuPlan::Probe, rows), cancel.clone()).await.unwrap();
+        engine::spawn(engine_spec(test_conf_for(pa), pb, rows), cancel.clone()).await.unwrap();
 
     let mut order: Vec<&'static str> = Vec::new();
     while let Ok(Some(ev)) = tokio::time::timeout(PATIENCE, rx.recv()).await {
@@ -800,115 +769,30 @@ async fn rows_are_announced_before_the_engine_reports_connected() {
         vec![crate::state::status::CONNECTING, "engine-connected"],
         "列必須先宣告，引擎的 connected 才能來——反過來的話列永遠卡在 connecting"
     );
-    // 順帶：本地埠在探測窗裡就已經在聽了，不是等 stack 起來才開
-    assert!(crate::winsys::is_listening(local), "探測期間本地埠不可以是關的");
+    assert!(crate::winsys::is_listening(local), "快樂路徑上本地埠要真的在聽");
     cancel.cancel();
 }
 
-// ------------- W10.9～W10.12：探測那一段的事件迴圈（覆審打回 2026-08-24 搬過來）
-//
-// `probe_phase` 只吃四條通道，所以這四條完全不必架真的隧道：直接餵事件與封包
-// 就能把「等握手」「送出去了沒」「事件有沒有被吞掉」逐條釘死。
-
-/// `probe_phase` 的結論（結局 ＋ 留給 stack 的那幾顆封包）
-type ProbeResult = tokio::task::JoinHandle<(Probe, Vec<Vec<u8>>)>;
-
-struct ProbeBench {
-    out_rx: mpsc::Receiver<Vec<u8>>,
-    in_tx: mpsc::Sender<Vec<u8>>,
-    dev_tx: mpsc::Sender<DeviceEvent>,
-    ev_rx: mpsc::Receiver<EngineEvent>,
-}
-
-/// 起一顆只有四條通道的探測檯，回傳 (結論的 JoinHandle, 對面那四頭)
-fn probe_bench(
-    conf: WgConf,
-    cancel: CancellationToken,
-    handshake_wait: Duration,
-    probe_timeout: Duration,
-) -> (ProbeResult, ProbeBench) {
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (dev_tx, mut dev_rx) = mpsc::channel::<DeviceEvent>(8);
-    let (ev_tx, ev_rx) = mpsc::channel::<EngineEvent>(8);
-    let join = tokio::spawn(async move {
-        let io = engine::ProbeIo {
-            outbound: &out_tx,
-            inbound: &mut in_rx,
-            device_events: &mut dev_rx,
-            events: &ev_tx,
-        };
-        let done = engine::probe_phase(&conf, io, &cancel, handshake_wait, probe_timeout).await;
-        (done.outcome, done.buffered)
-    });
-    (join, ProbeBench { out_rx, in_tx, dev_tx, ev_rx })
-}
-
-/// W10.9 等不到握手：**一顆探測封包都不送**，結論是 `Skipped`（資訊級）而不是
-/// `Failed`（警告級）。舊版在這裡丟警告，等於在隧道還沒通的時候叫使用者去調 MTU
+/// W4.21 這一輪已經被取消掉時，**一個埠都不准綁**。
+///
+/// 綁下去的話就是替一棵已經死掉的任務樹佔住本地埠，而下一輪起來時會發現
+/// 自己的埠被「自己」佔著，於是那一條列變成 port_busy——一個看起來像
+/// 「別的程式搶了我的埠」、其實是自己殭屍代綁的故障（覆審實錘 R5）。
 #[tokio::test]
-async fn no_handshake_means_skipped_not_failed() {
-    let cancel = CancellationToken::new();
-    let conf = test_conf_for(0, vec![IpAddr::V4(B_ADDR)]);
-    let (join, mut bench) =
-        probe_bench(conf, cancel, Duration::from_millis(150), Duration::from_millis(150));
-    let (outcome, buffered) = join.await.unwrap();
-    assert_eq!(outcome, Probe::Skipped(crate::wg::mtu::NO_HANDSHAKE));
-    assert!(!outcome.is_warning(), "沒送出去就沒有資格說線路不行");
-    assert!(buffered.is_empty());
-    assert!(bench.out_rx.try_recv().is_err(), "握手沒完成前不可以送任何探測封包");
-}
+async fn a_cancelled_round_binds_nothing() {
+    let (pa, pb) = two_free_udp_ports();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (local, rows) = one_free_socks_row().await;
+    // 引擎起來之前這一輪就被 halt 掉了
+    cancel.cancel();
 
-/// W10.10 握手來了才送探測封包；有回音就是 `Ok`，而且那顆 `HandshakeOk`
-/// **照樣往上送**（探測不吃事件——吃掉的話畫面永遠不會翻成 connected）
-#[tokio::test]
-async fn a_reply_after_the_handshake_takes_the_high_mtu() {
-    let cancel = CancellationToken::new();
-    let conf = test_conf_for(0, vec![IpAddr::V4(B_ADDR)]);
-    let (join, mut bench) =
-        probe_bench(conf, cancel, Duration::from_secs(2), Duration::from_secs(2));
-
-    bench.dev_tx.send(DeviceEvent::HandshakeOk).await.unwrap();
-    let request = tokio::time::timeout(PATIENCE, bench.out_rx.recv()).await.unwrap().unwrap();
-    assert_eq!(request.len(), crate::wg::mtu::HIGH_MTU);
-    bench.in_tx.send(crate::wg::mtu::tests::reply_to(&request)).await.unwrap();
-
-    let (outcome, _) = join.await.unwrap();
-    assert_eq!(outcome, Probe::Ok);
-    assert_eq!(
-        bench.ev_rx.try_recv(),
-        Ok(EngineEvent::Engine(EngineHealth::Connected, None)),
-        "探測期間看到的握手事件必須即時往上送"
-    );
-}
-
-/// W10.11 送出去了卻沒有回音：這才是 `Failed`（警告級）
-#[tokio::test]
-async fn silence_after_a_real_probe_is_a_failure() {
-    let cancel = CancellationToken::new();
-    let conf = test_conf_for(0, vec![IpAddr::V4(B_ADDR)]);
-    let (join, bench) =
-        probe_bench(conf, cancel, Duration::from_secs(2), Duration::from_millis(150));
-    bench.dev_tx.send(DeviceEvent::HandshakeOk).await.unwrap();
-    let (outcome, _) = join.await.unwrap();
-    assert_eq!(outcome, Probe::Failed);
-    assert!(outcome.is_warning());
-}
-
-/// W10.12 探測窗裡先到的**其他**封包不算回音，而且不被丟掉——它們會被交給
-/// 隨後起來的 stack（`prefill`）
-#[tokio::test]
-async fn unrelated_packets_are_kept_for_the_stack_and_never_count_as_a_reply() {
-    let cancel = CancellationToken::new();
-    let conf = test_conf_for(0, vec![IpAddr::V4(B_ADDR)]);
-    let (join, bench) =
-        probe_bench(conf, cancel, Duration::from_secs(2), Duration::from_millis(250));
-    bench.dev_tx.send(DeviceEvent::HandshakeOk).await.unwrap();
-    for i in 0u8..3 {
-        bench.in_tx.send(vec![i; 120]).await.unwrap();
+    let mut rx =
+        engine::spawn(engine_spec(test_conf_for(pa), pb, rows), cancel.clone()).await.unwrap();
+    // 通道關掉之前不該出現任何列事件
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        if let EngineEvent::Row(port, st, _) = ev {
+            panic!("已取消的一輪不可以還去綁埠：{port} → {st}");
+        }
     }
-    let (outcome, buffered) = join.await.unwrap();
-    assert_eq!(outcome, Probe::Failed, "雜訊不可以被誤認成回音");
-    assert_eq!(buffered.len(), 3, "先到的封包留給 stack，不白白丟掉");
-    assert_eq!(buffered[0], vec![0u8; 120], "順序照到站的順序");
+    assert!(!crate::winsys::is_listening(local), "已取消的一輪不可以佔住本地埠");
 }
