@@ -447,3 +447,18 @@ fn a_stuck_reconnect_eventually_asks_for_a_rebuild() {
     assert_eq!(RECONNECT_REBUILD_AFTER, Duration::from_secs(60));
     assert!(RECONNECT_REBUILD_AFTER > RETRY);
 }
+
+// ------------------------------ MTU 自動探測（PM 裁決 2026-08-24 第四件）
+
+/// W6.22 探不探的條件：**兩邊都沒指定時才探**，優先序一個字都沒變
+#[test]
+fn the_probe_only_runs_when_nobody_specified_an_mtu() {
+    assert!(should_probe_mtu(None, None), "什麼都沒指定才輪到自動探測");
+    assert!(!should_probe_mtu(Some(1400), None), "介面上填了值就照他的");
+    assert!(!should_probe_mtu(None, Some(1420)), "conf 明寫了就照 conf");
+    assert!(!should_probe_mtu(Some(1400), Some(1420)), "兩個都有一樣不探");
+
+    // 會被探測取代的就是「什麼都不知道」那個位子上的預設值
+    assert_eq!(effective_mtu(None, None), mtu::SAFE_MTU);
+    assert_eq!(mtu::HIGH_MTU, 1420, "探得過才升到這個值");
+}

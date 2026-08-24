@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::state::status;
 
-use super::{conf, device, socks5, stack};
+use super::{conf, device, mtu as pmtu, socks5, stack};
 
 /// 引擎事件通道的深度。一條連線的列數是個位數，這裡只要不擋住組裝就夠
 const EVENT_CHANNEL_DEPTH: usize = 64;
@@ -47,7 +47,12 @@ pub struct EngineSpec {
     /// 刻意不讓引擎自己去讀 `conf.mtu`：生效優先序（介面覆寫 ＞ conf 明寫 ＞
     /// [`conf::APP_DEFAULT_MTU`]）是設定層的事，由 `wg::effective_mtu` 算完再
     /// 傳進來，引擎這一層只負責照著設。
+    ///
+    /// `probe_mtu` 為真時這個值是**探測失敗的退路**（就是應用層預設 1280）。
     pub mtu: usize,
+    /// 要不要自動探測路徑 MTU（由 `wg::should_probe_mtu` 決定：介面與 `.conf`
+    /// 都沒指定時才為真，優先序因此不受影響）。詳見 [`super::mtu`]
+    pub probe_mtu: bool,
     /// 0..N 條列。零條時 supervise 根本不會呼叫 [`spawn`]（§5.2）
     pub rows: Vec<(String, RowSpec)>,
 }
@@ -73,7 +78,7 @@ pub async fn spawn(
     cancel: CancellationToken,
 ) -> Result<mpsc::Receiver<EngineEvent>, String> {
     let (events, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
-    let EngineSpec { name, conf, mtu, rows } = spec;
+    let EngineSpec { name, conf, mtu, probe_mtu, rows } = spec;
 
     // 端點每次重連前重解一次，動態 DNS 的端點才跟得上。這是整個 wg/ 底下
     // 唯一一處會用到系統解析器的地方，而且它解的是隧道**外**的位址。
@@ -94,7 +99,25 @@ pub async fn spawn(
     )
     .map_err(|e| format!("[{name}] 綁不到 UDP 埠：{e}"))?;
 
-    let device::DeviceHandle { outbound, inbound, events: mut device_events, .. } = device_handle;
+    let device::DeviceHandle { outbound, mut inbound, events: mut device_events, .. } =
+        device_handle;
+
+    // MTU 必須在 stack 建起來之前就定案（smoltcp 的 MTU 是建構參數），
+    // 所以自動探測排在這裡：device 已經在跑、stack 還沒有人在用 inbound
+    let mtu = if probe_mtu {
+        let outcome =
+            run_mtu_probe(&conf, &outbound, &mut inbound, &mut device_events, &events, &cancel)
+                .await;
+        if outcome.is_warning() {
+            log::warn!("[{name}] {}", outcome.log());
+        } else {
+            log::info!("[{name}] {}", outcome.log());
+        }
+        let _ = events.send(EngineEvent::Log(outcome.log())).await;
+        outcome.mtu()
+    } else {
+        mtu
+    };
 
     let stack = stack::spawn(
         stack::StackConfig {
@@ -154,20 +177,79 @@ pub async fn spawn(
                 _ = cancel.cancelled() => break,
                 e = device_events.recv() => match e { Some(e) => e, None => break },
             };
-            let translated = match event {
-                device::DeviceEvent::HandshakeOk => EngineEvent::Engine(status::CONNECTED, None),
-                device::DeviceEvent::HandshakeStale => {
-                    EngineEvent::Engine(status::RECONNECTING, None)
-                }
-                device::DeviceEvent::Fatal(msg) => EngineEvent::Engine(status::ERROR, Some(msg)),
-            };
-            if events.send(translated).await.is_err() {
+            if events.send(translate(event)).await.is_err() {
                 break;
             }
         }
     });
 
     Ok(rx)
+}
+
+/// device 的狀態訊號 → 引擎層的事件。抽成函式是因為 MTU 探測期間要先代班
+/// 轉一手：device 的事件只在**變化時**推一次，探測時吃掉的那一顆
+/// `HandshakeOk` 沒補回去的話，畫面就再也不會翻成 connected
+fn translate(event: device::DeviceEvent) -> EngineEvent {
+    match event {
+        device::DeviceEvent::HandshakeOk => EngineEvent::Engine(status::CONNECTED, None),
+        device::DeviceEvent::HandshakeStale => EngineEvent::Engine(status::RECONNECTING, None),
+        device::DeviceEvent::Fatal(msg) => EngineEvent::Engine(status::ERROR, Some(msg)),
+    }
+}
+
+/// 自動 MTU 探測的完整一輪：挑目標 → 等握手 → 送一顆 1420 的 ICMP echo。
+///
+/// 握手還沒完成時封包只會被 boringtun 排進佇列，探了必逾時，所以要先等；
+/// 等的期間看到的 device 事件**照樣往上送**（`translate`），畫面不會因為
+/// 探測而慢一拍。等不到（逾時、Fatal、被取消）就當探測失敗，走保守的
+/// [`pmtu::SAFE_MTU`]——這種時候隧道本來就還沒通，不值得再多等。
+async fn run_mtu_probe(
+    conf: &conf::WgConf,
+    outbound: &mpsc::Sender<Vec<u8>>,
+    inbound: &mut mpsc::Receiver<Vec<u8>>,
+    device_events: &mut mpsc::Receiver<device::DeviceEvent>,
+    events: &mpsc::Sender<EngineEvent>,
+    cancel: &CancellationToken,
+) -> pmtu::Probe {
+    let (src, dst) = match pmtu::target(&conf.addresses, &conf.dns, &conf.allowed_ips) {
+        Ok(pair) => pair,
+        Err(why) => return pmtu::Probe::Skipped(why),
+    };
+    if !wait_handshake(device_events, events, cancel, pmtu::HANDSHAKE_WAIT).await {
+        return pmtu::Probe::Failed;
+    }
+    pmtu::probe(outbound, inbound, src, dst, pmtu::PROBE_TIMEOUT).await
+}
+
+/// 等第一次握手完成，最多等 `patience`。期間收到的事件一律往上轉。
+/// 回 true 代表握上了
+async fn wait_handshake(
+    device_events: &mut mpsc::Receiver<device::DeviceEvent>,
+    events: &mpsc::Sender<EngineEvent>,
+    cancel: &CancellationToken,
+    patience: std::time::Duration,
+) -> bool {
+    let waited = tokio::time::timeout(patience, async {
+        loop {
+            let event = tokio::select! {
+                _ = cancel.cancelled() => return false,
+                e = device_events.recv() => match e { Some(e) => e, None => return false },
+            };
+            let handshook = event == device::DeviceEvent::HandshakeOk;
+            let fatal = matches!(event, device::DeviceEvent::Fatal(_));
+            if events.send(translate(event)).await.is_err() {
+                return false;
+            }
+            if handshook {
+                return true;
+            }
+            if fatal {
+                return false;
+            }
+        }
+    })
+    .await;
+    waited == Ok(true)
 }
 
 /// UDP 要綁的本地位址：跟著端點的 IP 版本走，`ListenPort` 省略時交給 OS 配

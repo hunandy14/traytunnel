@@ -642,7 +642,7 @@ async fn a_probed_forward_to_a_dead_backend_says_it_is_not_a_proxy() {
 // ------------------- 握手韌性與 MTU 自動探測（PM 裁決 2026-08-24）
 
 use crate::wg::conf::{SecretKey, WgConf};
-use crate::wg::engine::{self, EngineSpec};
+use crate::wg::engine::{self, EngineEvent, EngineSpec};
 
 /// W4.17 首次握手的寬限期**與 `stale_after` 分家**：對端從頭到尾沒回話時，
 /// 到期的是寬限期（這裡注入 600ms），不是那個 180 秒的 session 門檻。
@@ -692,8 +692,14 @@ fn test_conf_for(peer_port: u16, listen_port: u16, dns: Vec<IpAddr>) -> WgConf {
     }
 }
 
-fn bare_spec(conf: WgConf) -> EngineSpec {
-    EngineSpec { name: "bench".into(), conf, mtu: crate::wg::conf::APP_DEFAULT_MTU, rows: vec![] }
+fn probing_spec(conf: WgConf, probe_mtu: bool) -> EngineSpec {
+    EngineSpec {
+        name: "bench".into(),
+        conf,
+        mtu: crate::wg::conf::APP_DEFAULT_MTU,
+        probe_mtu,
+        rows: vec![],
+    }
 }
 
 /// W4.18 **每一次重建引擎都會重新解析端點**——DDNS 自癒能成立的全部理由。
@@ -706,7 +712,7 @@ async fn every_engine_build_resolves_the_endpoint_again() {
     let before = device::resolve_count();
     let cancel = tokio_util::sync::CancellationToken::new();
     for round in 1..=2usize {
-        engine::spawn(bare_spec(test_conf_for(pb, 0, vec![])), cancel.clone())
+        engine::spawn(probing_spec(test_conf_for(pb, 0, vec![]), false), cancel.clone())
             .await
             .expect("引擎起得來");
         assert_eq!(
@@ -715,5 +721,55 @@ async fn every_engine_build_resolves_the_endpoint_again() {
             "第 {round} 次重建也要重跑 resolve_endpoint，否則端點的 IP 漂走就再也回不來"
         );
     }
+    cancel.cancel();
+}
+
+/// W4.19 `.conf` 沒有 DNS 伺服器：跳過探測、用安全值，而且**留一行說明**。
+///
+/// 「為什麼我的隧道只有 1280」必須在日誌裡答得出來。
+#[tokio::test]
+async fn a_conf_without_dns_skips_the_probe_and_says_so() {
+    let (_pa, pb) = two_free_udp_ports();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut rx = engine::spawn(probing_spec(test_conf_for(pb, 0, vec![]), true), cancel.clone())
+        .await
+        .expect("引擎起得來");
+    let mut said = false;
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        if let EngineEvent::Log(line) = ev {
+            if line.contains("path MTU probe skipped") {
+                said = true;
+                break;
+            }
+        }
+    }
+    assert!(said, "跳過探測也要記一行，不可以靜悄悄地退回 1280");
+    cancel.cancel();
+}
+
+/// W4.20 開著自動探測時，握手成功的事件**不可以被探測吃掉**。
+///
+/// 探測要等握手完成才有意義，而 device 的事件只在變化時推一次——等的那一段
+/// 若沒有代班轉發，畫面就再也不會翻成 connected（引擎看起來永遠在連線中）。
+#[tokio::test]
+async fn probing_never_swallows_the_handshake_event() {
+    let (pa, pb) = two_free_udp_ports();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    // B 側先站好，A 才握得起來
+    let _b = spin_up(&SideSpec::b(pa, pb), &cancel);
+
+    let conf = test_conf_for(pb, pa, vec![IpAddr::V4(B_ADDR)]);
+    let mut rx = engine::spawn(probing_spec(conf, true), cancel.clone()).await.expect("引擎起得來");
+
+    let mut connected = false;
+    while let Ok(Some(ev)) = tokio::time::timeout(PATIENCE, rx.recv()).await {
+        if let EngineEvent::Engine(st, _) = ev {
+            if st == crate::state::status::CONNECTED {
+                connected = true;
+                break;
+            }
+        }
+    }
+    assert!(connected, "探測期間看到的 HandshakeOk 必須照樣往上送");
     cancel.cancel();
 }

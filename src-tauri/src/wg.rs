@@ -11,6 +11,7 @@ pub mod conf;
 pub mod device;
 pub mod dns;
 pub mod engine;
+pub mod mtu;
 pub mod socks5;
 pub mod stack;
 
@@ -319,6 +320,16 @@ pub fn effective_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> us
     override_mtu.or(conf_mtu).unwrap_or(conf::APP_DEFAULT_MTU)
 }
 
+/// 這一輪要不要自動探測路徑 MTU（PM 裁決 2026-08-24 的第四件）。
+///
+/// **只有兩邊都沒指定時才探**——優先序一個字都沒變：使用者在介面上填了值，
+/// 或 `.conf` 明寫了 MTU，那都是明確的意圖，自動探測沒有資格覆蓋它。
+/// 探不探的結果只影響 [`conf::APP_DEFAULT_MTU`] 那個「什麼都不知道」的位子：
+/// 探得過就往上升到 [`mtu::HIGH_MTU`]，探不過還是原來那個保守值。
+pub fn should_probe_mtu(override_mtu: Option<usize>, conf_mtu: Option<usize>) -> bool {
+    override_mtu.is_none() && conf_mtu.is_none()
+}
+
 /// 這一輪引擎的握手觀測：狀態變化時該記哪一行日誌，以及 reconnecting
 /// 卡了多久該重建引擎（DDNS 自癒，見 [`RECONNECT_REBUILD_AFTER`]）。
 ///
@@ -575,6 +586,9 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
 
         let cancel = CancellationToken::new();
         let mtu = effective_mtu(plan.mtu, conf.mtu);
+        // 兩邊都沒指定才輪到自動探測（優先序不變，見 should_probe_mtu）；
+        // 這時上面算出來的 mtu 就是探測失敗時的退路
+        let probe_mtu = should_probe_mtu(plan.mtu, conf.mtu);
         // 只有真的覆寫了才留一行：這正是「我設了 1400，它到底有沒有生效」那個
         // 問題的答案，而 MTU 黑洞的症狀（網頁載一半）本來就很難自己看出來
         if plan.mtu.is_some() {
@@ -584,6 +598,7 @@ async fn supervise(state: &Arc<AppState>, conn: &str, generation: u64) {
             name: conn.to_string(),
             conf,
             mtu,
+            probe_mtu,
             rows: plan.rows.iter().filter(|(_, r)| !busy.contains(&r.local())).cloned().collect(),
         };
         let mut events = match engine::spawn(spec, cancel.clone()).await {

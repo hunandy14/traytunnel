@@ -419,10 +419,12 @@ fn conf_summary_never_serialises_a_key() {
 /// 之外，資料路徑上不得出現對系統解析器的呼叫（設計書 §2.2 防線一）
 #[test]
 fn no_system_resolver_anywhere_but_device_resolve_endpoint() {
-    const SOURCES: [(&str, &str); 5] = [
+    const SOURCES: [(&str, &str); 6] = [
         ("conf.rs", include_str!("conf.rs")),
         ("dns.rs", include_str!("dns.rs")),
         ("engine.rs", include_str!("engine.rs")),
+        // MTU 探測也在資料路徑上：它自己組封包送進隧道，一樣不准碰系統解析器
+        ("mtu.rs", include_str!("mtu.rs")),
         ("socks5.rs", include_str!("socks5.rs")),
         ("stack.rs", include_str!("stack.rs")),
     ];
