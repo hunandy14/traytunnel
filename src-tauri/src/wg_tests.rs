@@ -357,6 +357,9 @@ fn every_row_reports_stopped_exactly_once_and_no_new_event_is_added() {
 /// 這一條就是規格本身。實際的動機是使用者那台 ASUS 路由器匯出的 `.conf` 不寫
 /// MTU，而他那條線路的路徑 MTU 又小於 1420，大封包靜默黑洞；他必須能在介面上
 /// 壓下去，而且**不必去改那份 `.conf`**。
+///
+/// 三態即最終方案：自動探測經評估取消（見 `wg::effective_mtu` 的說明），
+/// 保守預設 ＋ 手動覆寫欄就是答案。
 #[test]
 fn the_ui_override_beats_the_conf_which_beats_the_app_default() {
     // ① 兩者都有：介面說了算，conf 的值被覆寫掉
@@ -376,4 +379,261 @@ fn the_ui_override_beats_the_conf_which_beats_the_app_default() {
 fn an_override_may_equal_or_exceed_the_conf_value() {
     assert_eq!(effective_mtu(Some(1420), Some(1420)), 1420);
     assert_eq!(effective_mtu(Some(1500), Some(1280)), 1500);
+}
+
+// ------------------------------------------ 握手韌性（PM 裁決 2026-08-24）
+
+fn engine_event(health: engine::EngineHealth) -> engine::EngineEvent {
+    engine::EngineEvent::Engine(health, None)
+}
+
+fn addr(s: &str) -> std::net::SocketAddr {
+    s.parse().unwrap()
+}
+
+/// W6.19 首次握手的寬限期是**獨立的一個值**，而且遠小於 `REJECT_AFTER`。
+///
+/// 這一條就是規格：以前「從來沒握上」借用 180 秒當耐心值，使用者要盯著三分鐘
+/// 的 connecting 才看得到 reconnecting，底下所有靠 reconnecting 觸發的自癒
+/// 也一起被押到三分鐘之後。
+#[test]
+fn the_first_handshake_grace_is_its_own_much_shorter_value() {
+    use std::time::Duration;
+    assert_eq!(device::FIRST_HANDSHAKE_GRACE, Duration::from_secs(15));
+    // 值是推導出來的：意義是「撐得過幾次重送」，不是「15」這個數字
+    assert_eq!(device::FIRST_HANDSHAKE_GRACE, device::REKEY_TIMEOUT * 3);
+    assert!(device::FIRST_HANDSHAKE_GRACE > device::REKEY_TIMEOUT, "撐不過一次重送就沒有意義");
+    assert!(device::FIRST_HANDSHAKE_GRACE < device::REJECT_AFTER);
+    // 既有 session 的門檻一個字都沒動
+    assert_eq!(device::REJECT_AFTER, Duration::from_secs(180));
+}
+
+/// W6.20 狀態日誌：握手成功記**真的斷線時長**、進入 reconnecting 記一行，
+/// 兩者都只在變化時記一次。
+///
+/// 吃的是 typed 的 `EngineEvent`（不是 UI 字串），而且計時錨在引擎啟動那一刻。
+#[test]
+fn the_watch_logs_each_handshake_transition_exactly_once() {
+    use engine::EngineHealth::{Connected, Failed, Reconnecting};
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let mut watch = HandshakeWatch::new(t0, RECONNECT_REBUILD_AFTER);
+
+    // 握上了：耗時從引擎啟動起算
+    let line = watch.on_event(&engine_event(Connected), t0 + Duration::from_millis(420));
+    assert_eq!(line.as_deref(), Some("handshake ok in 420ms"));
+    // 同一個狀態再來一次不重複刷屏
+    assert!(watch.on_event(&engine_event(Connected), t0 + Duration::from_millis(500)).is_none());
+
+    // 掉線：以前這條路徑是完全靜默的
+    let line = watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(10));
+    assert_eq!(line.as_deref(), Some(HANDSHAKE_RETRY_LOG));
+    assert!(watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(12)).is_none());
+
+    // 再握上：耗時從**掉線那一刻**起算，不是從引擎啟動起算
+    let line = watch.on_event(&engine_event(Connected), t0 + Duration::from_secs(13));
+    assert_eq!(line.as_deref(), Some("handshake ok in 3000ms"));
+
+    // 其他事件不歸這顆狀態機管
+    assert!(watch.on_event(&engine_event(Failed), t0 + Duration::from_secs(14)).is_none());
+    let row = engine::EngineEvent::Row(1085, status::PORT_BUSY, None);
+    assert!(watch.on_event(&row, t0 + Duration::from_secs(14)).is_none());
+}
+
+/// W6.21 卡太久就該**去複查端點**（不是直接重建），而且複查**不可以動到
+/// 耗時的錨點**。
+///
+/// 覆審實錘 R3：兩個錨點量的是不同的東西——`phase_since` 是「這條隧道斷了
+/// 多久」，`recheck_since` 是「上次複查端點多久了」。共用一個的話，一段
+/// 10 分鐘的斷線最後會被報成「handshake ok in 60000ms」，因為中間每 60 秒
+/// 複查一次就把時鐘撥回去一次。
+#[test]
+fn a_recheck_never_disturbs_the_downtime_clock() {
+    use engine::EngineHealth::{Connected, Reconnecting};
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let step = Duration::from_secs(60);
+    let mut watch = HandshakeWatch::new(t0, step);
+
+    // 還沒掉線過：再久都不動它（隧道好好的，不可以自己去拆）
+    assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
+    watch.on_event(&engine_event(Connected), t0);
+    assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
+
+    watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(10));
+    assert!(!watch.overdue(t0 + Duration::from_secs(69)), "只是抖一下就去動它太吵");
+    assert!(watch.overdue(t0 + Duration::from_secs(70)), "門檻一到就該複查");
+
+    // 複查完、位址沒變：只有複查的時鐘往前推，斷線的時鐘不動
+    let after = watch.note_endpoint_unchanged(t0 + Duration::from_secs(70));
+    assert_eq!(after, AfterRecheck::KeepWaiting(Some(ENDPOINT_UNCHANGED_LOG.to_string())));
+    assert!(!watch.overdue(t0 + Duration::from_secs(129)), "複查過就重新計時");
+    assert!(watch.overdue(t0 + Duration::from_secs(130)), "下一次複查在一個門檻之後");
+    assert_eq!(
+        watch.note_endpoint_unchanged(t0 + Duration::from_secs(130)),
+        AfterRecheck::KeepWaiting(None),
+        "同一段掉線不重複刷屏——這正是離線端點每 80 秒洗一次日誌的來源"
+    );
+
+    // 復原：報的是**從掉線到現在**（10s → 200s，共 190 秒），
+    // 不是「距離上一次複查」的 70 秒
+    let line = watch.on_event(&engine_event(Connected), t0 + Duration::from_secs(200));
+    assert_eq!(line.as_deref(), Some("handshake ok in 190000ms"), "複查不可以把斷線時鐘撥回去");
+
+    // 正式常數：60 秒，比重連間隔（5 秒）大一個數量級
+    assert_eq!(RECONNECT_REBUILD_AFTER, Duration::from_secs(60));
+    assert!(RECONNECT_REBUILD_AFTER > RETRY);
+}
+
+/// W6.22 DDNS 自癒的裁決：**目前這個位址不在解析結果裡才算搬家**。
+///
+/// 覆審實錘 R2：一個名字回多筆 A 是常態（負載平衡、多線路），解析器每次
+/// 輪轉順序都不同。只比第一筆的話，一條好端端的隧道會因為 DNS 輪轉而被
+/// 反覆重建。
+#[test]
+fn only_an_address_that_left_the_record_set_justifies_a_rebuild() {
+    let a = addr("203.0.113.7:51820");
+    let b = addr("203.0.113.8:51820");
+    let moved = addr("203.0.113.9:51820");
+
+    // 雙 A 輪轉：兩次解析順序相反，但 current 兩次都在集合裡 → 不重建
+    assert_eq!(stuck_action(a, Ok(vec![a, b])), StuckAction::KeepWaiting);
+    assert_eq!(stuck_action(a, Ok(vec![b, a])), StuckAction::KeepWaiting, "輪轉不是搬家");
+    assert_eq!(stuck_action(b, Ok(vec![a, b])), StuckAction::KeepWaiting);
+
+    // 真的搬家了：目前這個位址已經不在紀錄裡
+    assert_eq!(stuck_action(a, Ok(vec![moved])), StuckAction::Rebuild);
+    assert_eq!(stuck_action(a, Ok(vec![b, moved])), StuckAction::Rebuild);
+    // 連埠變了也算
+    assert_eq!(stuck_action(a, Ok(vec![addr("203.0.113.7:51821")])), StuckAction::Rebuild);
+
+    // 解析失敗／空結果：自成一支，既不重建也不算「位址沒變」
+    assert_eq!(stuck_action(a, Err("nope".into())), StuckAction::Unresolved);
+    assert_eq!(stuck_action(a, Ok(vec![])), StuckAction::Unresolved);
+}
+
+/// W6.23 保險絲：位址從頭到尾沒變，但連續複查 `STUCK_RECHECK_FUSE` 次隧道
+/// 都不會好——還是重建一次。
+///
+/// `stuck_action` 只認得「端點搬家了」這一種故障；**端點沒搬家、但引擎自身
+/// 卡死**那一類未知故障若完全沒有重建的機會，等於把自癒能力押在
+/// 「我們已經想到所有故障模式」上。5 次 × 60 秒 ≈ 5 分鐘，比無條件重建
+/// （每 60 秒）安靜一個級距。
+#[test]
+fn five_unchanged_rechecks_still_blow_the_fuse() {
+    use engine::EngineHealth::{Connected, Reconnecting};
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let step = Duration::from_secs(60);
+    let mut watch = HandshakeWatch::new(t0, step);
+    watch.on_event(&engine_event(Reconnecting), t0);
+
+    // 前四次都只是等：不可以每 60 秒就把隧道拆掉重蓋
+    for n in 1..STUCK_RECHECK_FUSE {
+        let after = watch.note_endpoint_unchanged(t0 + step * n);
+        assert!(
+            matches!(after, AfterRecheck::KeepWaiting(_)),
+            "第 {n} 次複查位址沒變，這時候還不該重建"
+        );
+    }
+    // 第五次：保險絲燒斷
+    assert_eq!(
+        watch.note_endpoint_unchanged(t0 + step * STUCK_RECHECK_FUSE),
+        AfterRecheck::BlowFuse,
+        "連續 {STUCK_RECHECK_FUSE} 次都沒好，未知故障也該有一次自癒的機會"
+    );
+    // 日誌措辭要與「IP 變了」那一行分得開，否則使用者會被導去查 DNS
+    assert_ne!(rebuild_fuse_log(), REBUILD_LOG);
+    assert!(rebuild_fuse_log().contains("still stuck"));
+    assert_eq!(STUCK_RECHECK_FUSE, 5);
+
+    // 中途自己好了：計數歸零，下一段掉線重新數五次
+    let mut watch = HandshakeWatch::new(t0, step);
+    watch.on_event(&engine_event(Reconnecting), t0);
+    for n in 1..STUCK_RECHECK_FUSE {
+        watch.note_endpoint_unchanged(t0 + step * n);
+    }
+    watch.on_event(&engine_event(Connected), t0 + step * 5);
+    watch.on_event(&engine_event(Reconnecting), t0 + step * 6);
+    assert!(
+        matches!(watch.note_endpoint_unchanged(t0 + step * 7), AfterRecheck::KeepWaiting(_)),
+        "復原過就歸零：不可以在下一段掉線的第一次複查就燒保險絲"
+    );
+}
+
+/// W6.24 **解析失敗一次都不准計入保險絲**。
+///
+/// 覆審實錘 R1：解析失敗多半是本機的網路整個斷了（筆電剛醒、Wi-Fi 剛切換），
+/// 那不是「位址沒變而隧道卡死」的證據。拿它去燒保險絲的話，離線的那幾分鐘
+/// 會毫無理由地把引擎重建一輪又一輪——正好挑在最不該增加負擔的時候。
+#[test]
+fn a_failing_resolver_never_blows_the_fuse() {
+    use engine::EngineHealth::Reconnecting;
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let step = Duration::from_secs(60);
+    let mut watch = HandshakeWatch::new(t0, step);
+    watch.on_event(&engine_event(Reconnecting), t0);
+
+    // 連續 10 次解析失敗（是保險絲門檻的兩倍）：一次都不重建
+    for n in 1..=(STUCK_RECHECK_FUSE * 2) {
+        let line = watch.note_endpoint_unresolved(t0 + step * n);
+        if n == 1 {
+            assert_eq!(line.as_deref(), Some(ENDPOINT_UNRESOLVED_LOG), "第一次要說一聲");
+        } else {
+            assert!(line.is_none(), "第 {n} 次不重複刷屏");
+        }
+        // 每一次都有重新計時，下一次複查才會落在一個門檻之後
+        assert!(!watch.overdue(t0 + step * n + Duration::from_secs(59)));
+        assert!(watch.overdue(t0 + step * n + step));
+    }
+
+    // 網路回來了、位址也沒變：這時才開始數保險絲，而且從頭數
+    for n in 1..STUCK_RECHECK_FUSE {
+        assert!(
+            matches!(
+                watch.note_endpoint_unchanged(t0 + step * (STUCK_RECHECK_FUSE * 2 + n)),
+                AfterRecheck::KeepWaiting(_)
+            ),
+            "解析失敗那幾次不可以偷偷算進來（這是第 {n} 次真的複查成功）"
+        );
+    }
+    assert_eq!(
+        watch.note_endpoint_unchanged(t0 + step * (STUCK_RECHECK_FUSE * 3)),
+        AfterRecheck::BlowFuse
+    );
+    // 兩行訊息要分得開：一個叫人去看網路，一個叫人去看對端
+    assert_ne!(ENDPOINT_UNRESOLVED_LOG, ENDPOINT_UNCHANGED_LOG);
+}
+
+/// W6.25 **復原的事件優先於「卡太久」的判定**。
+///
+/// 一顆剛送達、還沒被處理的 `connected` 若被 overdue 搶先，一條剛剛自己
+/// 復原的隧道就會被當成卡死的拆掉重建。
+#[test]
+fn a_pending_event_is_always_handled_before_the_stuck_check() {
+    use engine::EngineHealth::{Connected, Reconnecting};
+    use std::time::Duration;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<engine::EngineEvent>(4);
+    let t0 = Instant::now();
+    let mut watch = HandshakeWatch::new(t0, Duration::from_secs(30));
+    watch.on_event(&engine_event(Reconnecting), t0);
+    let late = t0 + Duration::from_secs(60);
+    assert!(watch.overdue(late), "前提：這一刻已經卡過門檻了");
+
+    // 隧道其實剛剛就好了，那顆 connected 還排在佇列裡
+    tx.try_send(engine_event(Connected)).unwrap();
+    assert_eq!(
+        next_step(&mut rx, &watch, late),
+        Next::Event(engine_event(Connected)),
+        "佇列裡還有東西時不可以先去複查端點，那會把剛復原的隧道拆掉"
+    );
+
+    // 吃乾淨了才輪到複查
+    assert_eq!(next_step(&mut rx, &watch, late), Next::Recheck);
+    // 還沒到期就只是去等下一顆
+    assert_eq!(next_step(&mut rx, &watch, t0 + Duration::from_secs(1)), Next::Wait);
+    // 引擎那棵任務樹沒了
+    drop(tx);
+    assert_eq!(next_step(&mut rx, &watch, late), Next::Gone);
 }

@@ -223,6 +223,7 @@ fn spin_up_client(
             endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, peer_port)),
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, bind_port)),
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         },
         cancel.clone(),
     )
@@ -264,6 +265,7 @@ fn spin_up_wire(
             endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, peer_port)),
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, bind_port)),
             stale_after: device::REJECT_AFTER,
+            first_handshake_grace: device::FIRST_HANDSHAKE_GRACE,
         },
         cancel.clone(),
     )
