@@ -107,6 +107,8 @@ pub struct WgProxyView {
     pub name: String,
     pub conf_path: String,
     pub enabled: bool,
+    /// 使用者填的 MTU 覆寫值，沒填就是 None——編輯面板要把現值帶回欄位裡
+    pub mtu: Option<usize>,
     /// `.conf` 讀不到／解析不過時的訊息，讀得到就是 None
     pub conf_error: Option<String>,
     /// 卡片副標要顯示的東西（U4）
@@ -305,6 +307,7 @@ fn build_wg_views(
                 name: p.name.clone(),
                 conf_path: p.conf_path.clone(),
                 enabled: p.enabled,
+                mtu: p.mtu,
                 conf_error: summary.and_then(|r| r.as_ref().err()).cloned(),
                 // 這四項在任何 WireGuard 客戶端的介面上都看得到，而且使用者需要
                 // 它們才知道轉發列的 remote 該怎麼寫——不是機密（§5.3）

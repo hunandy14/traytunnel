@@ -234,7 +234,7 @@ fn spin_up_client(
         StackConfig {
             addresses: vec![smoltcp::wire::IpCidr::new(smoltcp::wire::IpAddress::from(A_ADDR), 32)],
             dns_servers: dns_servers.into_iter().map(smoltcp::wire::IpAddress::from).collect(),
-            mtu: crate::wg::conf::DEFAULT_MTU,
+            mtu: crate::wg::conf::APP_DEFAULT_MTU,
             allowed_ips: vec![crate::wg::conf::IpNet {
                 addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 prefix: 0,

@@ -197,6 +197,16 @@ pub struct WgProxy {
     pub conf_path: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 隧道 MTU 的覆寫值，None 代表「照 `.conf`」。
+    ///
+    /// 為什麼需要它：不少家用路由器（實測 ASUS）匯出的 `.conf` 根本不寫 MTU，
+    /// 而那條線路的路徑 MTU 又小於常見預設值，結果是大封包靜默黑洞——握手正常、
+    /// 小請求正常、網頁卻載一半就卡住。使用者不該為此被要求手改一份別的工具產出
+    /// 的檔案，所以覆寫住在這裡；`.conf` **永遠只讀不寫**。
+    ///
+    /// `skip_serializing_if` 讓 None 不會在 toml 裡留下一個鍵（§5.1 的鍵省略規則）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<usize>,
     /// 0..N 條列，與 [`Source::forwards`] 是同一個型別
     #[serde(default)]
     pub forwards: Vec<Forward>,
@@ -955,6 +965,16 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
         if p.conf_path.trim().is_empty() {
             return Err(format!("連線 {} 的 confPath 不可為空", p.name));
         }
+        if let Some(n) = p.mtu {
+            if !crate::wg::conf::MTU_RANGE.contains(&n) {
+                return Err(format!(
+                    "連線 {} 的 mtu {n} 超出合法範圍 {}..={}",
+                    p.name,
+                    crate::wg::conf::MTU_RANGE.start(),
+                    crate::wg::conf::MTU_RANGE.end()
+                ));
+            }
+        }
         for f in &p.forwards {
             check_row(&p.name, f)?;
             claim_local(&mut seen_locals, &p.name, f)?;
@@ -1109,6 +1129,14 @@ fn sync_wg_proxies(tables: &mut ArrayOfTables, proxies: &[WgProxy]) {
             t["name"] = value(p.name.as_str());
             t["confPath"] = value(p.conf_path.as_str());
             t["enabled"] = value(p.enabled);
+            // 鍵省略規則：沒有覆寫就不留鍵，別讓「照 .conf」在檔案上長成一個
+            // 看起來像被明確指定過的數字
+            match p.mtu {
+                Some(n) => t["mtu"] = value(n as i64),
+                None => {
+                    t.remove("mtu");
+                }
+            }
             if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
                 t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
             }
@@ -1474,7 +1502,18 @@ pub fn port_owner(cfg: &Config, local: u16) -> Option<String> {
     cfg.row(local).map(|(conn, f)| describe_row(conn.name(), f))
 }
 
-/// 新增／編輯 wg 連線的欄位驗證，回傳掛回欄位的訊息（前綴 `name:`／`confPath:`），
+/// MTU 覆寫欄位越界時的那一句話。**前端有一份逐字相同的副本**（sheet.ts 與
+/// dev-mock.ts）：本地檢查與後端檢查講的必須是同一句，否則同一個輸入在按 Save
+/// 前後會看到兩種說法。
+pub fn mtu_range_error() -> String {
+    format!(
+        "mtu: must be a whole number between {} and {}",
+        crate::wg::conf::MTU_RANGE.start(),
+        crate::wg::conf::MTU_RANGE.end()
+    )
+}
+
+/// 新增／編輯 wg 連線的欄位驗證，回傳掛回欄位的訊息（前綴 `name:`／`confPath:`／`mtu:`），
 /// 沒問題時 None（W3.9／W3.10）。
 ///
 /// `original_name` 是編輯前的連線名，None 代表新增。**連線型別建立後不可變**
@@ -1485,6 +1524,7 @@ pub fn validate_wg_proxy(
     original_name: Option<&str>,
     name: &str,
     conf_path: &str,
+    mtu: Option<usize>,
 ) -> Option<String> {
     if let Some(orig) = original_name {
         if cfg.wg_proxy(orig).is_none() {
@@ -1504,6 +1544,13 @@ pub fn validate_wg_proxy(
     // 先報那一個才對得上他當下在看的欄位
     if conf_path.trim().is_empty() {
         return Some("confPath: required".into());
+    }
+    // 空欄位＝不覆寫＝合法，所以只有真的填了東西才檢查範圍。訊息與前端
+    // （sheet.ts 的 localValidateWg、dev-mock 的 validateWgProxy）逐字相同
+    if let Some(n) = mtu {
+        if !crate::wg::conf::MTU_RANGE.contains(&n) {
+            return Some(mtu_range_error());
+        }
     }
     // 兩型連線共用一個命名空間（日誌前綴是 `[名字]`）
     let taken = cfg.sources.iter().any(|s| s.name == name)

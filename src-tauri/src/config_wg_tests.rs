@@ -1,4 +1,5 @@
-//! `config` 的 wg 與列分類法測試——設計書 §6 的 W3 系列（43 條，全部 F）。
+//! `config` 的 wg 與列分類法測試——設計書 §6 的 W3 系列（43 條，全部 F），
+//! 檔尾續編 W3.46～W3.49：`WgProxy.mtu` 覆寫欄位（PM 裁決 2026-08-24）。
 //!
 //! 與 `config_tests.rs` 同一層、同一個掛法（`#[path]`），只是把這一輪新加的
 //! 測試隔成獨立檔，既有那份一千四百行的檔案這一輪只被允許補新欄位。
@@ -65,7 +66,13 @@ fn src(name: &str, forwards: Vec<Forward>) -> Source {
 }
 
 fn proxy(name: &str, forwards: Vec<Forward>) -> WgProxy {
-    WgProxy { name: name.into(), conf_path: format!("wg/{name}.conf"), enabled: true, forwards }
+    WgProxy {
+        name: name.into(),
+        conf_path: format!("wg/{name}.conf"),
+        enabled: true,
+        mtu: None,
+        forwards,
+    }
 }
 
 fn cfg_of(sources: Vec<Source>, wg_proxies: Vec<WgProxy>) -> Config {
@@ -234,7 +241,7 @@ fn a_wg_name_must_not_be_empty_or_contain_spaces_or_brackets() {
         let cfg = cfg_of(vec![], vec![proxy(bad, vec![])]);
         assert!(validate_config(&cfg).is_err(), "名字 {bad:?} 要擋");
         assert!(
-            validate_wg_proxy(&cfg, None, bad, "wg/x.conf").unwrap().starts_with("name: "),
+            validate_wg_proxy(&cfg, None, bad, "wg/x.conf", None).unwrap().starts_with("name: "),
             "訊息要掛回 name 欄位：{bad:?}"
         );
     }
@@ -246,7 +253,9 @@ fn an_empty_conf_path_is_rejected() {
     let mut cfg = cfg_of(vec![], vec![proxy("ax4200", vec![])]);
     cfg.wg_proxies[0].conf_path = "   ".into();
     assert!(validate_config(&cfg).is_err());
-    assert!(validate_wg_proxy(&cfg, None, "ax4200", "   ").unwrap().starts_with("confPath: "));
+    assert!(validate_wg_proxy(&cfg, None, "ax4200", "   ", None)
+        .unwrap()
+        .starts_with("confPath: "));
 }
 
 /// W3.11 某條列的 `local = 0`
@@ -686,7 +695,7 @@ fn a_same_kind_edit_goes_through() {
 #[test]
 fn a_wg_upsert_cannot_take_over_an_ssh_source_name() {
     let cfg = cfg_of(vec![src("hk", vec![])], vec![]);
-    let err = validate_wg_proxy(&cfg, Some("hk"), "hk", "wg/hk.conf")
+    let err = validate_wg_proxy(&cfg, Some("hk"), "hk", "wg/hk.conf", None)
         .expect("不得把 ssh 源改寫成 wg 連線");
     assert!(err.starts_with("name: "), "{err}");
 }
@@ -880,4 +889,87 @@ fn saving_an_old_format_file_settles_after_the_first_pass() {
         std::fs::read_to_string(&path).unwrap()
     };
     assert_eq!(second, first, "第二次存檔不可以再動檔案一個位元組");
+}
+
+// -------------------------------------- MTU 覆寫欄位（PM 裁決 2026-08-24）
+
+/// W3.46 `mtu` 是選填的：舊設定檔沒有這個鍵，讀進來就是 None，也不觸發遷移
+#[test]
+fn a_wg_proxy_without_an_mtu_key_parses_as_none() {
+    let cfg = parse_config(BOTH).unwrap();
+    assert_eq!(cfg.wg_proxy("ax4200").unwrap().mtu, None, "沒寫 mtu 就是「照 .conf」");
+    assert!(validate_config(&cfg).is_ok());
+}
+
+/// W3.47 有寫就讀得到，而且鍵名是 camelCase 的 `mtu`
+#[test]
+fn a_written_mtu_key_round_trips() {
+    let raw = BOTH.replace(
+        "confPath = \"wg/ax4200.conf\"",
+        "confPath = \"wg/ax4200.conf\"
+mtu = 1400",
+    );
+    let cfg = parse_config(&raw).unwrap();
+    assert_eq!(cfg.wg_proxy("ax4200").unwrap().mtu, Some(1400));
+    assert!(validate_config(&cfg).is_ok());
+}
+
+/// W3.48 存檔的鍵省略規則（W3.43 的同一條規則，套到 mtu 上）：
+/// None 不寫鍵、Some 寫鍵，而且把覆寫拿掉時舊的鍵要真的消失。
+#[test]
+fn the_writer_omits_mtu_when_there_is_no_override() {
+    let dir = tmp_dir("wg-mtu-omission");
+    let path = dir.join(TOML_NAME);
+
+    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![socks("s", 1085)])]);
+    write_config_at(&path, &cfg).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("mtu"), "沒有覆寫就不該長出 mtu 鍵：{saved}");
+
+    // 填上覆寫 → 落檔
+    let mut cfg = parse_config(&saved).unwrap();
+    cfg.wg_proxy_mut("ax4200").unwrap().mtu = Some(1400);
+    write_config_at(&path, &cfg).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("mtu = 1400"), "{saved}");
+    assert_eq!(parse_config(&saved).unwrap().wg_proxy("ax4200").unwrap().mtu, Some(1400));
+
+    // 再把覆寫清掉 → 鍵要跟著消失，不可以留一個看起來像被指定過的數字
+    let mut cfg = parse_config(&saved).unwrap();
+    cfg.wg_proxy_mut("ax4200").unwrap().mtu = None;
+    write_config_at(&path, &cfg).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("mtu"), "清掉覆寫後殘留了 mtu 鍵：{saved}");
+    assert_eq!(parse_config(&saved).unwrap().wg_proxy("ax4200").unwrap().mtu, None);
+}
+
+/// W3.49 驗證：空（None）合法、範圍內合法、越界兩端各報一次，訊息前綴 `mtu:`。
+///
+/// 欄位驗證（`validate_wg_proxy`，掛回表單欄位）與整份設定的不變量檢查
+/// （`validate_config`，擋壞掉的設定檔）**兩條路徑都要擋**——前者是使用者
+/// 打字的入口，後者是有人手改 toml 的入口。
+#[test]
+fn the_mtu_override_is_range_checked_on_both_paths() {
+    let cfg = cfg_of(vec![], vec![proxy("ax4200", vec![socks("s", 1085)])]);
+
+    assert_eq!(validate_wg_proxy(&cfg, None, "new", "wg/new.conf", None), None, "空＝不覆寫＝合法");
+    assert_eq!(validate_wg_proxy(&cfg, None, "new", "wg/new.conf", Some(1400)), None);
+    // 邊界本身是合法的（576..=9000 是閉區間）
+    assert_eq!(validate_wg_proxy(&cfg, None, "new", "wg/new.conf", Some(576)), None);
+    assert_eq!(validate_wg_proxy(&cfg, None, "new", "wg/new.conf", Some(9000)), None);
+
+    for bad in [575usize, 9001, 0] {
+        let err = validate_wg_proxy(&cfg, None, "new", "wg/new.conf", Some(bad))
+            .unwrap_or_else(|| panic!("mtu = {bad} 要被擋下來"));
+        assert!(err.starts_with("mtu: "), "訊息要掛回 mtu 欄位：{err}");
+        assert_eq!(err, mtu_range_error(), "前後端共用的那一句，不可以各寫一份");
+    }
+
+    // 手改 toml 那條路徑
+    let mut bad_cfg = cfg.clone();
+    bad_cfg.wg_proxies[0].mtu = Some(100);
+    let err = validate_config(&bad_cfg).unwrap_err();
+    assert!(err.contains("mtu"), "{err}");
+    bad_cfg.wg_proxies[0].mtu = Some(1400);
+    assert!(validate_config(&bad_cfg).is_ok());
 }

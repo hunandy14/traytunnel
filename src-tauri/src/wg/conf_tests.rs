@@ -2,6 +2,7 @@
 //!
 //! W1.1～W1.31 是 `.conf` 解析本身，W1.32～W1.37 是 `wg::inspect_conf`
 //! （IPC `inspectConf`，§5.5 第 4 支）——同一份解析器的另一個入口。
+//! W1.38～W1.39 續編在檔尾：MTU 三態（PM 裁決 2026-08-24，預設值移到應用層）。
 //!
 //! 用 `#[path]` 掛回 conf.rs，慣例與 `config_tests.rs` 相同：生產碼與測試各佔
 //! 一個檔案，模組路徑仍是 `conf::tests`，`use super::*;` 拿得到私有項。
@@ -57,7 +58,9 @@ fn with_peer_line(line: &str) -> String {
 #[test]
 fn minimal_conf_fills_every_default() {
     let c = parse(&minimal()).expect("最小合法檔要解析得過");
-    assert_eq!(c.mtu, DEFAULT_MTU);
+    // PM 裁決 2026-08-24：解析器不再代入預設 MTU，「conf 沒寫」保留成 None，
+    // 預設值移到應用層（`conf::APP_DEFAULT_MTU`，由 `wg::effective_mtu` 套用）
+    assert_eq!(c.mtu, None);
     assert_eq!(c.listen_port, 0);
     assert_eq!(c.keepalive, None);
     assert_eq!(c.preshared_key, None);
@@ -265,7 +268,7 @@ fn allowed_ips_require_a_prefix() {
 /// W1.18 `MTU` 合法／越界／格式錯
 #[test]
 fn mtu_is_range_checked() {
-    assert_eq!(parse(&with_interface_line("MTU = 1280")).unwrap().mtu, 1280);
+    assert_eq!(parse(&with_interface_line("MTU = 1280")).unwrap().mtu, Some(1280));
     assert!(MTU_RANGE.contains(&1280));
     assert!(parse(&with_interface_line("MTU = 100")).is_err(), "低於下限要錯");
     assert!(parse(&with_interface_line("MTU = 99999")).is_err(), "高於上限要錯");
@@ -535,4 +538,29 @@ fn the_ipc_summary_never_serialises_a_key() {
     assert!(!obj.contains_key("privateKey"));
     assert!(!obj.contains_key("presharedKey"));
     assert!(!v.to_string().contains(&b64(PRIV)), "連值都不可以夾帶");
+}
+
+// ------------------------------------------------ MTU 三態（PM 裁決 2026-08-24）
+
+/// W1.38 `.conf` **有沒有明寫 MTU** 要分得出來（PM 裁決 2026-08-24）。
+///
+/// 這一條擋的是「在解析階段就 `unwrap_or(預設值)`」那種寫法：一補預設，
+/// 「對端管理員明寫了 1280」與「這份檔案根本沒提 MTU」就變成同一個值，
+/// 上層的優先序（介面覆寫 ＞ conf 明寫 ＞ 應用層預設）當場少掉一階。
+#[test]
+fn an_absent_mtu_stays_absent_and_a_written_one_is_kept() {
+    assert_eq!(parse(&minimal()).unwrap().mtu, None, "沒寫就是沒寫，不可以自己補一個");
+    assert_eq!(parse(&with_interface_line("MTU = 1400")).unwrap().mtu, Some(1400));
+    // 明寫的值剛好等於應用層預設時，兩者仍然是不同的事實
+    assert_eq!(
+        parse(&with_interface_line(&format!("MTU = {APP_DEFAULT_MTU}"))).unwrap().mtu,
+        Some(APP_DEFAULT_MTU)
+    );
+}
+
+/// W1.39 應用層預設值本身：1280，而且落在合法範圍內
+#[test]
+fn the_app_default_mtu_is_a_conservative_value_inside_the_range() {
+    assert_eq!(APP_DEFAULT_MTU, 1280, "Tailscale／Mullvad 這一類客戶端的共識保守值");
+    assert!(MTU_RANGE.contains(&APP_DEFAULT_MTU));
 }

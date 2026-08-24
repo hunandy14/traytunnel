@@ -1,4 +1,5 @@
-//! `wg` 生命週期與狀態的測試——設計書 §6 的 W6 系列（16 條，全部 F）。
+//! `wg` 生命週期與狀態的測試——設計書 §6 的 W6 系列（16 條，全部 F），
+//! 檔尾續編 W6.17～W6.18：MTU 生效優先序（PM 裁決 2026-08-24）。
 //!
 //! 比照 `state.rs` 既有的純函式測試風格：守門邏輯抽出來測，**不生 AppHandle**。
 
@@ -52,6 +53,7 @@ fn cfg_with_wg() -> Config {
             name: "ax4200".into(),
             conf_path: "wg/ax4200.conf".into(),
             enabled: true,
+            mtu: None,
             forwards: vec![socks("socks", 1085), fwd("nas-ssh", 2222), fwd("nas-http", 2280)],
         }],
     }
@@ -346,4 +348,32 @@ fn every_row_reports_stopped_exactly_once_and_no_new_event_is_added() {
             "冒出了新的狀態字彙：{s}"
         );
     }
+}
+
+// ------------------------------------------ MTU 優先序（PM 裁決 2026-08-24）
+
+/// W6.17 `effective_mtu` 的三態優先序：**介面覆寫 ＞ conf 明寫 ＞ 應用層預設**。
+///
+/// 這一條就是規格本身。實際的動機是使用者那台 ASUS 路由器匯出的 `.conf` 不寫
+/// MTU，而他那條線路的路徑 MTU 又小於 1420，大封包靜默黑洞；他必須能在介面上
+/// 壓下去，而且**不必去改那份 `.conf`**。
+#[test]
+fn the_ui_override_beats_the_conf_which_beats_the_app_default() {
+    // ① 兩者都有：介面說了算，conf 的值被覆寫掉
+    assert_eq!(effective_mtu(Some(1400), Some(1420)), 1400);
+    // ② 只有 conf 明寫：照 conf
+    assert_eq!(effective_mtu(None, Some(1420)), 1420);
+    // ③ 都沒有：落到應用層預設，而不是 wg-quick 那個 1420
+    assert_eq!(effective_mtu(None, None), conf::APP_DEFAULT_MTU);
+    assert_eq!(effective_mtu(None, None), 1280);
+    // ④ 只有介面覆寫（conf 沒寫 MTU，正是使用者那份檔案的樣子）
+    assert_eq!(effective_mtu(Some(1400), None), 1400);
+}
+
+/// W6.18 覆寫值與 conf 值相同時不是特例：算出來就是那個值，沒有「等於就忽略」
+/// 這種暗規則。順手釘住覆寫值可以比 conf 大（線路吃得下就該讓人往上調）。
+#[test]
+fn an_override_may_equal_or_exceed_the_conf_value() {
+    assert_eq!(effective_mtu(Some(1420), Some(1420)), 1420);
+    assert_eq!(effective_mtu(Some(1500), Some(1280)), 1500);
 }

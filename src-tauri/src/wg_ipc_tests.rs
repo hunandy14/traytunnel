@@ -61,6 +61,7 @@ fn cfg_with_wg() -> Config {
             name: "ax4200".into(),
             conf_path: "wg/ax4200.conf".into(),
             enabled: true,
+            mtu: None,
             forwards: vec![socks("socks", 1085), fwd("nas-ssh", 2222), fwd("nas-http", 2280)],
         }],
     }
