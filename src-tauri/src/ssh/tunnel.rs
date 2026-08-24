@@ -207,13 +207,15 @@ pub fn start(state: &Arc<AppState>, local: u16) {
     if state.with_config(|c| c.forward(local).is_none()) {
         return;
     }
-    let Some(generation) = state.claim_supervisor(local) else {
+    let Some(seat) = crate::state::claim_exit_seat(state, local) else {
         return; // 已經有一條線在跑
     };
+    let generation = seat.generation();
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
+        // 位子由租約的 Drop 歸還：提早 return 或 panic 都不會把它留在那裡
+        let _seat = seat;
         supervise(&st, local, generation).await;
-        st.release_supervisor(local, generation);
     });
 }
 

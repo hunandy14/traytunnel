@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -159,6 +159,9 @@ pub struct Snapshot {
     /// 已經下載好、等下一次啟動安裝的那一版版本號（不帶 v），沒有就是 null。
     /// 介面與系統匣靠它決定要不要給「Restart to update」
     pub pending_update: Option<String>,
+    /// 知道有新版、但下載失敗了正在退避等重試。介面靠它把「正在下載」的轉圈
+    /// 換成一句誠實的「下載失敗，之後會再試」
+    pub update_stalled: bool,
 }
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
@@ -176,6 +179,59 @@ pub(crate) fn claim_slot(slot: &mut Option<u64>, next: impl FnOnce() -> u64) -> 
 fn release_slot(slot: &mut Option<u64>, generation: u64) {
     if *slot == Some(generation) {
         *slot = None;
+    }
+}
+
+/// 監看位子的租約：`Drop` 時把位子還掉。
+///
+/// 原本是「`supervise().await` 之後手動 `release_supervisor`」。那一行只要
+/// 沒跑到，這個出口的位子就永遠佔著，而 `start` 看到有人佔位就直接 no-op
+/// ——結果是這條隧道再也起不來，連看門狗都救不了（它問的正是「位子在不在」）。
+/// 沒跑到的路徑不只一條：監看迴圈裡任何一處 panic、或有人在 `.await` 之後
+/// 加了一個 early return。
+///
+/// 交給 `Drop` 就不必再依賴「記得寫那一行」：任務正常結束、提早 return、
+/// panic 展開，位子都會回來。世代守門仍然在 `release_slot` 裡，
+/// 晚到的舊租約還是清不掉新迴圈的位子。
+pub struct SupervisorSeat {
+    state: Arc<AppState>,
+    who: SeatOwner,
+    generation: u64,
+}
+
+enum SeatOwner {
+    /// ssh 出口，身分是本地埠
+    Exit(u16),
+    /// wg 連線，身分是連線名（§5.2）
+    Wg(String),
+}
+
+impl SupervisorSeat {
+    /// 這一輪的世代號。監看迴圈每一次寫狀態都要帶著它（守門用）
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// 搶下某個 ssh 出口的監看位子，搶到就拿一張會自己歸還的租約。
+/// 回傳 None 代表已經有一條線在跑，不要再起第二條。
+pub fn claim_exit_seat(state: &Arc<AppState>, local: u16) -> Option<SupervisorSeat> {
+    let generation = state.claim_supervisor(local)?;
+    Some(SupervisorSeat { state: state.clone(), who: SeatOwner::Exit(local), generation })
+}
+
+/// 搶下某條 wg 連線的監看位子，語意與 [`claim_exit_seat`] 完全一致
+pub fn claim_wg_seat(state: &Arc<AppState>, conn: &str) -> Option<SupervisorSeat> {
+    let generation = state.wg_claim_supervisor(conn)?;
+    Some(SupervisorSeat { state: state.clone(), who: SeatOwner::Wg(conn.to_string()), generation })
+}
+
+impl Drop for SupervisorSeat {
+    fn drop(&mut self) {
+        match &self.who {
+            SeatOwner::Exit(local) => self.state.release_supervisor(*local, self.generation),
+            SeatOwner::Wg(conn) => self.state.wg_release_supervisor(conn, self.generation),
+        }
     }
 }
 
@@ -524,9 +580,6 @@ pub struct AppState {
     /// 這次執行生效的設定檔完整路徑，由 config::config_location() 解析而來；
     /// 全程式的回寫、備份與「開啟設定資料夾」都以它為準
     pub path: PathBuf,
-    /// 這次是不是可攜模式（設定檔就在執行檔旁邊），同樣來自 config_location()。
-    /// 目前只有「檢查更新」這一項的預設值跟著它走
-    portable: bool,
     cfg: Mutex<Config>,
     /// 環形緩衝，讓前端掛上監聽前（例如啟動當下）的日誌還能靠 Snapshot 補回來
     logs: Mutex<VecDeque<String>>,
@@ -549,10 +602,16 @@ pub struct AppState {
     update: Mutex<Option<UpdateInfo>>,
     /// 已經下載好、等下一次啟動才安裝的那一版，None 代表暫存區是空的
     pending: Mutex<Option<crate::update::Pending>>,
+    /// 「知道有新版，但下載失敗了、正在退避等下一次試」。
+    ///
+    /// 沒有這一格的話，介面只看得到「有新版」與「有東西就緒」兩個事實，
+    /// 於是「有新版但還沒就緒」一律被畫成轉圈的 Downloading…——網路壞掉時
+    /// 那顆 spinner 會轉上一整天，而它宣稱的事情根本沒有在發生。
+    update_stalled: AtomicBool,
 }
 
 impl AppState {
-    pub fn new(app: AppHandle, path: PathBuf, portable: bool, cfg: Config) -> Self {
+    pub fn new(app: AppHandle, path: PathBuf, cfg: Config) -> Self {
         let exits = cfg.locals().into_iter().map(|p| (p, ExitRuntime::default())).collect();
         let wg_confs = read_wg_confs(&cfg, config_dir(&path));
         let wg_engines: HashMap<String, WgEngineRuntime> =
@@ -560,7 +619,6 @@ impl AppState {
         AppState {
             app,
             path,
-            portable,
             cfg: Mutex::new(cfg),
             logs: Mutex::new(VecDeque::new()),
             exits: Mutex::new(exits),
@@ -573,6 +631,7 @@ impl AppState {
             read_only: AtomicBool::new(false),
             update: Mutex::new(None),
             pending: Mutex::new(None),
+            update_stalled: AtomicBool::new(false),
         }
     }
 
@@ -1133,22 +1192,14 @@ impl AppState {
         self.exiting.store(true, Ordering::SeqCst);
     }
 
-    /// 把「正在退出」收回來。
-    ///
-    /// 只有一條路會用到：更新交棒在最後一刻失敗了（安裝程式起不起來），
-    /// 程式要留在原地繼續跑，那面旗子就不可以留著——留著的話按下關閉鈕會直接
-    /// 結束程式而不是縮回系統匣（`CloseRequested` 那道判斷看的正是它）。
-    pub fn clear_exiting(&self) {
-        self.exiting.store(false, Ordering::SeqCst);
-    }
-
     pub fn autostart(&self) -> bool {
         crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
-    /// 這次執行要不要自動更新：設定檔沒寫的話，一般模式開、可攜模式關
+    /// 這次執行要不要自動更新。設定檔沒寫的話兩種模式都算開，
+    /// 理由見 `config::DEFAULT_AUTOMATIC_UPDATES`
     pub fn checks_for_updates(&self) -> bool {
-        self.with_config(|c| c.checks_for_updates(self.portable))
+        self.with_config(|c| c.checks_for_updates())
     }
 
     /// 記下背景檢查的結果並推事件；跟上次一樣就不重推，回傳值就是「這次有沒有變」。
@@ -1190,6 +1241,20 @@ impl AppState {
     /// 就緒的那一版版本號（不帶 v），暫存區空的就是 None
     pub fn staged_version(&self) -> Option<String> {
         self.pending.lock().unwrap().as_ref().map(|p| p.version.clone())
+    }
+
+    /// 記下「下載卡住了／又動起來了」；值沒變就不重推。
+    ///
+    /// 這一格是介面用來分辨「正在下載」與「下載失敗、等著重試」的唯一依據，
+    /// 所以每一次嘗試開始時要清掉、失敗時要設起來，兩邊都不能漏。
+    pub fn set_update_stalled(&self, stalled: bool) {
+        if self.update_stalled.swap(stalled, Ordering::SeqCst) != stalled {
+            self.emit_config_changed();
+        }
+    }
+
+    pub fn update_stalled(&self) -> bool {
+        self.update_stalled.load(Ordering::SeqCst)
     }
 
     /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
@@ -1238,6 +1303,7 @@ impl AppState {
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
             update: self.update_info(),
             pending_update: self.staged_version(),
+            update_stalled: self.update_stalled(),
         }
     }
 

@@ -1153,11 +1153,19 @@ body {
 }
 
 /* ------------------------------------------------------------ 更新 split button
-   About 版本列右側那顆會變身的鈕，參照 Windows Update：檢查中／已是最新／
-   有新版全部反映在同一顆鈕上，不另開對話框、不增減列。
+   About 版本列右側那顆會變身的鈕，參照 Windows Update：整條自動更新的每個
+   階段都反映在同一顆鈕上，不另開對話框、不增減列。
 
-   **零跳動是這一區的硬性要求**：狀態一換文字長度就變（Check for updates →
-   Checking… → Update to v0.10.0），所以主鈕給固定 min-width、圖示欄給固定
+   五個狀態（`data-state`）：
+     idle        沒有新版——主鈕整顆藏起來，只留下拉的柄
+     downloading 背景正在下載——灰字＋轉圈，不可按
+     stalled     下載失敗、退避等重試——琥珀色字，**不轉圈**，不可按
+     ready       下載好了——綠色主要鈕 Restart to update
+     portable    可攜／單檔版查到新版——綠色主要鈕 Get vX.Y.Z
+     busy        按下去之後、交棒給安裝程式之前——綠底＋轉圈
+
+   **零跳動是這一區的硬性要求**：狀態一換文字長度就變（Downloading v0.10.0…
+   → Restart to update (v0.10.0)），所以主鈕給固定 min-width、圖示欄給固定
    邊長，下拉走絕對定位。任何一項拿掉，整列都會在狀態切換時抽動一下。 */
 
 .split {
@@ -1257,34 +1265,56 @@ body {
   transform: rotate(180deg);
 }
 
-/* 有新版：整顆升成綠色主要鈕。柄也一起上綠，中間的分隔線改用深色，
-   不然淺色分隔線壓在綠底上會像一道裂縫 */
-.split[data-state="available"],
+/* 有事情可以按：整顆升成綠色主要鈕。柄也一起上綠，中間的分隔線改用深色，
+   不然淺色分隔線壓在綠底上會像一道裂縫。
+
+   三個狀態共用這一套綠：ready（Restart to update）、portable（Get vX.Y.Z）、
+   busy（Restarting…，按下去之後）。downloading 與 stalled 刻意**不**上綠——
+   那兩個狀態沒有事情要使用者做，綠色是在請他按下去。 */
+.split[data-state="ready"],
+.split[data-state="portable"],
 .split[data-state="busy"] {
   border-color: var(--accent);
 }
 
-.split[data-state="available"] .split-main,
+.split[data-state="ready"] .split-main,
+.split[data-state="portable"] .split-main,
 .split[data-state="busy"] .split-main,
-.split[data-state="available"] .split-chevron,
+.split[data-state="ready"] .split-chevron,
+.split[data-state="portable"] .split-chevron,
 .split[data-state="busy"] .split-chevron {
   background: var(--accent);
   color: var(--accent-ink);
 }
 
-.split[data-state="available"] .split-chevron,
+.split[data-state="ready"] .split-chevron,
+.split[data-state="portable"] .split-chevron,
 .split[data-state="busy"] .split-chevron {
   border-left-color: rgba(14, 38, 32, 0.3);
 }
 
-.split[data-state="available"] .split-main:hover,
-.split[data-state="available"] .split-chevron:hover {
+.split[data-state="ready"] .split-main:hover,
+.split[data-state="ready"] .split-chevron:hover,
+.split[data-state="portable"] .split-main:hover,
+.split[data-state="portable"] .split-chevron:hover {
   background: var(--accent-hover);
 }
 
 /* 綠色狀態下即使停用也不要褪成灰字，那是「正在為你更新」而不是「不能按」 */
 .split[data-state="busy"] .split-main:disabled {
   color: var(--accent-ink);
+}
+
+/* 背景正在下載：不上綠也不搶注意力，它只是在報告一件不需要使用者做什麼的事。
+   停用的灰字是對的，轉圈的圖示已經說明了狀態 */
+.split[data-state="downloading"] .split-main:disabled {
+  color: var(--muted);
+}
+
+/* 下載失敗、正在退避等重試：用警示色的字，但**不轉圈**——轉圈的意思是
+   「正在下載」，而現在的事實是「沒有在下載，等一下會再試」 */
+.split[data-state="stalled"] .split-main:disabled {
+  color: var(--amber);
 }
 
 .split-icon.spin .icon {

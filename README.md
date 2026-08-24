@@ -37,7 +37,9 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 本地埠衝突三層防護：設定階段擋重複埠（跨連線也擋，訊息會點名佔用者與它所屬的連線）、spawn 前偵測埠是否已被其他程序佔用（狀態顯示 `port_busy`，每 5 秒重查而不盲目 spawn），最後由 ssh 的 `ExitOnForwardFailure=yes` 兜底
 - 各隧道經本地 SOCKS5 埠檢測連通性，顯示對外 IP 與所在地（此功能會經隧道向第三方服務 ipinfo.io 發出請求）
 - 支援透過 `ProxyCommand`（例如 `cloudflared access ssh`）連線
-- 自動更新（VSCode 式）：啟動幾秒後與之後每 24 小時各查一次 Releases 上的 `latest.json`。**安裝版**（NSIS 裝的那一份）查到新版就在背景把安裝檔下載回來、驗過 minisign 簽章，存進 `%LOCALAPPDATA%\com.traytunnel.desktop\pending-update` 並記下它的 SHA-256；**下一次啟動的最早期**（UI 之前）重算一次雜湊確認檔案沒被動過，然後靜默交棒給安裝程式（NSIS 的 `/S /R /UPDATE`，連進度視窗都不出現），裝完由安裝程式把新版重新啟動起來——原本是 `--tray` 開機自啟進來的就照樣 `--tray`，不會突然彈一個視窗。不想等下一次啟動的話，設定頁的 `Restart to update` 與系統匣選單的同名項都可以現在就套用。同一版不會重複下載，下載失敗會退避重試（15 分、30 分、1 小時……封頂一天）並清掉殘檔，同一版連三次交棒都沒把版本換掉就放棄它、重新下載一份。**一般單檔與可攜版**不會改寫自己，按鈕是 `Get v<新版>`，只開系統瀏覽器到那一版的 release 頁讓你自己換檔案。是不是安裝版由登錄檔的解除安裝資訊判定（`InstallLocation` 要真的就是這支執行檔的所在資料夾）。檢查與下載失敗完全靜默，只在活動日誌留一行；整條路可以用設定頁的「Automatic updates」開關（設定檔的 `checkForUpdates`）關掉，關掉後完全不發網路請求（可攜模式預設就是關的），而且會把已經下載好等著裝的那一份也一併丟掉——套用更新那一步跑在設定檔載入之前，看不到這個開關，所以「關掉之後不會再被自動更新」只能靠當場清掉標記來兌現
+- 自動更新（VSCode 式）：啟動幾秒後與之後每 24 小時各查一次 Releases 上的 `latest.json`。**安裝版**（NSIS 裝的那一份）查到新版就在背景把安裝檔下載回來、驗過 minisign 簽章，存進 `%LOCALAPPDATA%\com.traytunnel.desktop\pending-update` 並記下它的 SHA-256；**下一次啟動的最早期**（UI 之前）重算一次雜湊確認檔案沒被動過，然後靜默交棒給安裝程式（NSIS 的 `/S /R /UPDATE`，連進度視窗都不出現），裝完由安裝程式把新版重新啟動起來——原本是 `--tray` 開機自啟進來的就照樣 `--tray`，不會突然彈一個視窗。不想等下一次啟動的話，設定頁的 `Restart to update` 與系統匣選單的同名項都可以現在就套用。同一版不會重複下載，下載失敗會退避重試（15 分、30 分、1 小時……封頂一天）並清掉殘檔，同一版連三次交棒都沒把版本換掉就放棄它、重新下載一份。**一般單檔與可攜版**不會改寫自己，只比對版本並把按鈕變成 `Get v<新版>`，開系統瀏覽器到那一版的 release 頁讓你自己換檔案（不下載、不安裝）。是不是安裝版由登錄檔的解除安裝資訊判定（`InstallLocation` 要真的就是這支執行檔的所在資料夾）。檢查與下載失敗完全靜默，只在活動日誌留一行，而畫面上會誠實顯示 `Download failed — will retry`（不是一顆轉到天荒地老的 spinner）。整條路可以用設定頁的「Automatic updates」開關（設定檔的 `checkForUpdates`）關掉，關掉後完全不發網路請求；**預設兩種模式都是開的**（可攜版原本預設關，但那讓可攜使用者完全失去「知道有新版」這件事，而它本來就只會拉一份幾百位元組的 latest.json）。關掉時會把已經下載好等著裝的那一份也一併丟掉，而且套用那一步自己還會再讀一次設定檔確認開關是開的——它跑在 `AppState` 存在之前，只有這樣「關掉之後不會再被自動更新」才是真的
+
+  自動安裝還有兩道保護：**已經有另一個實例在跑時絕不套用**（使用者雙擊了第二次圖示，那個第二實例只該去喚醒既有視窗，不可以起安裝程式把他正在用的第一實例連同隧道一起關掉——探測走 single-instance 外掛自己那把 `{identifier}-sim` 具名鎖），以及**同一版連三次交棒都沒把版本換掉就放棄它**（免得變成每次開機都跑一次安裝程式的迴圈）
 - 主視窗位置／大小會記住，下次啟動（含應用內更新後的重啟）沿用上次的位置與大小，不會每次都歸零置中
 - 單一實例：重複啟動只會把既有的主視窗叫出來
 - 系統匣提示跨連線彙總所有隧道狀態，例如 `Traytunnel - 3/4 connected`；右鍵選單是狀態行、隧道勾選、`Connect all`／`Disconnect all`／`Reconnect all`，多組連線時每組收成一個子選單（底下有 `Reconnect`）
@@ -72,7 +74,7 @@ Free code signing provided by [SignPath.io](https://signpath.io/) , certificate 
 - **隧道清單**：彙總卡下方是標題 `TUNNELS` 的隧道清單，整份包在單一外框裡，列與列之間用內縮的細分隔線分開，滑過去整列微亮。每列左側是狀態點、名稱與 `:local → remote`，右側兩行是最近一次自測結果（上行地點、下行對外 IP），最右邊是連接／中斷、重新連接、編輯三個鈕。外框高度跟著列數長，長到超過主區可用高度時就固定在那裡、改由框內捲動，外框與圓角一直留在畫面上。
 - **活動日誌頁**：左下的時鐘鈕（或 ⋯ 選單的 Activity）把主區換成所有連線的完整日誌，點任一連線 icon 即返回。
 - **設定頁**：左下的齒輪把主區換成設定頁。General 分節有「關閉時縮到系統匣」、「開機自動啟動」、「自動更新」三個即時生效的開關。下方的 About 分節有兩列：
-  - **版本列**——左邊是 app 的盾牌 logo，中間的標題平時是 `Version`、有新版時變成 `Update available`，副標永遠只是純版號（`v0.6.1`）。右邊是一顆 split button：**沒有事情可做時主鈕整顆不出現**，只留右側的柄。安裝版查到新版之後主鈕會依序走 `Downloading v<新版>…`（後端在背景下載，不必按任何東西）→ 綠色的 `Restart to update (v<新版>)`；按下去就交棒給安裝程式，鈕停在 `Restarting…`。可攜／單檔版沒有自動更新這條路，主鈕直接是綠色的 `Get v<新版>`，按下去開那一版的 release 頁。右側的柄點開下拉，收兩個次要動作：`View release notes`（開手上那一版的 release 頁，沒有就是 `releases/latest`）、`Download from Releases`（開 Releases 列表頁自己挑版本）。主鈕與圖示欄都是固定寬度、下拉走絕對定位，狀態文字再怎麼變版面都不會跳動。手動的「Check for updates／Check now」已經拿掉——背景每天查一次、查到就自己下載，那顆鈕能做的事後端早就做完了。
+  - **版本列**——左邊是 app 的盾牌 logo，中間的標題平時是 `Version`、有新版時變成 `Update available`，副標永遠只是純版號（`v0.6.1`）。右邊是一顆 split button：**沒有事情可做時主鈕整顆不出現**，只留右側的柄。安裝版查到新版之後主鈕會依序走 `Downloading v<新版>…`（後端在背景下載，不必按任何東西）→ 綠色的 `Restart to update (v<新版>)`；按下去就交棒給安裝程式，鈕停在 `Restarting…`。下載失敗時它會誠實地變成琥珀色的 `Download failed — will retry`（不轉圈——轉圈的意思是「正在下載」，而那時並沒有）。可攜／單檔版沒有自動更新這條路，主鈕直接是綠色的 `Get v<新版>`，按下去開那一版的 release 頁。右側的柄點開下拉，收兩個次要動作：`View release notes`（開手上那一版的 release 頁，沒有就是 `releases/latest`）、`Download from Releases`（開 Releases 列表頁自己挑版本）。主鈕與圖示欄都是固定寬度、下拉走絕對定位，狀態文字再怎麼變版面都不會跳動。手動的「Check for updates／Check now」已經拿掉——背景每天查一次、查到就自己下載，那顆鈕能做的事後端早就做完了。
   - **Config file 一列**——副標是實際生效的設定檔完整路徑，右側的圖示鈕開檔案總管並選中它。
 - **連線編輯**：⋯ 選單的 Edit connection 或側欄的「＋」會開出置中的編輯 sheet（name／host／user／ProxyCommand），驗證錯誤逐欄顯示；刪除連線需要一次確認。頁腳左側的 Test 鈕可以在存檔前就拿表單當下填的值試連一次（spawn 一次性 `ssh ... exit`，不建立任何轉發），結果就地顯示成功的綠字「Connected」或失敗的紅字（帶 ssh 的錯誤原因，例如 DNS 解析失敗、逾時、金鑰被拒），逾時 15 秒兜底；host／user 空白時按 Test 直接顯示欄位驗證錯誤，不會真的去連。
 - **隧道編輯**：列上的鉛筆、⋯ 選單的 Add tunnel、以及零隧道時的虛線引導卡，都開同一個 sheet（name／local port／remote）。remote 欄的提示是 `1080 (server-side port) or host:port`——只填埠號就是伺服器本機的那個埠，補成 `host:port` 由後端做。刪除隧道不跳確認，先從畫面移除、5 秒內可以按 Undo 收回。
@@ -117,6 +119,7 @@ npm run dev
 - 版本列那顆 split button 的每一個狀態都演得到，兩條車道各一套：
   - `__mock.update("installed", "0.7.0")` 演整條自動更新：主鈕先轉 `Downloading v0.7.0…`，約兩秒後變成綠色的 `Restart to update (v0.7.0)`
   - `__mock.update("portable", "0.7.0")` 演可攜車道：主鈕直接是綠色的 `Get v0.7.0`，沒有下載那一段
+  - `__mock.updateStalls()`（先 `update("installed")` 再叫）演下載失敗：主鈕變成琥珀色的 `Download failed — will retry`，**不轉圈**
   - `__mock.updateNone()` 回到沒有更新的狀態：標題退回 `Version`，主鈕整顆消失
   - `__mock.updateFails()` 讓按下 `Restart to update` 演成失敗，看鈕從 `Restarting…` 彈回來、原因寫進設定頁的錯誤列
   - 真後端的背景車道對「已是最新」與「檢查失敗」都是靜默的（失敗只在活動日誌留一行），畫面上沒有對應的狀態，所以那兩種結果沒有東西好演

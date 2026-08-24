@@ -161,6 +161,13 @@ export interface Snapshot {
    * 有值就代表「Restart to update」現在按得下去。
    */
   pendingUpdate: string | null;
+  /**
+   * 知道有新版、但下載失敗了正在退避等重試。
+   *
+   * 少了這一格的話，「有新版但還沒就緒」只有一種畫法（轉圈的 Downloading…），
+   * 於是網路壞掉時那顆 spinner 會轉上一整天，而它宣稱的事情根本沒有在發生。
+   */
+  updateStalled: boolean;
 }
 
 /** "exit-status" 事件 */

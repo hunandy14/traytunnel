@@ -65,6 +65,7 @@ const EMPTY: Snapshot = {
   logs: [],
   update: null,
   pendingUpdate: null,
+  updateStalled: false,
 };
 
 let snap: Snapshot = EMPTY;

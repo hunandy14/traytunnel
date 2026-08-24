@@ -434,26 +434,54 @@ fn missing_fields_fall_back_to_defaults() {
     assert!(cfg.sources[0].forwards.is_empty());
 }
 
-/// checkForUpdates 的預設值跟著模式走：設定檔沒寫時，一般模式開、可攜模式關。
-/// 這是可攜版「不主動連外」承諾的落點，寫死成單一預設值就等於毀約。
+/// 自動更新的預設值：**兩種模式都是開**。
+///
+/// 斷言從「一般開、可攜關」改成「都開」是刻意的行為變更。可攜版原本預設關掉，
+/// 理由是「不主動連外」，代價卻是可攜使用者完全失去了「知道有新版」這件事
+/// ——而可攜車道只會拉一份幾百位元組的 latest.json 並多顯示一顆按鈕，
+/// 不下載、不安裝、不改寫任何東西。真的不想連外的人把開關關掉就是了。
+///
+/// `None` 那一條沒有變：沒寫過就不可以在解析時決定成某個布林，否則寫檔那一步
+/// 會把一個使用者從沒動過的鍵寫進他的設定檔。
 #[test]
-fn check_for_updates_defaults_follow_the_mode() {
+fn automatic_updates_default_to_on() {
     let cfg = parse_config("closeToTray = true\n").unwrap();
     assert_eq!(cfg.check_for_updates, None, "沒寫就該是 None，不可以在解析時就決定");
-    assert!(cfg.checks_for_updates(false), "一般模式預設要檢查");
-    assert!(!cfg.checks_for_updates(true), "可攜模式預設不檢查");
+    assert!(cfg.checks_for_updates(), "沒寫時預設要開");
+    // 生效值必須就是那個常數，兩者不可以各自演化
+    assert_eq!(cfg.checks_for_updates(), crate::config::DEFAULT_AUTOMATIC_UPDATES);
 }
 
-/// 寫了就照使用者寫的算，兩種模式下都一樣——明示永遠蓋過預設
+/// 寫了就照使用者寫的算——明示永遠蓋過預設
 #[test]
-fn an_explicit_check_for_updates_wins_in_both_modes() {
+fn an_explicit_check_for_updates_wins() {
     let on = parse_config("checkForUpdates = true\n").unwrap();
     assert_eq!(on.check_for_updates, Some(true));
-    assert!(on.checks_for_updates(true) && on.checks_for_updates(false));
+    assert!(on.checks_for_updates());
 
     let off = parse_config("checkForUpdates = false\n").unwrap();
     assert_eq!(off.check_for_updates, Some(false));
-    assert!(!off.checks_for_updates(true) && !off.checks_for_updates(false));
+    assert!(!off.checks_for_updates());
+}
+
+/// 開機那條路讀設定的輕量版：只挖 `checkForUpdates` 一個鍵，不做遷移、不備份、
+/// 不建檔。它是「關掉自動更新之後就不會再被自動裝上去」唯一的落點——
+/// `apply_pending_at_startup` 跑在 `AppState` 存在之前，只有這一支問得到。
+#[test]
+fn the_lightweight_reader_sees_exactly_what_the_user_wrote() {
+    use crate::config::read_automatic_updates;
+    assert!(!read_automatic_updates("checkForUpdates = false\n"));
+    assert!(read_automatic_updates("checkForUpdates = true\n"));
+    // 沒寫、空檔、整份壞掉，一律是預設值——設定檔壞掉時整支程式本來就是用
+    // 預設值在跑，這一個鍵沒有理由自成一格
+    assert!(read_automatic_updates("closeToTray = true\n"));
+    assert!(read_automatic_updates(""));
+    assert!(read_automatic_updates("this is not : valid toml ["));
+    // 型別不對就當沒寫，不要把一個字串硬轉成 true
+    assert!(read_automatic_updates("checkForUpdates = \"false\"\n"));
+    // 它讀的必須是完整設定檔裡的那個鍵，不是隨便一段前綴
+    let full = "closeToTray = true\ncheckForUpdates = false\n\n[[sources]]\nname = \"hk\"\n";
+    assert!(!read_automatic_updates(full));
 }
 
 /// 沒設定過就不要把鍵寫進檔案：一寫下去，當下算出來的預設值就被固定住了，

@@ -26,7 +26,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::is_newer;
+use super::{is_newer, normalize_version};
 
 /// 就緒標記。開機時只讀這一份就知道要不要交棒，不必去碰十幾 MB 的安裝檔
 const MARKER_FILE: &str = "pending-update.json";
@@ -59,15 +59,15 @@ pub struct Pending {
     pub attempts: u32,
 }
 
-/// 版本號的比較用形式：去空白、去前導的 v
-fn normalize(version: &str) -> &str {
-    version.trim().trim_start_matches(['v', 'V'])
-}
-
 /// 一份 bytes 的 SHA-256，小寫十六進位
 pub fn digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let out = Sha256::digest(bytes);
-    out.iter().map(|b| format!("{b:02x}")).collect()
+    out.iter().fold(String::with_capacity(out.len() * 2), |mut acc, b| {
+        // write! 對 String 不會失敗
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 /// 把下載好的安裝檔存進暫存區並寫下就緒標記。
@@ -80,7 +80,7 @@ pub fn stage(dir: &Path, version: &str, bytes: &[u8]) -> std::io::Result<Pending
     let installer = dir.join(INSTALLER_FILE);
     std::fs::write(&installer, bytes)?;
     let pending = Pending {
-        version: normalize(version).to_string(),
+        version: normalize_version(version).to_string(),
         installer,
         sha256: digest(bytes),
         attempts: 0,
@@ -141,39 +141,43 @@ pub fn clear(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(INSTALLER_FILE));
 }
 
-/// 開機時看到一份標記，該拿它怎麼辦
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 開機時看到一份標記，該拿它怎麼辦。
+///
+/// 每個分支**自己帶著它需要的資料**：呼叫端因此拿不到「決定要裝、但手上沒有
+/// Pending」這種組合，也就不必寫 `expect` 或 `unwrap_or_default` 去把型別上
+/// 允許、邏輯上不可能的狀態補起來。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Apply {
     /// 沒有標記，照常啟動
     Nothing,
     /// 標記那一版比正在跑的新：交棒給安裝程式
-    Install,
+    Install(Pending),
     /// 標記那一版就是正在跑的這一版：上一次更新成功了，記一行再把暫存清掉
     Done,
     /// 標記那一版不比正在跑的新，而且也不是同一版：清掉暫存，什麼都不裝
     Stale,
     /// 同一版已經試過太多次：放棄它，清掉暫存
-    GaveUp,
+    GaveUp { version: String },
 }
 
 /// 開機那一刻的決策。降版保護在這裡：**只有嚴格大於目前這一版才裝**。
 ///
 /// 版本號解析不出來時 [`is_newer`] 一律回 false，於是落到 `Stale` 被清掉
 /// ——一份看不懂版本號的標記絕不會被執行。
-pub fn apply_action(pending: Option<&Pending>, current: &str) -> Apply {
+pub fn apply_action(pending: Option<Pending>, current: &str) -> Apply {
     let Some(p) = pending else {
         return Apply::Nothing;
     };
-    if normalize(&p.version) == normalize(current) {
+    if normalize_version(&p.version) == normalize_version(current) {
         return Apply::Done;
     }
     if !is_newer(&p.version, current) {
         return Apply::Stale;
     }
     if p.attempts >= MAX_ATTEMPTS {
-        return Apply::GaveUp;
+        return Apply::GaveUp { version: p.version };
     }
-    Apply::Install
+    Apply::Install(p)
 }
 
 /// 這一版要不要下載。
@@ -181,22 +185,25 @@ pub fn apply_action(pending: Option<&Pending>, current: &str) -> Apply {
 /// 暫存區裡躺著的就是同一版時不再下載一次（同版去重）；躺著的是別的版本時
 /// 照下不誤，新的那一份會直接覆蓋掉舊的（有更新的版本出現就換掉舊 pending）。
 pub fn should_download(version: &str, pending: Option<&Pending>) -> bool {
-    !matches!(pending, Some(p) if normalize(&p.version) == normalize(version))
+    !matches!(pending, Some(p) if normalize_version(&p.version) == normalize_version(version))
 }
 
 /// 下載連續失敗這麼多次之後，下一次要隔多久再試。
 ///
-/// 第一次失敗等 15 分鐘，之後每次加倍，上限就是常規的一天。退避要處理的是
-/// 「網路壞掉時不要每隔幾分鐘去敲一次 GitHub」，而不是「壞一次就放棄到明天」
-/// ——使用者的網路多半幾分鐘就回來了。
-pub fn retry_delay(failures: u32) -> Duration {
+/// 第一次失敗等 15 分鐘，之後每次加倍。退避要處理的是「網路壞掉時不要每隔
+/// 幾分鐘去敲一次 GitHub」，而不是「壞一次就放棄到明天」——使用者的網路
+/// 多半幾分鐘就回來了。
+///
+/// **上限由呼叫端給**（`cap`，實務上就是常規的檢查間隔）。上限只有一個權威，
+/// 這裡不再自己夾一次：兩處各夾一次的話，改了常規間隔卻忘了改這裡，
+/// 就會出現「退避比常規排程還久」這種沒有人想要、也沒有人會發現的行為。
+pub fn retry_delay(failures: u32, cap: Duration) -> Duration {
     const BASE_SECS: u64 = 15 * 60;
-    const CAP_SECS: u64 = 24 * 60 * 60;
     if failures == 0 {
         return Duration::ZERO;
     }
     let factor = 1u64.checked_shl(failures - 1).unwrap_or(u64::MAX);
-    Duration::from_secs(BASE_SECS.saturating_mul(factor).min(CAP_SECS))
+    Duration::from_secs(BASE_SECS.saturating_mul(factor)).min(cap)
 }
 
 /// 交棒給暫存的 NSIS 安裝程式時要帶的參數。
@@ -329,19 +336,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 開機決策的主線：比較新才裝
+    /// 開機決策的主線：比較新才裝，而且 `Install` 把那份標記一起帶出來
+    /// （呼叫端因此不必再 `expect` 一次自己剛剛才傳進去的東西）
     #[test]
     fn only_a_newer_staged_version_gets_installed() {
         assert_eq!(apply_action(None, "0.6.1"), Apply::Nothing);
-        assert_eq!(apply_action(Some(&pending("0.7.0", 0)), "0.6.1"), Apply::Install);
-        assert_eq!(apply_action(Some(&pending("v0.7.0", 0)), "0.6.1"), Apply::Install);
+        assert_eq!(
+            apply_action(Some(pending("0.7.0", 0)), "0.6.1"),
+            Apply::Install(pending("0.7.0", 0))
+        );
+        assert_eq!(
+            apply_action(Some(pending("v0.7.0", 0)), "0.6.1"),
+            Apply::Install(pending("v0.7.0", 0))
+        );
     }
 
     /// 標記那一版就是正在跑的這一版＝上一次更新成功了：記一行、清掉，不再裝一次
     #[test]
     fn the_version_we_are_already_running_means_the_update_landed() {
-        assert_eq!(apply_action(Some(&pending("0.7.0", 0)), "0.7.0"), Apply::Done);
-        assert_eq!(apply_action(Some(&pending("v0.7.0", 1)), "0.7.0"), Apply::Done);
+        assert_eq!(apply_action(Some(pending("0.7.0", 0)), "0.7.0"), Apply::Done);
+        assert_eq!(apply_action(Some(pending("v0.7.0", 1)), "0.7.0"), Apply::Done);
     }
 
     /// 降版保護：標記比現行版本舊就一律不裝。
@@ -350,20 +364,25 @@ mod tests {
     /// 都會走到這裡。把他手上比較新的那一份降回去是這條路最壞的失敗模式。
     #[test]
     fn a_staged_downgrade_is_refused_and_swept_away() {
-        assert_eq!(apply_action(Some(&pending("0.5.0", 0)), "0.6.1"), Apply::Stale);
+        assert_eq!(apply_action(Some(pending("0.5.0", 0)), "0.6.1"), Apply::Stale);
         // 版本號看不懂時同樣不裝——`is_newer` 對垃圾一律回 false
-        assert_eq!(apply_action(Some(&pending("latest", 0)), "0.6.1"), Apply::Stale);
-        assert_eq!(apply_action(Some(&pending("0.7", 0)), "0.6.1"), Apply::Stale);
+        assert_eq!(apply_action(Some(pending("latest", 0)), "0.6.1"), Apply::Stale);
+        assert_eq!(apply_action(Some(pending("0.7", 0)), "0.6.1"), Apply::Stale);
     }
 
-    /// 三次交棒都沒把版本換掉就放棄這一版，免得變成每次開機都跑一次安裝程式
+    /// 三次交棒都沒把版本換掉就放棄這一版，免得變成每次開機都跑一次安裝程式。
+    /// `GaveUp` 自己帶著版本號，日誌行不必再去翻原本那份標記
     #[test]
     fn the_same_version_is_given_up_on_after_three_attempts() {
-        assert_eq!(apply_action(Some(&pending("0.7.0", 2)), "0.6.1"), Apply::Install);
-        assert_eq!(apply_action(Some(&pending("0.7.0", MAX_ATTEMPTS)), "0.6.1"), Apply::GaveUp);
-        assert_eq!(apply_action(Some(&pending("0.7.0", 99)), "0.6.1"), Apply::GaveUp);
+        let gave_up = |v: &str| Apply::GaveUp { version: v.into() };
+        assert_eq!(
+            apply_action(Some(pending("0.7.0", 2)), "0.6.1"),
+            Apply::Install(pending("0.7.0", 2))
+        );
+        assert_eq!(apply_action(Some(pending("0.7.0", MAX_ATTEMPTS)), "0.6.1"), gave_up("0.7.0"));
+        assert_eq!(apply_action(Some(pending("0.7.0", 99)), "0.6.1"), gave_up("0.7.0"));
         // 放棄的判斷排在版本判斷之後：已經裝好的那一版永遠是 Done，不管試過幾次
-        assert_eq!(apply_action(Some(&pending("0.7.0", 99)), "0.7.0"), Apply::Done);
+        assert_eq!(apply_action(Some(pending("0.7.0", 99)), "0.7.0"), Apply::Done);
     }
 
     /// 同一版不重複下載；換了版本就照下，新的直接蓋掉舊的
@@ -376,17 +395,22 @@ mod tests {
         assert!(should_download("0.7.0", None));
     }
 
-    /// 退避是加倍的，而且封頂在一天——不會退避到比常規排程還久
+    /// 退避是加倍的，而且封頂在呼叫端給的那個上限——上限只有一個權威（呼叫端
+    /// 傳的就是常規檢查間隔），這裡不再自己夾一次
     #[test]
-    fn the_retry_delay_backs_off_and_stops_at_a_day() {
-        assert_eq!(retry_delay(0), Duration::ZERO);
-        assert_eq!(retry_delay(1), Duration::from_secs(15 * 60));
-        assert_eq!(retry_delay(2), Duration::from_secs(30 * 60));
-        assert_eq!(retry_delay(3), Duration::from_secs(60 * 60));
+    fn the_retry_delay_backs_off_and_stops_at_the_cap() {
         let day = Duration::from_secs(24 * 60 * 60);
-        assert_eq!(retry_delay(10), day);
+        assert_eq!(retry_delay(0, day), Duration::ZERO);
+        assert_eq!(retry_delay(1, day), Duration::from_secs(15 * 60));
+        assert_eq!(retry_delay(2, day), Duration::from_secs(30 * 60));
+        assert_eq!(retry_delay(3, day), Duration::from_secs(60 * 60));
+        assert_eq!(retry_delay(10, day), day);
         // 位移不可以溢位成 panic 或繞回一個很小的值
-        assert_eq!(retry_delay(u32::MAX), day);
+        assert_eq!(retry_delay(u32::MAX, day), day);
+        // 上限壓得比第一級還低時，第一級就直接被夾住
+        let tight = Duration::from_secs(60);
+        assert_eq!(retry_delay(1, tight), tight);
+        assert_eq!(retry_delay(9, tight), tight);
     }
 
     /// 安裝程式的參數是這條路上唯一沒辦法在開發期真的跑一次的東西，

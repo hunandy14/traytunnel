@@ -105,6 +105,45 @@ fn home_dir() -> Option<PathBuf> {
 
 /// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
 /// 全程式只有這一個入口，讀寫與備份都從回傳值派生。
+/// 設定檔沒寫 `checkForUpdates` 時，自動更新算開還是關。
+///
+/// **兩種模式都是開**。可攜版曾經預設關掉（理由是「丟在隨身碟或隔離環境裡跑，
+/// 不該主動連外」），但那讓可攜使用者完全失去了「知道有新版」這件事——而可攜
+/// 車道本來就只會做兩件事：拉一份幾百位元組的 latest.json、在設定頁多顯示一顆
+/// `Get vX.Y.Z`。它不會下載、不會安裝、不會改寫任何東西。用「不主動連外」去換
+/// 「永遠不知道有更新」並不划算，真的不想連外的人把開關關掉就是了。
+pub const DEFAULT_AUTOMATIC_UPDATES: bool = true;
+
+/// 「自動更新是不是開著」——**不經 `AppState`、不解析整份設定**的輕量版。
+///
+/// 只有一個呼叫端：`update::apply_pending_at_startup`。它跑在 `tauri::Builder`
+/// 之前（理由見那支函式），那時 `AppState` 還不存在，卻必須知道使用者到底有沒有
+/// 把自動更新關掉——否則「關掉之後不會再被自動更新」這個承諾在啟動這條路上是空的。
+///
+/// 刻意不走 `load_from_path`：那一支會做遷移判定、壞檔備份、必要時建檔，全都是
+/// 這個時間點不該發生的副作用（正常的載入流程幾毫秒後就會在 setup 裡完整跑一次）。
+/// 這裡只讀一個鍵，讀不到就用預設值。
+pub fn automatic_updates_enabled() -> bool {
+    let (dir, stem) = exe_parts();
+    let loc = resolve_location(&dir, &stem, home_dir().as_deref());
+    match std::fs::read_to_string(&loc.path) {
+        Ok(raw) => read_automatic_updates(&raw),
+        // 檔案還不存在（第一次啟動）就是預設值
+        Err(_) => DEFAULT_AUTOMATIC_UPDATES,
+    }
+}
+
+/// 從設定檔原文裡挖出 `checkForUpdates`。純函式，壞檔一律回預設值。
+///
+/// 壞檔回預設是對的方向：設定檔壞掉時整支程式本來就是用預設值在跑
+/// （見 `LoadOutcome::Broken`），這一個鍵沒有理由自成一格。
+pub fn read_automatic_updates(raw: &str) -> bool {
+    raw.parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("checkForUpdates").and_then(|v| v.as_bool()))
+        .unwrap_or(DEFAULT_AUTOMATIC_UPDATES)
+}
+
 pub fn config_location() -> ConfigLocation {
     let (dir, stem) = exe_parts();
     let loc = resolve_location(&dir, &stem, home_dir().as_deref());
@@ -227,9 +266,10 @@ pub struct Config {
     /// 而改鍵名的代價是每一份既有設定檔裡使用者親手關掉的那個 false 會被
     /// 默默忽略、變回預設的開。不值得。
     ///
-    /// 刻意是 `Option`：這一項的預設值**跟著執行模式走**（一般模式開、可攜模式
-    /// 關），設定檔裡沒寫的時候不能在這裡就決定成某個布林，否則可攜模式讀進來
-    /// 就會拿到一般模式的預設值。實際生效的值一律問 [`Config::checks_for_updates`]。
+    /// 刻意留 `Option` 而不是 `#[serde(default = "default_true")]`：`None` 與
+    /// `Some(true)` 在**寫檔**那一步意義不同——沒寫過就不要把鍵寫進使用者的
+    /// 設定檔（見 `write_config_at` 那段註解），只有他真的動過開關才落檔。
+    /// 實際生效的值一律問 [`Config::checks_for_updates`]。
     #[serde(default)]
     pub check_for_updates: Option<bool>,
     #[serde(default)]
@@ -274,8 +314,8 @@ impl Config {
     /// 設定檔沒寫（`None`）時看模式：一般模式視為開啟，可攜模式視為關閉——
     /// 可攜版常見的用法就是丟在隨身碟或隔離環境裡跑，預設不主動連外比較合理，
     /// 而且它本來也只能提示、不能就地更新。寫了就照使用者寫的算。
-    pub fn checks_for_updates(&self, portable: bool) -> bool {
-        self.check_for_updates.unwrap_or(!portable)
+    pub fn checks_for_updates(&self) -> bool {
+        self.check_for_updates.unwrap_or(DEFAULT_AUTOMATIC_UPDATES)
     }
 
     /// 每一條列，ssh 的先、wg 的後，各自照設定檔順序
@@ -333,12 +373,18 @@ impl Config {
     ///
     /// 連線層與列層是兩個獨立的意圖，`AND` 起來才是「這條列現在該不該跑」（§5.5）。
     pub fn enabled_locals(&self) -> Vec<u16> {
-        self.sources
-            .iter()
-            .flat_map(|s| s.forwards.iter())
-            .chain(self.wg_proxies.iter().filter(|p| p.enabled).flat_map(|p| p.forwards.iter()))
-            .filter(|f| f.enabled)
-            .map(|f| f.local)
+        // ssh 那一半直接用 `enabled_ssh_locals`，兩支就不會各自演化出
+        // 不一樣的「什麼叫 enabled」（看門狗吃的是那一支，隧道啟動吃的是這一支）
+        self.enabled_ssh_locals()
+            .into_iter()
+            .chain(
+                self.wg_proxies
+                    .iter()
+                    .filter(|p| p.enabled)
+                    .flat_map(|p| p.forwards.iter())
+                    .filter(|f| f.enabled)
+                    .map(|f| f.local),
+            )
             .collect()
     }
 
@@ -563,7 +609,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             close_to_tray: true,
-            // 預設值跟著模式走，所以這裡刻意留空（見 checks_for_updates）
+            // 沒動過就不落檔，所以這裡刻意留空（見欄位本身的說明）
             check_for_updates: None,
             sources: vec![Source {
                 name: "your-host".into(),
@@ -644,7 +690,8 @@ pub fn default_document() -> String {
          \n\
          # 自動更新（設定頁的 Automatic updates）：背景查新版、查到就靜默下載，\n\
          # 下一次啟動時安裝。啟動後查一次，之後每天一次。\n\
-         # 省略時：一般模式視為 true，可攜模式視為 false。關閉時完全不連外。\n\
+         # 可攜版只會檢查並顯示提示，不會下載也不會安裝。\n\
+         # 省略時視為 true。關閉時完全不連外。\n\
          #checkForUpdates = true\n\
          \n\
          # 每個 [[sources]] 是一組 ssh 連線參數，底下可以掛多個轉發出口。\n\

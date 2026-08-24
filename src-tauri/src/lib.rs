@@ -201,13 +201,22 @@ pub fn run() {
             let outcome = config::load_from_path(&loc.path);
             let cfg: Config = outcome.config().clone();
             let shared: Shared =
-                Arc::new(AppState::new(handle.clone(), loc.path.clone(), loc.portable, cfg.clone()));
+                Arc::new(AppState::new(handle.clone(), loc.path.clone(), cfg.clone()));
             // 壞檔又備份不出來時，原檔是使用者僅存的一份，這次執行一律不准回寫。
             // 要趕在任何存檔路徑（含系統匣、自啟自癒）跑起來之前拉閘。
             if outcome.read_only() {
                 shared.mark_read_only();
             }
             app.manage(shared.clone());
+
+            // 暫存區裡那份就緒的更新要在**畫系統匣之前**認回來，
+            // 「Restart to update」才會從第一次畫的時候就在選單上，
+            // 而不是等到下一次狀態變動才冒出來。
+            //
+            // 什麼時候真的會撈到東西：`apply_pending_at_startup` 有一條會「留著
+            // 標記不套用」的路——已經有另一個實例在跑（第二實例不可以把第一實例
+            // 裝掉）。那次啟動就是靠這裡把更新撈回狀態的。
+            update::restore_staged(&shared);
 
             build_tray(&handle, &shared)?;
 
@@ -240,10 +249,6 @@ pub fn run() {
                     }
                 });
             }
-
-            // 暫存區裡那份就緒的更新要在第一次畫系統匣之前認回來，
-            // 「Restart to update」才會從一開始就在選單上
-            update::restore_staged(&shared);
 
             shared.refresh_tray();
             shared.log("Traytunnel started");
@@ -338,11 +343,18 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
             tunnel::reconnect_all(st);
             wg::reconnect_running(st);
         }
-        // 已經下載好的更新，現在就套用。成功的話這一支不會回來
+        // 已經下載好的更新，現在就套用。
+        //
+        // 丟到 blocking 執行緒上：`apply_now` 要把十幾 MB 的安裝檔整個讀進來
+        // 算一次 SHA-256，而選單事件是在主執行緒上處理的，同步做等於讓整個
+        // 系統匣（連同主視窗）卡住那幾百毫秒。成功的話那條路不會回來。
         traymenu::ID_APPLY_UPDATE => {
-            if let Err(e) = update::apply_now(st) {
-                st.log(format!("update failed: {e}"));
-            }
+            let st = st.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = update::apply_now(&st) {
+                    st.log(format!("update failed: {e}"));
+                }
+            });
         }
         // 狀態行是停用的，照理點不到，真收到也是什麼都不做
         traymenu::ID_STATUS => {}

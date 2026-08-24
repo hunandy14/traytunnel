@@ -981,10 +981,11 @@ function settingsError(msg: string) {
 // ---------------------------------------------------------- About 版本列的更新鈕
 
 /**
- * 更新鈕的五個狀態。版本列的標題與右側 split button 都由它決定：
+ * 更新鈕的六個狀態。版本列的標題與右側 split button 都由它決定：
  *
  *   idle        沒有新版，也沒有待套用的東西——主鈕整顆藏起來，只留下拉的柄
- *   downloading 安裝版查到新版了，後端正在背景下載——spinner，不可按
+ *   downloading 安裝版查到新版了，後端正在背景下載——轉圈，不可按
+ *   stalled     下載失敗、正在退避等重試——琥珀色字，**不轉圈**，不可按
  *   ready       已經下載好等著裝——綠色主要鈕「Restart to update」
  *   portable    可攜／單檔版查到新版——綠色主要鈕「Get vX.Y.Z」，開瀏覽器
  *   busy        按下 Restart to update 之後、交棒給安裝程式之前的那段
@@ -992,15 +993,24 @@ function settingsError(msg: string) {
  * 沒有「checking／uptodate／failed」了：手動檢查那顆鈕已經拿掉，
  * 背景每天查一次、查到就自己下載，使用者沒有東西要等在畫面前面看。
  */
-type UpdateState = "idle" | "downloading" | "ready" | "portable" | "busy";
+type UpdateState = "idle" | "downloading" | "stalled" | "ready" | "portable" | "busy";
 
 /**
- * 目前已知的新版與已經就緒的那一版。按鈕要知道自己現在該做哪一件事，
- * 所以各留一份在這裡，而不是每次都回頭去問快照。
+ * 後端推來的三份事實。它們是這一區唯一的資料，畫面完全由它們推導出來。
  */
 let updateInfo: Snapshot["update"] = null;
 let pendingUpdate: string | null = null;
-let updateState: UpdateState = "idle";
+let updateStalled = false;
+
+/**
+ * 使用者按下 Restart to update 之後、交棒給安裝程式之前的那一小段。
+ *
+ * 這是**唯一**需要記在前端的狀態，因為它是後端不知道的事（那顆 promise 成功時
+ * 永遠不會 resolve）。其餘每一個狀態都由上面三份事實即時推導——留一份
+ * `updateState` 快取的話，就會有「事實變了、快取沒跟上」的縫，
+ * 而那種 bug 的樣子是「畫面停在一個早就不成立的狀態」。
+ */
+let restarting = false;
 
 const updateSplit = () => el<HTMLDivElement>("update-split");
 const updateMain = () => el<HTMLButtonElement>("btn-update");
@@ -1008,27 +1018,49 @@ const updateChevron = () => el<HTMLButtonElement>("btn-update-more");
 const updateMenu = () => el<HTMLDivElement>("update-menu");
 
 /**
- * 手上這幾份事實推出來的狀態。
+ * 現在是哪一個狀態。**每次都重算，不快取。**
  *
- * 順序就是優先序：已經下載好的那一版最要緊（它是唯一一個「按下去真的會更新」
- * 的狀態），其次才是「查到了但還在下載」。busy 不在這裡——它是使用者按下去
- * 之後的暫態，由 `startUpdate` 自己設，任何後端推來的事實都不准把它蓋掉。
+ * 順序就是優先序：
+ *
+ * 1. `restarting` 最大——它是使用者剛剛親手觸發的動作，後端接下來還會推好幾次
+ *    config-changed（交棒前會把隧道一條條收掉），那些事件不准把鈕從
+ *    Restarting… 拉回去。
+ * 2. 已經下載好的那一版次之，它是唯一一個「按下去真的會更新」的狀態。
+ * 3. 剩下的看那一版屬於哪條車道：可攜版沒有下載這一段，安裝版則要分
+ *    「正在下載」與「下載失敗等重試」——兩者在畫面上長得完全不同，
+ *    混為一談的話網路壞掉時那顆 spinner 會轉上一整天。
  */
-function derivedState(): UpdateState {
+function state(): UpdateState {
+  if (restarting) return "busy";
   if (pendingUpdate) return "ready";
-  if (updateInfo) return updateInfo.installed ? "downloading" : "portable";
-  return "idle";
+  if (!updateInfo) return "idle";
+  if (!updateInfo.installed) return "portable";
+  return updateStalled ? "stalled" : "downloading";
 }
 
 /** 每個狀態下主鈕長什麼樣：圖示、文字、能不能按、圖示要不要轉 */
-function mainLook(): { icon: IconName; label: string; disabled: boolean; spin: boolean } {
-  switch (updateState) {
+function mainLook(current: UpdateState): {
+  icon: IconName;
+  label: string;
+  disabled: boolean;
+  spin: boolean;
+} {
+  switch (current) {
     case "downloading":
       return {
         icon: "loader-circle",
         label: updateInfo ? `Downloading v${updateInfo.version}…` : "Downloading…",
         disabled: true,
         spin: true,
+      };
+    case "stalled":
+      // 轉圈的意思是「正在下載」。下載失敗、正在退避等下一次排程的時候，
+      // 誠實的說法是「失敗了，之後會再試」，不是一顆轉到天荒地老的 spinner
+      return {
+        icon: "triangle-alert",
+        label: "Download failed — will retry",
+        disabled: true,
+        spin: false,
       };
     case "ready":
       return {
@@ -1054,56 +1086,38 @@ function mainLook(): { icon: IconName; label: string; disabled: boolean; spin: b
 }
 
 /**
- * 把狀態畫到畫面上。
+ * 把當下的狀態畫到畫面上。
  *
  * 標題跟的是「有沒有東西可更新」而不是按鈕狀態：那一列的標題回答的是事實，
  * 按鈕回答的是「現在可以做什麼」。idle 時主鈕整顆藏起來——沒有新版時它能顯示的
  * 只有一句廢話，而一顆按不下去的鈕比沒有鈕更容易讓人以為是壞掉了。
  */
 function paintUpdateRow() {
+  const current = state();
   const has = Boolean(updateInfo || pendingUpdate);
   el<HTMLDivElement>("version-title").textContent = has ? "Update available" : "Version";
-  const look = mainLook();
-  updateSplit().dataset.state = updateState;
-  updateMain().hidden = updateState === "idle";
+  const look = mainLook(current);
+  updateSplit().dataset.state = current;
+  updateMain().hidden = current === "idle";
   updateMain().disabled = look.disabled;
   el<HTMLSpanElement>("update-label").textContent = look.label;
   const iconBox = el<HTMLSpanElement>("update-icon");
   setIcon(iconBox, look.icon, 14);
   iconBox.classList.toggle("spin", look.spin);
   // 交棒進行中就不要再讓人從下拉裡開第二件事
-  if (updateState === "busy") {
-    updateChevron().disabled = true;
-    closeUpdateMenu();
-  } else {
-    updateChevron().disabled = false;
-  }
+  updateChevron().disabled = current === "busy";
+  if (current === "busy") closeUpdateMenu();
 }
 
-/**
- * 後端推來的更新事實（啟動快照、config-changed、背景檢查的 update-available）。
- *
- * busy 由當下那個動作自己收尾，事件不准插隊改按鈕：按下去之後後端還會推
- * config-changed（它會把隧道一條條收掉），照收的話鈕會從 Restarting… 跳回去。
- * 標題還是要跟著更新，它反映的是事實而不是進行中的動作。
- */
-function applyUpdateFacts(info: Snapshot["update"], pending: string | null) {
-  updateInfo = info;
-  pendingUpdate = pending;
-  if (updateState === "busy") {
-    paintUpdateRow();
-    return;
-  }
-  updateState = derivedState();
-  paintUpdateRow();
-}
-
-/** 後端推了新設定就把 toggle 對齊回去 */
+/** 後端推了新設定就把 toggle 與更新列都對齊回去 */
 export function syncSettingsPage(snap: Snapshot) {
   setToggle(tgClose(), snap.closeToTray);
   setToggle(tgAutostart(), snap.autostart);
   setToggle(tgAutoUpdate(), snap.automaticUpdates);
-  applyUpdateFacts(snap.update ?? null, snap.pendingUpdate ?? null);
+  updateInfo = snap.update ?? null;
+  pendingUpdate = snap.pendingUpdate ?? null;
+  updateStalled = snap.updateStalled ?? false;
+  paintUpdateRow();
 }
 
 function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>) {
@@ -1177,17 +1191,18 @@ function closeUpdateMenu() {
  * 可攜版只是開一個瀏覽器分頁到那一版的 release 頁，按幾次都無所謂，鈕不必鎖。
  */
 function startUpdate() {
+  const current = state();
   settingsError("");
-  if (updateState === "portable") {
+  if (current === "portable") {
     const version = updateInfo?.version;
     if (version) void openReleasePage(version).catch((e) => settingsError(String(e)));
     return;
   }
-  if (updateState !== "ready") return;
-  updateState = "busy";
+  if (current !== "ready") return;
+  restarting = true;
   paintUpdateRow();
   void applyUpdate().catch((e) => {
-    updateState = derivedState();
+    restarting = false;
     paintUpdateRow();
     settingsError(String(e));
   });

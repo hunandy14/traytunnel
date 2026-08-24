@@ -71,6 +71,7 @@ function normalizeSnapshot(raw: Snapshot): Snapshot {
     logs: raw.logs ?? [],
     update: raw.update ?? null,
     pendingUpdate: raw.pendingUpdate ?? null,
+    updateStalled: raw.updateStalled ?? false,
   };
 }
 

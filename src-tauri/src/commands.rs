@@ -864,10 +864,18 @@ pub fn set_automatic_updates(state: State<'_, Shared>, on: bool) -> Result<(), S
 ///
 /// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，
 /// 所以前端不必為成功的情況做任何收尾。回 Err 才代表這次更新沒能開始。
+///
+/// 走 `spawn_blocking` 而不是直接做：`apply_now` 要把十幾 MB 的安裝檔整個讀進來
+/// 算一次 SHA-256（落地之後有沒有被動過，只有這一關驗得出來）。同步指令是在
+/// Tauri 的執行緒池上跑的，把那幾百毫秒的整檔讀取留在上面會擋住其他 IPC。
 #[tauri::command]
-pub fn apply_update(state: State<'_, Shared>) -> Result<(), String> {
-    let st = state.inner();
-    update::apply_now(st).inspect_err(|e| st.log(format!("update failed: {e}")))
+pub async fn apply_update(state: State<'_, Shared>) -> Result<(), String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        update::apply_now(&st).inspect_err(|e| st.log(format!("update failed: {e}")))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 某一版的 release 頁：發佈說明與該版的下載資產都在那一頁上。

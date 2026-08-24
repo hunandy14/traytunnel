@@ -22,11 +22,12 @@
 mod staged;
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use semver::Version;
 use tauri::{AppHandle, Manager};
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tauri_plugin_window_state::AppHandleExt as _;
 
 pub use staged::Pending;
@@ -86,20 +87,34 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
 const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
-/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
-/// productName）。
+/// 會出貨的那份 tauri.conf.json，編譯期就嵌進來。
 ///
-/// 這裡是常數而不是 `app.config().product_name`，因為開機那條路
-/// （[`apply_pending_at_startup`]）跑在 `tauri::Builder` 之前，那時根本還沒有
-/// `AppHandle` 可以問。常數與設定檔對不上會讓安裝版被誤判成可攜版，所以
-/// `the_constants_match_the_shipped_config` 那一條測試直接讀 tauri.conf.json
-/// 釘住它們一致——改了設定檔卻忘了改這裡，CI 會紅。
-const PRODUCT_NAME: &str = "traytunnel";
+/// 開機那條路（[`apply_pending_at_startup`]）跑在 `tauri::Builder` 之前，
+/// 那時還沒有 `AppHandle` 可以問設定，所以產品名與識別碼只能自己拿。
+/// 直接讀這份檔案而不是各抄一份常數：抄的話兩邊會漂，而漂掉的症狀是
+/// 安裝版被誤判成可攜版（更新整條路靜默失效）或暫存區寫進一個沒人會讀的資料夾。
+const TAURI_CONF: &str = include_str!("../tauri.conf.json");
 
-/// 應用識別碼（tauri.conf.json 的 identifier），同時是 `%LOCALAPPDATA%` 底下
-/// 那個資料夾的名字——Tauri 的 `app_local_data_dir()` 在 Windows 上就是
-/// `%LOCALAPPDATA%\{identifier}`。理由同 [`PRODUCT_NAME`]：開機那條路拿不到 AppHandle。
-const IDENTIFIER: &str = "com.traytunnel.desktop";
+/// tauri.conf.json 裡的一個頂層字串欄位。解析不出來就 panic——那代表出貨的設定
+/// 檔壞了或改了形狀，是編譯期就該被發現的事，絕不能默默退回一個猜的值。
+fn conf_str(key: &str) -> String {
+    let conf: serde_json::Value =
+        serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
+    conf.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("tauri.conf.json 少了頂層的 {key}"))
+        .to_string()
+}
+
+/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
+/// productName）
+static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
+
+/// 應用識別碼（tauri.conf.json 的 identifier）。三個地方用到它：
+/// `%LOCALAPPDATA%` 底下那個資料夾的名字（Tauri 的 `app_local_data_dir()`
+/// 在 Windows 上就是 `%LOCALAPPDATA%\{identifier}`）、single-instance 外掛的
+/// 具名互斥鎖、以及通知的 AUMID。
+static IDENTIFIER: LazyLock<String> = LazyLock::new(|| conf_str("identifier"));
 
 /// 暫存區在 `%LOCALAPPDATA%\{identifier}` 底下的資料夾名
 const STAGING_DIR: &str = "pending-update";
@@ -124,7 +139,25 @@ fn uninstall_subkey(product: &str) -> String {
 /// 而 `%TEMP%` 隨時會被清；何況從 `%TEMP%` 執行 exe 是防毒啟發式重點盯防的行為。
 fn staging_dir() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(local).join(IDENTIFIER).join(STAGING_DIR))
+    Some(PathBuf::from(local).join(&*IDENTIFIER).join(STAGING_DIR))
+}
+
+/// 版本號的比較用形式：去空白、去前導的 v。
+///
+/// 全程式只有這一份：`is_newer`、標記寫入、同版去重、開機決策都吃它，
+/// 各自寫一次 `trim_start_matches` 的話遲早會有一處漏掉而讓 `v0.7.0`
+/// 與 `0.7.0` 被當成兩個版本。
+pub(crate) fn normalize_version(version: &str) -> &str {
+    version.trim().trim_start_matches(['v', 'V'])
+}
+
+/// 清掉暫存區並把狀態同步歸零。
+///
+/// 「清檔案」與「清狀態」永遠要一起發生：只清檔案的話介面與系統匣會繼續顯示
+/// 一顆按下去必定失敗的「Restart to update」。這一支把兩件事綁死。
+fn drop_staged(st: &Shared, dir: &Path) {
+    staged::clear(dir);
+    st.set_staged(None);
 }
 
 /// 資料夾路徑的比較用形式：去掉前後空白、NSIS 寫進去的那對雙引號、尾端的分隔符，
@@ -158,7 +191,7 @@ pub fn is_installed() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let subkey = uninstall_subkey(PRODUCT_NAME);
+    let subkey = uninstall_subkey(&PRODUCT_NAME);
     crate::winsys::read_hkcu_string(&subkey, "InstallLocation")
         .is_some_and(|loc| location_matches(&loc, &exe))
 }
@@ -188,8 +221,9 @@ pub fn spawn_checker(state: &Shared) {
                 Outcome::DownloadFailed => failures.saturating_add(1),
                 Outcome::Settled => 0,
             };
+            // 退避的上限就是常規間隔，這裡是它唯一的權威來源
             let wait =
-                if failures == 0 { INTERVAL } else { staged::retry_delay(failures).min(INTERVAL) };
+                if failures == 0 { INTERVAL } else { staged::retry_delay(failures, INTERVAL) };
             tokio::time::sleep(wait).await;
         }
     });
@@ -221,19 +255,46 @@ async fn check_once(st: &Shared) -> Outcome {
     };
     // 每 24 小時會再查一次，同一版重複記一行只會讓活動日誌看起來像真的又發生了
     // 什麼事，所以「偵測到新版」這一行跟著 set_update 的去重走
-    if st.set_update(found.clone()) {
-        if let Some(u) = &found {
+    if st.set_update(found.info()) {
+        if let Some(u) = found.info() {
             st.log(format!("update available: v{}", u.version));
         }
     }
     match found {
-        Some(u) if u.installed => stage_if_needed(st, &u.version).await,
+        Found::Installed { update, .. } => stage_if_needed(st, *update).await,
         _ => Outcome::Settled,
     }
 }
 
+/// 一輪檢查查到的東西。
+///
+/// 安裝版那一支**把外掛的 `Update` 物件一起帶出來**：下載只能靠它，而拿到它的
+/// 唯一辦法是 `updater.check()`。不帶著走的話下載那一步得再查一次 latest.json，
+/// 同一輪就打了 GitHub 兩次，而且兩次之間 release 還可能換掉——那會變成
+/// 「宣告下載 A、實際下載 B」。
+enum Found {
+    None,
+    /// 安裝版：`update` 是下載要用的那把鑰匙，`info` 是給介面看的那一份
+    Installed {
+        update: Box<Update>,
+        info: UpdateInfo,
+    },
+    /// 可攜／單檔版：沒有下載這條路，只有一個版本號
+    Unmanaged(UpdateInfo),
+}
+
+impl Found {
+    fn info(&self) -> Option<UpdateInfo> {
+        match self {
+            Found::None => None,
+            Found::Installed { info, .. } => Some(info.clone()),
+            Found::Unmanaged(info) => Some(info.clone()),
+        }
+    }
+}
+
 /// 這次執行該走哪一條車道
-async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+async fn check_lane(app: &AppHandle) -> Result<Found, String> {
     if is_installed() {
         check_installed(app).await
     } else {
@@ -254,11 +315,18 @@ fn current_version() -> &'static str {
 /// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
 /// 這裡不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
 /// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道 CHECK_TIMEOUT。
-async fn check_installed(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+/// 拿到的 `Update` 物件**連同結果一起交出去**，下載那一步才不必再查一次
+/// latest.json（見 [`Found`]）。
+async fn check_installed(app: &AppHandle) -> Result<Found, String> {
     let updater =
         app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let found = updater.check().await.map_err(|e| e.to_string())?;
-    Ok(found.and_then(|u| accept_installed(&u.version, current_version())))
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(Found::None);
+    };
+    match accept_installed(&update.version, current_version()) {
+        Some(info) => Ok(Found::Installed { update: Box::new(update), info }),
+        None => Ok(Found::None),
+    }
 }
 
 /// 外掛回報的那一版要不要真的當成新版，由自家的 [`is_newer`] 再判一次。
@@ -276,10 +344,7 @@ fn accept_installed(remote: &str, current: &str) -> Option<UpdateInfo> {
     if !is_newer(remote, current) {
         return None;
     }
-    Some(UpdateInfo {
-        version: remote.trim().trim_start_matches(['v', 'V']).to_string(),
-        installed: true,
-    })
+    Some(UpdateInfo { version: normalize_version(remote).to_string(), installed: true })
 }
 
 // ------------------------------------------------- 可攜／單檔車道（不就地更新）
@@ -290,15 +355,18 @@ fn accept_installed(remote: &str, current: &str) -> Option<UpdateInfo> {
 /// 對非安裝版是有害的——單檔 exe 沒有安裝程式可以交棒，可攜版更不能被搬到
 /// %LOCALAPPDATA% 去（設定檔就在 exe 旁邊，換了位置等於換了一份設定）。
 /// 這裡只讀一個版本號，其餘什麼都不做。
-async fn check_unmanaged() -> Result<Option<UpdateInfo>, String> {
+async fn check_unmanaged() -> Result<Found, String> {
     // ureq 是阻塞式的，丟到 blocking 執行緒上跑，不擋住 async runtime
     let latest = tauri::async_runtime::spawn_blocking(fetch_latest_version)
         .await
         .map_err(|e| e.to_string())??;
     if !is_newer(&latest, current_version()) {
-        return Ok(None);
+        return Ok(Found::None);
     }
-    Ok(Some(UpdateInfo { version: latest, installed: false }))
+    Ok(Found::Unmanaged(UpdateInfo {
+        version: normalize_version(&latest).to_string(),
+        installed: false,
+    }))
 }
 
 /// 拿 latest.json 的 version 欄位。阻塞式，呼叫端負責丟到 blocking 執行緒。
@@ -323,7 +391,7 @@ fn fetch_latest_version() -> Result<String, String> {
 /// 因此 0.10.0 > 0.9.0，而 pre-release 一律小於同號的正式版。兩邊任一個解析
 /// 不出來就當成「沒有新版」：更新提示寧可漏報，也不要因為一個怪字串誤報。
 pub fn is_newer(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| Version::parse(s.trim().trim_start_matches(['v', 'V'])).ok();
+    let parse = |s: &str| Version::parse(normalize_version(s)).ok();
     match (parse(remote), parse(current)) {
         (Some(r), Some(c)) => r > c,
         _ => false,
@@ -335,9 +403,7 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
 ///
 /// 純函式，網址組法有問題要在測試裡就看得出來，不必等到實機按下去開錯頁。
 pub fn release_url(version: Option<&str>) -> String {
-    let tag = version
-        .map(|v| v.trim().trim_start_matches(['v', 'V']))
-        .filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
+    let tag = version.map(normalize_version).filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
     match tag {
         Some(v) => format!("{RELEASE_TAG_PREFIX}{v}"),
         None => LATEST_RELEASE_PAGE.to_string(),
@@ -368,17 +434,21 @@ fn open_page(st: &Shared, url: &str) {
 ///
 /// 同一版已經躺在暫存區裡就什麼都不做（不重複下載同一版本），只把狀態補上
 /// ——重啟之後第一次檢查一定會走到這一條，介面與系統匣靠它認回那份就緒的更新。
-async fn stage_if_needed(st: &Shared, version: &str) -> Outcome {
+async fn stage_if_needed(st: &Shared, update: Update) -> Outcome {
     let Some(dir) = staging_dir() else {
         st.log("update download skipped: LOCALAPPDATA is not set");
         return Outcome::Settled;
     };
     let already = staged::read(&dir);
-    if !staged::should_download(version, already.as_ref()) {
+    if !staged::should_download(&update.version, already.as_ref()) {
         st.set_staged(already);
+        st.set_update_stalled(false);
         return Outcome::Settled;
     }
-    match download_and_stage(st, &dir).await {
+    // 新的一輪嘗試：先把上一次的失敗記號收掉，介面才不會在下載途中還掛著
+    // 「Download failed」
+    st.set_update_stalled(false);
+    match download_and_stage(st, &dir, update).await {
         Ok(pending) => {
             st.log(format!(
                 "update v{} downloaded, it will be installed the next time Traytunnel starts",
@@ -391,8 +461,10 @@ async fn stage_if_needed(st: &Shared, version: &str) -> Outcome {
             st.log(format!("update download failed: {e}"));
             // 殘檔清理：寫到一半的安裝檔與指著它的標記一起收掉，
             // 下一次退避到期時是從乾淨狀態重來
-            staged::clear(&dir);
-            st.set_staged(None);
+            drop_staged(st, &dir);
+            // 介面上那顆鈕不可以一直轉圈：轉圈的意思是「正在下載」，
+            // 而現在的事實是「下載失敗了，之後會再試」
+            st.set_update_stalled(true);
             Outcome::DownloadFailed
         }
     }
@@ -400,36 +472,56 @@ async fn stage_if_needed(st: &Shared, version: &str) -> Outcome {
 
 /// 下載、驗簽、落地。
 ///
-/// 這裡刻意重查一次而不是把先前 check 的 `Update` 物件留著：那份東西帶著
-/// http client 與一堆執行期狀態，而且外掛沒有給任何公開的組法，存進共用狀態
-/// 只是徒增麻煩。多的那一次請求只是幾百位元組的 latest.json，一天最多一次。
+/// `update` 是**這一輪 check 拿到的那一顆**（見 [`Found`]），不再自己重查一次：
+/// 同一輪打兩次 GitHub 已經夠糟，更糟的是兩次之間 release 換掉，變成
+/// 「宣告下載 A、實際下載 B」。
 ///
 /// `download()` 回來的 bytes **已經過 minisign 驗簽**（外掛 updater.rs 的
 /// `verify_signature`，驗不過就是 Err），所以我們拿到的一定是簽章對得上的那份。
 /// 之後它要在磁碟上躺到下一次啟動，所以 [`staged::stage`] 會另外記一份 SHA-256。
-async fn download_and_stage(st: &Shared, dir: &Path) -> Result<Pending, String> {
-    let updater =
-        st.app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let mut update = updater
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No update available".to_string())?;
+///
+/// 落地**之前**還要再看一次開關（A1）：下載是十幾 MB、幾十秒的事，使用者完全
+/// 來得及在這段時間裡把「Automatic updates」關掉，而 `discard_staged` 在那一刻
+/// 清的是一個還不存在的暫存區。標記的創生點只有這裡一個，閘就設在這裡。
+async fn download_and_stage(
+    st: &Shared,
+    dir: &Path,
+    mut update: Update,
+) -> Result<Pending, String> {
     // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
     // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
     update.timeout = Some(DOWNLOAD_TIMEOUT);
 
     st.log(format!("downloading update v{} in the background", update.version));
     let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+
+    accept_staging(st.checks_for_updates())?;
     staged::stage(dir, &update.version, &bytes).map_err(|e| e.to_string())
+}
+
+/// 下載途中開關被關掉時的訊息
+const GATE_CLOSED_MID_DOWNLOAD: &str =
+    "automatic updates were turned off while the download was in flight";
+
+/// 下載完了，這份 bytes 還能不能落地成標記。
+///
+/// 抽成一支函式是為了讓這道閘看得見也測得起來：它守的是一個沒有它就完全
+/// 觀察不到的競態——下載是十幾 MB、幾十秒的事，使用者完全來得及在這段時間裡
+/// 把「Automatic updates」關掉，而 `discard_staged` 在那一刻清的是一個**還不存在**
+/// 的暫存區。等下載回來才寫下標記的話，那份更新就這樣復活了。
+fn accept_staging(still_enabled: bool) -> Result<(), String> {
+    if still_enabled {
+        Ok(())
+    } else {
+        Err(GATE_CLOSED_MID_DOWNLOAD.to_string())
+    }
 }
 
 /// 把暫存區整個丟掉。使用者把「Automatic updates」關掉時走這一條。
 ///
-/// 為什麼非丟不可：開機那條路（[`apply_pending_at_startup`]）跑在設定檔載入
-/// **之前**，它看不到那個開關。留著標記的話，一個剛剛才說「不要自動更新我」的
-/// 使用者下一次開機還是會被更新——而且是靜默的。要讓開關真的說了算，
-/// 唯一的辦法就是在關掉的當下把待安裝的那一份清掉。
+/// 為什麼非丟不可：開機那條路（[`apply_pending_at_startup`]）雖然也會自己讀一次
+/// 設定，但那是最後一道保險；使用者關掉開關的當下就把待安裝的那一份收掉，
+/// 介面才不會繼續掛著一顆「Restart to update」，狀態也才與他剛剛的意思一致。
 pub fn discard_staged(st: &Shared) {
     let Some(dir) = staging_dir() else {
         return;
@@ -437,16 +529,21 @@ pub fn discard_staged(st: &Shared) {
     if st.staged_version().is_some() {
         st.log("discarded the update that was waiting to be installed");
     }
-    staged::clear(&dir);
-    st.set_staged(None);
+    drop_staged(st, &dir);
+    st.set_update_stalled(false);
 }
 
 /// 啟動時把暫存區裡那份就緒的更新認回來，讓設定頁與系統匣一開始就看得到它。
 ///
+/// **這不是死碼**：[`apply_pending_at_startup`] 有兩條會「留著標記不套用」的路
+/// ——已經有另一個實例在跑（A3），或這一次啟動時開關是關的。前者之後就是這一支
+/// 把那份更新撈回狀態，使用者才看得到系統匣的「Restart to update」；後者則由
+/// 同一道開關擋掉，不會撈。
+///
 /// 只有安裝版走這條路，而且刻意**不驗雜湊**——那是十幾 MB 的事，留到真的要
 /// 交棒的那一刻再算。這裡只是把「有一份 vX.Y.Z 等著」放進狀態。
 pub fn restore_staged(st: &Shared) {
-    if !is_installed() {
+    if !is_installed() || !st.checks_for_updates() {
         return;
     }
     let Some(dir) = staging_dir() else {
@@ -462,28 +559,112 @@ fn launch_installer(installer: &Path, tray: bool) -> std::io::Result<()> {
     std::process::Command::new(installer).args(staged::installer_args(tray)).spawn().map(|_| ())
 }
 
+/// single-instance 外掛在 Windows 上用的具名互斥鎖名字。
+///
+/// 抄自 tauri-plugin-single-instance 2.4.3 的 `platform_impl/windows.rs`：
+/// 它用 `CreateMutexW` 建 `{identifier}-sim`。名字裡的版本後綴只有 `semver`
+/// 特性開啟時才會加，而我們沒有開，所以跨版本是同一個名字——這正是我們要的：
+/// **正在跑的那個實例可能是舊版**。
+fn single_instance_mutex_name() -> String {
+    format!("{}-sim", *IDENTIFIER)
+}
+
+/// 現在是不是已經有另一個 Traytunnel 實例在跑。
+///
+/// 用 `OpenMutexW`（**只開不建**）去探 single-instance 外掛那把鎖：開得起來就代表
+/// 有人握著它。刻意不用 `CreateMutexW`——那會讓我們自己也成為那個名字的擁有者，
+/// 幾毫秒後外掛在同一個行程裡再建一次時就會看到 `ERROR_ALREADY_EXISTS`，
+/// 把自己誤判成第二個實例。
+fn another_instance_is_running() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+
+    let name = crate::winsys::wide(&single_instance_mutex_name());
+    // SAFETY: name 是 NUL 結尾的寬字串，OpenMutexW 只讀它；回傳的 handle 立刻關掉
+    unsafe {
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
+/// 開機時到底該不該走套用那條路，以及不走的話要拿暫存區怎麼辦。
+///
+/// 三個布林都是外面探出來的事實，所以這一支是純函式、測得到——那三件事各自
+/// 都要碰登錄檔、Win32 或磁碟，混在一起就再也驗不了它們的組合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// 可以往下走，去看暫存區裡有什麼
+    Proceed,
+    /// 不走，而且**暫存區原樣留著**（之後還會用到）
+    SkipAndKeep,
+    /// 不走，順手把暫存區清掉（那份東西永遠不會被裝了）
+    SkipAndClear,
+}
+
+pub fn startup_gate(installed: bool, another_instance: bool, automatic_updates: bool) -> Gate {
+    if !installed {
+        // 可攜／單檔版根本不該碰暫存區——那是安裝版的東西，
+        // 而同一台機器上兩種版本共用同一個 %LOCALAPPDATA% 資料夾
+        return Gate::SkipAndKeep;
+    }
+    if another_instance {
+        // 第二實例：正在被使用的第一實例不可以被裝掉。留著，下次冷啟動再說
+        return Gate::SkipAndKeep;
+    }
+    if !automatic_updates {
+        // 開關關著就不會有人來裝它，留著只是佔十幾 MB
+        return Gate::SkipAndClear;
+    }
+    Gate::Proceed
+}
+
 /// 開機最早期的那一步：有就緒的更新就交棒給安裝程式，這支函式**不會回來**。
 ///
 /// 呼叫位置是規格的一部分：它必須排在 `tauri::Builder` 之前，尤其是
 /// **single-instance 外掛註冊之前**。那顆外掛一初始化就把具名互斥鎖拿在手上，
 /// 而 NSIS 的靜默安裝會去找還活著的舊行程並把它關掉；我們在還沒拿任何鎖的時候
 /// 就 spawn 完安裝程式並 `exit(0)`，等於整個繞開那一段互相等待。這也是為什麼
-/// 這支函式拿不到 `AppHandle`，所有需要的東西（產品名、識別碼、版本）都用常數。
+/// 這支函式拿不到 `AppHandle`，需要的東西（產品名、識別碼、版本、設定）全部自己拿。
 /// **不要把它往後搬。**
+///
+/// 三道閘依序擋在真的交棒之前：
+///
+/// 1. **不是安裝版**就完全不碰暫存區；
+/// 2. **已經有另一個實例在跑**（A3）——這是最兇的一顆暗雷：使用者雙擊了第二次
+///    圖示，而暫存區裡剛好有一份更新，於是這個「本來只該去喚醒既有視窗」的第二
+///    實例會起安裝程式，把使用者**正在用**的第一實例連同他的隧道一起關掉。
+///    這時什麼都不做，讓 single-instance 外掛照常把焦點轉過去就好；標記留著，
+///    下一次真正的冷啟動再裝（留著的那一份由 `restore_staged` 撈回狀態）。
+/// 3. **自動更新被關掉了**（A2）——套用是自動更新的最後一步，開關關著就不該發生。
+///    設定這時還沒被 `AppState` 載入，所以自己走一次輕量路徑讀那一個鍵。
+///    關著就順手把暫存清掉，不留一份永遠不會被裝的檔案佔著十幾 MB。
 ///
 /// 回傳的是要補進活動日誌的行——AppState 這時還不存在，所以先收著，
 /// 等 setup 裡狀態建好了再一起記。
 pub fn apply_pending_at_startup(tray: bool) -> Vec<String> {
-    // 可攜／單檔版沒有這條路，連暫存區都不該去碰
-    if !is_installed() {
-        return Vec::new();
-    }
     let Some(dir) = staging_dir() else {
         return Vec::new();
     };
-    let pending = staged::read(&dir);
+    // 這三件事各自要碰登錄檔、Win32 與磁碟，探完之後交給純函式判斷（測得到）
+    let gate = startup_gate(
+        is_installed(),
+        another_instance_is_running(),
+        crate::config::automatic_updates_enabled(),
+    );
+    match gate {
+        Gate::Proceed => {}
+        Gate::SkipAndKeep => return Vec::new(),
+        Gate::SkipAndClear => {
+            staged::clear(&dir);
+            return Vec::new();
+        }
+    }
     let current = current_version();
-    match staged::apply_action(pending.as_ref(), current) {
+    match staged::apply_action(staged::read(&dir), current) {
         staged::Apply::Nothing => Vec::new(),
         staged::Apply::Done => {
             staged::clear(&dir);
@@ -493,16 +674,14 @@ pub fn apply_pending_at_startup(tray: bool) -> Vec<String> {
             staged::clear(&dir);
             Vec::new()
         }
-        staged::Apply::GaveUp => {
-            let version = pending.map(|p| p.version).unwrap_or_default();
+        staged::Apply::GaveUp { version } => {
             staged::clear(&dir);
             vec![format!(
                 "gave up installing v{version} after {} attempts, it will be downloaded again",
                 staged::MAX_ATTEMPTS
             )]
         }
-        staged::Apply::Install => {
-            let pending = pending.expect("Apply::Install 一定伴隨一份標記");
+        staged::Apply::Install(pending) => {
             // 落地之後被動過的檔案一律不執行：簽章驗的是下載當時那串 bytes，
             // 這一關驗的是現在磁碟上這顆檔案
             if !staged::verify(&pending) {
@@ -512,8 +691,10 @@ pub fn apply_pending_at_startup(tray: bool) -> Vec<String> {
                     pending.version
                 )];
             }
-            // 計數一定要在起安裝程式**之前**落地：安裝程式會把我們關掉，
-            // 之後沒有任何機會再寫東西
+            // 計數只在**這條自動路**上遞增（A5），而且一定要在起安裝程式之前落地：
+            // 安裝程式會把我們關掉，之後沒有任何機會再寫東西。手動按下的那條路
+            // 不碰這個計數——它的失敗使用者當場看得到，會自己再按一次，
+            // 沒有道理讓那幾次把自動重試的額度燒光。
             if let Err(e) = staged::note_attempt(&dir, &pending) {
                 staged::clear(&dir);
                 return vec![format!("could not record the update attempt: {e}")];
@@ -531,17 +712,25 @@ pub fn apply_pending_at_startup(tray: bool) -> Vec<String> {
 
 /// 系統匣與設定頁的「Restart to update」：不等下一次開機，現在就交棒。
 ///
-/// 與開機那條路的差別只在於**這裡有東西要先收**：隧道、視窗狀態、資源表。
-/// 這幾件事原本是交給 updater 外掛的 `on_before_exit` hook 做的（它在
-/// `ShellExecuteW` 前一刻同步呼叫），現在交棒由我們自己做，就自己照同樣的順序來。
+/// **順序是這一支唯一要緊的事**（A4）：驗雜湊 → 起安裝程式 → 起得來了才收尾。
+///
+/// 收尾那一組（`mark_exiting`／`kill_all_jobs`／存視窗狀態／`cleanup_before_exit`）
+/// 原本排在 spawn 之前，那是照著 updater 外掛 `on_before_exit` 的位置抄的。
+/// 問題是 `cleanup_before_exit` 會把視窗藏起來並清掉資源表，而那**是收不回來的**
+/// ——spawn 一旦失敗，使用者就得到一個沒有視窗、也沒有隧道的無頭行程，
+/// 而錯誤訊息要顯示在那個已經不存在的視窗上。改成 spawn 成功才收尾之後，
+/// 失敗路徑上什麼都還沒動過，錯誤照常顯示、隧道照常跑。
+///
+/// 代價是安裝程式起來的那一瞬間我們才開始收隧道。這是可以接受的：NSIS 的靜默
+/// 安裝要先解壓、還要去找並關掉舊行程，我們手上有的是毫秒級的餘裕；而萬一真的
+/// 被搶先關掉，失去的也只是一次視窗位置存檔，不是一個壞掉的狀態。
 ///
 /// 視窗狀態要自己存是因為這條路不會發 `RunEvent::Exit`（行程直接 `exit(0)`），
 /// tauri-plugin-window-state 落地存檔的 hook 不會跑——那正是「更新後視窗歸零
 /// 置中」的成因。
 ///
-/// 起安裝程式那一步真的失敗時要把剛剛收掉的東西放回去：否則介面上每個出口
-/// 還顯示連著、實際一條都不通，而且按關閉鈕會直接結束程式而不是縮回系統匣
-/// （`CloseRequested` 那道判斷看的正是 `exiting`）。
+/// 雜湊那一步是十幾 MB 的整檔讀取，呼叫端負責把它放到 blocking 執行緒上
+/// （見 `commands::apply_update`），不要在 UI 執行緒上直接叫這一支。
 pub fn apply_now(st: &Shared) -> Result<(), String> {
     if !is_installed() {
         return Err("This build cannot update itself".into());
@@ -549,32 +738,24 @@ pub fn apply_now(st: &Shared) -> Result<(), String> {
     let dir = staging_dir().ok_or("LOCALAPPDATA is not set")?;
     let pending = staged::read(&dir).ok_or("No update is ready to install")?;
     if !staged::verify(&pending) {
-        staged::clear(&dir);
-        st.set_staged(None);
+        drop_staged(st, &dir);
         return Err("The staged installer did not match its checksum".into());
     }
     // 視窗已經藏起來（縮在系統匣裡）的話，更新完也不該突然彈一個視窗出來
     let tray = !main_window_visible(&st.app);
     st.log(format!("restarting to install v{}", pending.version));
-    staged::note_attempt(&dir, &pending).map_err(|e| e.to_string())?;
 
+    // 這裡**不**動 attempts（A5）：那個計數是自動路的保險絲
+    launch_installer(&pending.installer, tray).map_err(|e| e.to_string())?;
+
+    // 交棒確定開始了，現在才收尾——上面任何一步失敗時，程式都還是完好的
     st.mark_exiting();
     st.kill_all_jobs();
     if let Err(e) = st.app.save_window_state(crate::winstate::flags()) {
         log::warn!("could not save window state before the update installer takes over: {e}");
     }
     st.app.cleanup_before_exit();
-
-    match launch_installer(&pending.installer, tray) {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            // 交棒沒成功，把程式放回可用的狀態
-            st.clear_exiting();
-            crate::tunnel::start_enabled(st);
-            crate::wg::start_enabled(st);
-            Err(e.to_string())
-        }
-    }
+    std::process::exit(0);
 }
 
 fn main_window_visible(app: &AppHandle) -> bool {
@@ -783,21 +964,12 @@ mod tests {
         );
     }
 
-    /// 開機那條路跑在 `tauri::Builder` 之前，拿不到 AppHandle，只能用常數
-    /// 記著產品名與識別碼。常數與設定檔一旦對不上，症狀是安裝版被當成可攜版
-    /// （更新整條路靜默失效），或暫存區寫到一個沒人會去讀的資料夾。
-    /// 這裡直接讀真的會出貨的那份設定釘住它們。
-    #[test]
-    fn the_constants_match_the_shipped_config() {
-        let raw = include_str!("../tauri.conf.json");
-        let conf: serde_json::Value = serde_json::from_str(raw).expect("必須是合法 JSON");
-        assert_eq!(conf.pointer("/productName").and_then(|v| v.as_str()), Some(PRODUCT_NAME));
-        assert_eq!(conf.pointer("/identifier").and_then(|v| v.as_str()), Some(IDENTIFIER));
-    }
-
     /// 暫存區的組法要與 Tauri 的 `app_local_data_dir()` 一致：
     /// Windows 上那一支就是 `%LOCALAPPDATA%\{identifier}`。組錯的話，
     /// 寫進去的標記與讀出來的標記會是兩個不同的資料夾，更新永遠不會被套用。
+    ///
+    /// 產品名與識別碼本身不必再釘——它們現在直接讀出貨的 tauri.conf.json
+    /// （見 `conf_str`），沒有第二份可以漂掉。
     #[test]
     fn the_staging_dir_matches_tauris_own() {
         let Some(dir) = staging_dir() else {
@@ -805,7 +977,112 @@ mod tests {
             return;
         };
         let local = std::env::var("LOCALAPPDATA").expect("staging_dir 回了 Some 就一定讀得到");
-        assert_eq!(dir, PathBuf::from(local).join(IDENTIFIER).join("pending-update"));
+        assert_eq!(dir, PathBuf::from(local).join(&*IDENTIFIER).join("pending-update"));
+    }
+
+    /// single-instance 外掛在 Windows 上建的是 `{identifier}-sim` 這把具名鎖
+    /// （2.4.3 的 platform_impl/windows.rs）。名字錯掉的話探測永遠回 false，
+    /// A3 那道保護等於不存在——而症狀是「偶爾雙擊圖示會把正在用的程式裝掉」，
+    /// 幾乎不可能從使用者回報裡認出來。
+    #[test]
+    fn the_instance_probe_uses_the_plugins_own_mutex_name() {
+        assert_eq!(single_instance_mutex_name(), format!("{}-sim", *IDENTIFIER));
+        assert!(single_instance_mutex_name().ends_with("-sim"));
+        // 名字裡不可以有版本號：外掛的版本後綴只有 semver 特性開著才會加，
+        // 而我們沒開——加了的話就探不到「正在跑的是舊版」那個實例
+        assert!(!single_instance_mutex_name().contains(current_version()));
+    }
+
+    /// 開機三道閘的組合。這一支是純函式，因為它要判斷的三件事各自都得碰
+    /// 登錄檔、Win32 與磁碟，混在一起就再也驗不了它們的組合。
+    #[test]
+    fn the_startup_gate_only_proceeds_for_an_installed_solo_auto_updating_run() {
+        assert_eq!(startup_gate(true, false, true), Gate::Proceed);
+    }
+
+    /// 這份原始碼自己。下面兩條測的是**語句順序**與**某一支不可以碰某個 API**，
+    /// 那是型別系統管不到、卻一改就靜默出錯的東西，所以直接讀原文釘住
+    /// （與 `the_stylesheet_makes_the_hidden_attribute_actually_hide`、
+    /// `the_shipped_updater_config_parses` 同一套做法）。
+    const THIS_FILE: &str = include_str!("update.rs");
+
+    /// 取出某一支函式的本體（從簽名那一行到下一個頂層 `}`）
+    fn body_of(name: &str) -> &'static str {
+        let start = THIS_FILE.find(name).unwrap_or_else(|| panic!("找不到 {name}"));
+        let rest = &THIS_FILE[start..];
+        let end = rest.find("\n}\n").unwrap_or_else(|| panic!("{name} 沒有結尾"));
+        &rest[..end]
+    }
+
+    /// 下載途中把開關關掉，那份下載**不可以**還是落地成標記。
+    ///
+    /// 這是一個很容易漏掉的競態：`discard_staged` 在使用者按下開關的當下清暫存，
+    /// 但那時下載還在路上，它清的是一個還不存在的東西；幾十秒後 `stage()` 一寫，
+    /// 那份被拒絕的更新就復活了，而且下一次開機真的會裝上去。
+    ///
+    /// 標記的創生點只有 `download_and_stage` 一個，所以閘設在那裡，
+    /// 而且必須排在 `download()` 與 `staged::stage()` **之間**。
+    #[test]
+    fn a_download_that_finishes_after_the_switch_was_turned_off_is_thrown_away() {
+        assert!(accept_staging(true).is_ok());
+        assert_eq!(accept_staging(false), Err(GATE_CLOSED_MID_DOWNLOAD.to_string()));
+
+        let body = body_of("async fn download_and_stage");
+        let download = body.find(".download(").expect("要有下載那一步");
+        let gate = body.find("accept_staging(").expect("下載完一定要再看一次開關");
+        let stage = body.find("staged::stage(").expect("要有落地那一步");
+        assert!(download < gate && gate < stage, "閘必須夾在下載與落地之間：{body}");
+    }
+
+    /// 手動按下的「Restart to update」**不可以**消耗自動重試的額度。
+    ///
+    /// `attempts` 是自動路的保險絲（同一版連三次交棒都沒把版本換掉就放棄它）。
+    /// 手動那條路的失敗使用者當場看得到、會自己再按一次，讓那幾次把額度燒光的話，
+    /// 一個好端端的更新會因為使用者多按了三下就被永久丟掉。
+    #[test]
+    fn the_manual_restart_never_burns_the_automatic_retry_budget() {
+        let manual = body_of("pub fn apply_now");
+        assert!(
+            !manual.contains("note_attempt"),
+            "apply_now 不可以動 attempts，那是自動路的保險絲：{manual}"
+        );
+        // 反過來，自動那一條一定要記
+        let auto = body_of("pub fn apply_pending_at_startup");
+        assert!(auto.contains("note_attempt"), "開機自動安裝必須把嘗試次數落地");
+    }
+
+    /// 第二實例絕不套用，而且**標記要留著**。
+    ///
+    /// 這是這條路上最兇的一顆暗雷：使用者雙擊了第二次圖示，暫存區裡剛好有一份
+    /// 更新，於是這個本來只該去喚醒既有視窗的第二實例會起安裝程式，把他
+    /// **正在用**的第一實例連同所有隧道一起關掉。清掉標記同樣不行——那會讓
+    /// 已經下載好的更新平白消失，下一次還得再抓一次。
+    #[test]
+    fn a_second_instance_never_installs_and_never_throws_the_update_away() {
+        assert_eq!(startup_gate(true, true, true), Gate::SkipAndKeep);
+        // 開關關著時「留著」與「清掉」都說得通，但第二實例這一關排在前面：
+        // 這時候連判斷都不該再往下走
+        assert_eq!(startup_gate(true, true, false), Gate::SkipAndKeep);
+    }
+
+    /// 關掉自動更新之後就不會再被自動裝上去。
+    ///
+    /// 套用那條路跑在設定檔載入之前，`AppState` 還不存在，所以這道閘讀的是
+    /// 設定檔原文（`config::automatic_updates_enabled`）。沒有它的話，
+    /// 一個剛剛才說「不要自動更新我」的使用者下一次開機還是會被靜默更新。
+    #[test]
+    fn turning_automatic_updates_off_stops_the_startup_install() {
+        assert_eq!(startup_gate(true, false, false), Gate::SkipAndClear);
+    }
+
+    /// 可攜／單檔版完全不碰暫存區——那是安裝版的東西，而同一台機器上兩種版本
+    /// 共用同一個 `%LOCALAPPDATA%` 資料夾。可攜版跑起來就把它清掉的話，
+    /// 使用者裝好的那一份會平白失去已經下載好的更新。
+    #[test]
+    fn an_unmanaged_build_leaves_the_installed_builds_staging_alone() {
+        assert_eq!(startup_gate(false, false, true), Gate::SkipAndKeep);
+        assert_eq!(startup_gate(false, false, false), Gate::SkipAndKeep);
+        assert_eq!(startup_gate(false, true, true), Gate::SkipAndKeep);
     }
 
     /// tauri.conf.json 的 plugins.updater 一旦寫壞（少了 pubkey、endpoint 不是

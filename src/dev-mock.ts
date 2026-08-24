@@ -188,6 +188,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
   // 預設沒有新版，更新列不出現；各種更新情境由 __mock 那邊演練（見 installScenarioHooks）
   update: null,
   pendingUpdate: null,
+  updateStalled: false,
 };
 
 /** 假的出口自測結果，格式與真後端一致（`ip  city, country`）；沒列到的埠就當作測不到 */
@@ -275,6 +276,22 @@ type UpdateKind = "installed" | "portable";
 
 /** 演一下背景下載要花的時間，不然 Downloading… 那顆 spinner 一幀都看不到 */
 const DOWNLOAD_DELAY_MS = 1800;
+
+/**
+ * 那顆假下載的計時器。
+ *
+ * 一定要能取消：連叫兩次 `__mock.update()`（或中途 `updateNone()`）時，
+ * 先前那顆計時器還在路上，時間到了照樣會把它那一版的 `pendingUpdate` 寫進去
+ * ——畫面就會莫名其妙跳回一個已經被換掉、甚至已經被清掉的版本。
+ */
+let downloadTimer: number | null = null;
+
+function cancelDownload() {
+  if (downloadTimer !== null) {
+    window.clearTimeout(downloadTimer);
+    downloadTimer = null;
+  }
+}
 
 /** 更新資訊改變時的唯一出口，與真後端一樣：存進狀態並推 update-available */
 function setUpdate(info: Snapshot["update"]) {
@@ -978,8 +995,10 @@ function handle(cmd: string, args: Args): unknown {
     case "set_automatic_updates":
       state.automaticUpdates = Boolean(args.on);
       if (!state.automaticUpdates) {
+        cancelDownload();
         state.update = null;
         state.pendingUpdate = null;
+        state.updateStalled = false;
       }
       pushConfig();
       log(null, state.automaticUpdates ? "automatic updates enabled" : "automatic updates disabled");
@@ -1074,11 +1093,16 @@ function installScenarioHooks() {
      * 所以那兩種結果沒有東西好演；要清掉現在這一份請用 __mock.updateNone()。
      */
     update(kind: UpdateKind, version = "9.9.9") {
+      // 上一輪的假下載還在路上就先取消，免得它時間到了把舊版本寫回來
+      cancelDownload();
+      state.pendingUpdate = null;
+      state.updateStalled = false;
       setUpdate({ version, installed: kind === "installed" });
       log(null, `(browser mock) update available: v${version}`);
       if (kind !== "installed") return;
       log(null, `downloading update v${version} in the background`);
-      window.setTimeout(() => {
+      downloadTimer = window.setTimeout(() => {
+        downloadTimer = null;
         state.pendingUpdate = version;
         pushConfig();
         log(
@@ -1087,9 +1111,23 @@ function installScenarioHooks() {
         );
       }, DOWNLOAD_DELAY_MS);
     },
+    /**
+     * 演練「查到新版、但下載失敗正在退避等重試」：主鈕變成琥珀色的
+     * `Download failed — will retry`，**不轉圈**。先 update("installed") 再叫它。
+     */
+    updateStalls() {
+      cancelDownload();
+      state.pendingUpdate = null;
+      state.updateStalled = true;
+      pushConfig();
+      log(null, "update download failed: (browser mock) simulated network error");
+      return state.updateStalled;
+    },
     /** 回到「沒有任何更新」：標題退回 Version，主鈕整顆消失 */
     updateNone() {
+      cancelDownload();
       state.pendingUpdate = null;
+      state.updateStalled = false;
       setUpdate(null);
       pushConfig();
       log(null, "(browser mock) no update available");
