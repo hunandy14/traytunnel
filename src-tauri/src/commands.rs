@@ -7,7 +7,7 @@
 
 use tauri::{AppHandle, Manager, State};
 
-use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
+use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy, DEFAULT_SOCKS_PORT};
 use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
 
@@ -597,6 +597,8 @@ pub fn delete_forward(state: State<'_, Shared>, local: u16) {
 /// 注意：**沒有 socksPort**——SOCKS5 埠是底下的一條 `socks` 列（§1.3）。
 ///
 /// `mtu` 是選填的隧道 MTU 覆寫（省略／null＝照 `.conf`，見 `wg::effective_mtu`）。
+///
+/// **新建**時可能順手附一條預設的 SOCKS5 列，規則見 [`config::default_socks_row`]。
 #[tauri::command]
 pub fn upsert_wg_proxy(
     state: State<'_, Shared>,
@@ -605,7 +607,22 @@ pub fn upsert_wg_proxy(
     conf_path: String,
     mtu: Option<usize>,
 ) -> Option<String> {
-    let st = state.inner();
+    upsert_wg_proxy_with(state.inner(), original_name, name, conf_path, mtu, winsys::is_listening)
+}
+
+/// [`upsert_wg_proxy`] 的本體，執行期埠探測作為參數注入。
+///
+/// 抽這一層出來只為了一件事：附贈預設 SOCKS5 列的第三個條件是「本機沒有程式在聽
+/// 1080」，那是一次真的系統呼叫，測試裡沒辦法穩定安排。production 綁的是
+/// `winsys::is_listening`。
+fn upsert_wg_proxy_with(
+    st: &Shared,
+    original_name: Option<String>,
+    name: String,
+    conf_path: String,
+    mtu: Option<usize>,
+    port_listening: impl Fn(u16) -> bool,
+) -> Option<String> {
     let name = name.trim().to_string();
     let conf_path = conf_path.trim().to_string();
     if let Some(err) = st.with_config(|c| {
@@ -631,23 +648,30 @@ pub fn upsert_wg_proxy(
                     p.mtu = mtu;
                 }
             }
-            // 新連線底下還沒有任何列，所以也還沒有東西要跑；enabled 沿用預設的
-            // true，使用者按下總開關（或加了第一條列）時才真的起引擎
-            None => c.wg_proxies.push(WgProxy {
-                name: name.clone(),
-                conf_path: conf_path.clone(),
-                enabled: true,
-                mtu,
-                forwards: Vec::new(),
-            }),
+            // 新連線的 enabled 沿用預設的 true。底下有沒有東西要跑，看 1080 淨不
+            // 淨空——淨空就附一條預設 SOCKS5 列（回傳值告訴外面附了沒有），
+            // 否則連線底下一條列都沒有，使用者加了第一條列時才真的起引擎
+            None => {
+                let default_row =
+                    config::default_socks_row(c, original_name.as_deref(), &port_listening);
+                let added = default_row.is_some();
+                c.wg_proxies.push(WgProxy {
+                    name: name.clone(),
+                    conf_path: conf_path.clone(),
+                    enabled: true,
+                    mtu,
+                    forwards: default_row.into_iter().collect(),
+                });
+                return Ok(added);
+            }
         }
-        Ok(())
+        Ok(false)
     });
-    match written {
+    let added_default = match written {
         Err(e) => return Some(save_error_message(st, e)),
         Ok(Err(err)) => return Some(err),
-        Ok(Ok(())) => {}
-    }
+        Ok(Ok(added)) => added,
+    };
 
     st.emit_config_changed();
     st.log_from(
@@ -657,9 +681,16 @@ pub fn upsert_wg_proxy(
             None => "WireGuard connection added",
         },
     );
+    if added_default {
+        st.log_from(&name, format!("default SOCKS5 proxy added on port {DEFAULT_SOCKS_PORT}"));
+    }
     // 改名之後舊名的引擎已經被 sync_exits 收掉了；換了 conf 就要用新的那一份重來
     if original_name.is_some() {
         wg::restart(st, &name);
+    } else if added_default {
+        // 附上的列與手建列無異：手建一條 enabled 的列（upsert_row）存完就直接起線，
+        // 這一條沒有理由停在那裡等使用者再按一次
+        wg::start(st, &name);
     }
     None
 }

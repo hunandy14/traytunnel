@@ -1572,6 +1572,57 @@ pub fn port_owner(cfg: &Config, local: u16) -> Option<String> {
     cfg.row(local).map(|(conn, f)| describe_row(conn.name(), f))
 }
 
+/// 新建 WG 連線時預設附贈的 SOCKS5 埠。1080 是 SOCKS5 的慣例埠，絕大多數瀏覽器
+/// 外掛與命令列工具的預設值都指著它——附贈的意義就在於「不必再設定一次」。
+pub const DEFAULT_SOCKS_PORT: u16 = 1080;
+
+/// 附贈那條列的名字。刻意中性：它與手建的列沒有任何差別，名字不該暗示
+/// 「這條是系統給的、不能動」。
+pub const DEFAULT_SOCKS_NAME: &str = "socks";
+
+/// 新建一條 WG 連線時，要不要順手附一條 SOCKS5 列——要的話回傳那一筆。
+///
+/// 規則只有一條，而且三個條件缺一不可：
+///
+///   1. **新建路徑**。`original_name` 指得到一條既有連線就是編輯，編輯永不附
+///      ——使用者早就看過這條連線底下有什麼了，事後長出一條列是驚嚇不是方便。
+///   2. **設定層淨空**：[`DEFAULT_SOCKS_PORT`] 在整個埠鍵空間（SSH 的列 ＋ 所有
+///      WG 連線的列）裡沒有登記者。本地埠是列的全域唯一鍵（D5），這裡撞上就等於
+///      附了也存不進去。
+///   3. **執行期淨空**：本機沒有別的程式在聽那個埠。設定裡沒人登記不代表沒人在用
+///      ——真正常見的情況正是使用者本來就跑著一份別的代理。
+///
+/// 任一條不成立就**什麼都不附**，不去找替代埠：使用者要的是「1080 就是我的代理」
+/// 這個確定性，隨機挑一個埠給他反而每次都要回頭查是哪個號碼。
+///
+/// `port_listening` 是可注入的執行期探測（production 綁 `winsys::is_listening`）
+/// ——真去綁一個埠才測得到的東西，在單元測試裡沒辦法穩定重現。
+pub fn default_socks_row(
+    cfg: &Config,
+    original_name: Option<&str>,
+    port_listening: impl Fn(u16) -> bool,
+) -> Option<Forward> {
+    if original_name.is_some_and(|orig| cfg.wg_proxy(orig).is_some()) {
+        return None; // 條件 1
+    }
+    if cfg.forward(DEFAULT_SOCKS_PORT).is_some() {
+        return None; // 條件 2
+    }
+    if port_listening(DEFAULT_SOCKS_PORT) {
+        return None; // 條件 3
+    }
+    Some(Forward {
+        name: DEFAULT_SOCKS_NAME.into(),
+        local: DEFAULT_SOCKS_PORT,
+        // socks 列沒有目的地，也不帶 probeProxy（它恆測）——與 upsert_wg_socks
+        // 手建出來的那一筆逐欄位相同
+        remote: None,
+        kind: RowKind::Socks,
+        probe_proxy: false,
+        enabled: true,
+    })
+}
+
 /// MTU 覆寫欄位越界時的那一句話。**前端有一份逐字相同的副本**（sheet.ts 與
 /// dev-mock.ts）：本地檢查與後端檢查講的必須是同一句，否則同一個輸入在按 Save
 /// 前後會看到兩種說法。
