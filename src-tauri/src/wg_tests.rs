@@ -463,12 +463,13 @@ fn a_stuck_reconnect_eventually_asks_for_an_endpoint_recheck() {
     assert!(watch.overdue(t0 + Duration::from_secs(40)), "門檻一到就該複查");
 
     // 複查完、位址沒變：重新計時，而且同一段掉線只記一行
-    let line = watch.note_endpoint_unchanged(t0 + Duration::from_secs(40));
-    assert_eq!(line.as_deref(), Some(ENDPOINT_UNCHANGED_LOG));
+    let after = watch.note_endpoint_unchanged(t0 + Duration::from_secs(40));
+    assert_eq!(after, AfterRecheck::KeepWaiting(Some(ENDPOINT_UNCHANGED_LOG.to_string())));
     assert!(!watch.overdue(t0 + Duration::from_secs(69)), "複查過就重新計時");
     assert!(watch.overdue(t0 + Duration::from_secs(70)), "下一次複查在一個門檻之後");
-    assert!(
-        watch.note_endpoint_unchanged(t0 + Duration::from_secs(70)).is_none(),
+    assert_eq!(
+        watch.note_endpoint_unchanged(t0 + Duration::from_secs(70)),
+        AfterRecheck::KeepWaiting(None),
         "同一段掉線不重複刷屏——這正是離線端點每 80 秒洗一次日誌的來源"
     );
 
@@ -502,6 +503,55 @@ fn only_a_changed_endpoint_address_justifies_a_rebuild() {
     assert_eq!(stuck_action(current, Ok(other_port)), StuckAction::Rebuild);
     // 這一刻解析不出來（多半是本機網路整個斷了）：等，不重建
     assert_eq!(stuck_action(current, Err("nope".into())), StuckAction::KeepWaiting);
+}
+
+/// W6.25 保險絲：位址從頭到尾沒變，但連續複查 `STUCK_RECHECK_FUSE` 次隧道
+/// 都不會好——還是重建一次。
+///
+/// PM 裁決 2026-08-24（採納重做後的自我提示）：`stuck_action` 只認得「端點
+/// 搬家了」這一種故障；**端點沒搬家、但引擎自身卡死**那一類未知故障若完全
+/// 沒有重建的機會，等於把自癒能力押在「我們已經想到所有故障模式」上。
+/// 5 次 × 60 秒 ≈ 5 分鐘，比舊版的每 60 秒無條件重建安靜一個級距。
+#[test]
+fn five_unchanged_rechecks_still_blow_the_fuse() {
+    use engine::EngineHealth::{Connected, Reconnecting};
+    use std::time::Duration;
+    let t0 = Instant::now();
+    let step = Duration::from_secs(60);
+    let mut watch = HandshakeWatch::new(t0, step);
+    watch.on_event(&engine_event(Reconnecting), t0);
+
+    // 前四次都只是等：不可以每 60 秒就把隧道拆掉重蓋
+    for n in 1..STUCK_RECHECK_FUSE {
+        let after = watch.note_endpoint_unchanged(t0 + step * n);
+        assert!(
+            matches!(after, AfterRecheck::KeepWaiting(_)),
+            "第 {n} 次複查位址沒變，這時候還不該重建"
+        );
+    }
+    // 第五次：保險絲燒斷
+    assert_eq!(
+        watch.note_endpoint_unchanged(t0 + step * STUCK_RECHECK_FUSE),
+        AfterRecheck::BlowFuse,
+        "連續 {STUCK_RECHECK_FUSE} 次都沒好，未知故障也該有一次自癒的機會"
+    );
+    // 日誌措辭要與「IP 變了」那一行分得開，否則使用者會被導去查 DNS
+    assert_ne!(rebuild_fuse_log(), REBUILD_LOG);
+    assert!(rebuild_fuse_log().contains("still stuck"));
+    assert_eq!(STUCK_RECHECK_FUSE, 5);
+
+    // 中途自己好了：計數歸零，下一段掉線重新數五次
+    let mut watch = HandshakeWatch::new(t0, step);
+    watch.on_event(&engine_event(Reconnecting), t0);
+    for n in 1..STUCK_RECHECK_FUSE {
+        watch.note_endpoint_unchanged(t0 + step * n);
+    }
+    watch.on_event(&engine_event(Connected), t0 + step * 5);
+    watch.on_event(&engine_event(Reconnecting), t0 + step * 6);
+    assert!(
+        matches!(watch.note_endpoint_unchanged(t0 + step * 7), AfterRecheck::KeepWaiting(_)),
+        "復原過就歸零：不可以在下一段掉線的第一次複查就燒保險絲"
+    );
 }
 
 /// W6.24 **復原的事件優先於「卡太久」的判定**。

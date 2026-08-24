@@ -39,6 +39,21 @@ pub const RETRY: Duration = Duration::from_secs(5);
 /// 已經試過十幾次，還沒起來就不是抖動。
 pub const RECONNECT_REBUILD_AFTER: Duration = Duration::from_secs(60);
 
+/// 保險絲：連續這麼多次複查都說「位址沒變」，還是重建一次引擎。
+///
+/// [`stuck_action`] 只認得「端點搬家了」這一種故障。**端點沒搬家、但引擎自身
+/// 卡死**（某條任務死了、UDP socket 廢了、boringtun 進了誰也沒想到的狀態）
+/// 那一類未知故障，如果完全沒有重建的機會，就等於把自癒能力押在
+/// 「我們已經想到所有故障模式」這個假設上。
+///
+/// 5 次 × [`RECONNECT_REBUILD_AFTER`] ≈ 5 分鐘。這個級距同時滿足兩件事：
+/// 對「對端還沒開機」那種常見情況，重建噪音從每 60 秒降到每 5 分鐘；
+/// 對真的卡死的引擎，最遲 5 分鐘會被換掉一次。
+///
+/// 計數在復原（connected）時歸零；重建之後整顆 `HandshakeWatch` 會跟著
+/// 那一輪引擎重新建立，自然也是零。
+pub const STUCK_RECHECK_FUSE: u32 = 5;
+
 /// 進入 reconnecting 時記的那一行。stale 路徑以前是完全靜默的，
 /// 使用者只看得到一個變色的點，日誌裡卻查不到任何線索
 const HANDSHAKE_RETRY_LOG: &str = "handshake not completed, retrying";
@@ -48,6 +63,13 @@ const ENDPOINT_UNCHANGED_LOG: &str = "still reconnecting, endpoint address uncha
 
 /// 端點的位址真的變了、要重建引擎時記的那一行
 const REBUILD_LOG: &str = "endpoint address changed, rebuilding engine";
+
+/// 保險絲燒斷時記的那一行。**措辭刻意與 [`REBUILD_LOG`] 不同**：兩者的成因
+/// 完全不一樣，日誌上分不出來的話，使用者查「我的隧道為什麼一直重連」時
+/// 會被導向錯誤的方向（去查 DNS，而問題根本不在那裡）
+fn rebuild_fuse_log() -> String {
+    format!("still stuck after {STUCK_RECHECK_FUSE} endpoint checks, rebuilding engine anyway")
+}
 
 /// 埠佔用預檢的複查間隔，與 `ssh::tunnel::PORT_GRACE` 同值同理由
 pub const PORT_GRACE: Duration = Duration::from_millis(500);
@@ -362,6 +384,9 @@ pub(crate) struct HandshakeWatch {
     /// reconnecting 連續超過這麼久就該去複查端點
     /// （production 是 [`RECONNECT_REBUILD_AFTER`]）
     rebuild_after: Duration,
+    /// 這一段掉線裡，複查端點得到「位址沒變」的次數（保險絲的計數器，
+    /// 見 [`STUCK_RECHECK_FUSE`]）。復原成 connected 時歸零
+    unchanged_checks: u32,
     phase: Phase,
 }
 
@@ -381,7 +406,7 @@ impl HandshakeWatch {
     /// 才是真的耗時（覆審打回 2026-08-24：原本建在 spawn 之後，探測路徑上
     /// 事件早就在佇列裡等著，量出來恆為 0ms）
     pub(crate) fn new(now: Instant, rebuild_after: Duration) -> Self {
-        HandshakeWatch { since: now, rebuild_after, phase: Phase::Waiting }
+        HandshakeWatch { since: now, rebuild_after, unchanged_checks: 0, phase: Phase::Waiting }
     }
 
     /// 吃一顆引擎事件，回傳「要記的那一行日誌」（沒變化就回 None）。
@@ -398,6 +423,8 @@ impl HandshakeWatch {
                 let ms = now.saturating_duration_since(self.since).as_millis();
                 self.phase = Phase::Ok;
                 self.since = now;
+                // 自己好起來了：保險絲的計數歸零，下一次掉線重新數
+                self.unchanged_checks = 0;
                 Some(format!("handshake ok in {ms}ms"))
             }
             (engine::EngineHealth::Reconnecting, Phase::Reconnecting | Phase::Rechecked) => None,
@@ -418,18 +445,35 @@ impl HandshakeWatch {
             && now.saturating_duration_since(self.since) >= self.rebuild_after
     }
 
-    /// 複查過了、端點沒變：重新計時（下一次複查在一個門檻之後），
-    /// 並回傳「這一段掉線要不要記那一行」——同一段只記第一次
-    pub(crate) fn note_endpoint_unchanged(&mut self, now: Instant) -> Option<String> {
+    /// 複查過了、端點沒變。重新計時（下一次複查在一個門檻之後），
+    /// 並決定這一次要不要燒保險絲。
+    pub(crate) fn note_endpoint_unchanged(&mut self, now: Instant) -> AfterRecheck {
         self.since = now;
+        self.unchanged_checks += 1;
+        // 保險絲：位址從頭到尾沒變，但隧道就是不會好——引擎自身卡死這類**未知
+        // 故障**不該完全沒有自癒手段（見 [`STUCK_RECHECK_FUSE`]）
+        if self.unchanged_checks >= STUCK_RECHECK_FUSE {
+            return AfterRecheck::BlowFuse;
+        }
         match self.phase {
             Phase::Reconnecting => {
                 self.phase = Phase::Rechecked;
-                Some(ENDPOINT_UNCHANGED_LOG.to_string())
+                AfterRecheck::KeepWaiting(Some(ENDPOINT_UNCHANGED_LOG.to_string()))
             }
-            _ => None,
+            // 同一段掉線只記第一次，不刷屏
+            _ => AfterRecheck::KeepWaiting(None),
         }
     }
+}
+
+/// 複查完端點、而且位址沒變之後要做什麼
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AfterRecheck {
+    /// 繼續等這顆引擎自己好起來；`Some` 是要記的那一行（同一段掉線只記第一次）
+    KeepWaiting(Option<String>),
+    /// 保險絲燒了：位址沒變，但已經連續複查 [`STUCK_RECHECK_FUSE`] 次都沒好，
+    /// 還是重建一次
+    BlowFuse,
 }
 
 /// `consume` 這一圈該做什麼。
@@ -849,6 +893,9 @@ async fn consume(
 /// 位址沒變就重新計時、記一行（同一段掉線只記一次），**不動這顆引擎**——
 /// 無條件重建等於每 60 秒把一條只是暫時連不上的隧道整個拆掉重蓋一次，
 /// 而那條隧道八成只是對端還沒開機。
+///
+/// 但也不能永遠不重建：連續 [`STUCK_RECHECK_FUSE`] 次都說「位址沒變」而隧道
+/// 就是不會好的時候，保險絲會燒斷，還是重建一次（見那個常數的說明）。
 async fn recheck_endpoint(
     state: &Arc<AppState>,
     conn: &str,
@@ -861,12 +908,18 @@ async fn recheck_endpoint(
             state.log_from(conn, REBUILD_LOG);
             true
         }
-        StuckAction::KeepWaiting => {
-            if let Some(line) = watch.note_endpoint_unchanged(Instant::now()) {
-                state.log_from(conn, line);
+        StuckAction::KeepWaiting => match watch.note_endpoint_unchanged(Instant::now()) {
+            AfterRecheck::BlowFuse => {
+                state.log_from(conn, rebuild_fuse_log());
+                true
             }
-            false
-        }
+            AfterRecheck::KeepWaiting(line) => {
+                if let Some(line) = line {
+                    state.log_from(conn, line);
+                }
+                false
+            }
+        },
     }
 }
 
