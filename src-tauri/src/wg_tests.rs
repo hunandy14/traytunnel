@@ -8,7 +8,8 @@ use super::*;
 use std::collections::BTreeMap;
 
 use crate::config::{
-    apply_source_enabled, apply_wg_enabled, should_probe, Config, Forward, RowKind, Source, WgProxy,
+    apply_source_enabled, apply_wg_enabled, row_source_enabled, should_probe, Config, Forward,
+    RowKind, Source, WgProxy,
 };
 use crate::state::{self, status, TestView, Worker};
 
@@ -44,6 +45,7 @@ fn cfg_with_wg() -> Config {
             host: "hk.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             forwards: vec![Forward {
                 remote: Some("127.0.0.1:1080".into()),
                 ..fwd("exit-a", 1080)
@@ -269,6 +271,65 @@ fn the_ssh_connection_switch_is_deliberately_asymmetric() {
         cfg.sources[0].forwards.iter().all(|f| f.enabled),
         "重新打開時全部列都會起——因為剛剛全被寫成 true"
     );
+}
+
+// ---------------------------------- SSH 主卡總開關（PM 裁決：與 WG 現行行為完全一致）
+//
+// 上面 `the_ssh_connection_switch_is_deliberately_asymmetric` 這條測試釘住的是
+// 舊語意（Disconnect 選單項在用），**這一輪的 PM 裁決推翻了它**：SSH 主卡的總
+// 開關要與 WG 的 `set_wg_enabled` 完全同步——只動 `Source.enabled`，底下列的
+// 逐列意圖一個都不碰。舊測試依規範保留、不改斷言（見任務指示），因此上面那條
+// 現在會是紅燈；這裡另外釘住新語意，兩條測試的斷言互斥正是這次行為變更的證據。
+
+/// W6.12（覆審後）`apply_source_enabled(name, false)`：只改 `Source.enabled`，
+/// 三條列（含中間那條本來就停用的）一個都不被動到。對照 W6.10 的 wg 版本。
+#[test]
+fn turning_a_source_off_never_touches_its_rows() {
+    let mut cfg = cfg_with_wg();
+    cfg.sources[0].forwards.push(Forward { enabled: false, ..fwd("db", 5432) });
+    cfg.sources[0].forwards.push(fwd("web", 8080)); // enabled = true
+
+    assert!(apply_source_enabled(&mut cfg, "hk", false));
+    assert!(!cfg.sources[0].enabled);
+    let flags: Vec<bool> = cfg.sources[0].forwards.iter().map(|f| f.enabled).collect();
+    assert_eq!(flags, vec![true, false, true], "列的逐條意圖要原封不動");
+}
+
+/// 再打開：源自己的 enabled 復原成 true，列的 enabled 完全沒被這一支動過
+/// ——`enabled_locals_of`（實際拉起哪些列）另外看列自己的旗標，不歸這支管。
+#[test]
+fn turning_a_source_back_on_does_not_rewrite_its_rows_either() {
+    let mut cfg = cfg_with_wg();
+    cfg.sources[0].forwards.push(Forward { enabled: false, ..fwd("db", 5432) });
+    apply_source_enabled(&mut cfg, "hk", false);
+
+    assert!(apply_source_enabled(&mut cfg, "hk", true));
+    assert!(cfg.sources[0].enabled);
+    assert!(cfg.sources[0].forwards[0].enabled, "本來就開著的那條列還是開著");
+    assert!(!cfg.sources[0].forwards[1].enabled, "本來就關著的那條列不會被總開關順便打開");
+}
+
+/// 對不存在的源名：記一行日誌就退，不 panic、不建出幽靈連線（W6.15 的 ssh 對照組）
+#[test]
+fn apply_source_enabled_on_an_unknown_name_is_a_no_op() {
+    let mut cfg = cfg_with_wg();
+    let before = cfg.clone();
+    assert!(!apply_source_enabled(&mut cfg, "nope", false), "找不到就回 false");
+    assert_eq!(cfg, before, "不可以憑空長出一條連線");
+}
+
+/// `row_source_enabled`：源關著就擋下每一條列，不管列自己的 enabled 是不是
+/// true；源開著時完全不影響列自己的判斷（那是 `enabled_locals_of` 的事）。
+#[test]
+fn row_source_enabled_gates_every_row_under_a_disabled_source() {
+    let mut cfg = cfg_with_wg();
+    assert!(row_source_enabled(&cfg, 1080));
+
+    cfg.sources[0].enabled = false;
+    assert!(!row_source_enabled(&cfg, 1080), "源關著，列自己是 true 也不該放行");
+    // wg 的列不歸這支管（它問的只有 ssh 源），也不該 panic
+    assert!(!row_source_enabled(&cfg, 1085));
+    assert!(!row_source_enabled(&cfg, 9999), "不存在的埠一律 false");
 }
 
 /// W6.13 落檔順序：先存檔成功才動引擎；存檔失敗時引擎維持原狀，

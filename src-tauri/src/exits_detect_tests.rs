@@ -308,6 +308,7 @@ fn the_protocol_cache_never_reaches_the_config_file() {
             host: "h.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             forwards: vec![Forward {
                 name: "exit-a".into(),
                 local: 1080,

@@ -127,6 +127,9 @@ pub struct SourceView {
     pub host: String,
     pub user: String,
     pub proxy_command: String,
+    /// 連線總開關（W6.12 起與 `WgProxyView.enabled` 同一套語意），主卡的
+    /// 總開關與「整卡變暗」讀的就是這個旗標
+    pub enabled: bool,
     pub exits: Vec<ExitView>,
 }
 
@@ -283,6 +286,7 @@ fn build_views(cfg: &Config, exits: &BTreeMap<u16, ExitRuntime>) -> Vec<SourceVi
             host: s.host.clone(),
             user: s.user.clone(),
             proxy_command: s.proxy_command.clone(),
+            enabled: s.enabled,
             exits: row_views(&s.forwards, exits),
         })
         .collect()

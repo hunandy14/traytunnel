@@ -34,6 +34,7 @@ fn src(name: &str, forwards: Vec<Forward>) -> Source {
         host: format!("{name}.example.com"),
         user: "bob".into(),
         proxy_command: String::new(),
+        enabled: true,
         forwards,
     }
 }
@@ -424,6 +425,57 @@ fn forward_enabled_is_read_back() {
     let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = false\n";
     let cfg = parse_config(raw).unwrap();
     assert!(!cfg.sources[0].forwards[0].enabled);
+}
+
+/// 源自己的總開關（W6.12）：沒有 `enabled` 鍵的舊檔一律當成開著，
+/// 與 `WgProxy.enabled` 的舊檔相容規則同一套（見 config.rs 的 `default_true`）
+#[test]
+fn source_enabled_defaults_to_true_when_the_key_is_missing() {
+    let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n";
+    let cfg = parse_config(raw).unwrap();
+    assert!(cfg.sources[0].enabled);
+}
+
+#[test]
+fn source_enabled_is_read_back() {
+    let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\nenabled = false\n";
+    let cfg = parse_config(raw).unwrap();
+    assert!(!cfg.sources[0].enabled);
+}
+
+/// 源的 enabled 存檔後要讀得回同一個值，跟 forward 的 enabled 走同一套機制
+#[test]
+fn source_enabled_round_trips_through_write() {
+    let dir = tmp_dir("source-enabled-write");
+    let mut cfg = Config::default();
+    cfg.sources[0].enabled = false;
+    write_config(&dir, &cfg).unwrap();
+    let back = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+    assert!(!back.sources[0].enabled);
+    assert_eq!(back, cfg);
+}
+
+/// 程式啟動只拉起 enabled=true 的來源（W6.12 起與 wg 對稱）：源關著，
+/// 底下的列就算自己 enabled=true 也不在 `enabled_locals()` 裡
+#[test]
+fn enabled_locals_requires_the_owning_source_to_be_enabled_too() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        wg_proxies: Vec::new(),
+        sources: vec![
+            src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
+            src("tw", vec![fwd("c", 1090)]),
+        ],
+    };
+    assert_eq!(cfg.enabled_locals(), vec![1080, 1090]);
+
+    cfg.sources[0].enabled = false;
+    assert_eq!(
+        cfg.enabled_locals(),
+        vec![1090],
+        "hk 源關著，1080 即使列自己 enabled=true 也不該被拉起來"
+    );
 }
 
 #[test]
@@ -890,6 +942,7 @@ fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
                 host: "hk.example.com".into(),
                 user: "alice".into(),
                 proxy_command: String::new(),
+                enabled: true,
                 forwards: vec![],
             },
             Source {
@@ -897,6 +950,7 @@ fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
                 host: "tk.example.com".into(),
                 user: "alice".into(),
                 proxy_command: String::new(),
+                enabled: true,
                 forwards: vec![],
             },
         ],

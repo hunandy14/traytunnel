@@ -178,6 +178,10 @@ pub struct Source {
     pub user: String,
     #[serde(default)]
     pub proxy_command: String,
+    /// 這個源的連線總開關；設定檔沒有這個欄位時視為 true（W6.12 起與 `WgProxy.enabled`
+    /// 同一套語意，見 [`apply_source_enabled`]）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub forwards: Vec<Forward>,
 }
@@ -321,12 +325,14 @@ impl Config {
         self.all_rows().map(|f| f.local).collect()
     }
 
-    /// 現在該跑的列：ssh 只看列自己的 enabled，wg 還要**連線也 enabled**（W3.4）。
+    /// 現在該跑的列：兩型連線都要**連線也 enabled 且列自己也 enabled**（W3.4／W6.12）。
     ///
     /// 連線層與列層是兩個獨立的意圖，`AND` 起來才是「這條列現在該不該跑」（§5.5）。
+    /// ssh 與 wg 自 W6.12 起同一套規則：程式啟動只拉起總開關開著的連線。
     pub fn enabled_locals(&self) -> Vec<u16> {
         self.sources
             .iter()
+            .filter(|s| s.enabled)
             .flat_map(|s| s.forwards.iter())
             .chain(self.wg_proxies.iter().filter(|p| p.enabled).flat_map(|p| p.forwards.iter()))
             .filter(|f| f.enabled)
@@ -449,16 +455,20 @@ pub fn ordered_rows(forwards: &[Forward]) -> Vec<&Forward> {
     socks.chain(rest).collect()
 }
 
-/// ssh 的連線總開關：**逐條改寫每個 forward 的 `enabled`**（W6.12 的對照組）。
+/// ssh 的連線總開關：**只改連線自己的 `enabled`**，列的 `enabled` 一個都不碰。
 ///
-/// 與 [`apply_wg_enabled`] 刻意不對稱，實作時別「順手對齊」——理由見 §5.5 那張表。
+/// 自 W6.12 起與 [`apply_wg_enabled`] 是同一套語意（PM 裁決：SSH 主卡總開關要與
+/// WG 現行行為完全一致）——關閉時底下每一條列的逐列意圖原封不動，重新打開時
+/// 只有原本 enabled = true 的那幾條會被拉起來，這正是使用者期待的「記憶效果」。
+/// 舊制那種「逐條輾平覆寫每列 `Forward.enabled`」的粗粒度行為已經廢止：那是
+/// 主卡選單裡已移除的 Disconnect 項在用的語意，不能沿用到總開關上。
 /// 回傳 false 代表沒有這條連線。
 pub fn apply_source_enabled(cfg: &mut Config, name: &str, on: bool) -> bool {
     match cfg.source_mut(name) {
         Some(s) => {
-            for f in s.forwards.iter_mut() {
-                f.enabled = on;
-            }
+            // 只有這一行。底下 forwards 的 enabled **一個都不碰**——那是使用者
+            // 的逐列意圖，連線重新打開時要原封不動地還給他（比照 apply_wg_enabled）
+            s.enabled = on;
             true
         }
         None => false,
@@ -477,6 +487,17 @@ pub fn apply_wg_enabled(cfg: &mut Config, name: &str, on: bool) -> bool {
         }
         None => false,
     }
+}
+
+/// 這條列所屬的源有沒有被總開關關掉：`ssh::tunnel::start` 靠它擋下「源關著、
+/// 卻還是有辦法讓某一條列連上」的路（例如系統匣直接勾選單一列、或存檔前的
+/// upsert 順手把新列拉起來）。
+///
+/// wg 那邊的等價守門是 [`crate::wg::should_run_engine`]；差別只在 ssh 沒有引擎，
+/// 執行單位是列本身，所以這裡問的是單一列而不是整條連線。列不存在（或不屬於
+/// 任何 ssh 源）一律回 false，不必另外檢查。
+pub fn row_source_enabled(cfg: &Config, local: u16) -> bool {
+    cfg.locate(local).is_some_and(|(s, _)| s.enabled)
 }
 
 /// 讀檔後的 `probeProxy` 遷移掃描（§1.7／W3.27）。
@@ -548,6 +569,7 @@ impl Default for Config {
                 host: "your-host.example.com".into(),
                 user: "your-user".into(),
                 proxy_command: "cloudflared access ssh --hostname %h".into(),
+                enabled: true,
                 forwards: vec![
                     Forward {
                         name: "exit-a".into(),
@@ -773,6 +795,8 @@ impl LegacyConfig {
                 host: self.host.trim().to_string(),
                 user: self.user.trim().to_string(),
                 proxy_command: self.proxy_command,
+                // 舊制沒有這個欄位，遷移後視為開啟——舊檔裡的連線本來就是在跑的
+                enabled: true,
                 forwards: self.forwards,
             }],
             // 舊制當然沒有 wg 代理
@@ -1159,6 +1183,7 @@ fn sync_sources(tables: &mut ArrayOfTables, sources: &[Source]) {
             t["host"] = value(s.host.as_str());
             t["user"] = value(s.user.as_str());
             t["proxyCommand"] = value(s.proxy_command.as_str());
+            t["enabled"] = value(s.enabled);
             if !matches!(t.get("forwards"), Some(Item::ArrayOfTables(_))) {
                 t["forwards"] = Item::ArrayOfTables(ArrayOfTables::new());
             }

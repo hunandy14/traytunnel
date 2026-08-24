@@ -197,14 +197,16 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
     result
 }
 
-/// 啟動單一出口的監看迴圈；出口不在設定裡就什麼都不做。
+/// 啟動單一出口的監看迴圈；出口不在設定裡、或它所屬的源已被總開關關掉時
+/// 什麼都不做（W6.12：源關著就不該有辦法讓底下任何一條列連上，即使是被系統匣
+/// 直接勾選、或存檔時順手要拉起新列這種繞過主視窗總開關的路徑）。
 /// 呼叫端負責先把 enabled 寫進設定。
 ///
 /// 語意是「確保這個出口有一條線在跑」：已經有監看迴圈時直接 no-op，
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
 /// 還佔著的埠，誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
-    if state.with_config(|c| c.forward(local).is_none()) {
+    if !state.with_config(|c| crate::config::row_source_enabled(c, local)) {
         return;
     }
     let Some(generation) = state.claim_supervisor(local) else {
@@ -569,6 +571,7 @@ mod tests {
                     host: "h.example.com".into(),
                     user: "bob".into(),
                     proxy_command: "cloudflared access ssh --hostname %h".into(),
+                    enabled: true,
                     forwards: vec![
                         Forward {
                             name: "a".into(),
@@ -593,6 +596,7 @@ mod tests {
                     host: "t.example.com".into(),
                     user: "alice".into(),
                     proxy_command: String::new(),
+                    enabled: true,
                     forwards: vec![Forward {
                         name: "c".into(),
                         local: 1090,
@@ -687,6 +691,26 @@ mod tests {
         let count = value("ServerAliveCountMax=");
         assert!(interval * count <= 30, "偵測窗口 {interval}x{count} 秒太寬");
         assert!(interval >= 5, "探測太密只是白費封包");
+    }
+
+    /// 源的總開關關掉時，`start()` 靠 `row_source_enabled` 擋下底下每一條列——
+    /// 不管那條列自己的 `enabled` 是不是 true。源開著時才照列自己的 enabled 走。
+    #[test]
+    fn row_source_enabled_follows_the_owning_source_switch() {
+        use crate::config::row_source_enabled;
+        let mut c = cfg();
+        // hk 源開著：兩條列（不論列自己 enabled 與否）都算「源允許它跑」
+        assert!(row_source_enabled(&c, 1080));
+        assert!(row_source_enabled(&c, 1083), "列自己 enabled=false 不影響這一關要問的事");
+
+        c.sources[0].enabled = false;
+        assert!(!row_source_enabled(&c, 1080), "源關著，列自己是 true 也不該放行");
+        assert!(!row_source_enabled(&c, 1083));
+        // 別的源不受影響
+        assert!(row_source_enabled(&c, 1090));
+
+        // 不存在的埠一律 false，不 panic
+        assert!(!row_source_enabled(&c, 9999));
     }
 
     #[test]

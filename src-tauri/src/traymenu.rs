@@ -341,6 +341,7 @@ mod tests {
             host: "h.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             exits,
         }
     }

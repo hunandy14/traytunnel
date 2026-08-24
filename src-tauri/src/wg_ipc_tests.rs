@@ -52,6 +52,7 @@ fn cfg_with_wg() -> Config {
             host: "hk.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             forwards: vec![Forward {
                 remote: Some("127.0.0.1:1080".into()),
                 ..fwd("exit-a", 1080)

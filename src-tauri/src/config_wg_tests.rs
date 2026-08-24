@@ -61,6 +61,7 @@ fn src(name: &str, forwards: Vec<Forward>) -> Source {
         host: format!("{name}.example.com"),
         user: "bob".into(),
         proxy_command: String::new(),
+        enabled: true,
         forwards,
     }
 }

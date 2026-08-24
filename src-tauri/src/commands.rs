@@ -176,7 +176,11 @@ pub fn stop_source(state: State<'_, Shared>, name: String) {
     set_source_enabled(state.inner(), &name, false);
 }
 
-/// 連接／中斷一個源底下全部的出口
+/// 源層級的連線總開關（W6.12 起與 `set_wg_enabled` 同一套語意）：只改
+/// `Source.enabled`，底下各列的意圖一個都不碰。存檔成功才動隧道——
+/// 開時只拉起列自己也 enabled 的那些（`tunnel::start_source`），
+/// 關時把底下所有列一起停掉（`tunnel::halt_source`），列的 enabled 原樣留著，
+/// 下次打開才能照使用者原本的選擇恢復。
 fn set_source_enabled(st: &Shared, name: &str, on: bool) {
     if !require_source(st, name) {
         return;
@@ -289,12 +293,14 @@ pub fn upsert_source(
                     s.proxy_command = proxy_command.clone();
                 }
             }
-            // 新的源底下還沒有任何出口
+            // 新的源底下還沒有任何出口；enabled 沿用預設的 true，比照
+            // upsert_wg_proxy 新增 wg 連線的規則
             None => c.sources.push(Source {
                 name: target.clone(),
                 host: host.clone(),
                 user: user.clone(),
                 proxy_command: proxy_command.clone(),
+                enabled: true,
                 forwards: Vec::new(),
             }),
         }
@@ -659,9 +665,12 @@ pub fn delete_wg_proxy(state: State<'_, Shared>, name: String) {
 
 /// 連線層的引擎總開關（§5.5 第 3 支）。
 ///
-/// 與 ssh 的 `set_source_enabled` **刻意不對稱**：只改連線自己的 `enabled`，
-/// 底下各列的意圖一個都不碰。存檔成功才動引擎，步驟由
-/// [`wg::wg_enabled_steps`] 決定（那一串抽出來才測得到，W6.13／W6.14）。
+/// 自 W6.12 起與 ssh 的 `set_source_enabled` 是同一套語意：只改連線自己的
+/// `enabled`，底下各列的意圖一個都不碰。差別只在 ssh 沒有引擎這個執行實體，
+/// 因此不需要「零列就不留空轉引擎」這一關（W6.14），也就沒有對應的
+/// `steps` 抽出來測——`set_source_enabled` 直接呼叫 `tunnel::start_source`／
+/// `halt_source` 即可。存檔成功才動引擎，步驟由 [`wg::wg_enabled_steps`]
+/// 決定（那一串抽出來才測得到，W6.13／W6.14）。
 #[tauri::command]
 pub fn set_wg_enabled(state: State<'_, Shared>, name: String, on: bool) {
     let st = state.inner();
