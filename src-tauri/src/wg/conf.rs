@@ -7,8 +7,6 @@
 use std::net::IpAddr;
 use std::path::Path;
 
-use base64::Engine as _;
-
 /// `[Interface] MTU` 省略時的預設值
 pub const DEFAULT_MTU: usize = 1420;
 
@@ -350,6 +348,9 @@ fn split_list(value: &str) -> impl Iterator<Item = &str> {
 ///
 /// 錯誤訊息只講鍵名與失敗的種類，**一個輸入位元組都不回放**（W1.10／W1.34）。
 fn decode_key(value: &str, key: &'static str) -> Result<[u8; 32], String> {
+    // 這個 use 刻意留在函式內：放在模組頂層的話，`conf_tests.rs` 的
+    // `use super::*;` 會把它一併帶進去，測試檔自己那一行就變成重複匯入
+    use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(value.trim())
         .map_err(|_| format!("{key} 不是合法的 base64"))?;
