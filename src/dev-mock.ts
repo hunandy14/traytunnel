@@ -642,15 +642,30 @@ function handle(cmd: string, args: Args): unknown {
 
     // ---------------------------------------------------------- 出口層級（ssh／wg 共用同一個埠鍵空間）
 
+    /**
+     * 這兩支都會改寫 exit.enabled（那是「使用者要不要它跑」的意圖，見 start／stop
+     * 的 setIntent），所以**一定要推 config-changed**——真後端的 set_exit_enabled
+     * 就是這樣（PR #35 驗證過），旁邊的 set_wg_enabled 也是。
+     *
+     * 少了這一行，前端永遠學不到 enabled 變了：exit-status 事件只帶得回 status，
+     * 列開關綁的卻是 enabled，於是開關的視覺卡死在舊值、關掉之後再也開不回來。
+     *
+     * pushConfig 擺在最後，照「最終狀態確定後再推」的既有裁決：start() 是同步
+     * 把狀態帶到 connecting 才回來的，這時照相拿到的才是成立的那一份。
+     */
     case "start_exit": {
       const hit = find(args.local as number);
-      if (hit) start(hit.exit, ownerName(hit.owner));
+      if (!hit) return null;
+      start(hit.exit, ownerName(hit.owner));
+      pushConfig();
       return null;
     }
 
     case "stop_exit": {
       const hit = find(args.local as number);
-      if (hit) stop(hit.exit, ownerName(hit.owner));
+      if (!hit) return null;
+      stop(hit.exit, ownerName(hit.owner));
+      pushConfig();
       return null;
     }
 

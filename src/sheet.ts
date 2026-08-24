@@ -153,6 +153,20 @@ interface Handlers {
 let handlers: Handlers = { onSaved: () => {}, onDeleted: () => {} };
 let open = false;
 let busy = false;
+
+/**
+ * 送出／刪除進行中的鎖。
+ *
+ * 一律走這一支而不是直接指派 `busy`：除了旗標本身，`.conf` 路徑輸入框也要跟著
+ * 唯讀。那個欄位現在可以手打（不再是純唯讀的選檔結果），而表單的值在按下 Save
+ * 的當下就已經被讀走了——這時還能改路徑、還能連帶觸發自動帶名，畫面就會跟送出去
+ * 的內容對不起來。瀏覽鈕靠 pickConf 開頭的 `if (busy) return` 擋，兩者同一道 gate。
+ */
+function setBusy(next: boolean) {
+  busy = next;
+  wgInput("conf").readOnly = next;
+}
+
 /** null 代表這是「新增」 */
 let originalName: string | null = null;
 let originalKind: ConnKind | null = null;
@@ -304,7 +318,7 @@ function deleteConfirmText(target: ConnTarget | null): string {
 export function openSourceSheet(target: ConnTarget | null) {
   originalName = target ? target.data.name : null;
   originalKind = target ? target.kind : null;
-  busy = false;
+  setBusy(false);
 
   const tabs = el<HTMLElement>("src-type-tabs");
   const badge = el<HTMLSpanElement>("src-type-badge");
@@ -364,7 +378,7 @@ async function saveSsh() {
   }
 
   const name = sshInput("name").value.trim();
-  busy = true;
+  setBusy(true);
   try {
     const err = await upsertSource({
       originalName: originalKind === "ssh" ? originalName : null,
@@ -373,7 +387,7 @@ async function saveSsh() {
       user: sshInput("user").value.trim(),
       proxyCommand: sshInput("proxyCommand").value.trim(),
     });
-    busy = false;
+    setBusy(false);
     if (err) {
       // 送出的是 ssh 那組欄位，錯誤就一定歸 ssh 分頁——不看回應到達時的 activeTab
       assignError(err, "ssh");
@@ -382,12 +396,16 @@ async function saveSsh() {
     closeSourceSheet();
     handlers.onSaved(name);
   } catch (e) {
-    busy = false;
+    setBusy(false);
     setGeneralError(el<HTMLDivElement>("src-error"), String(e));
   }
 }
 
 async function saveWg() {
+  // 在路徑欄裡貼上路徑後直接按 Enter 的話 blur 不會發生，這裡補帶一次名字，
+  // 免得使用者拿到一句「name is required」卻不知道本來會自動帶
+  suggestNameFromConf();
+
   const errors = localValidateWg();
   const keys = Object.keys(errors) as WgField[];
   if (keys.length > 0) {
@@ -396,14 +414,14 @@ async function saveWg() {
   }
 
   const name = wgInput("wgName").value.trim();
-  busy = true;
+  setBusy(true);
   try {
     const err = await upsertWgProxy({
       originalName: originalKind === "wg" ? originalName : null,
       name,
       confPath: wgInput("conf").value.trim(),
     });
-    busy = false;
+    setBusy(false);
     if (err) {
       assignError(err, "wg");
       return;
@@ -411,7 +429,7 @@ async function saveWg() {
     closeSourceSheet();
     handlers.onSaved(name);
   } catch (e) {
-    busy = false;
+    setBusy(false);
     setGeneralError(el<HTMLDivElement>("src-error"), String(e));
   }
 }
@@ -477,6 +495,28 @@ async function testNow() {
   }
 }
 
+/**
+ * Name 還空著的話，拿 .conf 的檔名（去掉副檔名）順手帶一個進去。
+ *
+ * 兩條入口共用：按瀏覽鈕選檔，以及直接在路徑欄手打／貼上。只在空的時候帶，
+ * 使用者自己填過就不動他的——這跟 remote 的正規化一樣，是預填而不是強制。
+ *
+ * 預填完**立刻驗一次**：檔名不受連線名的規則管，「My VPN.conf」這種帶空格的
+ * 名字在 Windows 上再正常不過，直接塞進去等於埋一顆到按下 Save 才爆的雷
+ * ——而且那時錯誤指著的是一個使用者根本沒動過的欄位。當場標紅，他馬上就知道
+ * 要改。路徑是空的就什麼都不做（清空路徑不該憑空生出一個名字）。
+ */
+function suggestNameFromConf() {
+  const nameField = wgInput("wgName");
+  if (nameField.value.trim()) return;
+  const path = wgInput("conf").value.trim();
+  if (!path) return;
+  const suggested = basename(path).replace(/\.conf$/i, "");
+  if (!suggested) return;
+  nameField.value = suggested;
+  setFieldError(backdrop(), "wgName", validateConnName(suggested) ?? "");
+}
+
 /** .conf 路徑輸入框內嵌的 folder icon 鈕：叫原生檔案選擇器，取消時 pickWgConf 回 null */
 async function pickConf() {
   // Save 在途時表單的值已經被讀走了，這時換掉 .conf 路徑（還可能連帶改 Name）
@@ -488,19 +528,7 @@ async function pickConf() {
     wgInput("conf").value = path;
     setFieldError(backdrop(), "conf", "");
     invalidateTest();
-    // 選檔當下順手帶一個名字，使用者還沒自己填的話——跟 remote 的正規化一樣，
-    // 只是預填，使用者仍然可以自己改。
-    //
-    // 預填完立刻驗一次：檔名不受連線名的規則管，「My VPN.conf」這種帶空格的
-    // 名字在 Windows 上再正常不過，直接塞進去等於埋一顆到按下 Save 才爆的雷
-    // ——而且那時錯誤指著的是一個使用者根本沒動過的欄位。當場標紅，他馬上
-    // 就知道要改。
-    const nameField = wgInput("wgName");
-    if (!nameField.value.trim()) {
-      const suggested = basename(path).replace(/\.conf$/i, "");
-      nameField.value = suggested;
-      setFieldError(backdrop(), "wgName", validateConnName(suggested) ?? "");
-    }
+    suggestNameFromConf();
   } catch (e) {
     setFieldError(backdrop(), "conf", String(e));
   }
@@ -510,15 +538,15 @@ async function commitDelete() {
   const target = originalName;
   const kind = originalKind;
   if (!target || !kind || busy) return;
-  busy = true;
+  setBusy(true);
   try {
     if (kind === "ssh") await deleteSource(target);
     else await deleteWgProxy(target);
-    busy = false;
+    setBusy(false);
     closeSourceSheet();
     handlers.onDeleted(target);
   } catch (e) {
-    busy = false;
+    setBusy(false);
     showFoot("edit");
     setGeneralError(el<HTMLDivElement>("src-error"), String(e));
   }
@@ -570,6 +598,16 @@ export function initSourceSheet(h: Handlers) {
       if (e.key === "Enter") void save();
     });
   }
+
+  /**
+   * 路徑欄可以手打／貼上，所以自動帶名要綁在「輸入完」而不是每一次按鍵：
+   * 綁 input 的話第一個字母敲下去就會把 Name 填成那個字母，之後 Name 不再是空的、
+   * 就再也不會更新，使用者最後拿到的是一個殘缺的名字。blur 才是「這欄我填完了」。
+   *
+   * 走 Enter 直接送出的路徑不會經過 blur，saveWg 開頭因此也補了一次（同一支函式，
+   * 只在 Name 為空時作用，重複呼叫是安全的）。
+   */
+  wgInput("conf").addEventListener("blur", suggestNameFromConf);
 }
 
 // ---------------------------------------------------------------- 轉發（forward 列）sheet

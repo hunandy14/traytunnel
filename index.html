@@ -248,7 +248,8 @@
             <label class="sheet-field field-conf">
               <span class="edit-label">.conf path</span>
               <span class="input with-icon">
-                <input id="wg-conf" class="mono" spellcheck="false" placeholder="C:\Users\you\wg\home-relay.conf" readonly />
+                <!-- 路徑可以手打／貼上，不是唯讀的選檔結果；送出期間由 setBusy 暫時鎖成唯讀 -->
+                <input id="wg-conf" class="mono" spellcheck="false" placeholder="C:\Users\you\wg\home-relay.conf" />
                 <button class="input-icon-btn" id="wg-pick" type="button" title="Browse…" data-icon="folder-open" data-icon-size="14"></button>
               </span>
               <span class="field-error"></span>
