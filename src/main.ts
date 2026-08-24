@@ -59,11 +59,12 @@ import { basename } from "./util";
 const EMPTY: Snapshot = {
   closeToTray: true,
   autostart: false,
-  checkForUpdates: true,
+  automaticUpdates: true,
   sources: [],
   wgProxies: [],
   logs: [],
   update: null,
+  pendingUpdate: null,
 };
 
 let snap: Snapshot = EMPTY;

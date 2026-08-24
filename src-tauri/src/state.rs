@@ -146,8 +146,9 @@ pub struct UpdateInfo {
 pub struct Snapshot {
     pub close_to_tray: bool,
     pub autostart: bool,
-    /// 實際生效的值（設定檔沒寫時已經照模式決定好了），設定頁的開關直接吃它
-    pub check_for_updates: bool,
+    /// 「Automatic updates」開關實際生效的值（設定檔沒寫時已經照模式決定好了），
+    /// 設定頁的開關直接吃它
+    pub automatic_updates: bool,
     pub sources: Vec<SourceView>,
     /// wg 連線。對舊前端是相容的加法：沒有就是空陣列
     pub wg_proxies: Vec<WgProxyView>,
@@ -155,6 +156,9 @@ pub struct Snapshot {
     pub logs: Vec<String>,
     /// 背景檢查發現的新版，沒有就是 null（介面靠它決定要不要顯示更新列）
     pub update: Option<UpdateInfo>,
+    /// 已經下載好、等下一次啟動安裝的那一版版本號（不帶 v），沒有就是 null。
+    /// 介面與系統匣靠它決定要不要給「Restart to update」
+    pub pending_update: Option<String>,
 }
 
 /// 監看迴圈的佔位：位子有人就不發新號，避免同一個出口被起第二條 ssh。
@@ -543,6 +547,8 @@ pub struct AppState {
     read_only: AtomicBool,
     /// 背景更新檢查的結果，None 代表目前沒有新版可用
     update: Mutex<Option<UpdateInfo>>,
+    /// 已經下載好、等下一次啟動才安裝的那一版，None 代表暫存區是空的
+    pending: Mutex<Option<crate::update::Pending>>,
 }
 
 impl AppState {
@@ -566,6 +572,7 @@ impl AppState {
             exiting: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
             update: Mutex::new(None),
+            pending: Mutex::new(None),
         }
     }
 
@@ -900,6 +907,14 @@ impl AppState {
         });
     }
 
+    /// 這個出口的監看位子上有沒有人。
+    ///
+    /// **只讀，不搶位子**——看門狗要問的正是「有沒有」，拿 `claim_supervisor`
+    /// 去問等於自己把位子占走，之後真正的監看迴圈反而起不來。
+    pub fn has_supervisor(&self, local: u16) -> bool {
+        self.with_exit_mut(local, |rt| rt.supervisor.is_some()).unwrap_or(false)
+    }
+
     /// 搶下這個出口的監看位子，回傳 None 代表已經有一條線在跑，不要再起第二條
     pub fn claim_supervisor(&self, local: u16) -> Option<u64> {
         let counter = &self.generation;
@@ -1045,6 +1060,11 @@ impl AppState {
         self.wg_engines.lock().unwrap().get_mut(conn).map(f)
     }
 
+    /// 這條連線的監看位子上有沒有人。理由同 [`AppState::has_supervisor`]：只讀，不搶
+    pub fn wg_has_supervisor(&self, conn: &str) -> bool {
+        self.with_engine_mut(conn, |rt| rt.supervisor.is_some()).unwrap_or(false)
+    }
+
     /// 搶下這條連線的監看位子，回傳 None 代表已經有一顆引擎在跑（或連線不在了）
     pub fn wg_claim_supervisor(&self, conn: &str) -> Option<u64> {
         let counter = &self.generation;
@@ -1113,32 +1133,63 @@ impl AppState {
         self.exiting.store(true, Ordering::SeqCst);
     }
 
+    /// 把「正在退出」收回來。
+    ///
+    /// 只有一條路會用到：更新交棒在最後一刻失敗了（安裝程式起不起來），
+    /// 程式要留在原地繼續跑，那面旗子就不可以留著——留著的話按下關閉鈕會直接
+    /// 結束程式而不是縮回系統匣（`CloseRequested` 那道判斷看的正是它）。
+    pub fn clear_exiting(&self) {
+        self.exiting.store(false, Ordering::SeqCst);
+    }
+
     pub fn autostart(&self) -> bool {
         crate::winsys::autostart_enabled(&autostart_name(&self.app))
     }
 
-    /// 這次執行要不要檢查更新：設定檔沒寫的話，一般模式開、可攜模式關
+    /// 這次執行要不要自動更新：設定檔沒寫的話，一般模式開、可攜模式關
     pub fn checks_for_updates(&self) -> bool {
         self.with_config(|c| c.checks_for_updates(self.portable))
     }
 
-    /// 記下背景檢查的結果並推事件；跟上次一樣就不重推。
+    /// 記下背景檢查的結果並推事件；跟上次一樣就不重推，回傳值就是「這次有沒有變」。
     ///
     /// 每 24 小時會再查一次，同一個新版本重複推的話，設定頁那一列會無謂重畫，
-    /// 也讓事件流看起來像真的又發生了什麼事。
-    pub fn set_update(&self, info: Option<UpdateInfo>) {
+    /// 也讓事件流看起來像真的又發生了什麼事。呼叫端拿回傳值決定要不要在活動
+    /// 日誌記那一行「偵測到新版」——同一個理由，一版只記一次。
+    pub fn set_update(&self, info: Option<UpdateInfo>) -> bool {
         {
             let mut slot = self.update.lock().unwrap();
             if *slot == info {
-                return;
+                return false;
             }
             *slot = info.clone();
         }
         let _ = self.app.emit("update-available", info);
+        true
     }
 
     pub fn update_info(&self) -> Option<UpdateInfo> {
         self.update.lock().unwrap().clone()
+    }
+
+    /// 記下暫存區裡那份就緒的更新；跟上次一樣就不重推。
+    ///
+    /// 變了就全量推一次：設定頁那顆鈕與系統匣的「Restart to update」都吃這一份，
+    /// 而它們平常是靠 config-changed 更新的，這裡沿用同一條路就不必再多一種事件。
+    pub fn set_staged(&self, pending: Option<crate::update::Pending>) {
+        {
+            let mut slot = self.pending.lock().unwrap();
+            if *slot == pending {
+                return;
+            }
+            *slot = pending;
+        }
+        self.emit_config_changed();
+    }
+
+    /// 就緒的那一版版本號（不帶 v），暫存區空的就是 None
+    pub fn staged_version(&self) -> Option<String> {
+        self.pending.lock().unwrap().as_ref().map(|p| p.version.clone())
     }
 
     /// 每個源與其出口的當下樣貌，Snapshot 與系統匣選單共用這一份算法。
@@ -1162,12 +1213,13 @@ impl AppState {
     /// 這個保證就不成立：兩條執行緒可以在「A 取完快照、還沒配號」時交錯，
     /// 讓 A 拿到比較大的號碼卻載著比較舊的快照，於是 B 那份新的先被貼上去、
     /// 又被 A 那份舊的蓋掉，系統匣就這樣停在過期的狀態直到下一次狀態變化。
-    fn views_with_seq(&self) -> (Vec<SourceView>, Vec<WgProxyView>, u64) {
+    fn views_with_seq(&self) -> (Vec<SourceView>, Vec<WgProxyView>, Option<String>, u64) {
+        let ready = self.staged_version();
         self.with_config(|cfg| {
             let exits = self.exits.lock().unwrap();
             let views = build_views(cfg, &exits);
             let wg = build_wg_views(cfg, &exits, &self.wg_confs.lock().unwrap());
-            (views, wg, crate::traymenu::next_seq())
+            (views, wg, ready, crate::traymenu::next_seq())
         })
     }
 
@@ -1180,11 +1232,12 @@ impl AppState {
         Snapshot {
             close_to_tray: self.with_config(|c| c.close_to_tray),
             autostart: self.autostart(),
-            check_for_updates: self.checks_for_updates(),
+            automatic_updates: self.checks_for_updates(),
             sources,
             wg_proxies,
             logs: self.logs.lock().unwrap().iter().cloned().collect(),
             update: self.update_info(),
+            pending_update: self.staged_version(),
         }
     }
 
@@ -1194,8 +1247,8 @@ impl AppState {
     /// 系統匣只讀（`refresh` 當場把它轉成選單模型），讀完再把那一份讓給要
     /// 序列化的 Snapshot。兩個接收端彼此獨立，先後順序不影響結果。
     pub fn emit_config_changed(&self) {
-        let (sources, wg, seq) = self.views_with_seq();
-        crate::traymenu::refresh(&self.app, &sources, &wg, seq);
+        let (sources, wg, ready, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, &wg, ready.as_deref(), seq);
         let _ = self.app.emit("config-changed", self.snapshot_with(sources, wg));
     }
 
@@ -1204,8 +1257,8 @@ impl AppState {
     /// 鎖紀律：先取快照與號碼牌（鎖在 `views_with_seq` 裡取完就放掉），之後只碰
     /// 快照，真正碰 tray 的動作在背景執行緒上做，絕不持鎖呼叫系統匣。
     pub fn refresh_tray(&self) {
-        let (sources, wg, seq) = self.views_with_seq();
-        crate::traymenu::refresh(&self.app, &sources, &wg, seq);
+        let (sources, wg, ready, seq) = self.views_with_seq();
+        crate::traymenu::refresh(&self.app, &sources, &wg, ready.as_deref(), seq);
     }
 }
 

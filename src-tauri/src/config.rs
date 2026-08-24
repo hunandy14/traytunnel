@@ -217,7 +217,15 @@ pub struct WgProxy {
 pub struct Config {
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
-    /// 要不要在背景檢查新版。
+    /// 自動更新的總開關（設定頁的「Automatic updates」）。
+    ///
+    /// 它管的是整條自動更新路：背景查版本、查到就靜默下載、下一次啟動安裝。
+    /// 關掉之後完全不連外。
+    ///
+    /// **鍵名維持 `checkForUpdates` 不改**：介面上的名字從「Check for updates」
+    /// 換成「Automatic updates」是因為它現在做的事更多了，但這是同一個開關，
+    /// 而改鍵名的代價是每一份既有設定檔裡使用者親手關掉的那個 false 會被
+    /// 默默忽略、變回預設的開。不值得。
     ///
     /// 刻意是 `Option`：這一項的預設值**跟著執行模式走**（一般模式開、可攜模式
     /// 關），設定檔裡沒寫的時候不能在這裡就決定成某個布林，否則可攜模式讀進來
@@ -329,6 +337,20 @@ impl Config {
             .iter()
             .flat_map(|s| s.forwards.iter())
             .chain(self.wg_proxies.iter().filter(|p| p.enabled).flat_map(|p| p.forwards.iter()))
+            .filter(|f| f.enabled)
+            .map(|f| f.local)
+            .collect()
+    }
+
+    /// 現在該跑的 **ssh** 列。看門狗要的就是這一份。
+    ///
+    /// 與 [`Config::enabled_locals`] 的差別是它不含 wg 的列：wg 的列沒有自己的
+    /// 監看迴圈（統一由引擎那一條代管），拿它們去問「監看位子在不在」永遠是否，
+    /// 混進來就會讓看門狗每次都誤報。
+    pub fn enabled_ssh_locals(&self) -> Vec<u16> {
+        self.sources
+            .iter()
+            .flat_map(|s| s.forwards.iter())
             .filter(|f| f.enabled)
             .map(|f| f.local)
             .collect()
@@ -620,7 +642,8 @@ pub fn default_document() -> String {
          # 關閉鈕（X）是否只隱藏到系統匣。\n\
          closeToTray = {close}\n\
          \n\
-         # 是否在背景檢查新版（啟動後一次，之後每天一次）。\n\
+         # 自動更新（設定頁的 Automatic updates）：背景查新版、查到就靜默下載，\n\
+         # 下一次啟動時安裝。啟動後查一次，之後每天一次。\n\
          # 省略時：一般模式視為 true，可攜模式視為 false。關閉時完全不連外。\n\
          #checkForUpdates = true\n\
          \n\

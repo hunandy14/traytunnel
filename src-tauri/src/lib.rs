@@ -7,6 +7,7 @@ mod ssh;
 mod state;
 mod traymenu;
 mod update;
+mod watchdog;
 // WireGuard → 本地 SOCKS5（行程內使用者態隧道）
 mod wg;
 mod winstate;
@@ -117,6 +118,21 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ---------------------------------------------------------------- 更新交棒
+    //
+    // 這一段**必須是整支程式的第一件事**，位置本身就是規格：
+    //
+    // * 排在 single-instance 外掛註冊之前。那顆外掛一初始化就把具名互斥鎖拿在
+    //   手上，而 NSIS 的靜默安裝會去找還活著的舊行程並把它關掉；我們在還沒拿
+    //   任何鎖的時候就 spawn 完安裝程式並 `exit(0)`，整段互相等待完全不會發生。
+    // * 排在任何 UI 之前。使用者不該看見一個一閃就消失的視窗。
+    //
+    // 有就緒的更新時這一行不會回來（行程直接退出），所以它前面不可以放任何
+    // 有副作用的初始化。**不要把它往後搬。**
+    //
+    // 回來的是要補進活動日誌的行——AppState 這時還不存在，先收著，setup 裡再記。
+    let update_notes = update::apply_pending_at_startup(is_tray_start());
+
     tauri::Builder::default()
         // single-instance 必須第一個註冊：第二個實例只負責喚醒主視窗
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -168,9 +184,8 @@ pub fn run() {
             commands::set_autostart,
             commands::get_config_path,
             commands::open_config_dir,
-            commands::set_check_for_updates,
-            commands::check_for_updates_now,
-            commands::install_update,
+            commands::set_automatic_updates,
+            commands::apply_update,
             commands::open_release_page,
             commands::open_releases_page,
             commands::window_close,
@@ -226,8 +241,15 @@ pub fn run() {
                 });
             }
 
+            // 暫存區裡那份就緒的更新要在第一次畫系統匣之前認回來，
+            // 「Restart to update」才會從一開始就在選單上
+            update::restore_staged(&shared);
+
             shared.refresh_tray();
             shared.log("Traytunnel started");
+            for note in update_notes {
+                shared.log(note);
+            }
             shared.log(format!(
                 "config: {}{}",
                 loc.path.display(),
@@ -287,9 +309,16 @@ pub fn run() {
                 show_main(&handle);
             }
 
-            // enabled 的出口開機就自己連，兩型連線都算
+            // enabled 的出口開機就自己連，兩型連線都算。先記一行「要連幾條」：
+            // 沒有它就分不出「自動連線根本沒被觸發」與「觸發了但一條都沒起來」
+            shared.log(format!(
+                "starting {} enabled exit(s)",
+                shared.with_config(|c| c.enabled_locals().len())
+            ));
             tunnel::start_enabled(&shared);
             wg::start_enabled(&shared);
+            // 十幾秒後複查一次，該在跑卻沒在跑的自己補踢一腳
+            watchdog::spawn(&shared);
             // 更新檢查排在最後：它自己先睡幾秒，啟動路徑上不佔任何時間
             update::spawn_checker(&shared);
             Ok(())
@@ -308,6 +337,12 @@ fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
         traymenu::ID_RECONNECT_ALL => {
             tunnel::reconnect_all(st);
             wg::reconnect_running(st);
+        }
+        // 已經下載好的更新，現在就套用。成功的話這一支不會回來
+        traymenu::ID_APPLY_UPDATE => {
+            if let Err(e) = update::apply_now(st) {
+                st.log(format!("update failed: {e}"));
+            }
         }
         // 狀態行是停用的，照理點不到，真收到也是什麼都不做
         traymenu::ID_STATUS => {}
@@ -355,7 +390,8 @@ fn toggle_all(st: &Shared) {
 }
 
 fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
-    let model = traymenu::menu_model(&shared.source_views(), &shared.wg_views());
+    let ready = shared.staged_version();
+    let model = traymenu::menu_model(&shared.source_views(), &shared.wg_views(), ready.as_deref());
     let menu = traymenu::build(app, &model)?;
 
     // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來

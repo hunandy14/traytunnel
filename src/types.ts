@@ -129,10 +129,11 @@ export interface WgProxyInfo {
 }
 
 /**
- * 有新版可用時的資訊。null（或欄位不存在）代表沒有新版，設定頁就不顯示更新列。
+ * 有新版可用時的資訊。null（或欄位不存在）代表沒有新版。
  *
- * installed 決定使用者看到的是哪一種動作：安裝版可以就地更新（Restart to
- * update），可攜／單檔版只能開瀏覽器到 Releases 自己換檔案（Download）。
+ * installed 決定接下來會發生什麼事：安裝版由後端自己在背景下載好，之後
+ * `pendingUpdate` 會冒出來（介面給「Restart to update」）；可攜／單檔版沒有
+ * 自動更新這條路，只能開瀏覽器到那一版的 release 頁自己換檔案（Get vX.Y.Z）。
  */
 export interface UpdateInfo {
   /** 遠端公告的新版本號，不帶 v */
@@ -143,8 +144,11 @@ export interface UpdateInfo {
 export interface Snapshot {
   closeToTray: boolean;
   autostart: boolean;
-  /** 實際生效的值：設定檔沒寫時，一般模式是 true、可攜模式是 false */
-  checkForUpdates: boolean;
+  /**
+   * 「Automatic updates」實際生效的值：設定檔沒寫時，一般模式是 true、
+   * 可攜模式是 false
+   */
+  automaticUpdates: boolean;
   sources: SourceInfo[];
   /** WireGuard 連線，欄位名稱與 Rust 端的 wgProxies 對齊 */
   wgProxies: WgProxyInfo[];
@@ -152,6 +156,11 @@ export interface Snapshot {
   logs: string[];
   /** 背景更新檢查的結果，沒有新版就是 null */
   update: UpdateInfo | null;
+  /**
+   * 已經下載好、等下一次啟動安裝的那一版版本號（不帶 v），沒有就是 null。
+   * 有值就代表「Restart to update」現在按得下去。
+   */
+  pendingUpdate: string | null;
 }
 
 /** "exit-status" 事件 */

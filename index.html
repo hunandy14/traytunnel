@@ -143,10 +143,10 @@
           <div class="setting-row">
             <span class="setting-icon" data-icon="download" data-icon-size="17"></span>
             <div class="setting-text">
-              <div class="setting-name">Check for updates</div>
-              <div class="setting-hint">Look for new versions in the background, once a day</div>
+              <div class="setting-name">Automatic updates</div>
+              <div class="setting-hint">Download new versions in the background and install them on the next start</div>
             </div>
-            <button class="toggle" id="tg-updates" role="switch" aria-checked="false"></button>
+            <button class="toggle" id="tg-auto-update" role="switch" aria-checked="false"></button>
           </div>
 
           <div class="field-error" id="settings-error"></div>
@@ -156,7 +156,11 @@
                Update available，副標永遠只是純版號，右邊那顆 split button 則把
                「現在是什麼狀況」與「可以做什麼」合成同一顆會變身的鈕（參照 Windows
                Update 的作法），不另外增減整列。狀態文字長短不一，所以主鈕
-               與圖示欄都是固定寬度，下拉走絕對定位，版面全程零跳動。 -->
+               與圖示欄都是固定寬度，下拉走絕對定位，版面全程零跳動。
+
+               更新改成全自動之後，**主鈕只在真的有事情可做時才出現**：沒有新版時
+               它整顆藏起來，只留柄。手動的「Check for updates／Check now」已經拿掉
+               ——背景每天查一次、查到就自己下載，那顆鈕能做的事後端早就做完了。 -->
           <div class="setting-row" id="row-version">
             <img class="about-icon" src="/icon.svg" alt="" />
             <div class="setting-text">
@@ -166,15 +170,12 @@
               <div class="setting-hint" id="app-version">v__APP_VERSION_PLACEHOLDER__</div>
             </div>
             <div class="split" id="update-split" data-state="idle">
-              <button class="split-main" id="btn-update" type="button">
-                <span class="split-icon" id="update-icon" data-icon="refresh-cw" data-icon-size="14"></span>
-                <span class="split-label" id="update-label">Check for updates</span>
+              <button class="split-main" id="btn-update" type="button" hidden>
+                <span class="split-icon" id="update-icon" data-icon="download" data-icon-size="14"></span>
+                <span class="split-label" id="update-label"></span>
               </button>
               <button class="split-chevron" id="btn-update-more" type="button" title="More update options" aria-haspopup="true" aria-expanded="false" data-icon="chevron-down" data-icon-size="14"></button>
               <div class="split-menu" id="update-menu" role="menu" hidden>
-                <button class="split-menu-item" id="mi-check-now" type="button" role="menuitem">
-                  <span class="ico" data-icon="refresh-cw" data-icon-size="14"></span>Check now
-                </button>
                 <button class="split-menu-item" id="mi-release-notes" type="button" role="menuitem">
                   <span class="ico" data-icon="external-link" data-icon-size="14"></span>View release notes
                 </button>

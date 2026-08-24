@@ -326,6 +326,11 @@ async fn supervise(state: &Arc<AppState>, local: u16, generation: u64) {
         }
 
         state.set_exit_status_of(local, generation, status::CONNECTING, None);
+        // spawn 之**前**記一行，不是之後。這一行與下面那句「ssh starting (pid …)」
+        // 之間的時間差，就是 `CreateProcess` 真的花掉的時間——更新重啟後第一次
+        // spawn 曾經卡了大約十秒（Defender 對剛落地的新執行檔做完整掃描），
+        // 而那段時間在日誌上原本是一片空白，看起來就像程式什麼都沒做
+        state.log_from(sname, format!("{} : spawning ssh", f.name));
 
         // spawn 失敗的分支自己記下重試訊息，不再補一行「disconnected」
         let mut spawn_failed = false;

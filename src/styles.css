@@ -1230,6 +1230,15 @@ body {
   transition: background 130ms var(--ease), color 130ms var(--ease);
 }
 
+/* 沒有任何更新動作可做時主鈕整顆藏起來，只剩下拉的柄。
+   柄原本只圓右半邊、左邊還帶一條分隔線（那是給它旁邊那顆主鈕用的），
+   主鈕不在時那兩樣都得收掉，否則會剩下一個左邊被切平、還掛著一道
+   斷線的怪方塊 */
+.split-main[hidden] + .split-chevron {
+  border-left: 0;
+  border-radius: 3px;
+}
+
 .split-chevron:hover:not(:disabled) {
   background: var(--hover-strong);
   color: var(--text);
