@@ -4832,7 +4832,7 @@ dependencies = [
 
 [[package]]
 name = "traytunnel"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
@@ -4842,6 +4842,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "smoltcp",
  "tauri",
  "tauri-build",

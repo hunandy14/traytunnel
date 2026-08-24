@@ -195,6 +195,30 @@ fn a_wg_row_is_only_enabled_when_its_connection_is() {
     assert_eq!(cfg.enabled_locals(), vec![1080, 1085]);
 }
 
+/// `enabled_ssh_locals()` **一條 wg 的列都不可以帶進來**。
+///
+/// 這是啟動自癒看門狗的準入名單。wg 的列沒有自己的監看迴圈（底下所有列都由
+/// 引擎那一條代管），所以拿 wg 的埠去問「監看位子在不在」永遠是否——混進來
+/// 的話看門狗每次啟動都會對同一批 wg 列誤報，還會拿 ssh 那一套動詞去踢它們。
+#[test]
+fn the_watchdogs_ssh_roster_never_contains_a_wg_row() {
+    let mut cfg = cfg_of(
+        vec![src("hk", vec![fwd("exit-a", 1080, "127.0.0.1:1080")])],
+        vec![proxy("ax4200", vec![socks("socks", 1085), fwd("nas", 2222, "10.0.0.5:22")])],
+    );
+    assert_eq!(cfg.enabled_ssh_locals(), vec![1080]);
+    // wg 那邊怎麼開關都不影響這份名單
+    cfg.wg_proxies[0].enabled = false;
+    assert_eq!(cfg.enabled_ssh_locals(), vec![1080]);
+    // 停用 ssh 那一條才會讓它消失
+    cfg.sources[0].forwards[0].enabled = false;
+    assert!(cfg.enabled_ssh_locals().is_empty());
+    // 而 enabled_locals() 仍然是「ssh 那一半 + wg 那一半」的聯集
+    cfg.sources[0].forwards[0].enabled = true;
+    cfg.wg_proxies[0].enabled = true;
+    assert_eq!(cfg.enabled_locals(), vec![1080, 1085, 2222]);
+}
+
 /// W3.5 wg 的某條列撞到 ssh 出口的 local
 #[test]
 fn a_wg_row_clashing_with_an_ssh_exit_is_rejected() {

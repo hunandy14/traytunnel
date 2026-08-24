@@ -21,6 +21,8 @@ pub const ID_OPEN: &str = "open";
 pub const ID_EXIT: &str = "exit";
 pub const ID_ALL_TOGGLE: &str = "all-toggle";
 pub const ID_RECONNECT_ALL: &str = "reconnect-all";
+/// 有一份更新已經下載好在等著時才出現：點了就立刻重啟套用
+pub const ID_APPLY_UPDATE: &str = "apply-update";
 /// 單一出口的開關，後面接本地埠
 pub const EXIT_PREFIX: &str = "exit:";
 /// 單一源的重接，後面接源名
@@ -203,7 +205,11 @@ fn join(sections: Vec<Vec<Node>>) -> Vec<Node> {
 }
 
 /// 狀態快照 → 選單模型。這是版面規則的唯一出處。
-pub fn menu_model(sources: &[SourceView], wg: &[WgProxyView]) -> Vec<Node> {
+///
+/// `ready` 是已經下載好、等著套用的那一版版本號（沒有就是 None）。它自成一段
+/// 放在視窗動作之前：那是一個「會把程式關掉再開起來」的動作，混在隧道那幾項
+/// 中間太容易誤點，而放在最底下又會跟 Exit 黏在一起。
+pub fn menu_model(sources: &[SourceView], wg: &[WgProxyView], ready: Option<&str>) -> Vec<Node> {
     let mut sections = vec![vec![Node::Status(status_line(sources, wg))]];
     if !sources.is_empty() || !wg.is_empty() {
         sections.push(if flattened(sources, wg) {
@@ -216,6 +222,10 @@ pub fn menu_model(sources: &[SourceView], wg: &[WgProxyView]) -> Vec<Node> {
             item(ID_RECONNECT_ALL, "Reconnect all"),
         ]);
     }
+    sections.push(match ready {
+        Some(version) => vec![item(ID_APPLY_UPDATE, format!("Restart to update (v{version})"))],
+        None => Vec::new(),
+    });
     sections.push(vec![item(ID_OPEN, "Open window"), item(ID_EXIT, "Exit")]);
     join(sections)
 }
@@ -228,8 +238,8 @@ pub struct TrayView {
     pub menu: Vec<Node>,
 }
 
-pub fn tray_view(sources: &[SourceView], wg: &[WgProxyView]) -> TrayView {
-    TrayView { tooltip: tooltip_text(sources, wg), menu: menu_model(sources, wg) }
+pub fn tray_view(sources: &[SourceView], wg: &[WgProxyView], ready: Option<&str>) -> TrayView {
+    TrayView { tooltip: tooltip_text(sources, wg), menu: menu_model(sources, wg, ready) }
 }
 
 // ---------------------------------------------------------------- 貼到系統匣
@@ -294,8 +304,14 @@ pub fn next_seq() -> u64 {
 /// 模型在呼叫端的執行緒上就算好（純函式，不碰鎖也不碰 tray），真正碰系統匣的
 /// 動作丟到背景執行：選單事件是在主執行緒上處理的，若在事件處理途中同步把選單
 /// 換掉，等於在自己的回呼裡抽掉正在用的那一份。
-pub fn refresh(app: &AppHandle, sources: &[SourceView], wg: &[WgProxyView], seq: u64) {
-    let view = tray_view(sources, wg);
+pub fn refresh(
+    app: &AppHandle,
+    sources: &[SourceView],
+    wg: &[WgProxyView],
+    ready: Option<&str>,
+    seq: u64,
+) {
+    let view = tray_view(sources, wg, ready);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = APPLY.lock().unwrap_or_else(|e| e.into_inner());
@@ -322,14 +338,15 @@ mod tests {
     use super::*;
 
     /// `menu_model`／`tray_view`／`status_line`／`tooltip_text`／`toggle_label`
-    /// 的簽名依 §5.6 都多了一個 `&[WgProxyView]`。既有這一組測試講的是「只有
-    /// ssh 源時的版面」，**斷言一個字都沒改**，只是由這幾支薄墊片補上空陣列；
-    /// wg 那半邊由下面的專屬測試覆蓋。
+    /// 的簽名依 §5.6 都多了一個 `&[WgProxyView]`，`menu_model`／`tray_view`
+    /// 之後又多了一個「有沒有就緒的更新」。既有這一組測試講的是「只有 ssh 源、
+    /// 沒有待套用更新時的版面」，**斷言一個字都沒改**，只是由這幾支薄墊片補上
+    /// 空陣列與 None；另外那兩半由各自的專屬測試覆蓋。
     fn menu_model(sources: &[SourceView]) -> Vec<Node> {
-        super::menu_model(sources, &[])
+        super::menu_model(sources, &[], None)
     }
     fn tray_view(sources: &[SourceView]) -> TrayView {
-        super::tray_view(sources, &[])
+        super::tray_view(sources, &[], None)
     }
     fn status_line(sources: &[SourceView]) -> String {
         super::status_line(sources, &[])
@@ -612,6 +629,46 @@ mod tests {
         assert_eq!(id.strip_prefix(EXIT_PREFIX).and_then(|p| p.parse::<u16>().ok()), Some(1080));
     }
 
+    /// 更新下載好之後，系統匣多一段「Restart to update」，就在視窗動作之前。
+    ///
+    /// 這是使用者不必打開主視窗就能套用更新的那一條路（自動更新平常是等下一次
+    /// 啟動才裝，這一項讓他可以現在就裝）。標籤帶著版本號，因為點下去的後果
+    /// （程式關掉再開起來）值得先讓人看清楚要換到哪一版。
+    #[test]
+    fn a_ready_update_adds_its_own_section_above_the_window_actions() {
+        let model = super::menu_model(&[], &[], Some("0.6.2"));
+        assert_eq!(
+            model,
+            vec![
+                Node::Status("No connections".into()),
+                Node::Separator,
+                item("apply-update", "Restart to update (v0.6.2)"),
+                Node::Separator,
+                item("open", "Open window"),
+                item("exit", "Exit"),
+            ]
+        );
+        // 沒有就緒的更新時完全不留痕跡，連分隔線都不多一條
+        assert!(!menu_model(&[])
+            .iter()
+            .any(|n| matches!(n, Node::Item { id, .. } if id == ID_APPLY_UPDATE)));
+        assert_eq!(menu_model(&[]).len(), 4);
+    }
+
+    /// 有隧道時那一項照樣落在「全域動作」與「視窗動作」之間
+    #[test]
+    fn the_update_item_sits_between_the_global_and_window_actions() {
+        let model = super::menu_model(&two_sources(), &[], Some("0.6.2"));
+        let at = model
+            .iter()
+            .position(|n| n == &item("apply-update", "Restart to update (v0.6.2)"))
+            .expect("要有這一項");
+        assert_eq!(model[at - 1], Node::Separator);
+        assert_eq!(model[at + 1], Node::Separator);
+        assert_eq!(model[at - 2], item("reconnect-all", "Reconnect all"));
+        assert_eq!(model[at + 2], item("open", "Open window"));
+    }
+
     /// 版面不變量：不會有連在一起的分隔線，也不會開頭或結尾就是分隔線
     #[test]
     fn separators_never_bunch_up() {
@@ -620,6 +677,8 @@ mod tests {
             menu_model(&[source("hk", vec![])]),
             menu_model(&[source("hk", vec![exit("a", 1080, true, status::STOPPED)])]),
             menu_model(&two_sources()),
+            super::menu_model(&[], &[], Some("0.6.2")),
+            super::menu_model(&two_sources(), &[], Some("0.6.2")),
         ];
         for model in cases {
             assert_ne!(model.first(), Some(&Node::Separator));

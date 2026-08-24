@@ -8,7 +8,7 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
-use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
+use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
@@ -96,6 +96,23 @@ fn halt_row(st: &Shared, local: u16) {
     }
 }
 
+/// 「這一次連線是使用者要的」這件事，在活動日誌上留一行。
+///
+/// 為什麼要有它：日誌裡原本只看得到「ssh starting (pid …)」那一類**結果**，
+/// 看不出這條線是開機時自動拉起來的、還是使用者剛剛親手按的。更新重啟後那個
+/// 十秒空窗（Defender 掃描新落地的執行檔）就是靠這個差別才判得出來——沒有這一行，
+/// 「使用者按了但沒反應」與「開機自動連線還沒輪到」在日誌上長得一模一樣。
+///
+/// 只在 `on` 為真時記：中斷那條路本來就會留下 stopped 狀態，不缺這一行。
+fn log_connect_requested(st: &Shared, local: u16) {
+    let name =
+        st.with_config(|c| c.row(local).map(|(conn, f)| (conn.name().to_string(), f.name.clone())));
+    match name {
+        Some((conn, row)) => st.log_from(&conn, format!("{row} : connect requested")),
+        None => st.log(format!("port {local} : connect requested")),
+    }
+}
+
 /// 源不存在時記一行就回
 pub fn require_source(st: &Shared, name: &str) -> bool {
     if st.with_config(|c| c.source(name).is_none()) {
@@ -122,6 +139,9 @@ pub fn set_exit_enabled(st: &Shared, local: u16, on: bool) {
         // 真值——唯讀模式下這條路每次都會走到，只重建系統匣的話介面會一直停在假狀態。
         st.emit_config_changed();
         return;
+    }
+    if on {
+        log_connect_requested(st, local);
     }
     apply_enabled(st, on, || start_row(st, local), || halt_row(st, local));
 }
@@ -193,6 +213,10 @@ fn set_source_enabled(st: &Shared, name: &str, on: bool) {
         st.emit_config_changed();
         return;
     }
+    if on {
+        let count = st.with_config(|c| c.enabled_locals_of(name).len());
+        st.log_from(name, format!("connect requested for {count} exit(s)"));
+    }
     apply_enabled(st, on, || tunnel::start_source(st, name), || tunnel::halt_source(st, name));
 }
 
@@ -210,6 +234,10 @@ pub fn set_all_enabled(st: &Shared, on: bool) {
         // emit_config_changed 一次把介面與系統匣都重建回真值
         st.emit_config_changed();
         return;
+    }
+    if on {
+        let count = st.with_config(|c| c.enabled_locals().len());
+        st.log(format!("connect requested for all {count} exit(s)"));
     }
     apply_enabled(
         st,
@@ -809,44 +837,45 @@ pub fn open_config_dir(state: State<'_, Shared>) {
     }
 }
 
-/// 背景檢查更新的開關。
+/// 自動更新的總開關（設定頁的「Automatic updates」）。
 ///
-/// 關掉之後完全不再連外，並把已經找到的那一版也從畫面上收掉——使用者既然選擇
-/// 不再接收更新提示，留著那一列等同繼續提示。打開則立刻查一次，
-/// 不必等到明天的排程。
+/// 關掉之後完全不再連外，已經找到的那一版從畫面上收掉，**已經下載好躺在暫存區的
+/// 那一份也一起丟掉**。最後這一件不是順手做的：套用更新那條路跑在設定檔載入
+/// 之前（見 `update::discard_staged`），它看不到這個開關，所以「關掉之後不會再
+/// 被自動更新」這個承諾只能靠現在就把標記清掉來兌現。
+///
+/// 打開則立刻查一次，不必等到明天的排程。
 #[tauri::command]
-pub fn set_check_for_updates(state: State<'_, Shared>, on: bool) -> Result<(), String> {
+pub fn set_automatic_updates(state: State<'_, Shared>, on: bool) -> Result<(), String> {
     let st = state.inner();
     st.update_config(|c| c.check_for_updates = Some(on)).map_err(|e| save_error_message(st, e))?;
     st.emit_config_changed();
-    st.log(if on { "update checks enabled" } else { "update checks disabled" });
+    st.log(if on { "automatic updates enabled" } else { "automatic updates disabled" });
     if on {
         update::check_now(st);
     } else {
         st.set_update(None);
+        update::discard_staged(st);
     }
     Ok(())
 }
 
-/// 安裝版的「Restart to update」：下載並交棒給 NSIS 安裝程式。
+/// 設定頁與系統匣的「Restart to update」：把已經下載好的那一版現在就裝上去。
 ///
 /// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，
 /// 所以前端不必為成功的情況做任何收尾。回 Err 才代表這次更新沒能開始。
-#[tauri::command]
-pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
-    let st = state.inner().clone();
-    update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
-}
-
-/// 使用者主動按下的「Check now」。
 ///
-/// **不受背景檢查開關管**：那個開關管的是自動連外，親手按下這顆鈕就是對這一次
-/// 連外的明示同意。結果直接回傳，讓按鈕呈現得出 Up to date 與 Check failed
-/// 那兩個瞬態——Err 就是失敗，Ok(None) 就是已經最新。
+/// 走 `spawn_blocking` 而不是直接做：`apply_now` 要把十幾 MB 的安裝檔整個讀進來
+/// 算一次 SHA-256（落地之後有沒有被動過，只有這一關驗得出來）。同步指令是在
+/// Tauri 的執行緒池上跑的，把那幾百毫秒的整檔讀取留在上面會擋住其他 IPC。
 #[tauri::command]
-pub async fn check_for_updates_now(state: State<'_, Shared>) -> Result<Option<UpdateInfo>, String> {
+pub async fn apply_update(state: State<'_, Shared>) -> Result<(), String> {
     let st = state.inner().clone();
-    update::check_manually(&st).await
+    tauri::async_runtime::spawn_blocking(move || {
+        update::apply_now(&st).inspect_err(|e| st.log(format!("update failed: {e}")))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 某一版的 release 頁：發佈說明與該版的下載資產都在那一頁上。

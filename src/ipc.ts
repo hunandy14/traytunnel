@@ -67,7 +67,15 @@ function normalizeSnapshot(raw: Snapshot): Snapshot {
     mtu: p.mtu ?? null,
     exits: (p.exits ?? []).map(normalizeExit),
   }));
-  return { ...raw, sources, wgProxies, logs: raw.logs ?? [], update: raw.update ?? null };
+  return {
+    ...raw,
+    sources,
+    wgProxies,
+    logs: raw.logs ?? [],
+    update: raw.update ?? null,
+    pendingUpdate: raw.pendingUpdate ?? null,
+    updateStalled: raw.updateStalled ?? false,
+  };
 }
 
 export const getState = () => invoke<Snapshot>("get_state").then(normalizeSnapshot);
@@ -163,9 +171,12 @@ export const upsertWgSocks = (input: WgSocksInput) =>
 export const setCloseToTray = (on: boolean) => invoke<void>("set_close_to_tray", { on });
 export const setAutostart = (on: boolean) => invoke<void>("set_autostart", { on });
 
-/** 背景檢查更新的開關；關掉之後完全不連外 */
-export const setCheckForUpdates = (on: boolean) =>
-  invoke<void>("set_check_for_updates", { on });
+/**
+ * 自動更新的總開關（背景查版本、靜默下載、下次啟動安裝一整條）；
+ * 關掉之後完全不連外
+ */
+export const setAutomaticUpdates = (on: boolean) =>
+  invoke<void>("set_automatic_updates", { on });
 
 /** 這次執行實際生效的設定檔完整路徑（可攜模式與家目錄模式會不一樣） */
 export const getConfigPath = () => invoke<string>("get_config_path");
@@ -176,20 +187,12 @@ export const openConfigDir = () => invoke<void>("open_config_dir");
 // ------------------------------------------------------------ 更新
 
 /**
- * 安裝版的就地更新：下載新版安裝檔並交棒給它。
+ * 「Restart to update」：把已經下載好的那一版現在就裝上去。
  *
  * 正常情況下這個 promise **不會 resolve**——安裝程式一起來，程式本身就退出了。
- * 會 reject 才代表更新沒能開始（沒網路、簽章驗不過之類）。
+ * 會 reject 才代表更新沒能開始（暫存檔驗不過、安裝程式起不來之類）。
  */
-export const installUpdate = () => invoke<void>("install_update");
-
-/**
- * 使用者主動按下的檢查更新。
- *
- * **不受背景檢查開關管**：那個開關管的是自動連外，親手按下就是明示同意這一次。
- * resolve 成 null 代表已經是最新，reject 代表這次檢查失敗（原因後端會寫進活動日誌）。
- */
-export const checkForUpdatesNow = () => invoke<UpdateInfo | null>("check_for_updates_now");
+export const applyUpdate = () => invoke<void>("apply_update");
 
 /**
  * 開某一版的 release 頁：發佈說明與那一版的下載資產都在同一頁上，所以可攜版的

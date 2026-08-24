@@ -133,14 +133,16 @@ pub fn start(state: &Arc<AppState>, conn: &str) {
         state.log_from(conn, format!("cannot start: {err}"));
         return;
     }
-    let Some(generation) = state.wg_claim_supervisor(conn) else {
+    let Some(seat) = crate::state::claim_wg_seat(state, conn) else {
         return; // 已經有一顆引擎在跑
     };
+    let generation = seat.generation();
     let st = state.clone();
     let name = conn.to_string();
     tauri::async_runtime::spawn(async move {
+        // 位子由租約的 Drop 歸還（與 ssh 那邊同一套）
+        let _seat = seat;
         supervise(&st, &name, generation).await;
-        st.wg_release_supervisor(&name, generation);
     });
 }
 
@@ -187,9 +189,31 @@ fn rebuild_owner(state: &Arc<AppState>, local: u16) {
     restart(state, &conn);
 }
 
-/// 所有 enabled 的 wg 連線都拉起來（程式啟動與 start_all 都走這裡）
+/// 現在**應該**有一顆引擎在跑的那些連線。
+///
+/// 兩個條件：底下至少有一條該跑的列（`should_run_engine`），而且 `.conf` 讀得過
+/// ——壞 conf 的連線 [`start`] 一律拒絕並記一行，把它算進「應該在跑」只會讓
+/// 看門狗每次啟動都對同一條連線報一次錯。
+///
+/// `start_enabled` 與看門狗的複查共用這一支：准入條件只有一個定義，
+/// 兩邊就不會對「這條連線該不該在跑」給出不同的答案。
+pub fn wants_engine(state: &Arc<AppState>) -> Vec<String> {
+    state
+        .with_config(|c| {
+            c.wg_proxies
+                .iter()
+                .filter(|p| should_run_engine(c, &p.name))
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .filter(|name| state.wg_conf_error(name).is_none())
+        .collect()
+}
+
+/// 所有該跑的 wg 連線都拉起來（程式啟動與 start_all 都走這裡）
 pub fn start_enabled(state: &Arc<AppState>) {
-    for conn in connection_names(state) {
+    for conn in wants_engine(state) {
         start(state, &conn);
     }
 }
