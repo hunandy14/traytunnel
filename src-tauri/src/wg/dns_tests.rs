@@ -22,7 +22,19 @@ const A_PRIV: [u8; 32] = [0x01; 32];
 const B_PRIV: [u8; 32] = [0x02; 32];
 const A_ADDR: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
 const B_ADDR: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 2);
-const PATIENCE: Duration = Duration::from_secs(10);
+/// 每一次等待的硬上限。
+///
+/// 這是**失敗才付得到**的數字：查詢正常回來時一秒都不會花在這裡，只有真的卡住
+/// 才會等滿。訂得寬是刻意的——CI runner 比開發機慢好幾倍，而且整個 runner 可能
+/// 因為別的工作而停頓數秒，訂緊了換來的不是「早點發現問題」，是隨機紅燈。
+const PATIENCE: Duration = Duration::from_secs(60);
+
+/// 「要等隧道內那顆假伺服器回話」的那幾條測試給查詢的預算。
+///
+/// 同樣是失敗才付得到：答案一到就回，寬鬆不會讓測試變慢。刻意不沿用 production 的
+/// `DEFAULT_TIMEOUT`（5 秒）——那個值是給真實使用者的取捨，拿來當測試預算在
+/// 負載高的機器上太貼邊（本輪就實測到一次整輪停頓把它撞破）。
+const QUERY_BUDGET: Duration = Duration::from_secs(30);
 
 async fn deadline<F: std::future::Future>(f: F) -> F::Output {
     tokio::time::timeout(PATIENCE, f).await.expect("等待逾時：查詢沒有回來")
@@ -310,7 +322,7 @@ async fn a_record_from_the_tunnel_dns_comes_back() {
     let bench = bench_with(
         script(&[("host.test.invalid", Answer::Records(vec![want]))]),
         vec![B_ADDR],
-        crate::wg::dns::DEFAULT_TIMEOUT,
+        QUERY_BUDGET,
     );
     let got = resolve(&bench.client, "host.test.invalid").await.unwrap();
     assert_eq!(got, vec![want]);
@@ -324,7 +336,7 @@ async fn an_aaaa_only_name_resolves_to_v6() {
     let bench = bench_with(
         script(&[("v6.test.invalid", Answer::Records(vec![want]))]),
         vec![B_ADDR],
-        crate::wg::dns::DEFAULT_TIMEOUT,
+        QUERY_BUDGET,
     );
     let got = resolve(&bench.client, "v6.test.invalid").await.unwrap();
     assert_eq!(got, vec![want]);
@@ -339,7 +351,7 @@ async fn an_invalid_tld_still_resolves_through_the_tunnel() {
     let bench = bench_with(
         script(&[("nonexistent.invalid", Answer::Records(vec![want]))]),
         vec![B_ADDR],
-        crate::wg::dns::DEFAULT_TIMEOUT,
+        QUERY_BUDGET,
     );
     let got = resolve(&bench.client, "nonexistent.invalid").await.unwrap();
     assert_eq!(got, vec![want], "答案只可能來自隧道內的那顆假伺服器");
@@ -349,11 +361,8 @@ async fn an_invalid_tld_still_resolves_through_the_tunnel() {
 /// W5.4 NXDOMAIN → `ResolveError::NotFound`（SOCKS5 對應 0x04）
 #[tokio::test]
 async fn nxdomain_maps_to_not_found() {
-    let bench = bench_with(
-        script(&[("gone.test.invalid", Answer::NxDomain)]),
-        vec![B_ADDR],
-        crate::wg::dns::DEFAULT_TIMEOUT,
-    );
+    let bench =
+        bench_with(script(&[("gone.test.invalid", Answer::NxDomain)]), vec![B_ADDR], QUERY_BUDGET);
     assert_eq!(resolve(&bench.client, "gone.test.invalid").await, Err(ResolveError::NotFound));
     assert_eq!(
         crate::wg::socks5::reply_for_resolve(&ResolveError::NotFound),
@@ -396,7 +405,7 @@ async fn the_seventeenth_query_fails_fast_instead_of_blocking() {
     for i in 0..crate::wg::dns::QUERY_SLOTS + 1 {
         s.insert(format!("slot{i}.test.invalid"), Answer::Silent);
     }
-    let bench = bench_with(s, vec![B_ADDR], Duration::from_secs(30));
+    let bench = bench_with(s, vec![B_ADDR], QUERY_BUDGET);
     let mut pending = Vec::new();
     for i in 0..crate::wg::dns::QUERY_SLOTS {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -409,8 +418,10 @@ async fn the_seventeenth_query_fails_fast_instead_of_blocking() {
             .unwrap();
         pending.push(rx);
     }
+    // 「立刻回」的上限。與查詢預算（30 秒）差了 6 倍，慢機器上仍分得出
+    // 「立刻回」與「卡住等逾時」，但不會因為 runner 慢就誤判
     let extra =
-        tokio::time::timeout(Duration::from_secs(1), resolve(&bench.client, "slot16.test.invalid"))
+        tokio::time::timeout(Duration::from_secs(5), resolve(&bench.client, "slot16.test.invalid"))
             .await
             .expect("用罄時要立刻回，不可以卡住");
     assert_eq!(extra, Err(ResolveError::Timeout));
@@ -426,7 +437,7 @@ async fn a_second_server_takes_over_when_the_first_is_silent() {
     let bench = bench_with(
         script(&[("failover.test.invalid", Answer::Records(vec![want]))]),
         vec![dead, B_ADDR],
-        Duration::from_secs(10),
+        QUERY_BUDGET,
     );
     let got = resolve(&bench.client, "failover.test.invalid").await.unwrap();
     assert_eq!(got, vec![want]);
