@@ -196,25 +196,16 @@ fn set_source_enabled(st: &Shared, name: &str, on: bool) {
     apply_enabled(st, on, || tunnel::start_source(st, name), || tunnel::halt_source(st, name));
 }
 
-/// 全部連接／全部中斷：跨連線、跨連線型把 enabled 一起翻過去。
+/// 全部連接／全部中斷：跨連線、跨連線型把 enabled 一起翻過去，**連線層與列層
+/// 兩型都翻**（`Source.enabled`／`WgProxy.enabled` 都跟著 `on` 走）。
 ///
-/// 這一支**刻意比 `set_wg_enabled` 粗**：使用者按的是「全部」，那就是所有列
-/// 加所有連線一起翻，不保留任何逐列意圖。`set_wg_enabled` 那條「不碰列的
-/// enabled」的規則管的是單一連線的總開關，兩者要的是不同的東西。
+/// 這一支**刻意比 `set_wg_enabled`／`set_source_enabled` 粗**：使用者按的是
+/// 「全部」，那就是所有連線加所有列一起翻，不保留任何逐列或逐連線意圖。
+/// 那兩支「只動連線總開關、不碰列的 enabled」的規則管的是單一連線的總開關，
+/// 兩者要的是不同的東西——這裡若漏翻 `Source.enabled`，關掉的連線會被卡在
+/// `enabled_locals()` 永遠為空的狀態，Connect all 因此完全失效。
 pub fn set_all_enabled(st: &Shared, on: bool) {
-    if !save(st, |c| {
-        for s in c.sources.iter_mut() {
-            for f in s.forwards.iter_mut() {
-                f.enabled = on;
-            }
-        }
-        for p in c.wg_proxies.iter_mut() {
-            p.enabled = on;
-            for f in p.forwards.iter_mut() {
-                f.enabled = on;
-            }
-        }
-    }) {
+    if !save(st, |c| config::apply_all_enabled(c, on)) {
         // 同上。系統匣的 Start／Stop all 還會連帶讓那一列的標籤與整份勾選跟著錯，
         // emit_config_changed 一次把介面與系統匣都重建回真值
         st.emit_config_changed();

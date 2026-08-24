@@ -489,6 +489,29 @@ pub fn apply_wg_enabled(cfg: &mut Config, name: &str, on: bool) -> bool {
     }
 }
 
+/// `set_all_enabled` 的純函式版：全部連接／全部中斷，跨連線、跨連線型把
+/// enabled 一起翻過去，**連線層與列層兩型都翻**，不保留任何逐列或逐連線意圖。
+///
+/// 抽成純函式是為了不必生一顆 `AppState`／`AppHandle` 就測得到——`commands.rs`
+/// 那層只剩存檔與 IPC 收尾。與 [`apply_source_enabled`]／[`apply_wg_enabled`]
+/// 刻意不同：那兩支只動連線總開關、不碰列的 enabled，這裡兩層都要跟著 `on`
+/// 走。漏翻 `Source.enabled` 的話，關掉的來源會卡在 [`Config::enabled_locals`]
+/// 永遠為空的狀態，`Connect all` 因此完全失效（審查阻擋缺陷 2026-08-24）。
+pub fn apply_all_enabled(cfg: &mut Config, on: bool) {
+    for s in cfg.sources.iter_mut() {
+        s.enabled = on;
+        for f in s.forwards.iter_mut() {
+            f.enabled = on;
+        }
+    }
+    for p in cfg.wg_proxies.iter_mut() {
+        p.enabled = on;
+        for f in p.forwards.iter_mut() {
+            f.enabled = on;
+        }
+    }
+}
+
 /// 這條列所屬的源有沒有被總開關關掉：`ssh::tunnel::start` 靠它擋下「源關著、
 /// 卻還是有辦法讓某一條列連上」的路（例如系統匣直接勾選單一列、或存檔前的
 /// upsert 順手把新列拉起來）。

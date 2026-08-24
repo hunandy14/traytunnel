@@ -478,6 +478,33 @@ fn enabled_locals_requires_the_owning_source_to_be_enabled_too() {
     );
 }
 
+/// 審查阻擋缺陷的守衛測試：`set_all_enabled` 的 sources 迴圈曾經漏翻
+/// `Source.enabled`，關掉的來源被 Connect all 打開後仍然卡在
+/// `enabled_locals()` 永遠為空——這裡釘住 `apply_all_enabled` 兩層都要翻。
+#[test]
+fn apply_all_enabled_also_flips_the_source_flag_not_just_its_rows() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        wg_proxies: Vec::new(),
+        sources: vec![src("hk", vec![fwd("a", 1080)])],
+    };
+
+    assert!(apply_source_enabled(&mut cfg, "hk", false), "先關掉這個源");
+    assert!(
+        cfg.enabled_locals().is_empty(),
+        "源關著，enabled_locals 應該是空的（即使列自己還是 enabled=true）"
+    );
+
+    apply_all_enabled(&mut cfg, true);
+    assert!(cfg.sources[0].enabled, "Connect all 要把源自己的總開關一起打開");
+    assert_eq!(
+        cfg.enabled_locals(),
+        vec![1080],
+        "源打開之後，enabled_locals 不該再是空的——這正是 Connect all 失效的那個症狀"
+    );
+}
+
 #[test]
 fn missing_fields_fall_back_to_defaults() {
     let cfg = parse_config("[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n").unwrap();

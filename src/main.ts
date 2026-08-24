@@ -608,7 +608,7 @@ function paintCard(exit: ExitInfo) {
 const exitTogglePending = new Set<number>();
 
 /**
- * 列開關按下去之後。與 toggleWgEngine 同款三件套，理由也一樣：
+ * 列開關按下去之後。與 toggleConnEnabled 同款三件套，理由也一樣：
  *
  *   - **防連點**：按下去到 config-changed 回來之間 exit.enabled 還是舊值，
  *     連按兩下會依同一個舊值算出同一個動作、送兩次一模一樣的指令；「開→關」
