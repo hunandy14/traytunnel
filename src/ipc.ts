@@ -55,6 +55,9 @@ function normalizeExit(raw: ExitInfo): ExitInfo {
 function normalizeSnapshot(raw: Snapshot): Snapshot {
   const sources: SourceInfo[] = (raw.sources ?? []).map((s) => ({
     ...s,
+    // 舊後端還沒送這個欄位時，沒有鍵就等於「還沒關過」，跟 Rust 端的
+    // serde 預設（default_true）與 wgProxies.mtu 的 ?? 補值走同一套慣例
+    enabled: s.enabled ?? true,
     exits: (s.exits ?? []).map(normalizeExit),
   }));
   // wgProxies 在舊後端根本不存在，直接 .map 會讓 UI 在第一次取狀態就整個掛掉
@@ -77,6 +80,13 @@ export const restartExit = (local: number) => invoke<void>("restart_exit", { loc
 
 // ------------------------------------------------------------ 源層級
 
+/**
+ * SSH 主卡的連線總開關，與 `setWgEnabled` 同一套語意（見上方說明）：只改寫
+ * `SourceInfo.enabled`，底下各列的 enabled 意圖一個都不碰。
+ *
+ *   stopSource ：把底下所有列停掉，各列的意圖原封不動
+ *   startSource：只啟動列自己也 enabled = true 的那些
+ */
 export const startSource = (name: string) => invoke<void>("start_source", { name });
 export const stopSource = (name: string) => invoke<void>("stop_source", { name });
 
@@ -126,8 +136,7 @@ export const deleteWgProxy = (name: string) => invoke<void>("delete_wg_proxy", {
  * 連線層的引擎總開關（wg-design.md §5.5 第 3 支）。前端的連線總開關與 ⋯ 選單的
  * Connect／Disconnect 都走這一支，不要退回「逐列迴圈呼叫 start_exit／stop_exit」。
  *
- * 與 ssh 的 set_source_enabled **刻意不對稱**：ssh 沒有「連線」這個執行實體，
- * 停它只能逐條改寫每個出口的 enabled；wg 的連線是一顆真的引擎，這一支只改寫
+ * 自 SSH 主卡總開關上線起與 `startSource`／`stopSource` 是同一套語意：只改寫
  * 連線自己的 enabled，**底下各列的 enabled 意圖一個都不碰**——
  *
  *   on = false：停引擎、收掉所有列的監聽器，各列的意圖原封不動

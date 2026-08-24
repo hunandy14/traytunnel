@@ -79,23 +79,23 @@ export function sourceTone(exits: ExitInfo[]): Tone {
  *
  * 融合三層資訊，由重到輕：
  *
- *   1. `.conf` 壞掉（confError）→ 紅。那是連線本身的問題，不是列的彙總看得
- *      出來的，這種連線根本起不來。
- *   2. WG 引擎關著 → 灰。列的意圖還在，但引擎沒開它們不可能跑。
- *   3. 其餘照列的彙總（sourceTone）。引擎開著卻沒有任何列在跑時**刻意不給灰**
+ *   1. `.conf` 壞掉（confError，只有 WG 有這個欄位）→ 紅。那是連線本身的問題，
+ *      不是列的彙總看得出來的，這種連線根本起不來。
+ *   2. 連線總開關關著（SSH／WG 皆有 `conn.data.enabled`，主卡總開關的行為
+ *      自 SSH 對齊 WG 起兩者同一套語意）→ 灰。列的意圖還在，但連線沒開它們
+ *      不可能跑。
+ *   3. 其餘照列的彙總（sourceTone）。連線開著卻沒有任何列在跑時**刻意不給灰**
  *      ——灰配上一顆寫著 Disconnect 的開關是自相矛盾的畫面，改用琥珀表示
- *      「引擎起來了，只是還沒有東西在上面跑」。
+ *      「連線起來了，只是還沒有東西在上面跑」。
  *
  * exits 要是呼叫端先濾掉 pendingDelete 之後的清單。
  */
 export function connTone(conn: ConnRef, exits: ExitInfo[]): Tone {
-  if (conn.kind === "wg") {
-    if (conn.data.confError) return "red";
-    if (!conn.data.enabled) return "grey";
-    const active = activeExits(exits);
-    if (active.some(isBad)) return "red";
-    if (!active.some(isRunning)) return "amber";
-  }
+  if (conn.kind === "wg" && conn.data.confError) return "red";
+  if (!conn.data.enabled) return "grey";
+  const active = activeExits(exits);
+  if (active.some(isBad)) return "red";
+  if (!active.some(isRunning)) return "amber";
   return sourceTone(exits);
 }
 
@@ -110,18 +110,16 @@ export function connTone(conn: ConnRef, exits: ExitInfo[]): Tone {
  * 完整訊息由呼叫端自己貼在需要的地方（summary 副標與引擎點的 tooltip）。
  */
 export function connStatusText(conn: ConnRef, exits: ExitInfo[]): string {
-  if (conn.kind === "wg") {
-    if (conn.data.confError) return "config error";
-    if (!conn.data.enabled) return "stopped";
-  }
+  if (conn.kind === "wg" && conn.data.confError) return "config error";
+  if (!conn.data.enabled) return "stopped";
   if (exits.length === 0) return "no rows";
   const active = activeExits(exits);
   if (active.some((e) => e.status === "port_busy")) return "port busy";
   if (active.some((e) => e.status === "error")) return "error";
-  if (!active.some(isRunning)) {
-    // 引擎開著、卻沒有列在跑（列全被停用，或一條都還沒建）：不是「停止」，是閒置
-    return conn.kind === "wg" && conn.data.enabled ? "idle" : "stopped";
-  }
+  // 連線總開關開著、卻沒有列在跑（列全被停用，或一條都還沒建）：不是「停止」，是閒置。
+  // SSH 與 WG 自總開關對齊起同一套判斷，都以 conn.data.enabled 為準（上面已經
+  // 提前擋掉關著的情況，這裡能走到就代表開著）
+  if (!active.some(isRunning)) return "idle";
   if (active.every((e) => e.status === "connected")) return "connected";
   if (active.some((e) => e.status === "reconnecting")) return "reconnecting";
   return "connecting";
