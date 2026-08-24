@@ -236,7 +236,10 @@ pub(crate) fn cleared_test_state(
     _last_test: Option<TestView>,
     _detected: Option<crate::exits::ProxyProtocol>,
 ) -> (Option<TestView>, Option<crate::exits::ProxyProtocol>) {
-    todo!("W8.25")
+    // 兩個欄位一起歸零。收兩個參數不是為了看它們的值，而是為了讓呼叫端在
+    // 型別上就交不出「只清一個」的寫法——`clear_exit_test` 的兩行賦值改成
+    // 一次解構，就不會有人日後只更新其中一行。
+    (None, None)
 }
 
 /// 設定 + 執行期狀態 → 每個源與其出口的當下樣貌。

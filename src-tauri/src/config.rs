@@ -388,15 +388,15 @@ impl ConnRef<'_> {
 ///
 /// ①③（純轉發）為 false——它們指向任意 TCP 服務，拿代理協定去打必定失敗，
 /// 只會製造一個永遠亮著的假紅點；②④（`probeProxy`）與 ⑤（`socks`）為 true。
-pub fn should_probe(_kind: RowKind, _probe_proxy: bool) -> bool {
-    todo!("W3.25")
+pub fn should_probe(kind: RowKind, probe_proxy: bool) -> bool {
+    matches!(kind, RowKind::Socks) || probe_proxy
 }
 
 /// 要探測的列裡，哪些還需要先識別協定（W3.26）。
 ///
 /// `socks` 列的 listener 是引擎自己起的，協定已知，免識別（§1.5）。
-pub fn needs_detect(_kind: RowKind) -> bool {
-    todo!("W3.26")
+pub fn needs_detect(kind: RowKind) -> bool {
+    !matches!(kind, RowKind::Socks)
 }
 
 /// 快照與系統匣看到的列順序：`socks` 列一律排在 `forward` 列之前，
