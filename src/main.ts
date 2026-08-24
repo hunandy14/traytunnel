@@ -356,7 +356,14 @@ function renderSummary(conn: ConnRef | null) {
   // exit.enabled 同一個語意層級：兩者都是「意圖」，不是即時狀態——後者由狀態點負責。
   const masterToggle = el<HTMLButtonElement>("summary-master-toggle");
   masterToggle.hidden = !conn;
-  setToggle(masterToggle, conn ? conn.data.enabled : false, TOGGLE_TITLES);
+  // pending 期間（toggleConnEnabled 已經樂觀翻過去、還沒等到 config-changed）
+  // 不要用快照裡的舊值蓋掉樂觀顯示：render() 會被別的事件（例如同一條連線底下
+  // 某一列的 exit-status）連帶觸發，快照這時候還是翻之前的舊值，蓋下去就會把
+  // 剛翻過去的開關閃回舊狀態，等真正的 config-changed 抵達又翻一次回去，
+  // 使用者看到的是 OFF → ON → OFF 這種來回閃爍。
+  if (!conn || !masterTogglePending.has(conn.name)) {
+    setToggle(masterToggle, conn ? conn.data.enabled : false, TOGGLE_TITLES);
+  }
 
   // 中段：大分數＋小字狀態。分母是看得到的列數（跟畫面上的卡片張數對得起來），
   // 顏色與底下那行小字則跟兩顆狀態點同源——之前小字自己算一套，會出現
