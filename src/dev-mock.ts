@@ -434,6 +434,38 @@ function stop(exit: ExitInfo, source: string, setIntent = true) {
   log(source, `${exit.name}: stopped`);
 }
 
+/** SSH 的 SourceInfo 與 WG 的 WgProxyInfo 在連線總開關這件事上共用的形狀 */
+interface EnableableConn {
+  name: string;
+  enabled: boolean;
+  exits: ExitInfo[];
+}
+
+/**
+ * 連線層總開關的共用邏輯：SSH 的 start_source／stop_source 與 WG 的
+ * set_wg_enabled 都是同一套語意——
+ *
+ *   on = false：把底下所有列停掉，各列自身的 enabled 意圖不動
+ *   on = true ：只啟動列自己也 enabled = true 的那些（尊重逐列的意圖）
+ *
+ * 兩支 start／stop 都帶 setIntent = false，理由同上：這是連線層的意圖，
+ * 不該連帶把列自己的逐列意圖也改寫掉。
+ *
+ * 呼叫端**不要**在呼叫這支之前先判斷「已經是目標狀態就整段跳過」——真後端
+ * 的 set_source_enabled／set_wg_enabled 都是無條件存檔、無條件呼叫
+ * start／halt（靠 start()／halt() 自己的世代守門保證冪等，不是靠呼叫端提早
+ * return），這裡跳過的話會把「旗標對、但列其實沒真的在跑」這種漂移狀態修
+ * 不回來。
+ */
+function applyConnEnabled(conn: EnableableConn, on: boolean) {
+  conn.enabled = on;
+  if (on) {
+    for (const e of conn.exits) if (e.enabled && e.status === "stopped") start(e, conn.name, false);
+  } else {
+    for (const e of conn.exits) if (e.status !== "stopped") stop(e, conn.name, false);
+  }
+}
+
 /**
  * 編輯一條既有的列：停→改→起→pushConfig。
  *
@@ -725,20 +757,10 @@ function handle(cmd: string, args: Args): unknown {
 
     // ---------------------------------------------------------- 源層級
 
-    /**
-     * SSH 主卡的連線總開關（與下面的 set_wg_enabled 同一套語意）：
-     *
-     *   stop_source ：把底下所有列停掉，各列自身的 enabled 意圖不動
-     *   start_source：只啟動 enabled = true 的列（尊重逐列的意圖）
-     *
-     * 所以這裡的 start／stop 都帶 setIntent = false，理由與 set_wg_enabled
-     * 完全一樣。已經是那個狀態就不重複動作，也不重推 config-changed。
-     */
     case "start_source": {
       const src = findSource(args.name as string);
-      if (!src || src.enabled) return null;
-      src.enabled = true;
-      for (const e of src.exits) if (e.enabled && e.status === "stopped") start(e, src.name, false);
+      if (!src) return null;
+      applyConnEnabled(src, true);
       pushConfig();
       log(src.name, "connection enabled");
       return null;
@@ -746,9 +768,8 @@ function handle(cmd: string, args: Args): unknown {
 
     case "stop_source": {
       const src = findSource(args.name as string);
-      if (!src || !src.enabled) return null;
-      src.enabled = false;
-      for (const e of src.exits) if (e.status !== "stopped") stop(e, src.name, false);
+      if (!src) return null;
+      applyConnEnabled(src, false);
       pushConfig();
       log(src.name, "connection disabled");
       return null;
@@ -864,12 +885,7 @@ function handle(cmd: string, args: Args): unknown {
         return null;
       }
       if (proxy.enabled === on) return null;
-      proxy.enabled = on;
-      if (on) {
-        for (const e of proxy.exits) if (e.enabled && e.status === "stopped") start(e, proxy.name, false);
-      } else {
-        for (const e of proxy.exits) if (e.status !== "stopped") stop(e, proxy.name, false);
-      }
+      applyConnEnabled(proxy, on);
       pushConfig();
       log(proxy.name, on ? "engine started" : "engine stopped");
       return null;

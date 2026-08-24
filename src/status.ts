@@ -84,19 +84,20 @@ export function sourceTone(exits: ExitInfo[]): Tone {
  *   2. 連線總開關關著（SSH／WG 皆有 `conn.data.enabled`，主卡總開關的行為
  *      自 SSH 對齊 WG 起兩者同一套語意）→ 灰。列的意圖還在，但連線沒開它們
  *      不可能跑。
- *   3. 其餘照列的彙總（sourceTone）。連線開著卻沒有任何列在跑時**刻意不給灰**
- *      ——灰配上一顆寫著 Disconnect 的開關是自相矛盾的畫面，改用琥珀表示
- *      「連線起來了，只是還沒有東西在上面跑」。
+ *   3. 其餘照列的彙總（sourceTone），但把它的灰改判成琥珀：連線開著卻沒有
+ *      任何列在跑時**刻意不給灰**——灰配上一顆寫著 Disconnect 的開關是自相
+ *      矛盾的畫面，改用琥珀表示「連線起來了，只是還沒有東西在上面跑」。
+ *      sourceTone 本身回灰的兩種情況（exits 是空的、或沒有一個在跑）在這裡
+ *      是同一個「連線開著、沒東西在跑」的意思，不必在這裡另外重複一次
+ *      isBad／isRunning 那組階梯。
  *
  * exits 要是呼叫端先濾掉 pendingDelete 之後的清單。
  */
 export function connTone(conn: ConnRef, exits: ExitInfo[]): Tone {
   if (conn.kind === "wg" && conn.data.confError) return "red";
   if (!conn.data.enabled) return "grey";
-  const active = activeExits(exits);
-  if (active.some(isBad)) return "red";
-  if (!active.some(isRunning)) return "amber";
-  return sourceTone(exits);
+  const tone = sourceTone(exits);
+  return tone === "grey" ? "amber" : tone;
 }
 
 /**
