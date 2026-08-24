@@ -621,6 +621,37 @@ function paintCard(exit: ExitInfo) {
   setToggle(refs.toggle, exit.enabled, TOGGLE_TITLES);
 }
 
+/**
+ * 已經送出 start_exit／stop_exit、還在等回應的列（以 local 為鍵）。
+ * 與連線總開關的 wgEnginePending 是同一套道理，只是對象換成單一條列。
+ */
+const exitTogglePending = new Set<number>();
+
+/**
+ * 列開關按下去之後。與 toggleWgEngine 同款三件套，理由也一樣：
+ *
+ *   - **防連點**：按下去到 config-changed 回來之間 exit.enabled 還是舊值，
+ *     連按兩下會依同一個舊值算出同一個動作、送兩次一模一樣的指令；「開→關」
+ *     這種一心二意的連點，最後生效的是哪一個純看回應順序碰運氣。
+ *   - **樂觀更新**：先把開關撥過去，否則在後端回話之前看起來像按了沒反應。
+ *   - **收尾無條件 render**：把樂觀的猜測校正回快照的事實。多數情況
+ *     config-changed 早就到了、這次 render 只是冪等重畫；但後端可以合法地
+ *     拒絕或什麼都不做，少了這一手開關會停在一個永遠不會被修正的位置。
+ */
+function toggleExit(exit: ExitInfo, node: HTMLElement) {
+  if (exitTogglePending.has(exit.local)) return;
+  const next = !exit.enabled;
+  setToggle(node, next, TOGGLE_TITLES);
+  exitTogglePending.add(exit.local);
+  void run(
+    () => (next ? startExit(exit.local) : stopExit(exit.local)),
+    `${next ? "connect" : "disconnect"} ${exit.name}`,
+  ).finally(() => {
+    exitTogglePending.delete(exit.local);
+    render();
+  });
+}
+
 function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement {
   const dot = h("span", { class: "dot" });
 
@@ -654,10 +685,7 @@ function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement 
   // 跟 stopExit／startExit 既有的 IPC 與系統匣勾選同一套邏輯，行為對齊。
   const toggle = h("button", { class: "toggle", attrs: { role: "switch", type: "button" } });
   if (dimmed) toggle.disabled = true;
-  toggle.addEventListener("click", () => {
-    if (exit.enabled) void run(() => stopExit(exit.local), `disconnect ${exit.name}`);
-    else void run(() => startExit(exit.local), `connect ${exit.name}`);
-  });
+  toggle.addEventListener("click", () => toggleExit(exit, toggle));
 
   // 閉包只抓連線的名字與型別兩個原始值，不抓整個 ConnRef：卡片會活到下一次
   // renderCards 為止，抓住 ConnRef 等於連著它指到的那一份快照一起留下來，
