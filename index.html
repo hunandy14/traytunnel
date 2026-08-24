@@ -254,6 +254,14 @@
               </span>
               <span class="field-error"></span>
             </label>
+            <!-- 選填的 MTU 覆寫，緊貼 .conf 路徑欄下方：它修飾的就是上面那份檔案。
+                 空白＝照 .conf（.conf 也沒寫就用 1280），永遠不回寫那份檔案。 -->
+            <label class="sheet-field field-mtu">
+              <span class="edit-label">MTU</span>
+              <span class="input"><input id="wg-mtu" class="mono" spellcheck="false" placeholder="Auto (1280 or config value)" /></span>
+              <span class="setting-hint">Overrides the config file. Raise it (e.g. 1400) for throughput if your line allows; lower it if pages stall.</span>
+              <span class="field-error"></span>
+            </label>
           </div>
 
           <div class="field-error general" id="src-error"></div>

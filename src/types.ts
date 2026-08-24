@@ -113,6 +113,11 @@ export interface WgProxyInfo {
   name: string;
   confPath: string;
   enabled: boolean;
+  /**
+   * 隧道 MTU 的覆寫值，null 代表「照 .conf」（.conf 也沒寫就用應用層預設 1280）。
+   * 編輯面板要靠它把現值帶回欄位裡。
+   */
+  mtu: number | null;
   /** .conf 讀不到／解析不過時的訊息，讀得到就是 null */
   confError: string | null;
   /** 以下四項來自 .conf，唯讀顯示用；金鑰永遠不在其中 */
@@ -237,6 +242,8 @@ export interface WgProxyInput {
   originalName: string | null;
   name: string;
   confPath: string;
+  /** 選填的 MTU 覆寫；null＝不覆寫，後端會把設定檔裡的 mtu 鍵拿掉 */
+  mtu: number | null;
 }
 
 /** test_connection 的輸入：拿表單當下的值測，不必先存檔 */
