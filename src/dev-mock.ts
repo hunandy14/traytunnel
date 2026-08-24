@@ -26,7 +26,9 @@ import type {
 } from "./types";
 import { validateConnName } from "./util";
 
-const STORE_KEY = "traytunnel-dev-mock-v5";
+// v6：SourceInfo 加了 enabled 欄位（SSH 主卡總開關），舊版存的快照缺這個鍵，
+// 版本號往前推一格讓舊的 sessionStorage 內容失效，不必另外寫相容補值邏輯
+const STORE_KEY = "traytunnel-dev-mock-v6";
 
 /**
  * local 全域唯一，出口一律用埠號跨連線找。「一條連線」的形狀直接用前端那邊的
@@ -72,6 +74,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       host: "gateway-jp.example.com",
       user: "ubuntu",
       proxyCommand: "cloudflared access ssh --hostname %h",
+      enabled: true,
       exits: [
         // ② forward + probeProxy=true：後端是代理服務，會做出口檢測並識別協定
         {
@@ -102,6 +105,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       host: "gw-tw.example.com",
       user: "ec2-user",
       proxyCommand: "cloudflared access ssh --hostname %h",
+      enabled: true,
       exits: [
         {
           name: "socks-tw",
@@ -130,6 +134,7 @@ const DEFAULT_SNAPSHOT: Snapshot = {
       host: "lab.internal",
       user: "root",
       proxyCommand: "",
+      enabled: true,
       exits: [],
     },
   ],
@@ -473,6 +478,38 @@ function stop(exit: ExitInfo, source: string, setIntent = true) {
   log(source, `${exit.name}: stopped`);
 }
 
+/** SSH 的 SourceInfo 與 WG 的 WgProxyInfo 在連線總開關這件事上共用的形狀 */
+interface EnableableConn {
+  name: string;
+  enabled: boolean;
+  exits: ExitInfo[];
+}
+
+/**
+ * 連線層總開關的共用邏輯：SSH 的 start_source／stop_source 與 WG 的
+ * set_wg_enabled 都是同一套語意——
+ *
+ *   on = false：把底下所有列停掉，各列自身的 enabled 意圖不動
+ *   on = true ：只啟動列自己也 enabled = true 的那些（尊重逐列的意圖）
+ *
+ * 兩支 start／stop 都帶 setIntent = false，理由同上：這是連線層的意圖，
+ * 不該連帶把列自己的逐列意圖也改寫掉。
+ *
+ * 呼叫端**不要**在呼叫這支之前先判斷「已經是目標狀態就整段跳過」——真後端
+ * 的 set_source_enabled／set_wg_enabled 都是無條件存檔、無條件呼叫
+ * start／halt（靠 start()／halt() 自己的世代守門保證冪等，不是靠呼叫端提早
+ * return），這裡跳過的話會把「旗標對、但列其實沒真的在跑」這種漂移狀態修
+ * 不回來。
+ */
+function applyConnEnabled(conn: EnableableConn, on: boolean) {
+  conn.enabled = on;
+  if (on) {
+    for (const e of conn.exits) if (e.enabled && e.status === "stopped") start(e, conn.name, false);
+  } else {
+    for (const e of conn.exits) if (e.status !== "stopped") stop(e, conn.name, false);
+  }
+}
+
 /**
  * 編輯一條既有的列：停→改→起→pushConfig。
  *
@@ -767,16 +804,18 @@ function handle(cmd: string, args: Args): unknown {
     case "start_source": {
       const src = findSource(args.name as string);
       if (!src) return null;
-      log(src.name, "starting all exits");
-      for (const e of src.exits) if (e.status === "stopped") start(e, src.name);
+      applyConnEnabled(src, true);
+      pushConfig();
+      log(src.name, "connection enabled");
       return null;
     }
 
     case "stop_source": {
       const src = findSource(args.name as string);
       if (!src) return null;
-      log(src.name, "stopping all exits");
-      for (const e of src.exits) if (e.status !== "stopped") stop(e, src.name);
+      applyConnEnabled(src, false);
+      pushConfig();
+      log(src.name, "connection disabled");
       return null;
     }
 
@@ -800,7 +839,8 @@ function handle(cmd: string, args: Args): unknown {
         pushConfig();
         log(input.name, `source updated (${input.user}@${input.host})`);
       } else {
-        state.sources.push({ ...input, exits: [] });
+        // enabled 沿用預設的 true，比照真後端新增源與新增 wg 連線的規則
+        state.sources.push({ ...input, enabled: true, exits: [] });
         pushConfig();
         log(input.name, `source added (${input.user}@${input.host})`);
       }
@@ -903,12 +943,7 @@ function handle(cmd: string, args: Args): unknown {
         return null;
       }
       if (proxy.enabled === on) return null;
-      proxy.enabled = on;
-      if (on) {
-        for (const e of proxy.exits) if (e.enabled && e.status === "stopped") start(e, proxy.name, false);
-      } else {
-        for (const e of proxy.exits) if (e.status !== "stopped") stop(e, proxy.name, false);
-      }
+      applyConnEnabled(proxy, on);
       pushConfig();
       log(proxy.name, on ? "engine started" : "engine stopped");
       return null;
@@ -1211,7 +1246,7 @@ export function installDevMock() {
   log(null, "Traytunnel started");
   log(null, "(browser mock) no Tauri runtime, using fake backend");
   window.setTimeout(() => {
-    for (const s of state.sources) for (const e of s.exits) if (e.enabled) start(e, s.name);
+    for (const s of state.sources) if (s.enabled) for (const e of s.exits) if (e.enabled) start(e, s.name);
     for (const p of state.wgProxies) if (p.enabled) for (const e of p.exits) if (e.enabled) start(e, p.name);
   }, 250);
 }

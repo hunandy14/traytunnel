@@ -34,6 +34,7 @@ fn src(name: &str, forwards: Vec<Forward>) -> Source {
         host: format!("{name}.example.com"),
         user: "bob".into(),
         proxy_command: String::new(),
+        enabled: true,
         forwards,
     }
 }
@@ -424,6 +425,131 @@ fn forward_enabled_is_read_back() {
     let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n\n[[sources.forwards]]\nname = \"a\"\nlocal = 1080\nremote = \"127.0.0.1:1080\"\nenabled = false\n";
     let cfg = parse_config(raw).unwrap();
     assert!(!cfg.sources[0].forwards[0].enabled);
+}
+
+/// 源自己的總開關（W6.12）：沒有 `enabled` 鍵的舊檔一律當成開著，
+/// 與 `WgProxy.enabled` 的舊檔相容規則同一套（見 config.rs 的 `default_true`）
+#[test]
+fn source_enabled_defaults_to_true_when_the_key_is_missing() {
+    let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\n";
+    let cfg = parse_config(raw).unwrap();
+    assert!(cfg.sources[0].enabled);
+}
+
+#[test]
+fn source_enabled_is_read_back() {
+    let raw = "[[sources]]\nname = \"s\"\nhost = \"h\"\nuser = \"u\"\nenabled = false\n";
+    let cfg = parse_config(raw).unwrap();
+    assert!(!cfg.sources[0].enabled);
+}
+
+/// 源的 enabled 存檔後要讀得回同一個值，跟 forward 的 enabled 走同一套機制
+#[test]
+fn source_enabled_round_trips_through_write() {
+    let dir = tmp_dir("source-enabled-write");
+    let mut cfg = Config::default();
+    cfg.sources[0].enabled = false;
+    write_config(&dir, &cfg).unwrap();
+    let back = parse_config(&std::fs::read_to_string(dir.join(TOML_NAME)).unwrap()).unwrap();
+    assert!(!back.sources[0].enabled);
+    assert_eq!(back, cfg);
+}
+
+/// 程式啟動只拉起 enabled=true 的來源（W6.12 起與 wg 對稱）：源關著，
+/// 底下的列就算自己 enabled=true 也不在 `enabled_locals()` 裡
+#[test]
+fn enabled_locals_requires_the_owning_source_to_be_enabled_too() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        wg_proxies: Vec::new(),
+        sources: vec![
+            src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
+            src("tw", vec![fwd("c", 1090)]),
+        ],
+    };
+    assert_eq!(cfg.enabled_locals(), vec![1080, 1090]);
+
+    cfg.sources[0].enabled = false;
+    assert_eq!(
+        cfg.enabled_locals(),
+        vec![1090],
+        "hk 源關著，1080 即使列自己 enabled=true 也不該被拉起來"
+    );
+}
+
+/// 審查阻擋缺陷的守衛測試：`set_all_enabled` 的 sources 迴圈曾經漏翻
+/// `Source.enabled`，關掉的來源被 Connect all 打開後仍然卡在
+/// `enabled_locals()` 永遠為空——這裡釘住 `apply_all_enabled` 兩層都要翻。
+#[test]
+fn apply_all_enabled_also_flips_the_source_flag_not_just_its_rows() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        wg_proxies: Vec::new(),
+        sources: vec![src("hk", vec![fwd("a", 1080)])],
+    };
+
+    assert!(apply_source_enabled(&mut cfg, "hk", false), "先關掉這個源");
+    assert!(
+        cfg.enabled_locals().is_empty(),
+        "源關著，enabled_locals 應該是空的（即使列自己還是 enabled=true）"
+    );
+
+    apply_all_enabled(&mut cfg, true);
+    assert!(cfg.sources[0].enabled, "Connect all 要把源自己的總開關一起打開");
+    assert_eq!(
+        cfg.enabled_locals(),
+        vec![1080],
+        "源打開之後，enabled_locals 不該再是空的——這正是 Connect all 失效的那個症狀"
+    );
+}
+
+/// `row_source_enabled`（W6.12）：源關著就擋下底下每一條列，不管列自己的
+/// enabled 是不是 true；源開著時完全不受列自己的 enabled 影響（那是
+/// `enabled_locals_of` 的事）。跨源、跨連線型都不誤傷：別的 ssh 源不受影響，
+/// wg 的列一律不歸這支管（它只問 ssh 源）。
+///
+/// 這條測試原本在 ssh/tunnel.rs 與 wg_tests.rs 各留一份幾乎相同的版本，
+/// PR #44 覆審要求併成一條，放在 `row_source_enabled` 本身所在的 config.rs
+/// 這一側最合適。
+#[test]
+fn row_source_enabled_gates_every_row_under_a_disabled_source() {
+    let mut cfg = Config {
+        close_to_tray: true,
+        check_for_updates: None,
+        sources: vec![
+            src("hk", vec![fwd("a", 1080), Forward { enabled: false, ..fwd("b", 1083) }]),
+            src("tw", vec![fwd("c", 1090)]),
+        ],
+        wg_proxies: vec![WgProxy {
+            name: "wg1".into(),
+            conf_path: "wg1.conf".into(),
+            enabled: true,
+            mtu: None,
+            forwards: vec![Forward {
+                name: "d".into(),
+                local: 1085,
+                remote: None,
+                kind: RowKind::Socks,
+                probe_proxy: false,
+                enabled: true,
+            }],
+        }],
+    };
+
+    // hk 源開著：兩條列（不論列自己 enabled 與否）都算「源允許它跑」
+    assert!(row_source_enabled(&cfg, 1080));
+    assert!(row_source_enabled(&cfg, 1083), "列自己 enabled=false 不影響這一關要問的事");
+
+    cfg.sources[0].enabled = false;
+    assert!(!row_source_enabled(&cfg, 1080), "源關著，列自己是 true 也不該放行");
+    assert!(!row_source_enabled(&cfg, 1083));
+    assert!(row_source_enabled(&cfg, 1090), "別的源不受影響");
+    // wg 的列一律不歸這支管（它只問 ssh 源），不管源自己的 enabled 是不是 true
+    assert!(!row_source_enabled(&cfg, 1085));
+
+    assert!(!row_source_enabled(&cfg, 9999), "不存在的埠一律 false，不 panic");
 }
 
 #[test]
@@ -918,6 +1044,7 @@ fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
                 host: "hk.example.com".into(),
                 user: "alice".into(),
                 proxy_command: String::new(),
+                enabled: true,
                 forwards: vec![],
             },
             Source {
@@ -925,6 +1052,7 @@ fn writing_over_a_file_with_both_formats_keeps_the_source_comments() {
                 host: "tk.example.com".into(),
                 user: "alice".into(),
                 proxy_command: String::new(),
+                enabled: true,
                 forwards: vec![],
             },
         ],

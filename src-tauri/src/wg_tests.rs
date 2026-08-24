@@ -44,6 +44,7 @@ fn cfg_with_wg() -> Config {
             host: "hk.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             forwards: vec![Forward {
                 remote: Some("127.0.0.1:1080".into()),
                 ..fwd("exit-a", 1080)
@@ -249,27 +250,55 @@ fn turning_it_back_on_only_starts_the_rows_the_user_left_enabled() {
     assert_eq!(rows_to_start(&cfg, "ax4200"), vec![1085, 2280], "中間那條停用的仍是 stopped");
 }
 
-/// W6.12 對比：ssh 的 `set_source_enabled` 逐條把 forward 的 enabled 寫掉。
-///
-/// **行為刻意與 W6.10 不同**——這條測試存在的目的就是釘住這個不對稱，
-/// 避免日後有人「順手對齊」。理由見 §5.5 那張表。
+// ---------------------------------- SSH 主卡總開關（PM 裁決：與 WG 現行行為完全一致）
+//
+// 這裡原本有一條 `the_ssh_connection_switch_is_deliberately_asymmetric`，釘住的
+// 是舊語意（Disconnect 選單項在用：逐條輾平覆寫每列的 enabled）。使用者
+// 2026-08-24 拍板的新規格推翻了它——SSH 主卡的總開關要與 WG 的
+// `set_wg_enabled` 完全同步：只動 `Source.enabled`，底下列的逐列意圖一個都
+// 不碰。舊測試守衛的設計已不成立，PM 裁決予以刪除，新語意改由下面這幾條
+// 測試接手釘住。
+
+/// W6.12（覆審後）`apply_source_enabled(name, false)`：只改 `Source.enabled`，
+/// 三條列（含中間那條本來就停用的）一個都不被動到。對照 W6.10 的 wg 版本。
 #[test]
-fn the_ssh_connection_switch_is_deliberately_asymmetric() {
+fn turning_a_source_off_never_touches_its_rows() {
     let mut cfg = cfg_with_wg();
     cfg.sources[0].forwards.push(Forward { enabled: false, ..fwd("db", 5432) });
+    cfg.sources[0].forwards.push(fwd("web", 8080)); // enabled = true
 
     assert!(apply_source_enabled(&mut cfg, "hk", false));
-    assert!(
-        cfg.sources[0].forwards.iter().all(|f| !f.enabled),
-        "ssh 沒有「連線」這個執行實體，要停就只能逐條停"
-    );
+    assert!(!cfg.sources[0].enabled);
+    let flags: Vec<bool> = cfg.sources[0].forwards.iter().map(|f| f.enabled).collect();
+    assert_eq!(flags, vec![true, false, true], "列的逐條意圖要原封不動");
+}
+
+/// 再打開：源自己的 enabled 復原成 true，列的 enabled 完全沒被這一支動過
+/// ——`enabled_locals_of`（實際拉起哪些列）另外看列自己的旗標，不歸這支管。
+#[test]
+fn turning_a_source_back_on_does_not_rewrite_its_rows_either() {
+    let mut cfg = cfg_with_wg();
+    cfg.sources[0].forwards.push(Forward { enabled: false, ..fwd("db", 5432) });
+    apply_source_enabled(&mut cfg, "hk", false);
 
     assert!(apply_source_enabled(&mut cfg, "hk", true));
-    assert!(
-        cfg.sources[0].forwards.iter().all(|f| f.enabled),
-        "重新打開時全部列都會起——因為剛剛全被寫成 true"
-    );
+    assert!(cfg.sources[0].enabled);
+    assert!(cfg.sources[0].forwards[0].enabled, "本來就開著的那條列還是開著");
+    assert!(!cfg.sources[0].forwards[1].enabled, "本來就關著的那條列不會被總開關順便打開");
 }
+
+/// 對不存在的源名：記一行日誌就退，不 panic、不建出幽靈連線（W6.15 的 ssh 對照組）
+#[test]
+fn apply_source_enabled_on_an_unknown_name_is_a_no_op() {
+    let mut cfg = cfg_with_wg();
+    let before = cfg.clone();
+    assert!(!apply_source_enabled(&mut cfg, "nope", false), "找不到就回 false");
+    assert_eq!(cfg, before, "不可以憑空長出一條連線");
+}
+
+// `row_source_enabled` 的守門測試搬到 config_tests.rs 去了（那裡跟
+// apply_source_enabled／enabled_locals 同屬 config.rs 的純函式測試群；
+// 這裡原本與 ssh/tunnel.rs 各留一份幾乎相同的版本，PR #44 覆審要求只留一條）。
 
 /// W6.13 落檔順序：先存檔成功才動引擎；存檔失敗時引擎維持原狀，
 /// 並推一次 `emit_config_changed` 把樂觀翻過去的開關拉回真值

@@ -103,9 +103,28 @@ fn tooltip_text(sources: &[SourceView], wg: &[WgProxyView]) -> String {
     }
 }
 
-/// 有任何出口 enabled 就給 Disconnect all，全停時給 Connect all
+/// 「有效意圖」的列：連線也 enabled、列自己也 enabled，兩者 AND 起來才算——
+/// 與 `Config::enabled_locals()` 同一套判準（W6.12 起兩型連線都有連線層總開關）。
+///
+/// `toggle_label` 靠它跟 `lib.rs` 的 `toggle_all`（判向用的正是
+/// `enabled_locals().is_empty()`）對齊：只看列的 enabled 會讓標籤與動作方向
+/// 反過來——來源關著、列卻還是 enabled=true 時，標籤誤判成「還有東西開著」
+/// 顯示 Disconnect all，點下去卻因為 `enabled_locals()` 是空的而往
+/// `set_all_enabled(true)` 那個方向走，變成「按下 Disconnect all 卻全部連上」。
+fn effectively_enabled_exits<'a>(
+    sources: &'a [SourceView],
+    wg: &'a [WgProxyView],
+) -> impl Iterator<Item = &'a ExitView> {
+    sources
+        .iter()
+        .filter(|s| s.enabled)
+        .flat_map(|s| s.exits.iter())
+        .chain(wg.iter().filter(|p| p.enabled).flat_map(|p| p.exits.iter()))
+}
+
+/// 有任何「有效意圖」的出口就給 Disconnect all，全停（或連線層總開關關著）時給 Connect all
 fn toggle_label(sources: &[SourceView], wg: &[WgProxyView]) -> &'static str {
-    if all_exits(sources, wg).any(|e| e.enabled) {
+    if effectively_enabled_exits(sources, wg).any(|e| e.enabled) {
         "Disconnect all"
     } else {
         "Connect all"
@@ -358,6 +377,7 @@ mod tests {
             host: "h.example.com".into(),
             user: "bob".into(),
             proxy_command: String::new(),
+            enabled: true,
             exits,
         }
     }
@@ -553,6 +573,36 @@ mod tests {
         sources[0].exits[0].enabled = false;
         assert_eq!(toggle_label(&sources), "Connect all");
         assert_eq!(menu_model(&sources)[5], item("all-toggle", "Connect all"));
+    }
+
+    /// 阻擋缺陷守衛（PR #44 覆審）：來源被總開關關掉，但底下的列全部還是
+    /// enabled=true——標籤要跟 `lib.rs::toggle_all` 判向用的
+    /// `enabled_locals().is_empty()` 同一個方向：Connect all。只看列的
+    /// enabled（不看來源總開關）會讓標籤說 Disconnect all，點下去卻因為
+    /// `enabled_locals()` 是空的而往 `set_all_enabled(true)` 走，方向整個反過來。
+    #[test]
+    fn a_source_switched_off_reads_as_connect_all_even_with_every_row_enabled() {
+        let mut sources = two_sources();
+        for s in sources.iter_mut() {
+            for e in s.exits.iter_mut() {
+                e.enabled = true;
+            }
+        }
+        assert_eq!(
+            toggle_label(&sources),
+            "Disconnect all",
+            "前提：列全開時本來就是 Disconnect all"
+        );
+
+        for s in sources.iter_mut() {
+            s.enabled = false;
+        }
+        assert_eq!(
+            toggle_label(&sources),
+            "Connect all",
+            "來源總開關都關著，即使列自己還是 enabled=true，標籤也要跟 \
+             enabled_locals() 一樣讀成空的方向"
+        );
     }
 
     /// 勾選狀態看的是設定裡的 enabled，不是連線狀態

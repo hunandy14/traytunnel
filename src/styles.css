@@ -544,14 +544,6 @@ body {
   color: var(--muted);
 }
 
-.summary-menu-item.go .ico {
-  color: var(--accent);
-}
-
-.summary-menu-item.danger .ico {
-  color: var(--red);
-}
-
 /* ------------------------------------------------------------ 按鈕 */
 
 .iconbtn {

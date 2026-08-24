@@ -100,6 +100,13 @@ export interface SourceInfo {
   host: string;
   user: string;
   proxyCommand: string;
+  /**
+   * 連線總開關：與 `WgProxyInfo.enabled` 同一套語意（主卡總開關讀的是它，
+   * 不是底下列的 enabled）。只影響連線本身，底下每一條列各自的 enabled
+   * 意圖不受它牽動——關閉時原封不動留著，重新打開時只有原本 enabled 的
+   * 那幾條會被拉起來。
+   */
+  enabled: boolean;
   exits: ExitInfo[];
 }
 

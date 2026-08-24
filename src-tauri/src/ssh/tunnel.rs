@@ -197,15 +197,26 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
     result
 }
 
-/// 啟動單一出口的監看迴圈；出口不在設定裡就什麼都不做。
+/// 啟動單一出口的監看迴圈；出口不在設定裡、或它所屬的源已被總開關關掉時
+/// 什麼都不做（W6.12：源關著就不該有辦法讓底下任何一條列連上，即使是被系統匣
+/// 直接勾選、或存檔時順手要拉起新列這種繞過主視窗總開關的路徑）。
 /// 呼叫端負責先把 enabled 寫進設定。
 ///
 /// 語意是「確保這個出口有一條線在跑」：已經有監看迴圈時直接 no-op，
 /// 不會另起一條。否則 start_all 打在已連線的出口上會讓新迴圈掃到舊 ssh
 /// 還佔著的埠，誤報 5 秒的 port_busy。要換新設定請走 halt 再 start。
 pub fn start(state: &Arc<AppState>, local: u16) {
-    if state.with_config(|c| c.forward(local).is_none()) {
-        return;
+    match state.with_config(|c| c.locate(local).map(|(s, _)| s.enabled)) {
+        Some(true) => {}
+        // 列存在，但所屬的源被總開關關著：這是這一關真正要擋的情況，值得留一行
+        // 診斷——否則系統匣直接勾選單一列、或 restart_exit 這類繞過主視窗總
+        // 開關的路徑會靜靜地什麼都不發生，使用者查不出「怎麼按了沒反應」。
+        Some(false) => {
+            state.log_exit(local, format!("port {local} : source is switched off, not starting"));
+            return;
+        }
+        // 列根本不在設定裡：既有行為就是安靜跳過（例如刪除競態），不必額外記一行
+        None => return,
     }
     let Some(seat) = crate::state::claim_exit_seat(state, local) else {
         return; // 已經有一條線在跑
@@ -576,6 +587,7 @@ mod tests {
                     host: "h.example.com".into(),
                     user: "bob".into(),
                     proxy_command: "cloudflared access ssh --hostname %h".into(),
+                    enabled: true,
                     forwards: vec![
                         Forward {
                             name: "a".into(),
@@ -600,6 +612,7 @@ mod tests {
                     host: "t.example.com".into(),
                     user: "alice".into(),
                     proxy_command: String::new(),
+                    enabled: true,
                     forwards: vec![Forward {
                         name: "c".into(),
                         local: 1090,
@@ -695,6 +708,10 @@ mod tests {
         assert!(interval * count <= 30, "偵測窗口 {interval}x{count} 秒太寬");
         assert!(interval >= 5, "探測太密只是白費封包");
     }
+
+    // `row_source_enabled` 的守門測試併到 config_tests.rs 去了（它跟
+    // apply_source_enabled／enabled_locals 那組同屬 config.rs 的純函式，
+    // 這裡與 wg_tests.rs 原本各留一份幾乎相同的版本，PR #44 覆審要求只留一條）。
 
     #[test]
     fn port_busy_only_when_something_is_listening() {

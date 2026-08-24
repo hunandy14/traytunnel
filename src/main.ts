@@ -1,7 +1,7 @@
 import { bootstrap } from "./bootstrap";
 import { installContextMenuGuard } from "./context-menu";
 import { el, h, setToggle } from "./dom";
-import { hydrateIcons, icon, setIcon } from "./icons";
+import { hydrateIcons, icon } from "./icons";
 import {
   deleteForward,
   getState,
@@ -352,11 +352,18 @@ function renderSummary(conn: ConnRef | null) {
   // 短狀態詞當常態，conf 壞掉時滑過去要看得到完整原因（副標會被省略號截斷）
   engineDot.title = confError ?? statusText;
 
-  // 總開關綁的是引擎旗標（conn.data.enabled），跟列開關綁 exit.enabled 同一個
-  // 語意層級：兩者都是「意圖」，不是即時狀態——後者由狀態點負責。
+  // 總開關綁的是連線旗標（conn.data.enabled，SSH／WG 皆有），跟列開關綁
+  // exit.enabled 同一個語意層級：兩者都是「意圖」，不是即時狀態——後者由狀態點負責。
   const masterToggle = el<HTMLButtonElement>("summary-master-toggle");
-  masterToggle.hidden = conn?.kind !== "wg";
-  setToggle(masterToggle, conn?.kind === "wg" && conn.data.enabled, TOGGLE_TITLES);
+  masterToggle.hidden = !conn;
+  // pending 期間（toggleConnEnabled 已經樂觀翻過去、還沒等到 config-changed）
+  // 不要用快照裡的舊值蓋掉樂觀顯示：render() 會被別的事件（例如同一條連線底下
+  // 某一列的 exit-status）連帶觸發，快照這時候還是翻之前的舊值，蓋下去就會把
+  // 剛翻過去的開關閃回舊狀態，等真正的 config-changed 抵達又翻一次回去，
+  // 使用者看到的是 OFF → ON → OFF 這種來回閃爍。
+  if (!conn || !masterTogglePending.has(conn.name)) {
+    setToggle(masterToggle, conn ? conn.data.enabled : false, TOGGLE_TITLES);
+  }
 
   // 中段：大分數＋小字狀態。分母是看得到的列數（跟畫面上的卡片張數對得起來），
   // 顏色與底下那行小字則跟兩顆狀態點同源——之前小字自己算一套，會出現
@@ -365,16 +372,6 @@ function renderSummary(conn: ConnRef | null) {
   num.textContent = !conn || total === 0 ? "—" : `${connected}/${total}`;
   num.className = `summary-score-num tone-${tone}`;
   el<HTMLDivElement>("summary-score-label").textContent = conn ? statusText : "no rows";
-
-  // 右段：⋯ 選單裡的連／斷那一項只服務 SSH——WG 已經有總開關做同一件事，
-  // 選單裡再放一項會是重複入口，所以 WG 連線直接把這一項藏起來。
-  const toggleOn = exits.some(isRunning);
-  setIcon(el<HTMLSpanElement>("menu-toggle-ico"), toggleOn ? "square" : "play", 14);
-  el<HTMLSpanElement>("menu-toggle-text").textContent = toggleOn ? "Disconnect" : "Connect";
-  const toggleItem = el<HTMLButtonElement>("menu-toggle-source");
-  toggleItem.hidden = conn?.kind === "wg";
-  toggleItem.classList.toggle("danger", toggleOn);
-  toggleItem.classList.toggle("go", !toggleOn);
 
   // WG 專屬的「新增代理」選單項，SSH 連線不顯示
   el<HTMLButtonElement>("menu-add-socks").hidden = conn?.kind !== "wg";
@@ -405,39 +402,40 @@ function menuItem(id: string, action: () => void) {
 }
 
 /**
- * WG 連線的總開關與 ⋯ 選單的連斷動作，兩個入口共用這一支。
+ * 主卡的連線總開關：SSH 與 WG 現在共用同一支。
  *
- * 走連線層級的 set_wg_enabled（wg-design.md §5.5 第 3 支），**不是**對底下每
- * 一條列各送一次 start_exit／stop_exit：後者不會寫到 wgProxies[name].enabled，
- * 而畫面上的總開關與「卡片變暗」讀的正是那個旗標——新建的 WG 連線
- * （enabled = false）會因此永遠變暗、列開關永遠停用、總開關永遠推不動。
+ * 走連線層級的指令（wg 是 set_wg_enabled，ssh 是 start_source／stop_source，
+ * wg-design.md §5.5 第 3 支的兩型對照組），**不是**對底下每一條列各送一次
+ * start_exit／stop_exit：後者不會寫到 `conn.data.enabled`，而畫面上的總開關
+ * 與「卡片變暗」讀的正是那個旗標——新建的連線（enabled = false）會因此永遠
+ * 變暗、列開關永遠停用、總開關永遠推不動。
  *
- * 語意也不同：逐列迴圈會連帶輾平每一條列自己的 enabled 意圖，而引擎總開關
+ * 語意也不同：逐列迴圈會連帶輾平每一條列自己的 enabled 意圖，而連線總開關
  * 關掉時列的意圖要原封不動，重新打開時只起原本就啟用的那幾條。
  */
 /**
- * 已經送出 set_wg_enabled、還在等回應的連線。
+ * 已經送出總開關指令、還在等回應的連線（名字為鍵，SSH／WG 共用同一個池子，
+ * 兩型連線本來就共用同一個命名空間）。
  *
  * 那顆開關按下去到 config-changed 回來之間，畫面上的旗標還是舊值——連按兩下
  * 就會依同一個舊值算出同一個 next，送出兩次一模一樣的指令；更糟的是「開→關」
  * 這種一心二意的連點，最後生效的是哪一個完全看回應順序碰運氣。
  */
-const wgEnginePending = new Set<string>();
+const masterTogglePending = new Set<string>();
 
-function toggleWgEngine(conn: ConnRef & { kind: "wg" }) {
-  if (wgEnginePending.has(conn.name)) return;
+function toggleConnEnabled(conn: ConnRef) {
+  if (masterTogglePending.has(conn.name)) return;
   const next = !conn.data.enabled;
   // 樂觀更新：先把開關撥過去，使用者才不會覺得按了沒反應。
   setToggle(el<HTMLButtonElement>("summary-master-toggle"), next, TOGGLE_TITLES);
-  wgEnginePending.add(conn.name);
-  void run(
-    () => setWgEnabled(conn.name, next),
-    `${next ? "connect" : "disconnect"} ${conn.name}`,
-  ).finally(() => {
-    wgEnginePending.delete(conn.name);
+  masterTogglePending.add(conn.name);
+  const action =
+    conn.kind === "wg" ? () => setWgEnabled(conn.name, next) : () => (next ? startSource(conn.name) : stopSource(conn.name));
+  void run(action, `${next ? "connect" : "disconnect"} ${conn.name}`).finally(() => {
+    masterTogglePending.delete(conn.name);
     // 收尾時照快照重畫一次，把上面那個樂觀的猜測校正回事實。
     // 多數情況 config-changed 早就到了、這一次 render 只是冪等的重畫；
-    // 但後端**可以合法地拒絕**（例如 .conf 解析不過的連線根本起不來，
+    // 但後端**可以合法地拒絕**（例如 .conf 解析不過的 wg 連線根本起不來，
     // 那時它不改旗標也不推 config-changed），少了這一手，開關就會停在
     // 一個永遠不會被修正的錯誤位置。
     render();
@@ -453,12 +451,12 @@ function toggleWgEngine(conn: ConnRef & { kind: "wg" }) {
  * off→on 才是真的重啟（順帶重讀 conf），也才對得起選單上那個字。
  */
 function reconnectWgEngine(conn: ConnRef & { kind: "wg" }) {
-  if (wgEnginePending.has(conn.name)) return;
-  wgEnginePending.add(conn.name);
+  if (masterTogglePending.has(conn.name)) return;
+  masterTogglePending.add(conn.name);
   void run(async () => {
     await setWgEnabled(conn.name, false);
     await setWgEnabled(conn.name, true);
-  }, `reconnect ${conn.name}`).finally(() => wgEnginePending.delete(conn.name));
+  }, `reconnect ${conn.name}`).finally(() => masterTogglePending.delete(conn.name));
 }
 
 function initSummaryMenu() {
@@ -484,27 +482,20 @@ function initSummaryMenu() {
 
   menuItem("menu-add-exit", beginCreateForward);
   menuItem("menu-add-socks", beginCreateSocks);
-  // 這一項只服務 SSH（WG 選單已經藏起來，見 renderSummary）：SSH 沒有「連線」
-  // 這個執行實體，連斷只能靠 start_source／stop_source 逐條掃過去
-  // （那一層在後端，前端不重複做一次迴圈）
-  menuItem("menu-toggle-source", () => {
-    const conn = currentConn();
-    if (!conn) return;
-    if (visibleExits(conn).some(isRunning)) void run(() => stopSource(conn.name), `stop ${conn.name}`);
-    else void run(() => startSource(conn.name), `start ${conn.name}`);
-  });
   menuItem("menu-reconnect-source", () => {
     const conn = currentConn();
     if (!conn) return;
     // WG 有一顆真的引擎可以重啟，走引擎級的 off→on（順帶重讀 conf）。
     // 引擎關著就什麼都不做——「重新連線」不該把一個使用者刻意停掉的連線
-    // 擅自開起來，這一點與下面 SSH 分支「只重接執行中的列」是同一個原則。
+    // 擅自開起來，這一點與下面 SSH 分支是同一個原則。
     if (conn.kind === "wg") {
       if (conn.data.enabled) reconnectWgEngine(conn);
       return;
     }
-    // SSH 一個出口就是一條 ssh 程序，只能逐條重接；
-    // 只重接目前連線中的列，停用中的維持停用，不拉起來
+    // SSH 一個出口就是一條 ssh 程序，只能逐條重接；連線總開關關著時比照 WG
+    // 不動作，不該把使用者刻意關掉的連線繞過總開關拉起來。
+    // 連線開著時只重接目前連線中的列，停用中的維持停用，不拉起來。
+    if (!conn.data.enabled) return;
     for (const exit of visibleExits(conn).filter(isRunning)) {
       void run(() => restartExit(exit.local), `reconnect ${exit.name}`);
     }
@@ -637,12 +628,12 @@ function paintCard(exit: ExitInfo) {
 
 /**
  * 已經送出 start_exit／stop_exit、還在等回應的列（以 local 為鍵）。
- * 與連線總開關的 wgEnginePending 是同一套道理，只是對象換成單一條列。
+ * 與連線總開關的 masterTogglePending 是同一套道理，只是對象換成單一條列。
  */
 const exitTogglePending = new Set<number>();
 
 /**
- * 列開關按下去之後。與 toggleWgEngine 同款三件套，理由也一樣：
+ * 列開關按下去之後。與 toggleConnEnabled 同款三件套，理由也一樣：
  *
  *   - **防連點**：按下去到 config-changed 回來之間 exit.enabled 還是舊值，
  *     連按兩下會依同一個舊值算出同一個動作、送兩次一模一樣的指令；「開→關」
@@ -767,8 +758,9 @@ function renderCards(conn: ConnRef | null) {
   const rows = conn ? visibleExits(conn) : [];
   const socksItems = rows.filter((e) => e.kind === "socks");
   const forwardItems = rows.filter((e) => e.kind !== "socks");
-  // 引擎沒開就整片變暗、列開關停用：那些列的意圖還在，但引擎關著它們不可能跑
-  const dimmed = conn?.kind === "wg" && !conn.data.enabled;
+  // 連線總開關沒開就整片變暗、列開關停用：那些列的意圖還在，但連線關著它們不可能跑
+  // （SSH／WG 皆有 conn.data.enabled，兩型自總開關對齊起同一套判斷）
+  const dimmed = conn ? !conn.data.enabled : false;
 
   renderGroup(el<HTMLDivElement>("proxies-list-head"), proxiesBox, socksItems, conn, dimmed);
   renderGroup(el<HTMLDivElement>("forwards-list-head"), forwardsBox, forwardItems, conn, dimmed);
@@ -1071,7 +1063,7 @@ el<HTMLButtonElement>("btn-settings").addEventListener("click", () => setView("s
 initSummaryMenu();
 el<HTMLButtonElement>("summary-master-toggle").addEventListener("click", () => {
   const conn = currentConn();
-  if (conn?.kind === "wg") toggleWgEngine(conn);
+  if (conn) toggleConnEnabled(conn);
 });
 el<HTMLButtonElement>("btn-first-source").addEventListener("click", () => openSourceSheet(null));
 
