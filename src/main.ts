@@ -564,6 +564,11 @@ function rememberProtocol(exit: ExitInfo) {
  *
  * `hint` 是「該不該說那句話」的**唯一**判準，徽章與底下的檢測行都引用它，
  * 不各自再算一次——兩處講的是同一件事，判準分兩份遲早會分岔。
+ *
+ * `kind === "socks"` 那一支**現在只有 `hint` 還在用**：引擎自建的列不再畫徽章
+ * （見 buildCard 的 showBadge），但它底下的檢測行仍然會問這裡。那句
+ * NOT_A_PROXY_HINT 講的是「把旗標關掉」，而 socks 列根本沒有那個旗標可以關，
+ * 所以這一支必須留著把 hint 釘在 false，不能讓它掉進下面 lastTest 失敗的分支。
  */
 function badgeLook(exit: ExitInfo): { text: string; accent: boolean; hint: boolean } {
   if (exit.kind === "socks") return { text: "SOCKS5", accent: true, hint: false };
@@ -659,7 +664,12 @@ function buildCard(exit: ExitInfo, conn: ConnRef, dimmed: boolean): HTMLElement 
   // 徽章：舊後端那個 true 是為了相容假設出來的，不足以拿來宣稱「這條列是代理」。
   // PR 之前這個位置本來就沒有徽章，憑空長出一排 PROXY／PROXY? 只會讓人以為設定
   // 被改過。後端補上 kind／probeProxy 後 legacy 不再成立，徽章自然回來。
-  const showBadge = !exit.legacy && showTest;
+  //
+  // 引擎自建的列（kind === "socks"）不畫徽章：它只會出現在「SOCKS5」區段裡，
+  // 在區段標題底下再掛一個寫著 SOCKS5 的徽章是零資訊的重複。PORT FORWARDS 那邊
+  // 勾了「目的地是代理」的轉發列不同——那個區段裡的列協定各異，徽章是唯一的
+  // 識別，原樣保留。
+  const showBadge = !exit.legacy && showTest && exit.kind !== "socks";
   let badge: HTMLElement | null = null;
   let nameEl: HTMLElement;
   if (showBadge) {
