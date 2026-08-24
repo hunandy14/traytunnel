@@ -588,7 +588,11 @@ mod tests {
                 e.enabled = true;
             }
         }
-        assert_eq!(toggle_label(&sources), "Disconnect all", "前提：列全開時本來就是 Disconnect all");
+        assert_eq!(
+            toggle_label(&sources),
+            "Disconnect all",
+            "前提：列全開時本來就是 Disconnect all"
+        );
 
         for s in sources.iter_mut() {
             s.enabled = false;
