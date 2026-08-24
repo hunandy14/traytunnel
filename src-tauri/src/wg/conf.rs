@@ -78,6 +78,17 @@ impl std::fmt::Display for IpNet {
     }
 }
 
+/// `AllowedIPs` 的出口過濾器：這個位址准不准進隧道（設計書 Q2、§2.2 防線二）。
+///
+/// **只有這一份實作**：stack 的出站過濾與 MTU 探測的目標挑選都走這裡。
+/// 兩邊各寫一份的話，遲早會出現「stack 擋得住、探測封包卻繞過去了」的後門。
+///
+/// 空清單只可能來自「conf 明寫了一個空的 `AllowedIPs`」——解析器對缺鍵的情況
+/// 補的是全開（W1.16），所以這裡照字面擋住。
+pub fn allowed(nets: &[IpNet], ip: &IpAddr) -> bool {
+    nets.iter().any(|n| n.contains(ip))
+}
+
 /// 兩串位元組的前 `bits` 個位元相不相等
 fn prefix_eq(a: &[u8], b: &[u8], bits: u8) -> bool {
     let bits = bits as usize;
@@ -105,7 +116,7 @@ pub struct WgConf {
     ///
     /// 這裡不在解析階段補預設：`.conf` 到底有沒有明寫 MTU 是上層要用到的資訊
     /// （優先序是「介面覆寫 ＞ conf 明寫 ＞ [`APP_DEFAULT_MTU`]」，見
-    /// `wg::effective_mtu`），一補預設就把「明寫 1280」與「沒寫」黏成同一件事。
+    /// `wg::plan_mtu`），一補預設就把「明寫 1280」與「沒寫」黏成同一件事。
     pub mtu: Option<usize>,
     /// `[Interface] ListenPort`，省略時 0（讓 OS 配）
     pub listen_port: u16,
@@ -332,7 +343,7 @@ pub fn parse(raw: &str) -> Result<WgConf, String> {
         private_key: SecretKey(private_key),
         addresses,
         dns,
-        // 沒寫就是 None：預設值由 `wg::effective_mtu` 在組引擎時才決定
+        // 沒寫就是 None：預設值由 `wg::plan_mtu` 在組引擎時才決定
         mtu,
         listen_port,
         peer_public_key,

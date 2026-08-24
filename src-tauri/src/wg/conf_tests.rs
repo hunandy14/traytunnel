@@ -59,7 +59,7 @@ fn with_peer_line(line: &str) -> String {
 fn minimal_conf_fills_every_default() {
     let c = parse(&minimal()).expect("最小合法檔要解析得過");
     // PM 裁決 2026-08-24：解析器不再代入預設 MTU，「conf 沒寫」保留成 None，
-    // 預設值移到應用層（`conf::APP_DEFAULT_MTU`，由 `wg::effective_mtu` 套用）
+    // 預設值移到應用層（`conf::APP_DEFAULT_MTU`，由 `wg::plan_mtu` 套用）
     assert_eq!(c.mtu, None);
     assert_eq!(c.listen_port, 0);
     assert_eq!(c.keepalive, None);

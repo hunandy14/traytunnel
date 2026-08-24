@@ -1,30 +1,34 @@
 //! 隧道內的路徑 MTU 自動探測（PM 裁決 2026-08-24）。
 //!
 //! 只有在**使用者沒覆寫、`.conf` 也沒明寫** MTU 的時候才會跑（優先序仍是
-//! 介面覆寫 ＞ conf 明寫 ＞ 這裡，見 `wg::effective_mtu` 與
-//! [`super::should_probe_mtu`]）。做法是握手完成後往隧道內的閘道
-//! （`.conf` 的第一個 DNS 伺服器）送一顆**填滿到 [`HIGH_MTU`] 位元組**的
-//! ICMP echo：
+//! 介面覆寫 ＞ conf 明寫 ＞ 這裡，見 [`super::plan_mtu`]）。做法是握手完成後
+//! 往隧道內的閘道（`.conf` 的第一個 DNS 伺服器）送一顆**填滿到 [`HIGH_MTU`]
+//! 位元組**的 ICMP echo：
 //!
 //! * 有回音 → 這條路徑吃得下 1420，本輪引擎就用 1420；
-//! * 逾時（含對端擋 ICMP） → 退回 [`SAFE_MTU`]，並記一行**警告**告訴使用者
-//!   可以手動把 MTU 調上去。
+//! * 真的送出去卻沒有回音 → [`Probe::Failed`]，退回 [`SAFE_MTU`] 並記一行
+//!   **警告**告訴使用者可以手動把 MTU 調上去；
+//! * 根本沒送出去（沒有可打的目標、或等不到握手） → [`Probe::Skipped`]，
+//!   一樣用 [`SAFE_MTU`] 但**只記資訊級**——隧道都還沒通的時候丟一句「請手動
+//!   調 MTU」是誤導。
 //!
 //! **一次到位，不做多級二分**：多級探測要好幾個 RTT，而 1420／1280 這兩個值
 //! 已經涵蓋了實務上絕大多數的線路；分不出來的那一段本來就該由使用者手填。
 //!
-//! 結果只活在這一輪引擎的生命週期裡，**不落設定檔**——換了網路（換 Wi-Fi、
-//! 插上手機熱點）再重連時本來就該重探一次。
+//! 結果只活在這一輪連線的執行期裡（supervise 每連線記一份，見
+//! [`super::mtu_for_round`]），**不落設定檔**——換了網路再重連時本來就該重探。
 //!
 //! 實作上刻意**不動用 smoltcp 的 ICMP socket**：那需要多開一個 feature，而且
 //! 探測必須發生在正式的 stack 建起來**之前**（smoltcp 的 MTU 是建構參數，
-//! 起好之後改不了）。手工組一顆 IPv4 + ICMP 封包直接餵給 device 的 outbound
-//! 通道，是這裡侵入性最小的做法：走的是與一般流量完全相同的那條加密路徑。
+//! 起好之後改不了）。封包本身則是用 smoltcp 的 `wire` 型別組出來的
+//! （`Ipv4Repr`／`Icmpv4Repr`），不手工排版面：版面與兩個校驗和都由它負責，
+//! 解析那一側也順帶免費拿到校驗和驗證。
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr};
 
 use super::conf::IpNet;
 
@@ -34,33 +38,55 @@ pub const HIGH_MTU: usize = 1420;
 /// 探不過（或不能探）時的保守值，就是應用層預設 [`super::conf::APP_DEFAULT_MTU`]
 pub const SAFE_MTU: usize = super::conf::APP_DEFAULT_MTU;
 
-/// 一顆探測封包的耐心。隧道內的閘道就在對面，1 秒綽綽有餘；
-/// 這也是「自動探測最多讓連線慢多久」的上限
+/// 一顆探測封包的耐心。隧道內的閘道就在對面，1 秒綽綽有餘
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// 探測前等握手的耐心。握手沒完成時封包只會被 boringtun 排進佇列，
-/// 探了也是逾時。3 秒容得下一次 `REKEY_TIMEOUT`（5 秒）以內的正常握手
-pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(3);
+/// 探測前等握手的耐心。
+///
+/// **必須大於 boringtun 的 `REKEY_TIMEOUT`（5 秒）**：握手的第一顆封包掉了是
+/// 常態，等不到那一次重試就宣告放棄的話，只是把「掉了一顆 UDP」誤釘成
+/// 「這條線路只吃得下 1280」。8 秒容得下一次完整的重試還有餘裕。
+///
+/// 這一段等待**不阻塞任何東西**：列的監聽器在探測開始前就綁好了，device 的
+/// 狀態事件也照常即時往上送（見 `engine::run` 的順序）。
+pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(REKEY_TIMEOUT.as_secs() + 3);
+
+/// boringtun 的 `REKEY_TIMEOUT`。這裡只拿來釘住 [`HANDSHAKE_WAIT`] 與它的關係
+pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 等不到握手時的跳過原因（[`Probe::Skipped`] 的一種，資訊級）
+pub const NO_HANDSHAKE: &str = "handshake not completed";
 
 /// ICMP echo 的識別碼與序號。這條隧道上同時只會有我們這一顆探測封包，
 /// 固定值就足以認得出自己的回音
 const ECHO_ID: u16 = 0x7767;
 const ECHO_SEQ: u16 = 1;
 
+/// IPv4 表頭（無選項）＋ ICMP echo 表頭的長度，用來換算 payload 要填多少
 const IPV4_HEADER_LEN: usize = 20;
-const ICMP_HEADER_LEN: usize = 8;
-const PROTO_ICMP: u8 = 1;
-const ICMP_ECHO_REQUEST: u8 = 8;
-const ICMP_ECHO_REPLY: u8 = 0;
+const ICMP_ECHO_HEADER_LEN: usize = 8;
 
-/// 探測的三種結局。狀態與日誌都由它決定，呼叫端不必自己拼字串
+/// 這一輪引擎的 MTU 決策，由 [`super::plan_mtu`] 產出。
+///
+/// 做成一個 enum 而不是「一個值 ＋ 一個 bool」：後者容得下
+/// 「要探測、但同時又指定了 1400」這種說不通的組合
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// 已經有人指定了（介面覆寫或 `.conf` 明寫，也可能是本連線上一輪探測的
+    /// 結果），照著設就是
+    Fixed(usize),
+    /// 沒有人指定過：這一輪連上之後探一次
+    Probe,
+}
+
+/// 探測的三種結局。狀態、日誌與日誌等級都由它決定，呼叫端不必自己拼字串
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
     /// 1420 的封包有回音
     Ok,
-    /// 逾時：路徑吃不下 1420，或對端擋 ICMP
+    /// **封包真的送出去了**，但沒有回音：路徑吃不下 1420，或對端擋 ICMP
     Failed,
-    /// 這一輪沒得探（附上原因，會出現在日誌裡）
+    /// 一顆探測封包都沒送出去（沒有可打的目標，或等不到握手）
     Skipped(&'static str),
 }
 
@@ -73,8 +99,11 @@ impl Probe {
         }
     }
 
-    /// 降級要記**警告級**（使用者明令）：吞吐量掉一截而畫面上什麼都看不出來，
-    /// 是最需要一行字解釋的那一類情況
+    /// 只有 [`Probe::Failed`] 記警告級。
+    ///
+    /// **真的量到了「這條路徑吃不下 1420」才算降級**，那時吞吐量掉一截而畫面上
+    /// 什麼都看不出來，值得一行警告。反過來說，連握手都還沒成功的時候丟一句
+    /// 「請手動調 MTU」只會把使用者推去改一個根本不相干的設定。
     pub fn is_warning(&self) -> bool {
         matches!(self, Probe::Failed)
     }
@@ -102,137 +131,81 @@ impl Probe {
 /// * `.conf` 沒寫 DNS——沒有一個「一定在隧道另一頭活著」的目標可打；
 /// * 介面沒有 IPv4 位址——這顆探測封包是 IPv4 的；
 /// * DNS 伺服器不在 `AllowedIPs` 內——那條位址本來就不該進隧道（§2.2 防線二），
-///   探測不可以是繞過它的後門。
+///   探測不可以是繞過它的後門。這裡呼叫的就是 stack 出口過濾器用的同一個
+///   [`super::conf::allowed`]，不另寫一份。
 pub fn target(
     addresses: &[IpNet],
     dns: &[IpAddr],
-    allowed: &[IpNet],
+    allowed_ips: &[IpNet],
 ) -> Result<(Ipv4Addr, Ipv4Addr), &'static str> {
-    let Some(dst) = dns.iter().find_map(|ip| match ip {
-        IpAddr::V4(v4) => Some(*v4),
-        IpAddr::V6(_) => None,
-    }) else {
+    let Some(dst) = dns.iter().find_map(only_v4) else {
         return Err("no IPv4 DNS server in the .conf");
     };
-    let Some(src) = addresses.iter().find_map(|n| match n.addr {
-        IpAddr::V4(v4) => Some(v4),
-        IpAddr::V6(_) => None,
-    }) else {
+    let Some(src) = addresses.iter().find_map(|n| only_v4(&n.addr)) else {
         return Err("the interface has no IPv4 address");
     };
-    if !allowed.iter().any(|n| n.contains(&IpAddr::V4(dst))) {
+    if !super::conf::allowed(allowed_ips, &IpAddr::V4(dst)) {
         return Err("the DNS server is outside AllowedIPs");
     }
     Ok((src, dst))
 }
 
-/// 送一顆填到 `total_len` 位元組的 ICMP echo，等它的回音。
-///
-/// 收到的其他封包一律丟掉：這時候正式的 stack 還沒起來，隧道上不會有別的
-/// 連線，而 TCP 的重送本來就不歸這一層管。
-pub async fn probe(
-    outbound: &mpsc::Sender<Vec<u8>>,
-    inbound: &mut mpsc::Receiver<Vec<u8>>,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    timeout: Duration,
-) -> Probe {
-    if outbound.send(echo_request(src, dst, HIGH_MTU)).await.is_err() {
-        return Probe::Failed;
-    }
-    let heard = tokio::time::timeout(timeout, async {
-        loop {
-            match inbound.recv().await {
-                Some(packet) if is_echo_reply(&packet, src, dst) => return true,
-                Some(_) => continue,
-                None => return false,
-            }
-        }
-    })
-    .await;
-    if heard == Ok(true) {
-        Probe::Ok
-    } else {
-        Probe::Failed
+fn only_v4(ip: &IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(_) => None,
     }
 }
 
 /// 一顆總長度剛好 `total_len` 位元組的 IPv4 ICMP echo request（含 IP 表頭）。
 ///
-/// DF 有設：這是路徑 MTU 探測，被沿路某一跳偷偷切開就失去意義了。
+/// 版面、兩個校驗和與 DF 旗標都由 smoltcp 的 `wire` 負責（`Ipv4Repr::emit`
+/// 本來就把 DF 設成 true——路徑 MTU 探測被沿路某一跳偷偷切開就失去意義了）。
 pub fn echo_request(src: Ipv4Addr, dst: Ipv4Addr, total_len: usize) -> Vec<u8> {
-    let total_len = total_len.max(IPV4_HEADER_LEN + ICMP_HEADER_LEN);
-    let mut packet = vec![0u8; total_len];
-
-    // ---- IPv4 表頭（20 位元組，沒有選項）
-    packet[0] = 0x45; // 版本 4、IHL 5
-    packet[1] = 0; // DSCP/ECN
-    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    packet[4..6].copy_from_slice(&ECHO_ID.to_be_bytes()); // Identification
-    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
-    packet[8] = 64; // TTL
-    packet[9] = PROTO_ICMP;
-    // 10..12 是表頭校驗和，先留 0
-    packet[12..16].copy_from_slice(&src.octets());
-    packet[16..20].copy_from_slice(&dst.octets());
-    let ip_sum = checksum(&packet[..IPV4_HEADER_LEN]);
-    packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-
-    // ---- ICMP echo request，其餘位元組留 0 當 padding
-    let icmp = &mut packet[IPV4_HEADER_LEN..];
-    icmp[0] = ICMP_ECHO_REQUEST;
-    icmp[1] = 0; // code
-                 // 2..4 是 ICMP 校驗和，先留 0
-    icmp[4..6].copy_from_slice(&ECHO_ID.to_be_bytes());
-    icmp[6..8].copy_from_slice(&ECHO_SEQ.to_be_bytes());
-    let icmp_sum = checksum(icmp);
-    packet[IPV4_HEADER_LEN + 2..IPV4_HEADER_LEN + 4].copy_from_slice(&icmp_sum.to_be_bytes());
-
-    packet
+    let total_len = total_len.max(IPV4_HEADER_LEN + ICMP_ECHO_HEADER_LEN);
+    let data = vec![0u8; total_len - IPV4_HEADER_LEN - ICMP_ECHO_HEADER_LEN];
+    let icmp = Icmpv4Repr::EchoRequest { ident: ECHO_ID, seq_no: ECHO_SEQ, data: &data };
+    let ip = Ipv4Repr {
+        src_addr: src,
+        dst_addr: dst,
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.buffer_len(),
+        hop_limit: 64,
+    };
+    let caps = ChecksumCapabilities::default();
+    let mut buffer = vec![0u8; ip.buffer_len() + icmp.buffer_len()];
+    ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer[..]), &caps);
+    icmp.emit(&mut Icmpv4Packet::new_unchecked(&mut buffer[ip.buffer_len()..]), &caps);
+    buffer
 }
 
 /// 這顆封包是不是**我們那一顆探測封包**的回音。
 ///
-/// 比對到 id／seq 為止：隧道內的其他流量（乃至於別人的 ping）不可以被誤認成
+/// 比對到 ident／seq 為止：隧道內的其他流量（乃至於別人的 ping）不可以被誤認成
 /// 探測成功，那會讓一條其實吃不下 1420 的線路被判定成吃得下，症狀就是網頁
-/// 載一半的靜默黑洞——正是這整件事要避免的東西。
+/// 載一半的靜默黑洞——正是這整件事要避免的東西。兩個校驗和由 `wire` 的
+/// `parse` 順帶驗掉。
 pub fn is_echo_reply(packet: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> bool {
-    if packet.len() < IPV4_HEADER_LEN + ICMP_HEADER_LEN {
+    let caps = ChecksumCapabilities::default();
+    let Ok(ipv4) = Ipv4Packet::new_checked(packet) else {
+        return false;
+    };
+    let Ok(header) = Ipv4Repr::parse(&ipv4, &caps) else {
+        return false;
+    };
+    // 回音的來源是我們打的那個閘道，目的地是我們自己
+    if header.next_header != IpProtocol::Icmp || header.src_addr != dst || header.dst_addr != src {
         return false;
     }
-    if packet[0] >> 4 != 4 || packet[9] != PROTO_ICMP {
+    let Ok(icmp) = Icmpv4Packet::new_checked(ipv4.payload()) else {
         return false;
+    };
+    match Icmpv4Repr::parse(&icmp, &caps) {
+        Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) => ident == ECHO_ID && seq_no == ECHO_SEQ,
+        _ => false,
     }
-    let ihl = (packet[0] & 0x0f) as usize * 4;
-    if ihl < IPV4_HEADER_LEN || packet.len() < ihl + ICMP_HEADER_LEN {
-        return false;
-    }
-    // 回音的來源是我們打的目標，目的地是我們自己
-    if packet[12..16] != dst.octets() || packet[16..20] != src.octets() {
-        return false;
-    }
-    let icmp = &packet[ihl..];
-    icmp[0] == ICMP_ECHO_REPLY
-        && icmp[4..6] == ECHO_ID.to_be_bytes()
-        && icmp[6..8] == ECHO_SEQ.to_be_bytes()
-}
-
-/// RFC 1071 的網際網路校驗和
-fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let (pairs, rest) = bytes.as_chunks::<2>();
-    for c in pairs {
-        sum += u16::from_be_bytes(*c) as u32;
-    }
-    if let [last] = rest {
-        sum += u16::from_be_bytes([*last, 0]) as u32;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 #[cfg(test)]
 #[path = "mtu_tests.rs"]
-mod tests;
+pub(crate) mod tests;

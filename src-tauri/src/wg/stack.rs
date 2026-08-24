@@ -112,17 +112,43 @@ pub struct StackConfig {
     pub dns_timeout: Duration,
 }
 
+/// **只有測試檯走這一支**：正式路徑要先建指令通道、綁完列再起 stack
+/// （見 `engine::run` 的順序），走的是 [`spawn_prewired`]
+#[cfg(test)]
 pub fn spawn(
     cfg: StackConfig,
     outbound: mpsc::Sender<Vec<u8>>,
     inbound: mpsc::Receiver<Vec<u8>>,
     cancel: CancellationToken,
 ) -> StackHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_DEPTH);
-    let join = tokio::spawn(run(cfg, outbound, inbound, cmd_rx, cancel));
+    let (cmd_tx, cmd_rx) = command_channel();
+    let join = spawn_prewired(cfg, outbound, inbound, cmd_rx, Vec::new(), cancel);
     StackHandle { cmd: cmd_tx, join }
 }
 
+/// 指令通道。**先建通道、後起 stack** 是引擎那一側的需要：列的監聽器必須在
+/// MTU 探測開始之前就綁好（否則探測那一秒鐘裡本地埠是關的，客戶端會直接被
+/// 拒絕），而監聽器需要一個現在就送得進去的 `cmd`。探測期間送進來的指令
+/// 排在通道裡等，stack 一起來就照順序處理。
+pub fn command_channel() -> (mpsc::Sender<StackCmd>, mpsc::Receiver<StackCmd>) {
+    mpsc::channel(CMD_CHANNEL_DEPTH)
+}
+
+/// [`spawn`] 的「通道自己帶來」版。`prefill` 是 stack 起來之前就已經到站的
+/// 入站封包（MTU 探測窗那一段收到的），開機時先灌進虛擬網卡的收包佇列，
+/// 不白白丟掉
+pub fn spawn_prewired(
+    cfg: StackConfig,
+    outbound: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::Receiver<Vec<u8>>,
+    cmd_rx: mpsc::Receiver<StackCmd>,
+    prefill: Vec<Vec<u8>>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run(cfg, outbound, inbound, cmd_rx, prefill, cancel))
+}
+
+#[cfg(test)]
 pub struct StackHandle {
     pub cmd: mpsc::Sender<StackCmd>,
     /// 同 `DeviceHandle::join`：正式路徑靠取消權杖收尾，這個 handle 只給
@@ -260,9 +286,11 @@ async fn run(
     outbound: mpsc::Sender<Vec<u8>>,
     mut inbound: mpsc::Receiver<Vec<u8>>,
     mut cmd_rx: mpsc::Receiver<StackCmd>,
+    prefill: Vec<Vec<u8>>,
     cancel: CancellationToken,
 ) {
-    let mut device = VirtualDevice { mtu: cfg.mtu, rx: VecDeque::new(), tx: outbound };
+    // 探測窗裡先到的封包排在收包佇列的最前面，順序與它們到站的順序相同
+    let mut device = VirtualDevice { mtu: cfg.mtu, rx: VecDeque::from(prefill), tx: outbound };
 
     let mut iface_cfg = smoltcp::iface::Config::new(HardwareAddress::Ip);
     // 不引入 rand：虛擬介面的序號種子只要每次啟動不同就夠了
@@ -478,7 +506,7 @@ fn handle_cmd(
         StackCmd::Connect { dst, reply } => {
             // Q2：AllowedIPs 是**出口過濾器**（真 WireGuard 的 cryptokey routing
             // 就是這個語意），擋下時明確回一個碼，比靜默黑洞好除錯得多
-            if !allowed(&cfg.allowed_ips, &to_std(&dst.addr)) {
+            if !conf::allowed(&cfg.allowed_ips, &to_std(&dst.addr)) {
                 let _ = reply.send(Err(ConnectError::NotAllowed));
                 return;
             }
@@ -553,12 +581,6 @@ fn handle_cmd(
             }
         }
     }
-}
-
-fn allowed(nets: &[conf::IpNet], ip: &IpAddr) -> bool {
-    // 空清單只可能來自「conf 明寫了一個空的 AllowedIPs」——解析器對缺鍵的情況
-    // 補的是全開（W1.16），所以這裡照字面擋住
-    nets.iter().any(|n| n.contains(ip))
 }
 
 #[derive(Default)]

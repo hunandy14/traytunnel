@@ -2,8 +2,28 @@
 //!
 //! 這一層只認**機制**：`Forward` 綁 `serve_forward`、`Socks` 綁 `serve_socks5`。
 //! `probeProxy` 不在這裡——它只決定 supervise 要不要排自測，封包怎麼走完全一樣。
+//!
+//! # 組裝順序（覆審打回 2026-08-24 後重做）
+//!
+//! [`spawn`] **立刻回傳事件通道**，真正的組裝在一個任務裡按這個順序跑：
+//!
+//! 1. 先綁全部列的監聽器並推 `Row(connecting)`——這一步必須排在任何引擎層
+//!    狀態事件之前。反過來的話，`Engine(connected)` 會先進佇列、被 supervise
+//!    攤成「每一條列 connected」，緊接著晚到的 `Row(connecting)` 又把它們壓回
+//!    connecting，而 device 只在**變化時**推事件，於是快樂路徑上每一條列
+//!    永遠卡在 connecting（W4.21 釘住）。
+//! 2. MTU 探測。**同一個迴圈**自始至終獨佔 `device_events`，等握手、等回音的
+//!    期間照樣即時把狀態事件往上送，不另開一份代班轉發。
+//! 3. 依探測結果起 stack（smoltcp 的 MTU 是建構參數，起好之後改不了，所以
+//!    探測只能排在它前面）。
+//! 4. 轉入常駐的事件轉發。
+//!
+//! 第 1 步與第 3 步之間有一段窗口（最長 `HANDSHAKE_WAIT + PROBE_TIMEOUT`），
+//! 那時本地埠已經在聽、stack 還沒起來：連進來的客戶端會把 `StackCmd` 排進
+//! 通道裡等，stack 一起來就照順序接上。埠是開的，只是慢一點回答。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +34,11 @@ use super::{conf, device, mtu as pmtu, socks5, stack};
 
 /// 引擎事件通道的深度。一條連線的列數是個位數，這裡只要不擋住組裝就夠
 const EVENT_CHANNEL_DEPTH: usize = 64;
+
+/// 探測窗裡先到的入站封包最多留幾顆。這一段最長不過幾秒，而且 stack 還沒起來
+/// 就沒有任何連線在等資料——留一小截防的是「剛好卡在窗口邊緣的那幾顆」，
+/// 不是拿來當緩衝區用的
+const PREFILL_LIMIT: usize = 32;
 
 /// 一條列要引擎替它做什麼。
 ///
@@ -42,47 +67,70 @@ pub struct EngineSpec {
     /// 連線名，同時是引擎的身分與日誌前綴
     pub name: String,
     pub conf: conf::WgConf,
-    /// 這顆引擎實際要用的隧道 MTU，**已經定案的那一個值**。
+    /// 已經解析完的對端位址。
+    ///
+    /// **解析在 supervise 那一層做**（`wg::supervise`），不在這裡：DDNS 自癒
+    /// 要「先解析、比對過再決定要不要重建」，那個決策點需要看得到上一輪用的是
+    /// 哪一個位址。引擎只管照著連。
+    pub endpoint: SocketAddr,
+    /// 這一輪的 MTU 決策：已經定案的值，或「連上之後探一次」。
     ///
     /// 刻意不讓引擎自己去讀 `conf.mtu`：生效優先序（介面覆寫 ＞ conf 明寫 ＞
-    /// [`conf::APP_DEFAULT_MTU`]）是設定層的事，由 `wg::effective_mtu` 算完再
-    /// 傳進來，引擎這一層只負責照著設。
-    ///
-    /// `probe_mtu` 為真時這個值是**探測失敗的退路**（就是應用層預設 1280）。
-    pub mtu: usize,
-    /// 要不要自動探測路徑 MTU（由 `wg::should_probe_mtu` 決定：介面與 `.conf`
-    /// 都沒指定時才為真，優先序因此不受影響）。詳見 [`super::mtu`]
-    pub probe_mtu: bool,
+    /// 自動探測 ＞ 應用層預設）是設定層的事，由 `wg::plan_mtu` 算完再傳進來。
+    pub mtu: pmtu::Plan,
     /// 0..N 條列。零條時 supervise 根本不會呼叫 [`spawn`]（§5.2）
     pub rows: Vec<(String, RowSpec)>,
+}
+
+/// 引擎自己的健康狀態。
+///
+/// **是個 enum 而不是 UI 字串**：supervise 的握手觀測（`wg::HandshakeWatch`）
+/// 要對它做完備的 match，拿 `&'static str` 比對的話，新增一個狀態時編譯器
+/// 一個字都不會說。翻成 exit-status 字彙是 [`EngineHealth::status`] 的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineHealth {
+    /// 握手有效
+    Connected,
+    /// 握手陳舊或還沒握上
+    Reconnecting,
+    /// 不可恢復，supervise 會收掉這一輪重來
+    Failed,
+}
+
+impl EngineHealth {
+    /// 對應的 exit-status 字彙（§5.3 的零新事件：一個新字都沒有）
+    pub fn status(self) -> &'static str {
+        match self {
+            EngineHealth::Connected => status::CONNECTED,
+            EngineHealth::Reconnecting => status::RECONNECTING,
+            EngineHealth::Failed => status::ERROR,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
     /// 引擎自己的狀態（握手）。**不直接對外推事件**——supervise 收到後翻譯成
     /// 「底下每一條列的 exit-status」（§5.3 的零新事件）
-    Engine(&'static str, Option<String>),
+    Engine(EngineHealth, Option<String>),
     /// 某一條列的狀態，餵給 `set_exit_status_of(local, ..)`
     Row(u16, &'static str, Option<String>),
+    /// 這一輪 MTU 探測的結果。supervise 記日誌（等級由結果決定）並把它記在
+    /// 本連線的執行期快取裡，重建時不再白探一次
+    Mtu(pmtu::Probe),
     Log(String),
 }
 
-/// 依序：解析端點 → 起 device → 起 stack → 逐條列綁監聽器。
+/// 起一顆引擎：綁 UDP、把組裝丟進背景任務、**立刻**回傳事件通道。
 ///
-/// `Forward` 綁 [`super::socks5::serve_forward`]、`Socks` 綁
-/// [`super::socks5::serve_socks5`]。**單一列綁不上（埠被佔）只讓那一條進
-/// `port_busy`，不讓整顆引擎失敗**；device／stack 起不來才回 `Err`，
-/// 且已起來的部分會被 `cancel` 收乾淨。
+/// 只有「UDP 綁不到」會回 `Err`（埠被別人佔住是常見情況，該當場讓 supervise
+/// 看到）。列綁不上不算引擎失敗——那一條進 `port_busy`，其他列照常跑（§5.2）。
 pub async fn spawn(
     spec: EngineSpec,
     cancel: CancellationToken,
 ) -> Result<mpsc::Receiver<EngineEvent>, String> {
     let (events, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
-    let EngineSpec { name, conf, mtu, probe_mtu, rows } = spec;
-
-    // 端點每次重連前重解一次，動態 DNS 的端點才跟得上。這是整個 wg/ 底下
-    // 唯一一處會用到系統解析器的地方，而且它解的是隧道**外**的位址。
-    let endpoint = device::resolve_endpoint(&conf.endpoint).await?;
+    let EngineSpec { name, conf, endpoint, mtu, rows } = spec;
 
     let device_handle = device::spawn(
         device::DeviceConfig {
@@ -99,27 +147,54 @@ pub async fn spawn(
     )
     .map_err(|e| format!("[{name}] 綁不到 UDP 埠：{e}"))?;
 
+    tokio::spawn(run(name, conf, mtu, rows, device_handle, events, cancel));
+    Ok(rx)
+}
+
+/// 組裝與常駐轉發。順序見模組說明
+async fn run(
+    name: String,
+    conf: conf::WgConf,
+    plan: pmtu::Plan,
+    rows: Vec<(String, RowSpec)>,
+    device_handle: device::DeviceHandle,
+    events: mpsc::Sender<EngineEvent>,
+    cancel: CancellationToken,
+) {
     let device::DeviceHandle { outbound, mut inbound, events: mut device_events, .. } =
         device_handle;
 
-    // MTU 必須在 stack 建起來之前就定案（smoltcp 的 MTU 是建構參數），
-    // 所以自動探測排在這裡：device 已經在跑、stack 還沒有人在用 inbound
-    let mtu = if probe_mtu {
-        let outcome =
-            run_mtu_probe(&conf, &outbound, &mut inbound, &mut device_events, &events, &cancel)
-                .await;
-        if outcome.is_warning() {
-            log::warn!("[{name}] {}", outcome.log());
-        } else {
-            log::info!("[{name}] {}", outcome.log());
+    // ① 先綁列。stack 還沒起來，所以指令通道要先自己建好
+    let (cmd_tx, cmd_rx) = stack::command_channel();
+    bind_rows(&name, rows, &cmd_tx, &events, &cancel).await;
+
+    // ② 探測（Plan::Fixed 時整段跳過，一顆封包都不送）
+    let (mtu, prefill) = match plan {
+        pmtu::Plan::Fixed(mtu) => (mtu, Vec::new()),
+        pmtu::Plan::Probe => {
+            let io = ProbeIo {
+                outbound: &outbound,
+                inbound: &mut inbound,
+                device_events: &mut device_events,
+                events: &events,
+            };
+            let done =
+                probe_phase(&conf, io, &cancel, pmtu::HANDSHAKE_WAIT, pmtu::PROBE_TIMEOUT).await;
+            if done.outcome.is_warning() {
+                log::warn!("[{name}] {}", done.outcome.log());
+            } else {
+                log::info!("[{name}] {}", done.outcome.log());
+            }
+            let mtu = done.outcome.mtu();
+            if events.send(EngineEvent::Mtu(done.outcome)).await.is_err() {
+                return;
+            }
+            (mtu, done.buffered)
         }
-        let _ = events.send(EngineEvent::Log(outcome.log())).await;
-        outcome.mtu()
-    } else {
-        mtu
     };
 
-    let stack = stack::spawn(
+    // ③ 起 stack，把探測窗裡先到的封包一起交給它
+    stack::spawn_prewired(
         stack::StackConfig {
             // D2：位址一律以 /32、/128 掛，路由靠 default route
             addresses: conf
@@ -138,15 +213,38 @@ pub async fn spawn(
         },
         outbound,
         inbound,
+        cmd_rx,
+        prefill,
         cancel.clone(),
     );
 
+    // ④ 常駐：device 的狀態訊號翻成引擎層的事件，supervise 再攤到各列
+    loop {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => break,
+            e = device_events.recv() => match e { Some(e) => e, None => break },
+        };
+        if events.send(translate(event)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// 逐條列綁監聽器並推 `Row(connecting)`。
+///
+/// 單一列綁不上（埠被佔）只讓那一條進 `port_busy`，其他列照常跑——這是與 ssh
+/// 刻意不同的那一點：一條隧道底下有多條列，一條被佔沒有理由拖垮其他（§5.2）。
+async fn bind_rows(
+    name: &str,
+    rows: Vec<(String, RowSpec)>,
+    cmd: &mpsc::Sender<stack::StackCmd>,
+    events: &mpsc::Sender<EngineEvent>,
+    cancel: &CancellationToken,
+) {
     for (row_name, row) in rows {
         let local = row.local();
         let listener = match tokio::net::TcpListener::bind((socks5::BIND_ADDR, local)).await {
             Ok(listener) => listener,
-            // 單一列綁不上只讓那一條進 port_busy，其他列照常跑（§5.2 與 ssh
-            // 刻意不同的那一點：一條隧道底下有多條列，一條被佔沒有理由拖垮其他）
             Err(e) => {
                 let _ = events.send(EngineEvent::Row(local, status::PORT_BUSY, None)).await;
                 let _ = events
@@ -155,7 +253,7 @@ pub async fn spawn(
                 continue;
             }
         };
-        let cmd = stack.cmd.clone();
+        let cmd = cmd.clone();
         let row_cancel = cancel.clone();
         match row {
             RowSpec::Forward { remote, .. } => {
@@ -169,87 +267,160 @@ pub async fn spawn(
         }
         let _ = events.send(EngineEvent::Row(local, status::CONNECTING, None)).await;
     }
-
-    // device 的狀態訊號翻成引擎層的事件；supervise 再把它攤到底下每一條列
-    tokio::spawn(async move {
-        loop {
-            let event = tokio::select! {
-                _ = cancel.cancelled() => break,
-                e = device_events.recv() => match e { Some(e) => e, None => break },
-            };
-            if events.send(translate(event)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    Ok(rx)
 }
 
-/// device 的狀態訊號 → 引擎層的事件。抽成函式是因為 MTU 探測期間要先代班
-/// 轉一手：device 的事件只在**變化時**推一次，探測時吃掉的那一顆
-/// `HandshakeOk` 沒補回去的話，畫面就再也不會翻成 connected
+/// device 的狀態訊號 → 引擎層的事件
 fn translate(event: device::DeviceEvent) -> EngineEvent {
     match event {
-        device::DeviceEvent::HandshakeOk => EngineEvent::Engine(status::CONNECTED, None),
-        device::DeviceEvent::HandshakeStale => EngineEvent::Engine(status::RECONNECTING, None),
-        device::DeviceEvent::Fatal(msg) => EngineEvent::Engine(status::ERROR, Some(msg)),
+        device::DeviceEvent::HandshakeOk => EngineEvent::Engine(EngineHealth::Connected, None),
+        device::DeviceEvent::HandshakeStale => {
+            EngineEvent::Engine(EngineHealth::Reconnecting, None)
+        }
+        device::DeviceEvent::Fatal(msg) => EngineEvent::Engine(EngineHealth::Failed, Some(msg)),
     }
 }
 
-/// 自動 MTU 探測的完整一輪：挑目標 → 等握手 → 送一顆 1420 的 ICMP echo。
+/// 探測那一段要用到的四條通道，打包起來只是為了不讓函式簽名長成一堵牆
+pub(crate) struct ProbeIo<'a> {
+    pub outbound: &'a mpsc::Sender<Vec<u8>>,
+    pub inbound: &'a mut mpsc::Receiver<Vec<u8>>,
+    pub device_events: &'a mut mpsc::Receiver<device::DeviceEvent>,
+    pub events: &'a mpsc::Sender<EngineEvent>,
+}
+
+/// 探測階段的產物：結論，以及這段期間先到、還沒有人收的入站封包
+pub(crate) struct Probed {
+    pub outcome: pmtu::Probe,
+    pub buffered: Vec<Vec<u8>>,
+}
+
+/// 等握手 → 送一顆填滿的 ICMP echo → 等回音。**這段期間 device 的狀態事件
+/// 照常即時往上送**（同一個 select，不另開代班任務）。
 ///
-/// 握手還沒完成時封包只會被 boringtun 排進佇列，探了必逾時，所以要先等；
-/// 等的期間看到的 device 事件**照樣往上送**（`translate`），畫面不會因為
-/// 探測而慢一拍。等不到（逾時、Fatal、被取消）就當探測失敗，走保守的
-/// [`pmtu::SAFE_MTU`]——這種時候隧道本來就還沒通，不值得再多等。
-async fn run_mtu_probe(
+/// 兩段等待都用 `sleep_until` 當 select 的其中一支，而不是把整段包進
+/// `tokio::time::timeout`：包進去的話，逾時那一刻正在 `events.send(...)`
+/// 的那一顆事件會連同整個 future 一起被丟掉——被吞掉的如果是 `HandshakeOk`，
+/// 畫面就再也不會翻成 connected。送出事件的那幾行一律落在 select 的**完成
+/// 分支裡**（select 選定之後才執行，不再被取消）。
+///
+/// 逾時的兩種語意刻意不同：等不到握手是 [`pmtu::Probe::Skipped`]（一顆探測
+/// 封包都還沒送出去，什麼都沒量到），送出去了才沒回音才是
+/// [`pmtu::Probe::Failed`]。
+pub(crate) async fn probe_phase(
     conf: &conf::WgConf,
-    outbound: &mpsc::Sender<Vec<u8>>,
-    inbound: &mut mpsc::Receiver<Vec<u8>>,
-    device_events: &mut mpsc::Receiver<device::DeviceEvent>,
-    events: &mpsc::Sender<EngineEvent>,
+    io: ProbeIo<'_>,
     cancel: &CancellationToken,
-) -> pmtu::Probe {
+    handshake_wait: Duration,
+    probe_timeout: Duration,
+) -> Probed {
+    let ProbeIo { outbound, inbound, device_events, events } = io;
+    let mut buffered: Vec<Vec<u8>> = Vec::new();
+
     let (src, dst) = match pmtu::target(&conf.addresses, &conf.dns, &conf.allowed_ips) {
         Ok(pair) => pair,
-        Err(why) => return pmtu::Probe::Skipped(why),
+        Err(why) => return Probed { outcome: pmtu::Probe::Skipped(why), buffered },
     };
-    if !wait_handshake(device_events, events, cancel, pmtu::HANDSHAKE_WAIT).await {
-        return pmtu::Probe::Failed;
-    }
-    pmtu::probe(outbound, inbound, src, dst, pmtu::PROBE_TIMEOUT).await
-}
 
-/// 等第一次握手完成，最多等 `patience`。期間收到的事件一律往上轉。
-/// 回 true 代表握上了
-async fn wait_handshake(
-    device_events: &mut mpsc::Receiver<device::DeviceEvent>,
-    events: &mpsc::Sender<EngineEvent>,
-    cancel: &CancellationToken,
-    patience: std::time::Duration,
-) -> bool {
-    let waited = tokio::time::timeout(patience, async {
-        loop {
-            let event = tokio::select! {
-                _ = cancel.cancelled() => return false,
-                e = device_events.recv() => match e { Some(e) => e, None => return false },
-            };
-            let handshook = event == device::DeviceEvent::HandshakeOk;
-            let fatal = matches!(event, device::DeviceEvent::Fatal(_));
-            if events.send(translate(event)).await.is_err() {
-                return false;
+    // ---- 第一段：等握手
+    let deadline = tokio::time::Instant::now() + handshake_wait;
+    let mut handshook = false;
+    while !handshook {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Probed { outcome: pmtu::Probe::Skipped(pmtu::NO_HANDSHAKE), buffered };
             }
-            if handshook {
-                return true;
-            }
-            if fatal {
-                return false;
+            _ = tokio::time::sleep_until(deadline) => break,
+            packet = inbound.recv() => match packet {
+                Some(packet) => stash(&mut buffered, packet),
+                None => break,
+            },
+            event = device_events.recv() => {
+                let Some(event) = event else { break };
+                // 事件照樣往上送（不管它是哪一種），送完再決定這一段還等不等
+                let next = Waiting::of(&event);
+                // send 在 select 的完成分支裡，不在任何可取消的 timeout scope 內
+                if events.send(translate(event)).await.is_err() {
+                    return Probed {
+                        outcome: pmtu::Probe::Skipped(pmtu::NO_HANDSHAKE),
+                        buffered,
+                    };
+                }
+                match next {
+                    Waiting::Handshook => handshook = true,
+                    Waiting::GiveUp => {
+                        return Probed {
+                            outcome: pmtu::Probe::Skipped(pmtu::NO_HANDSHAKE),
+                            buffered,
+                        };
+                    }
+                    Waiting::NotYet => {}
+                }
             }
         }
-    })
-    .await;
-    waited == Ok(true)
+    }
+    if !handshook {
+        return Probed { outcome: pmtu::Probe::Skipped(pmtu::NO_HANDSHAKE), buffered };
+    }
+
+    // ---- 第二段：送出探測封包，等它的回音
+    if outbound.send(pmtu::echo_request(src, dst, pmtu::HIGH_MTU)).await.is_err() {
+        return Probed { outcome: pmtu::Probe::Failed, buffered };
+    }
+    let deadline = tokio::time::Instant::now() + probe_timeout;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Probed { outcome: pmtu::Probe::Failed, buffered },
+            _ = tokio::time::sleep_until(deadline) => {
+                return Probed { outcome: pmtu::Probe::Failed, buffered };
+            }
+            packet = inbound.recv() => match packet {
+                Some(packet) if pmtu::is_echo_reply(&packet, src, dst) => {
+                    return Probed { outcome: pmtu::Probe::Ok, buffered };
+                }
+                Some(packet) => stash(&mut buffered, packet),
+                None => return Probed { outcome: pmtu::Probe::Failed, buffered },
+            },
+            event = device_events.recv() => {
+                let Some(event) = event else {
+                    return Probed { outcome: pmtu::Probe::Failed, buffered };
+                };
+                if events.send(translate(event)).await.is_err() {
+                    return Probed { outcome: pmtu::Probe::Failed, buffered };
+                }
+            }
+        }
+    }
+}
+
+/// 等握手的那一段收到一顆 device 事件之後，這一段還等不等。
+///
+/// 抽成一個 enum 是為了讓分類**只有一次 match**（而不是「一個 bool 記握上了、
+/// 一個 bool 記致命錯誤」那種湊法：兩個布林湊得出四種組合，其中兩種無意義）
+enum Waiting {
+    /// 握上了，可以送探測封包了
+    Handshook,
+    /// device 掛了，這一輪不必再等
+    GiveUp,
+    /// 還沒有結論（例如中途翻了一次 stale），繼續等
+    NotYet,
+}
+
+impl Waiting {
+    fn of(event: &device::DeviceEvent) -> Self {
+        match event {
+            device::DeviceEvent::HandshakeOk => Waiting::Handshook,
+            device::DeviceEvent::Fatal(_) => Waiting::GiveUp,
+            device::DeviceEvent::HandshakeStale => Waiting::NotYet,
+        }
+    }
+}
+
+/// 探測窗裡先到的封包先留著，等 stack 起來再一起交給它。滿了就丟——
+/// 這是 IP 層，而且這一段最長不過幾秒
+fn stash(buffered: &mut Vec<Vec<u8>>, packet: Vec<u8>) {
+    if buffered.len() < PREFILL_LIMIT {
+        buffered.push(packet);
+    }
 }
 
 /// UDP 要綁的本地位址：跟著端點的 IP 版本走，`ListenPort` 省略時交給 OS 配

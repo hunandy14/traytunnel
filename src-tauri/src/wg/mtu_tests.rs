@@ -1,8 +1,9 @@
-//! 自動 MTU 探測的測試——W10 系列（PM 裁決 2026-08-24 的第四件）。
+//! 自動 MTU 探測的封包與決策測試——W10 系列（PM 裁決 2026-08-24）。
 //!
-//! 探測本身是一顆純粹靠通道驅動的函式，所以**不需要真的架一條隧道**：
-//! 餵一顆回音進 inbound 就是「探得過」，什麼都不餵就是「探不過」。
-//! 封包的組裝與辨識則是純函式，逐欄位釘住。
+//! 這一份**只測純函式**：探測目標的挑選、封包長什麼樣子、什麼算自己的回音、
+//! 三種結局各自的 MTU 與日誌等級。真正把封包送出去、等回音、同時還要轉發
+//! device 事件的那一段是引擎的組裝順序問題，測在 `engine_tests.rs`
+//! （W10.9～W10.12，覆審打回 2026-08-24 後搬過去的）。
 
 use super::*;
 
@@ -17,22 +18,32 @@ fn ip(addr: &str) -> IpAddr {
     addr.parse().unwrap()
 }
 
-/// 把一顆 echo request 翻成對端會回的那顆 echo reply（來源／目的地對調、
-/// 型別改成 0、兩個校驗和重算），長度與原封包相同——真實的 echo reply
-/// 本來就會把整段 payload 原樣送回來
-fn reply_to(request: &[u8]) -> Vec<u8> {
-    let mut p = request.to_vec();
-    let (src, dst) = (p[12..16].to_vec(), p[16..20].to_vec());
-    p[12..16].copy_from_slice(&dst);
-    p[16..20].copy_from_slice(&src);
-    p[10..12].copy_from_slice(&[0, 0]);
-    let sum = checksum(&p[..20]);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
-    p[20] = 0; // ICMP_ECHO_REPLY
-    p[22..24].copy_from_slice(&[0, 0]);
-    let sum = checksum(&p[20..]);
-    p[22..24].copy_from_slice(&sum.to_be_bytes());
-    p
+/// 把一顆 echo request 翻成對端會回的那顆 echo reply。
+///
+/// 用的是同一組 `wire` 型別（覆審打回 2026-08-24：連測試檯也不再手工排版面
+/// 與算校驗和），長度與原封包相同——真實的 echo reply 本來就會把整段 payload
+/// 原樣送回來。
+pub(crate) fn reply_to(request: &[u8]) -> Vec<u8> {
+    let caps = ChecksumCapabilities::default();
+    let packet = Ipv4Packet::new_checked(request).expect("request 要是合法的 IPv4");
+    let header = Ipv4Repr::parse(&packet, &caps).expect("request 的表頭要解得開");
+    let icmp = Icmpv4Packet::new_checked(packet.payload()).unwrap();
+    let (ident, seq_no, data) = match Icmpv4Repr::parse(&icmp, &caps).unwrap() {
+        Icmpv4Repr::EchoRequest { ident, seq_no, data } => (ident, seq_no, data.to_vec()),
+        other => panic!("不是 echo request：{other:?}"),
+    };
+    let echo = Icmpv4Repr::EchoReply { ident, seq_no, data: &data };
+    let ip = Ipv4Repr {
+        src_addr: header.dst_addr,
+        dst_addr: header.src_addr,
+        next_header: IpProtocol::Icmp,
+        payload_len: echo.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut buffer = vec![0u8; ip.buffer_len() + echo.buffer_len()];
+    ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer[..]), &caps);
+    echo.emit(&mut Icmpv4Packet::new_unchecked(&mut buffer[ip.buffer_len()..]), &caps);
+    buffer
 }
 
 /// W10.1 探測目標就是 `.conf` 的第一個 IPv4 DNS 伺服器
@@ -47,8 +58,8 @@ fn the_probe_aims_at_the_first_ipv4_dns_server() {
 
 /// W10.2 三種「沒得探」：conf 沒 DNS、介面沒 IPv4、DNS 不在 AllowedIPs 內。
 ///
-/// 最後一條是刻意的：`AllowedIPs` 是出口過濾器（§2.2 防線二），
-/// 探測不可以變成繞過它的後門
+/// 最後一條是刻意的：`AllowedIPs` 是出口過濾器（§2.2 防線二），探測不可以
+/// 變成繞過它的後門。而且擋它的就是 stack 用的同一個 `conf::allowed`
 #[test]
 fn the_probe_is_skipped_when_there_is_nothing_safe_to_aim_at() {
     let addresses = [net("10.9.0.2", 32)];
@@ -61,23 +72,34 @@ fn the_probe_is_skipped_when_there_is_nothing_safe_to_aim_at() {
         target(&addresses, &[ip("8.8.8.8")], &allowed).is_err(),
         "DNS 落在 AllowedIPs 之外時不可以硬送，那是繞過出口過濾器"
     );
+    // 與 stack 出口過濾器同一份實作，不是各寫一份
+    assert!(!crate::wg::conf::allowed(&allowed, &ip("8.8.8.8")));
+    assert!(crate::wg::conf::allowed(&allowed, &ip("10.9.0.1")));
 }
 
-/// W10.3 探測封包：總長度剛好 [`HIGH_MTU`]、DF 有設、兩個校驗和都對
+/// W10.3 探測封包：總長度剛好 [`HIGH_MTU`]、DF 有設、兩個表頭都解得回來。
+///
+/// 覆審打回 2026-08-24：原本這條逐位元組比對手工排的版面與自算的校驗和；
+/// 改用 `wire` 之後版面歸 smoltcp 管，這裡改成釘住**規格**——尺寸、DF、
+/// 兩端位址、以及「解回來就是一顆 echo request」（`parse` 會順帶驗校驗和，
+/// 算錯的話這裡就會 Err）
 #[test]
 fn the_probe_packet_is_exactly_one_high_mtu_worth_of_bytes() {
-    let p = echo_request(US, GATEWAY, HIGH_MTU);
-    assert_eq!(p.len(), HIGH_MTU, "探的就是這個尺寸過不過得去");
-    assert_eq!(u16::from_be_bytes([p[2], p[3]]) as usize, HIGH_MTU, "IP 的 Total Length 要一致");
-    assert_eq!(p[0], 0x45);
-    assert_eq!(p[9], 1, "protocol = ICMP");
-    assert_eq!(u16::from_be_bytes([p[6], p[7]]) & 0x4000, 0x4000, "路徑 MTU 探測必須設 DF");
-    assert_eq!(p[12..16], US.octets(), "來源是介面位址");
-    assert_eq!(p[16..20], GATEWAY.octets(), "目的地是隧道內的閘道");
-    assert_eq!(p[20], 8, "ICMP echo request");
-    // 校驗和的定義：把含校驗和欄位在內的整段再算一次，結果必須是 0
-    assert_eq!(checksum(&p[..20]), 0, "IP 表頭校驗和");
-    assert_eq!(checksum(&p[20..]), 0, "ICMP 校驗和");
+    let raw = echo_request(US, GATEWAY, HIGH_MTU);
+    assert_eq!(raw.len(), HIGH_MTU, "探的就是這個尺寸過不過得去");
+
+    let caps = ChecksumCapabilities::default();
+    let packet = Ipv4Packet::new_checked(&raw[..]).expect("要是一顆合法的 IPv4 封包");
+    assert!(packet.dont_frag(), "路徑 MTU 探測必須設 DF");
+    let header = Ipv4Repr::parse(&packet, &caps).expect("表頭（含校驗和）要解得開");
+    assert_eq!(header.src_addr, US);
+    assert_eq!(header.dst_addr, GATEWAY);
+    assert_eq!(header.next_header, IpProtocol::Icmp);
+    assert_eq!(header.buffer_len() + header.payload_len, HIGH_MTU);
+
+    let icmp = Icmpv4Packet::new_checked(packet.payload()).unwrap();
+    let repr = Icmpv4Repr::parse(&icmp, &caps).expect("ICMP（含校驗和）要解得開");
+    assert!(matches!(repr, Icmpv4Repr::EchoRequest { .. }), "要是 echo request");
 }
 
 /// W10.4 只有**自己那一顆**探測封包的回音算數
@@ -93,75 +115,72 @@ fn only_our_own_echo_reply_counts() {
     assert!(!is_echo_reply(&good, Ipv4Addr::new(10, 9, 0, 8), GATEWAY));
     // request 本身不是 reply
     assert!(!is_echo_reply(&request, US, GATEWAY));
-    // id 不符（別的 ping）不算——誤認會讓一條吃不下 1420 的線路被判定成吃得下
-    let mut wrong_id = good.clone();
-    wrong_id[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
-    assert!(!is_echo_reply(&wrong_id, US, GATEWAY));
-    // 不是 ICMP、以及短到放不下表頭的碎片，都不算
-    let mut not_icmp = good.clone();
-    not_icmp[9] = 6;
-    assert!(!is_echo_reply(&not_icmp, US, GATEWAY));
+    // 別人的 ping 回音（ident 不同）不算——誤認會讓一條吃不下 1420 的線路
+    // 被判定成吃得下，症狀就是網頁載一半的靜默黑洞
+    let others = {
+        let caps = ChecksumCapabilities::default();
+        let data = [0u8; 16];
+        let echo = Icmpv4Repr::EchoReply { ident: 0x1234, seq_no: 1, data: &data };
+        let ip = Ipv4Repr {
+            src_addr: GATEWAY,
+            dst_addr: US,
+            next_header: IpProtocol::Icmp,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut buffer = vec![0u8; ip.buffer_len() + echo.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer[..]), &caps);
+        echo.emit(&mut Icmpv4Packet::new_unchecked(&mut buffer[ip.buffer_len()..]), &caps);
+        buffer
+    };
+    assert!(!is_echo_reply(&others, US, GATEWAY));
+    // 校驗和被改壞的不算（`wire` 的 parse 順帶驗掉）
+    let mut corrupt = good.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    assert!(!is_echo_reply(&corrupt, US, GATEWAY));
+    // 短到放不下表頭的碎片不算
     assert!(!is_echo_reply(&good[..20], US, GATEWAY));
     assert!(!is_echo_reply(&[], US, GATEWAY));
 }
 
-/// W10.5 有回音 → `Ok`，而且**真的有一顆 1420 的封包被送出去**
-#[tokio::test]
-async fn a_reply_means_the_path_takes_the_high_mtu() {
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(4);
-    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(4);
-    // 對面：收到什麼就回它的回音
-    tokio::spawn(async move {
-        let request = out_rx.recv().await.expect("探測封包要被送出去");
-        assert_eq!(request.len(), HIGH_MTU);
-        in_tx.send(reply_to(&request)).await.unwrap();
-    });
-    let got = probe(&out_tx, &mut in_rx, US, GATEWAY, PROBE_TIMEOUT).await;
-    assert_eq!(got, Probe::Ok);
-    assert_eq!(got.mtu(), HIGH_MTU);
-    assert!(!got.is_warning());
-}
-
-/// W10.6 沒有回音（對端擋 ICMP，或路徑吃不下 1420）→ 退回安全值，
-/// 而且要記**警告**：吞吐量掉一截而畫面上什麼都看不出來
-#[tokio::test]
-async fn silence_falls_back_to_the_safe_mtu_with_a_warning() {
-    let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(4);
-    let (_in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(4);
-    let got = probe(&out_tx, &mut in_rx, US, GATEWAY, Duration::from_millis(150)).await;
-    assert_eq!(got, Probe::Failed);
-    assert_eq!(got.mtu(), SAFE_MTU);
-    assert_eq!(got.mtu(), 1280);
-    assert!(got.is_warning(), "降級一定要記警告級（使用者明令）");
-    assert!(got.log().contains("set MTU manually"), "要告訴使用者可以手動調上去");
-}
-
-/// W10.7 隧道上的其他封包不可以被誤認成回音：雜訊照收，結論仍是逾時
-#[tokio::test]
-async fn unrelated_inbound_traffic_never_counts_as_a_reply() {
-    let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(4);
-    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(8);
-    for i in 0u8..4 {
-        in_tx.send(vec![i; 120]).await.unwrap();
-    }
-    let got = probe(&out_tx, &mut in_rx, US, GATEWAY, Duration::from_millis(150)).await;
-    assert_eq!(got, Probe::Failed);
-}
-
-/// W10.8 三種結局各自的 MTU 與日誌。跳過那一支也要留一行——
-/// 「為什麼我的隧道只有 1280」必須在日誌裡答得出來
+/// W10.5 三種結局各自的 MTU、日誌與**日誌等級**。
+///
+/// 覆審打回 2026-08-24 的重點在這裡：只有「封包真的送出去了卻沒回音」
+/// 才是警告，那時我們真的量到了東西；沒送出去的一律是資訊級——隧道都還沒通
+/// 的時候丟一句「請手動調 MTU」只會把使用者推去改一個不相干的設定
 #[test]
-fn every_outcome_says_which_mtu_it_picked_and_why() {
+fn only_a_real_measurement_gets_a_warning() {
     assert_eq!(Probe::Ok.mtu(), 1420);
     assert!(Probe::Ok.log().contains("1420"));
     assert!(!Probe::Ok.is_warning());
 
-    let skipped = Probe::Skipped("no IPv4 DNS server in the .conf");
-    assert_eq!(skipped.mtu(), SAFE_MTU);
-    assert!(skipped.log().contains("no IPv4 DNS server"), "原因要寫在日誌裡");
-    assert!(skipped.log().contains("1280"));
-    assert!(!skipped.is_warning(), "沒得探不是降級，不必用警告去嚇人");
-
     assert_eq!(Probe::Failed.mtu(), SAFE_MTU);
     assert!(Probe::Failed.log().contains("1280"));
+    assert!(Probe::Failed.is_warning(), "真的量到路徑吃不下 1420 才是降級");
+    assert!(Probe::Failed.log().contains("set MTU manually"), "要告訴使用者可以手動調上去");
+
+    for why in [NO_HANDSHAKE, "no IPv4 DNS server in the .conf"] {
+        let skipped = Probe::Skipped(why);
+        assert_eq!(skipped.mtu(), SAFE_MTU);
+        assert!(skipped.log().contains(why), "原因要寫在日誌裡：{why}");
+        assert!(skipped.log().contains("1280"));
+        assert!(!skipped.is_warning(), "一顆封包都沒送出去，沒有資格說線路不行");
+        assert!(!skipped.log().contains("set MTU manually"));
+    }
+}
+
+/// W10.6 等握手的耐心**必須大於** boringtun 的 `REKEY_TIMEOUT`。
+///
+/// 覆審打回 2026-08-24：原本是 3 秒，比重試間隔還短——握手的第一顆 UDP
+/// 掉了就會把一條好好的線路誤釘成 1280。新形狀下這段等待不阻塞任何 UX
+/// （列早就綁好、事件照流），所以放長是免費的
+#[test]
+fn the_handshake_patience_outlasts_one_rekey_timeout() {
+    assert!(
+        HANDSHAKE_WAIT > REKEY_TIMEOUT,
+        "等不到一次重試就放棄，等於把掉一顆 UDP 誤判成線路吃不下 1420"
+    );
+    assert_eq!(HANDSHAKE_WAIT, Duration::from_secs(8));
+    assert_eq!(PROBE_TIMEOUT, Duration::from_secs(1));
 }

@@ -352,33 +352,47 @@ fn every_row_reports_stopped_exactly_once_and_no_new_event_is_added() {
 
 // ------------------------------------------ MTU 優先序（PM 裁決 2026-08-24）
 
-/// W6.17 `effective_mtu` 的三態優先序：**介面覆寫 ＞ conf 明寫 ＞ 應用層預設**。
+/// 這一段的三態拿來當 `plan_mtu` 的斷言值，讀起來比 `mtu::Plan::Fixed(..)` 短
+use crate::wg::mtu::Plan::{Fixed, Probe as ProbePlan};
+
+/// W6.17 `plan_mtu` 的優先序：**介面覆寫 ＞ conf 明寫 ＞ 自動探測**。
 ///
 /// 這一條就是規格本身。實際的動機是使用者那台 ASUS 路由器匯出的 `.conf` 不寫
 /// MTU，而他那條線路的路徑 MTU 又小於 1420，大封包靜默黑洞；他必須能在介面上
 /// 壓下去，而且**不必去改那份 `.conf`**。
+///
+/// 覆審打回 2026-08-24：原本 `effective_mtu`（算值）與 `should_probe_mtu`
+/// （算要不要探）是兩支，各說一半；併成一個回傳 enum 的決策點之後，
+/// 「要探測、卻同時又指定了 1400」那種組合連表達都表達不出來。
 #[test]
-fn the_ui_override_beats_the_conf_which_beats_the_app_default() {
+fn the_ui_override_beats_the_conf_which_beats_the_probe() {
     // ① 兩者都有：介面說了算，conf 的值被覆寫掉
-    assert_eq!(effective_mtu(Some(1400), Some(1420)), 1400);
+    assert_eq!(plan_mtu(Some(1400), Some(1420)), Fixed(1400));
     // ② 只有 conf 明寫：照 conf
-    assert_eq!(effective_mtu(None, Some(1420)), 1420);
-    // ③ 都沒有：落到應用層預設，而不是 wg-quick 那個 1420
-    assert_eq!(effective_mtu(None, None), conf::APP_DEFAULT_MTU);
-    assert_eq!(effective_mtu(None, None), 1280);
-    // ④ 只有介面覆寫（conf 沒寫 MTU，正是使用者那份檔案的樣子）
-    assert_eq!(effective_mtu(Some(1400), None), 1400);
+    assert_eq!(plan_mtu(None, Some(1420)), Fixed(1420));
+    // ③ 只有介面覆寫（conf 沒寫 MTU，正是使用者那份檔案的樣子）
+    assert_eq!(plan_mtu(Some(1400), None), Fixed(1400));
+    // ④ 都沒有：才輪到自動探測。探不出來時它自己會落回應用層預設
+    assert_eq!(plan_mtu(None, None), ProbePlan);
+    assert_eq!(mtu::SAFE_MTU, conf::APP_DEFAULT_MTU);
+    assert_eq!(mtu::SAFE_MTU, 1280);
+    assert_eq!(mtu::HIGH_MTU, 1420, "探得過才升到這個值");
 }
 
 /// W6.18 覆寫值與 conf 值相同時不是特例：算出來就是那個值，沒有「等於就忽略」
 /// 這種暗規則。順手釘住覆寫值可以比 conf 大（線路吃得下就該讓人往上調）。
 #[test]
 fn an_override_may_equal_or_exceed_the_conf_value() {
-    assert_eq!(effective_mtu(Some(1420), Some(1420)), 1420);
-    assert_eq!(effective_mtu(Some(1500), Some(1280)), 1500);
+    assert_eq!(plan_mtu(Some(1420), Some(1420)), Fixed(1420));
+    assert_eq!(plan_mtu(Some(1500), Some(1280)), Fixed(1500));
 }
 
-// ------------------------------ 握手韌性三件套（PM 裁決 2026-08-24）
+// ------------------------------ 握手韌性（PM 裁決 2026-08-24，
+//                                 覆審打回後重做：typed 事件＋先解析後決定）
+
+fn engine_event(health: engine::EngineHealth) -> engine::EngineEvent {
+    engine::EngineEvent::Engine(health, None)
+}
 
 /// W6.19 首次握手的寬限期是**獨立的一個值**，而且遠小於 `REJECT_AFTER`。
 ///
@@ -394,53 +408,72 @@ fn the_first_handshake_grace_is_its_own_much_shorter_value() {
     assert_eq!(device::REJECT_AFTER, Duration::from_secs(180));
 }
 
-/// W6.20 狀態日誌：握手成功記耗時、進入 reconnecting 記一行，兩者都**只在
-/// 變化時**記一次
+/// W6.20 狀態日誌：握手成功記**真的耗時**、進入 reconnecting 記一行，
+/// 兩者都只在變化時記一次。
+///
+/// 覆審打回 2026-08-24 兩件事：吃的是 typed 的 `EngineEvent`（不是 UI 字串），
+/// 而且計時錨在引擎啟動那一刻——舊版把 watch 建在 `engine::spawn` 之後，
+/// 探測路徑上事件早就在佇列裡等著，量出來恆為 0ms。
 #[test]
 fn the_watch_logs_each_handshake_transition_exactly_once() {
+    use engine::EngineHealth::{Connected, Failed, Reconnecting};
     use std::time::Duration;
     let t0 = Instant::now();
     let mut watch = HandshakeWatch::new(t0, RECONNECT_REBUILD_AFTER);
 
     // 握上了：耗時從引擎啟動起算
-    let line = watch.on_status(status::CONNECTED, t0 + Duration::from_millis(420));
+    let line = watch.on_event(&engine_event(Connected), t0 + Duration::from_millis(420));
     assert_eq!(line.as_deref(), Some("handshake ok in 420ms"));
     // 同一個狀態再來一次不重複刷屏
-    assert!(watch.on_status(status::CONNECTED, t0 + Duration::from_millis(500)).is_none());
+    assert!(watch.on_event(&engine_event(Connected), t0 + Duration::from_millis(500)).is_none());
 
     // 掉線：以前這條路徑是完全靜默的
-    let line = watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(10));
+    let line = watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(10));
     assert_eq!(line.as_deref(), Some(HANDSHAKE_RETRY_LOG));
-    assert!(watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(12)).is_none());
+    assert!(watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(12)).is_none());
 
     // 再握上：耗時從**掉線那一刻**起算，不是從引擎啟動起算
-    let line = watch.on_status(status::CONNECTED, t0 + Duration::from_secs(13));
+    let line = watch.on_event(&engine_event(Connected), t0 + Duration::from_secs(13));
     assert_eq!(line.as_deref(), Some("handshake ok in 3000ms"));
 
-    // 其他狀態不歸這顆狀態機管
-    assert!(watch.on_status(status::PORT_BUSY, t0 + Duration::from_secs(14)).is_none());
-    assert!(watch.on_status(status::ERROR, t0 + Duration::from_secs(14)).is_none());
+    // 其他事件不歸這顆狀態機管
+    assert!(watch.on_event(&engine_event(Failed), t0 + Duration::from_secs(14)).is_none());
+    let row = engine::EngineEvent::Row(1085, status::PORT_BUSY, None);
+    assert!(watch.on_event(&row, t0 + Duration::from_secs(14)).is_none());
+    let probed = engine::EngineEvent::Mtu(mtu::Probe::Ok);
+    assert!(watch.on_event(&probed, t0 + Duration::from_secs(14)).is_none());
 }
 
-/// W6.21 DDNS 自癒：reconnecting 連續卡超過門檻就該重建引擎（重建＝重解析端點）
+/// W6.21 卡太久就該**去複查端點**（不是直接重建）。
 #[test]
-fn a_stuck_reconnect_eventually_asks_for_a_rebuild() {
+fn a_stuck_reconnect_eventually_asks_for_an_endpoint_recheck() {
+    use engine::EngineHealth::{Connected, Reconnecting};
     use std::time::Duration;
     let t0 = Instant::now();
     // 門檻可注入，正式路徑上傳的是 RECONNECT_REBUILD_AFTER
     let mut watch = HandshakeWatch::new(t0, Duration::from_secs(30));
 
-    // 還沒 reconnecting 過：再久都不重建（隧道好好的，不可以自己斷線）
+    // 還沒掉線過：再久都不動它（隧道好好的，不可以自己去拆）
     assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
-    watch.on_status(status::CONNECTED, t0);
+    watch.on_event(&engine_event(Connected), t0);
     assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
 
-    watch.on_status(status::RECONNECTING, t0 + Duration::from_secs(10));
-    assert!(!watch.overdue(t0 + Duration::from_secs(39)), "只是抖一下就重建太吵");
-    assert!(watch.overdue(t0 + Duration::from_secs(40)), "門檻一到就重建");
+    watch.on_event(&engine_event(Reconnecting), t0 + Duration::from_secs(10));
+    assert!(!watch.overdue(t0 + Duration::from_secs(39)), "只是抖一下就去動它太吵");
+    assert!(watch.overdue(t0 + Duration::from_secs(40)), "門檻一到就該複查");
 
-    // 中途自己好了就重新計時
-    watch.on_status(status::CONNECTED, t0 + Duration::from_secs(41));
+    // 複查完、位址沒變：重新計時，而且同一段掉線只記一行
+    let line = watch.note_endpoint_unchanged(t0 + Duration::from_secs(40));
+    assert_eq!(line.as_deref(), Some(ENDPOINT_UNCHANGED_LOG));
+    assert!(!watch.overdue(t0 + Duration::from_secs(69)), "複查過就重新計時");
+    assert!(watch.overdue(t0 + Duration::from_secs(70)), "下一次複查在一個門檻之後");
+    assert!(
+        watch.note_endpoint_unchanged(t0 + Duration::from_secs(70)).is_none(),
+        "同一段掉線不重複刷屏——這正是離線端點每 80 秒洗一次日誌的來源"
+    );
+
+    // 中途自己好了就歸零
+    watch.on_event(&engine_event(Connected), t0 + Duration::from_secs(71));
     assert!(!watch.overdue(t0 + Duration::from_secs(3600)));
 
     // 正式常數：60 秒，比重連間隔（5 秒）大一個數量級
@@ -448,17 +481,76 @@ fn a_stuck_reconnect_eventually_asks_for_a_rebuild() {
     assert!(RECONNECT_REBUILD_AFTER > RETRY);
 }
 
-// ------------------------------ MTU 自動探測（PM 裁決 2026-08-24 第四件）
-
-/// W6.22 探不探的條件：**兩邊都沒指定時才探**，優先序一個字都沒變
+/// W6.22 DDNS 自癒的裁決：**位址真的變了才重建**。
+///
+/// 覆審打回 2026-08-24：舊版是「卡了 60 秒就無條件重建」，在端點根本沒搬家的
+/// 情況下那是一個無限重建迴圈——每 60 秒把一條只是暫時連不上的隧道整個拆掉
+/// 重蓋，期間所有列都被打回 connecting，而它八成只是對端還沒開機。
 #[test]
-fn the_probe_only_runs_when_nobody_specified_an_mtu() {
-    assert!(should_probe_mtu(None, None), "什麼都沒指定才輪到自動探測");
-    assert!(!should_probe_mtu(Some(1400), None), "介面上填了值就照他的");
-    assert!(!should_probe_mtu(None, Some(1420)), "conf 明寫了就照 conf");
-    assert!(!should_probe_mtu(Some(1400), Some(1420)), "兩個都有一樣不探");
+fn only_a_changed_endpoint_address_justifies_a_rebuild() {
+    let current: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    let moved: std::net::SocketAddr = "203.0.113.9:51820".parse().unwrap();
 
-    // 會被探測取代的就是「什麼都不知道」那個位子上的預設值
-    assert_eq!(effective_mtu(None, None), mtu::SAFE_MTU);
-    assert_eq!(mtu::HIGH_MTU, 1420, "探得過才升到這個值");
+    assert_eq!(stuck_action(current, Ok(moved)), StuckAction::Rebuild, "IP 漂走了才重建");
+    assert_eq!(
+        stuck_action(current, Ok(current)),
+        StuckAction::KeepWaiting,
+        "位址沒變就別拆——重建一次也連不上，只是把畫面洗一遍"
+    );
+    // 連埠變了也算搬家
+    let other_port: std::net::SocketAddr = "203.0.113.7:51821".parse().unwrap();
+    assert_eq!(stuck_action(current, Ok(other_port)), StuckAction::Rebuild);
+    // 這一刻解析不出來（多半是本機網路整個斷了）：等，不重建
+    assert_eq!(stuck_action(current, Err("nope".into())), StuckAction::KeepWaiting);
+}
+
+/// W6.24 **復原的事件優先於「卡太久」的判定**。
+///
+/// 覆審打回 2026-08-24 揪出的競態：一顆剛送達、還沒被處理的 `connected`
+/// 若被 overdue 搶先，一條剛剛自己復原的隧道就會被當成卡死的拆掉重建。
+#[test]
+fn a_pending_event_is_always_handled_before_the_stuck_check() {
+    use engine::EngineHealth::{Connected, Reconnecting};
+    use std::time::Duration;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<engine::EngineEvent>(4);
+    let t0 = Instant::now();
+    let mut watch = HandshakeWatch::new(t0, Duration::from_secs(30));
+    watch.on_event(&engine_event(Reconnecting), t0);
+    let late = t0 + Duration::from_secs(60);
+    assert!(watch.overdue(late), "前提：這一刻已經卡過門檻了");
+
+    // 隧道其實剛剛就好了，那顆 connected 還排在佇列裡
+    tx.try_send(engine_event(Connected)).unwrap();
+    assert_eq!(
+        next_step(&mut rx, &watch, late),
+        Next::Event(engine_event(Connected)),
+        "佇列裡還有東西時不可以先去複查端點，那會把剛復原的隧道拆掉"
+    );
+
+    // 吃乾淨了才輪到複查
+    assert_eq!(next_step(&mut rx, &watch, late), Next::Recheck);
+    // 還沒到期就只是去等下一顆
+    assert_eq!(next_step(&mut rx, &watch, t0 + Duration::from_secs(1)), Next::Wait);
+    // 引擎那棵任務樹沒了
+    drop(tx);
+    assert_eq!(next_step(&mut rx, &watch, late), Next::Gone);
+}
+
+/// W6.23 探測快取：**上一輪探過就沿用，這一輪不再探**。
+///
+/// 覆審打回 2026-08-24：沒有快取的話，一個離線的端點會每 80 秒刷一次探測
+/// 日誌，而且每一輪都白等一次握手逾時。
+#[test]
+fn the_probe_result_is_reused_across_rebuilds() {
+    // 沒探過：照原計劃探
+    assert_eq!(mtu_for_round(ProbePlan, None), ProbePlan);
+    // 上一輪探到了 1420：直接用，不再探
+    assert_eq!(mtu_for_round(ProbePlan, Some(&mtu::Probe::Ok)), Fixed(mtu::HIGH_MTU));
+    // 上一輪探不過：也記住，不要每 80 秒再警告一次
+    assert_eq!(mtu_for_round(ProbePlan, Some(&mtu::Probe::Failed)), Fixed(mtu::SAFE_MTU));
+    // 上一輪連握手都沒等到：一樣沿用，重建輪不再白等 8 秒
+    let skipped = mtu::Probe::Skipped(mtu::NO_HANDSHAKE);
+    assert_eq!(mtu_for_round(ProbePlan, Some(&skipped)), Fixed(mtu::SAFE_MTU));
+    // 有人明寫過 MTU 的話，快取一點影響力都沒有
+    assert_eq!(mtu_for_round(Fixed(1400), Some(&mtu::Probe::Ok)), Fixed(1400));
 }
