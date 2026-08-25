@@ -1222,6 +1222,9 @@ body {
 }
 
 .split-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
   width: 22px;
   height: 100%;
