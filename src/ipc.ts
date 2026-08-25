@@ -187,12 +187,33 @@ export const openConfigDir = () => invoke<void>("open_config_dir");
 // ------------------------------------------------------------ 更新
 
 /**
- * 「Restart to update」：把已經下載好的那一版現在就裝上去。
+ * 系統匣那一項「Restart to update」：把**已經下載好**的那一版現在就裝上去。
+ *
+ * 設定頁不走這一支（它用 `installUpdate`，那一支連沒下載的情況也處理得了）
+ * ——系統匣那一項本來就只在暫存區有東西時才長出來，沒有「順便下載」這回事。
+ * 系統匣是 Rust 那邊直接叫的，所以這個包裝目前只有 dev-mock 那條路會用到，
+ * 留著是為了讓瀏覽器裡的 IPC 表面與真後端一致。
  *
  * 正常情況下這個 promise **不會 resolve**——安裝程式一起來，程式本身就退出了。
  * 會 reject 才代表更新沒能開始（暫存檔驗不過、安裝程式起不來之類）。
  */
 export const applyUpdate = () => invoke<void>("apply_update");
+
+/**
+ * 設定頁那顆綠色主鈕：把新版裝上去，沒下載過的話連下載一起做。
+ *
+ * 與 `applyUpdate` 的分工在後端（暫存區裡有沒有東西），前端只管按下去這一件事。
+ * 同樣**不受自動更新開關管**，而且成功時同樣不會 resolve。
+ */
+export const installUpdate = () => invoke<void>("install_update");
+
+/**
+ * 使用者主動按下的檢查更新。
+ *
+ * **不受自動更新開關管**：那個開關管的是自動連外，親手按下就是明示同意這一次。
+ * resolve 成 null 代表已經是最新，reject 代表這次檢查失敗（原因後端會寫進活動日誌）。
+ */
+export const checkForUpdatesNow = () => invoke<UpdateInfo | null>("check_for_updates_now");
 
 /**
  * 開某一版的 release 頁：發佈說明與那一版的下載資產都在同一頁上，所以可攜版的

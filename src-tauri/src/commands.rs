@@ -8,7 +8,7 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
-use crate::state::{autostart_name, Snapshot, MAIN_WINDOW};
+use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
 use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
@@ -945,6 +945,31 @@ pub async fn apply_update(state: State<'_, Shared>) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 使用者主動按下的「Check for updates／Check now」。
+///
+/// **不受自動更新開關管**：那個開關管的是自動連外，親手按下這顆鈕就是對這一次
+/// 連外的明示同意。結果直接回傳，讓按鈕呈現得出 Up to date 與 Check failed
+/// 那兩個瞬態——Err 就是失敗，Ok(None) 就是已經最新。
+#[tauri::command]
+pub async fn check_for_updates_now(state: State<'_, Shared>) -> Result<Option<UpdateInfo>, String> {
+    let st = state.inner().clone();
+    update::check_manually(&st).await
+}
+
+/// 設定頁那顆綠色主鈕：把新版裝上去。
+///
+/// 與 `apply_update` 的分工是「暫存區裡有沒有東西」：那一支只認已經下載好的
+/// 那一份（系統匣的「Restart to update」走它），這一支則從頭走完整條
+/// ——沒下載就下載，下載好了就交棒。自動更新關著時能更新的只有這條路。
+///
+/// 正常路徑上這個指令**不會回傳**——安裝程式一起來，這支程式就 exit 了，
+/// 所以前端不必為成功的情況做任何收尾。回 Err 才代表這次更新沒能開始。
+#[tauri::command]
+pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
+    let st = state.inner().clone();
+    update::install(&st).await.inspect_err(|e| st.log(format!("update failed: {e}")))
 }
 
 /// 某一版的 release 頁：發佈說明與該版的下載資產都在那一頁上。

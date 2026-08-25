@@ -19,10 +19,11 @@
 import { afterTransition, el, isToggleOn, setToggle } from "./dom";
 import { setIcon, type IconName } from "./icons";
 import {
-  applyUpdate,
+  checkForUpdatesNow,
   deleteSource,
   deleteWgProxy,
   getConfigPath,
+  installUpdate,
   openConfigDir,
   openReleasePage,
   openReleasesPage,
@@ -983,34 +984,28 @@ function settingsError(msg: string) {
 /**
  * 更新鈕的六個狀態。版本列的標題與右側 split button 都由它決定：
  *
- *   idle        沒有新版，也沒有待套用的東西——主鈕整顆藏起來，只留下拉的柄
- *   downloading 安裝版查到新版了，後端正在背景下載——轉圈，不可按
- *   stalled     下載失敗、正在退避等重試——琥珀色字，**不轉圈**，不可按
- *   ready       已經下載好等著裝——綠色主要鈕「Restart to update」
- *   portable    可攜／單檔版查到新版——綠色主要鈕「Get vX.Y.Z」，開瀏覽器
- *   busy        按下 Restart to update 之後、交棒給安裝程式之前的那段
+ *   idle      沒有新版（或還沒查過）——「Check for updates」，可按
+ *   checking  查詢進行中——spinner，不可按
+ *   uptodate  剛查完、已是最新——兩秒後自己退回 idle
+ *   failed    剛查完、查不到——同樣兩秒後退回 idle
+ *   available 有新版——綠色主要鈕，文字是要更新到哪一版
+ *   busy      安裝版按下更新後、交棒給安裝程式之前的那段
  *
- * 沒有「checking／uptodate／failed」了：手動檢查那顆鈕已經拿掉，
- * 背景每天查一次、查到就自己下載，使用者沒有東西要等在畫面前面看。
+ * **這六個狀態與「Automatic updates」開關完全無關**：那個開關管的是背景自動
+ * 連外與下次啟動自動安裝，按鈕列在開與關之下長得一模一樣、能按的東西也一樣。
  */
-type UpdateState = "idle" | "downloading" | "stalled" | "ready" | "portable" | "busy";
+type UpdateState = "idle" | "checking" | "uptodate" | "failed" | "available" | "busy";
+
+/** Up to date／Check failed 這兩個瞬態停留多久才退回常態 */
+const TRANSIENT_MS = 2000;
 
 /**
- * 後端推來的三份事實。它們是這一區唯一的資料，畫面完全由它們推導出來。
+ * 目前已知的新版。按鈕的行為分兩條車道，按下去的當下要知道自己是哪一條，
+ * 所以留一份在這裡，而不是每次都回頭去問快照。
  */
 let updateInfo: Snapshot["update"] = null;
-let pendingUpdate: string | null = null;
-let updateStalled = false;
-
-/**
- * 使用者按下 Restart to update 之後、交棒給安裝程式之前的那一小段。
- *
- * 這是**唯一**需要記在前端的狀態，因為它是後端不知道的事（那顆 promise 成功時
- * 永遠不會 resolve）。其餘每一個狀態都由上面三份事實即時推導——留一份
- * `updateState` 快取的話，就會有「事實變了、快取沒跟上」的縫，
- * 而那種 bug 的樣子是「畫面停在一個早就不成立的狀態」。
- */
-let restarting = false;
+let updateState: UpdateState = "idle";
+let transientTimer: number | null = null;
 
 const updateSplit = () => el<HTMLDivElement>("update-split");
 const updateMain = () => el<HTMLButtonElement>("btn-update");
@@ -1018,95 +1013,118 @@ const updateChevron = () => el<HTMLButtonElement>("btn-update-more");
 const updateMenu = () => el<HTMLDivElement>("update-menu");
 
 /**
- * 現在是哪一個狀態。**每次都重算，不快取。**
+ * 後端從 v0.6.2 起多了一份事實：`pendingUpdate`，已經下載好躺在暫存區、等著裝
+ * 的那一版（自動更新開著時背景車道會自己填它）。
  *
- * 順序就是優先序：
+ * 對這顆按鈕來說它與「查到有新版」是同一件事——都是「有一版可以更新過去」，
+ * 差別只在按下去之後後端要不要再抓一次檔案，而那是後端自己判斷的
+ * （`install_update` 看暫存區有沒有東西）。所以在這個交界處把它折成同一種
+ * `UpdateInfo`，狀態機本身維持原樣，不必為它多開一個狀態。
  *
- * 1. `restarting` 最大——它是使用者剛剛親手觸發的動作，後端接下來還會推好幾次
- *    config-changed（交棒前會把隧道一條條收掉），那些事件不准把鈕從
- *    Restarting… 拉回去。
- * 2. 已經下載好的那一版次之，它是唯一一個「按下去真的會更新」的狀態。
- * 3. 剩下的看那一版屬於哪條車道：可攜版沒有下載這一段，安裝版則要分
- *    「正在下載」與「下載失敗等重試」——兩者在畫面上長得完全不同，
- *    混為一談的話網路壞掉時那顆 spinner 會轉上一整天。
+ * `snap.update` 優先：它是「遠端現在最新的那一版」，而暫存區裡躺的可能是更早
+ * 一輪下載的舊版本。
  */
-function state(): UpdateState {
-  if (restarting) return "busy";
-  if (pendingUpdate) return "ready";
-  if (!updateInfo) return "idle";
-  if (!updateInfo.installed) return "portable";
-  return updateStalled ? "stalled" : "downloading";
+function effectiveUpdate(snap: Snapshot): Snapshot["update"] {
+  if (snap.update) return snap.update;
+  if (snap.pendingUpdate) return { version: snap.pendingUpdate, installed: true };
+  return null;
+}
+
+/**
+ * 主鈕在按下去會發生什麼事的那一版文字。
+ *
+ * 兩條車道的動作完全不同，所以連動詞都不一樣：安裝版是就地更新（下載安裝檔並
+ * 交棒給它，程式自己退出、裝完重啟），可攜／單檔版沒有安裝程式可以交棒、也不該
+ * 自己改寫自己，只能把使用者送到那一版的 release 頁自己把檔案換掉。
+ */
+function updateActionLabel(info: NonNullable<Snapshot["update"]>): string {
+  return info.installed ? `Update to v${info.version}` : `Get v${info.version}`;
 }
 
 /** 每個狀態下主鈕長什麼樣：圖示、文字、能不能按、圖示要不要轉 */
-function mainLook(current: UpdateState): {
-  icon: IconName;
-  label: string;
-  disabled: boolean;
-  spin: boolean;
-} {
-  switch (current) {
-    case "downloading":
-      return {
-        icon: "loader-circle",
-        label: updateInfo ? `Downloading v${updateInfo.version}…` : "Downloading…",
-        disabled: true,
-        spin: true,
-      };
-    case "stalled":
-      // 轉圈的意思是「正在下載」。下載失敗、正在退避等下一次排程的時候，
-      // 誠實的說法是「失敗了，之後會再試」，不是一顆轉到天荒地老的 spinner
-      return {
-        icon: "triangle-alert",
-        label: "Download failed — will retry",
-        disabled: true,
-        spin: false,
-      };
-    case "ready":
+function mainLook(): { icon: IconName; label: string; disabled: boolean; spin: boolean } {
+  switch (updateState) {
+    case "checking":
+      return { icon: "loader-circle", label: "Checking…", disabled: true, spin: true };
+    case "uptodate":
+      return { icon: "check", label: "Up to date", disabled: true, spin: false };
+    case "failed":
+      return { icon: "triangle-alert", label: "Check failed", disabled: true, spin: false };
+    case "available":
       return {
         icon: "download",
-        label: `Restart to update${pendingUpdate ? ` (v${pendingUpdate})` : ""}`,
-        disabled: false,
-        spin: false,
-      };
-    case "portable":
-      // 可攜／單檔版沒有安裝程式可以交棒、也不該自己改寫自己，
-      // 能做的只有把使用者送到那一版的 release 頁自己換檔案
-      return {
-        icon: "download",
-        label: updateInfo ? `Get v${updateInfo.version}` : "Update available",
+        // available 一定伴隨 updateInfo，這個退路只是為了不讓型別上的 null 變成畫面上的 undefined
+        label: updateInfo ? updateActionLabel(updateInfo) : "Update available",
         disabled: false,
         spin: false,
       };
     case "busy":
-      return { icon: "loader-circle", label: "Restarting…", disabled: true, spin: true };
+      return { icon: "loader-circle", label: "Updating…", disabled: true, spin: true };
     default:
-      return { icon: "download", label: "", disabled: true, spin: false };
+      return { icon: "refresh-cw", label: "Check for updates", disabled: false, spin: false };
   }
 }
 
 /**
- * 把當下的狀態畫到畫面上。
+ * 把狀態畫到畫面上。
  *
- * 標題跟的是「有沒有東西可更新」而不是按鈕狀態：那一列的標題回答的是事實，
- * 按鈕回答的是「現在可以做什麼」。idle 時主鈕整顆藏起來——沒有新版時它能顯示的
- * 只有一句廢話，而一顆按不下去的鈕比沒有鈕更容易讓人以為是壞掉了。
+ * 標題跟的是 updateInfo 而不是按鈕狀態：那一列的標題回答的是「有沒有新版」，
+ * 按鈕回答的是「現在可以做什麼」。所以重新檢查（checking）時標題不該從
+ * Update available 跳回 Version——已經查到的那一版並沒有因為你再查一次就消失。
  */
 function paintUpdateRow() {
-  const current = state();
-  const has = Boolean(updateInfo || pendingUpdate);
-  el<HTMLDivElement>("version-title").textContent = has ? "Update available" : "Version";
-  const look = mainLook(current);
-  updateSplit().dataset.state = current;
-  updateMain().hidden = current === "idle";
+  el<HTMLDivElement>("version-title").textContent = updateInfo ? "Update available" : "Version";
+  const look = mainLook();
+  updateSplit().dataset.state = updateState;
   updateMain().disabled = look.disabled;
   el<HTMLSpanElement>("update-label").textContent = look.label;
   const iconBox = el<HTMLSpanElement>("update-icon");
   setIcon(iconBox, look.icon, 14);
   iconBox.classList.toggle("spin", look.spin);
-  // 交棒進行中就不要再讓人從下拉裡開第二件事
-  updateChevron().disabled = current === "busy";
-  if (current === "busy") closeUpdateMenu();
+  // 連外進行中就不要再讓人從下拉裡開第二件事；這兩個狀態也不該被選單蓋住
+  const locked = updateState === "checking" || updateState === "busy";
+  updateChevron().disabled = locked;
+  if (locked) closeUpdateMenu();
+}
+
+function setUpdateState(next: UpdateState) {
+  if (transientTimer !== null) {
+    window.clearTimeout(transientTimer);
+    transientTimer = null;
+  }
+  updateState = next;
+  paintUpdateRow();
+  // 兩個瞬態都會自己退場，退到哪裡看那時候手上有沒有新版
+  if (next === "uptodate" || next === "failed") {
+    transientTimer = window.setTimeout(() => {
+      transientTimer = null;
+      setUpdateState(updateInfo ? "available" : "idle");
+    }, TRANSIENT_MS);
+  }
+}
+
+/**
+ * 後端推來的更新資訊（啟動快照、config-changed、背景檢查的 update-available）。
+ *
+ * checking 與 busy 這兩個狀態由當下那個動作自己收尾，事件不准插隊改按鈕：
+ * 手動檢查本身就會讓後端推一次 update-available，那個事件很可能比 invoke 的
+ * resolve 還早到，照收的話按鈕會先閃一下 available 再被 resolve 蓋回去。
+ * 標題還是要跟著更新，它反映的是事實而不是進行中的動作。
+ */
+function applyUpdateInfo(info: Snapshot["update"]) {
+  updateInfo = info;
+  if (updateState === "checking" || updateState === "busy") {
+    paintUpdateRow();
+    return;
+  }
+  if (info) {
+    setUpdateState("available");
+    return;
+  }
+  // 新版沒了（例如使用者把自動更新關掉）就退回常態；
+  // 剛查完的那兩個瞬態則留給它們自己的計時器收尾，不要中途打斷
+  if (updateState === "available") setUpdateState("idle");
+  else paintUpdateRow();
 }
 
 /** 後端推了新設定就把 toggle 與更新列都對齊回去 */
@@ -1114,10 +1132,7 @@ export function syncSettingsPage(snap: Snapshot) {
   setToggle(tgClose(), snap.closeToTray);
   setToggle(tgAutostart(), snap.autostart);
   setToggle(tgAutoUpdate(), snap.automaticUpdates);
-  updateInfo = snap.update ?? null;
-  pendingUpdate = snap.pendingUpdate ?? null;
-  updateStalled = snap.updateStalled ?? false;
-  paintUpdateRow();
+  applyUpdateInfo(effectiveUpdate(snap));
 }
 
 function wireToggle(node: HTMLElement, apply: (on: boolean) => Promise<unknown>) {
@@ -1182,38 +1197,59 @@ function closeUpdateMenu() {
 }
 
 /**
+ * 手動檢查一次。
+ *
+ * **刻意不看 automaticUpdates 開關**：那個開關管的是背景自動連外，使用者親手按下
+ * 這顆鈕就是對這一次連外的明示同意，再拿背景開關擋他只會變成按了沒反應。
+ * 三種結果都直接反映在同一顆鈕上：有新版就變綠、已最新與失敗各閃一下兩秒的
+ * 瞬態再退回去。失敗的詳細原因後端已經寫進活動日誌，不必再彈一次錯誤列。
+ */
+function runUpdateCheck() {
+  if (updateState === "checking" || updateState === "busy") return;
+  closeUpdateMenu();
+  settingsError("");
+  setUpdateState("checking");
+  void checkForUpdatesNow()
+    .then((info) => {
+      updateInfo = info;
+      setUpdateState(info ? "available" : "uptodate");
+    })
+    .catch(() => setUpdateState("failed"));
+}
+
+/**
  * 綠色主鈕按下去之後。兩條車道的收尾方式不一樣：
  *
  * 安裝版按下去就沒有回頭路了（安裝程式接手、程式退出），所以先進 busy 把鈕鎖住
  * 避免連按兩次，而且那個 promise 成功時根本不會 resolve——只有失敗要處理，
- * 把鈕放回它該有的樣子並把原因寫在設定頁的錯誤列。
+ * 把鈕放回 available 並把原因寫在設定頁的錯誤列。
  *
  * 可攜版只是開一個瀏覽器分頁到那一版的 release 頁，按幾次都無所謂，鈕不必鎖。
  */
 function startUpdate() {
-  const current = state();
+  const info = updateInfo;
+  if (!info) return;
   settingsError("");
-  if (current === "portable") {
-    const version = updateInfo?.version;
-    if (version) void openReleasePage(version).catch((e) => settingsError(String(e)));
+  if (!info.installed) {
+    void openReleasePage(info.version).catch((e) => settingsError(String(e)));
     return;
   }
-  if (current !== "ready") return;
-  restarting = true;
-  paintUpdateRow();
-  void applyUpdate().catch((e) => {
-    restarting = false;
-    paintUpdateRow();
+  setUpdateState("busy");
+  void installUpdate().catch((e) => {
+    setUpdateState("available");
     settingsError(String(e));
   });
 }
 
 /**
- * 版本列右側的 split button。主鈕只在有事情可做時才在，柄點開的下拉收兩個
- * 次要動作（看發佈說明、去 Releases 自己挑版本）。
+ * 版本列右側的 split button。主鈕依當下狀態分岔（有新版就更新、其餘一律是
+ * 檢查一次），柄點開的下拉收三個次要動作。
  */
 function initUpdateControl() {
-  updateMain().addEventListener("click", startUpdate);
+  updateMain().addEventListener("click", () => {
+    if (updateState === "available") startUpdate();
+    else runUpdateCheck();
+  });
 
   updateChevron().addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1235,11 +1271,12 @@ function initUpdateControl() {
     }
   });
 
-  // 查到新版（或已經下載好）就開那一版的 release 頁，都沒有就退回 releases/latest
+  el<HTMLButtonElement>("mi-check-now").addEventListener("click", runUpdateCheck);
+
+  // 查到新版就開那一版的 release 頁，還沒查到就退回 releases/latest
   el<HTMLButtonElement>("mi-release-notes").addEventListener("click", () => {
     closeUpdateMenu();
-    const version = pendingUpdate ?? updateInfo?.version ?? null;
-    void openReleasePage(version).catch((e) => settingsError(String(e)));
+    void openReleasePage(updateInfo?.version ?? null).catch((e) => settingsError(String(e)));
   });
 
   el<HTMLButtonElement>("mi-downloads").addEventListener("click", () => {
