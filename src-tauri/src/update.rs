@@ -237,6 +237,48 @@ pub fn check_now(state: &Shared) {
     });
 }
 
+/// 使用者主動按下的檢查（設定頁的「Check for updates」與下拉的「Check now」）。
+///
+/// 刻意**不**看 `checks_for_updates` 那道閘：它管的是「要不要自己在背景連外」，
+/// 而使用者親手按下這顆鈕，就是對這一次連外的明示同意。拿背景開關去擋一個
+/// 當面的請求，得到的只會是一顆按了沒反應的鈕。
+///
+/// 與背景車道的另一個差別是結果要回傳：按鈕靠它呈現 Up to date／Check
+/// failed 那兩個瞬態，而背景車道對這兩種結果都是靜默的。共用狀態照樣更新，
+/// 兩條車道與介面看到的始終是同一份事實。
+///
+/// 查到新版之後還多做一件 v0.6.1 沒有的事：**自動更新開著時把它交給既有的
+/// 暫存鏈**（`stage_if_needed`）。少了這一步，手動查到的那一版不會被下載，
+/// 「開著自動更新時，檢查到的更新重啟就會裝上去」這個承諾在手動檢查之後
+/// 就不成立了。丟到背景去跑是因為下載是十幾 MB、幾十秒的事，而這支函式的
+/// 回傳值是那顆按鈕在等的東西，不可以被它拖住。
+pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
+    let found = match check_lane(&st.app).await {
+        Ok(found) => found,
+        Err(e) => {
+            st.log(format!("update check failed: {e}"));
+            return Err(e);
+        }
+    };
+    let info = found.info();
+    st.set_update(info.clone());
+    match &info {
+        Some(u) => st.log(format!("update check: v{} is available", u.version)),
+        None => st.log("update check: already up to date"),
+    }
+    // 開關關著就不下載：`download_and_stage` 那道 A1 閘本來也會擋掉落地，
+    // 但沒有理由先白抓十幾 MB 再把它丟掉
+    if let Found::Installed { update, .. } = found {
+        if st.checks_for_updates() {
+            let bg = st.clone();
+            tauri::async_runtime::spawn(async move {
+                stage_if_needed(&bg, *update).await;
+            });
+        }
+    }
+    Ok(info)
+}
+
 /// 查一次，查到新版而且這一份是安裝版就順手把它下載進暫存區。
 ///
 /// 任何失敗都只記一行就算了——更新不成功不影響程式本身能不能用，
@@ -758,6 +800,66 @@ pub fn apply_now(st: &Shared) -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// 使用者親手按下的那顆綠色主鈕（設定頁的「Update to vX.Y.Z」）。
+///
+/// 這是 v0.6.1 的手動更新鏈，尾巴換成 v0.6.2 的暫存＋交棒那一段：
+///
+/// 1. 暫存區裡已經有一份（自動車道先下載好了）就直接交棒，不必再抓一次十幾 MB；
+/// 2. 沒有的話重查一次拿 `Update` 物件，下載（外掛在這一步驗簽），落地成暫存，
+///    再走同一支 [`apply_now`]。
+///
+/// **手動這條路不看「Automatic updates」開關**，理由與 [`check_manually`] 相同：
+/// 使用者按下這顆鈕就是對這一次更新的明示同意。所以它也不經過
+/// `download_and_stage` ——那一支帶著 A1 那道閘（下載途中開關被關掉就把成果丟掉），
+/// 那道閘守的是「背景偷偷下載完才落地」那個競態，套到當面的請求上只會變成
+/// 「按了沒反應」。
+///
+/// 落地之後那份暫存不會變成一個沒人收的爛攤子：交棒成功的話這個行程就沒了，
+/// 失敗的話開關關著時下一次啟動的 [`startup_gate`] 會把它清掉（`SkipAndClear`），
+/// 開著時則正好被自動車道認回來。
+///
+/// 重查而不是把先前 check 的 `Update` 物件存起來：那份東西帶著 http client 與
+/// 一堆執行期狀態，存進共用狀態只是徒增麻煩，而使用者按下按鈕的當下重查一次，
+/// 拿到的也一定是最新的那一版。
+pub async fn install(st: &Shared) -> Result<(), String> {
+    if !is_installed() {
+        return Err("This build cannot update itself".into());
+    }
+    let dir = staging_dir().ok_or("LOCALAPPDATA is not set")?;
+    if st.staged_version().is_some() {
+        return hand_over(st).await;
+    }
+    let updater =
+        st.app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    let mut update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No update available".to_string())?;
+    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
+    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
+
+    st.log(format!("downloading update v{}", update.version));
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+
+    let pending = staged::stage(&dir, &update.version, &bytes).map_err(|e| e.to_string())?;
+    st.set_staged(Some(pending));
+    // 剛剛才自己抓下來的那一份，退避旗標留著只會讓介面繼續掛著一句「下載失敗」
+    st.set_update_stalled(false);
+    hand_over(st).await
+}
+
+/// 把交棒那一段丟到 blocking 執行緒上（C1）。
+///
+/// [`apply_now`] 要把十幾 MB 的安裝檔整個讀進來算一次 SHA-256，而它的呼叫端是
+/// 一個 async 指令——留在 async 執行緒上會擋住整個 runtime。成功時它自己
+/// `exit(0)`，所以這支函式正常路徑上同樣不會回來。
+async fn hand_over(st: &Shared) -> Result<(), String> {
+    let st = st.clone();
+    tauri::async_runtime::spawn_blocking(move || apply_now(&st)).await.map_err(|e| e.to_string())?
+}
+
 fn main_window_visible(app: &AppHandle) -> bool {
     app.get_webview_window(MAIN_WINDOW).and_then(|w| w.is_visible().ok()).unwrap_or(false)
 }
@@ -1054,6 +1156,98 @@ mod tests {
         // 反過來，自動那一條一定要記
         let auto = body_of("pub fn apply_pending_at_startup");
         assert!(auto.contains("note_attempt"), "開機自動安裝必須把嘗試次數落地");
+    }
+
+    /// 手動那條路**不可以**被「Automatic updates」開關擋下。
+    ///
+    /// 這是整個設計的核心不對稱，而且是最容易被下一個讀者「順手修正」掉的一條：
+    /// `download_and_stage` 上面明明白白有一道看開關的閘（A1），照著抄到手動路上
+    /// 看起來很合理——實際結果是使用者關掉自動更新之後，那顆綠色的
+    /// 「Update to vX.Y.Z」按下去毫無反應。
+    ///
+    /// 兩支手動入口都不准出現 `checks_for_updates` 那道**前置**閘：
+    /// `check_manually` 只在查完之後拿它決定「要不要順手下載」，
+    /// `install` 則從頭到尾都不該問它。
+    #[test]
+    fn the_manual_lane_ignores_the_automatic_updates_switch() {
+        let install = body_of("pub async fn install");
+        assert!(
+            !install.contains("checks_for_updates") && !install.contains("accept_staging"),
+            "手動更新是使用者當面的請求，不可以被自動更新開關擋下：{install}"
+        );
+
+        let check = body_of("pub async fn check_manually");
+        let lane = check.find("check_lane(").expect("要有真的去查的那一步");
+        let gate = check.find("checks_for_updates()").expect("下載與否還是要看開關");
+        assert!(lane < gate, "開關只准決定「查到之後要不要順手下載」，不准擋住查詢本身：{check}");
+    }
+
+    /// 手動更新的順序：下載 → 落地 → 交棒，而且交棒要走 blocking 執行緒（C1）。
+    ///
+    /// 落地那一步不是可有可無的中繼站：[`apply_now`] 唯一的資料來源就是暫存區，
+    /// 少了它交棒那一步會直接回「No update is ready to install」——而使用者剛剛
+    /// 才等完一次十幾 MB 的下載。
+    #[test]
+    fn the_manual_update_downloads_then_stages_then_hands_over_off_thread() {
+        let body = body_of("pub async fn install");
+        let download = body.find(".download(").expect("要有下載那一步");
+        let stage = body.find("staged::stage(").expect("下載回來要先落地成暫存");
+        let hand = body.rfind("hand_over(").expect("最後要交棒");
+        assert!(download < stage && stage < hand, "順序必須是下載→落地→交棒：{body}");
+
+        // 交棒會整檔算一次 SHA-256，留在 async 執行緒上會擋住整個 runtime
+        let off_thread = body_of("async fn hand_over");
+        assert!(
+            off_thread.contains("spawn_blocking"),
+            "apply_now 是十幾 MB 的整檔讀取，一定要丟到 blocking 執行緒：{off_thread}"
+        );
+    }
+
+    /// 手動更新同樣不可以消耗自動重試的額度（A5）。
+    ///
+    /// `the_manual_restart_never_burns_the_automatic_retry_budget` 釘的是
+    /// `apply_now`，這一條釘的是走到它之前的那一段——`install` 自己也不准去記帳。
+    #[test]
+    fn the_manual_update_never_burns_the_automatic_retry_budget() {
+        let body = body_of("pub async fn install");
+        assert!(
+            !body.contains("note_attempt"),
+            "attempts 是自動路的保險絲，手動的失敗使用者當場看得到：{body}"
+        );
+    }
+
+    /// 設定頁那顆主鈕**永遠在**。
+    ///
+    /// v0.6.2 把它改成「沒事做就整顆藏起來」（`hidden` 屬性寫在 HTML 上、
+    /// 由 JS 開關），於是自動更新關掉之後那一列就完全沒有入口了——使用者
+    /// 連查一次都做不到。這一版把它請回來：idle 時是「Check for updates」。
+    ///
+    /// 直接讀出貨的 index.html，比照
+    /// `the_stylesheet_makes_the_hidden_attribute_actually_hide` 的做法。
+    #[test]
+    fn the_update_button_is_always_in_the_settings_page() {
+        let html = include_str!("../../index.html").replace("\r\n", "\n");
+        let start = html.find(r#"id="btn-update""#).expect("版本列一定要有主鈕");
+        let tag = &html[start..start + html[start..].find('>').expect("標籤沒有結尾")];
+        assert!(!tag.contains("hidden"), "主鈕不可以預設藏起來：{tag}");
+
+        // 下拉裡的「Check now」是同一件事的第二個入口，一起釘住
+        assert!(html.contains(r#"id="mi-check-now""#), "下拉要保留 Check now");
+    }
+
+    /// 兩支手動指令都要真的註冊進 invoke_handler。
+    ///
+    /// 漏掉的症狀只有執行期才看得到（前端 invoke 直接 reject，按鈕按下去
+    /// 跳一句看不懂的錯誤），型別系統完全管不到——指令函式本身照樣編得過。
+    #[test]
+    fn the_manual_update_commands_are_registered() {
+        let lib = include_str!("lib.rs");
+        for cmd in ["check_for_updates_now", "install_update"] {
+            assert!(
+                lib.contains(&format!("commands::{cmd}")),
+                "{cmd} 沒有註冊進 invoke_handler，前端會叫不到"
+            );
+        }
     }
 
     /// 第二實例絕不套用，而且**標記要留著**。

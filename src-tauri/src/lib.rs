@@ -185,6 +185,8 @@ pub fn run() {
             commands::get_config_path,
             commands::open_config_dir,
             commands::set_automatic_updates,
+            commands::check_for_updates_now,
+            commands::install_update,
             commands::apply_update,
             commands::open_release_page,
             commands::open_releases_page,
