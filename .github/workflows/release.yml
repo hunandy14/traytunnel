@@ -67,7 +67,7 @@ jobs:
               matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"},{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
               ;;
             *)
-              echo "::error::未知的 platform 輸入：$platform（要 all / windows / macos 其中之一）"
+              echo "::error::未知的 platform 輸入：${platform}（要 all / windows / macos 其中之一）"
               exit 1
               ;;
           esac
@@ -245,10 +245,10 @@ jobs:
           bundle_hash=$(shasum -a 256 "$bundle_tar" | awk '{print $1}')
           release_hash=$(shasum -a 256 "$release_tar" | awk '{print $1}')
           if [ "$bundle_hash" != "$release_hash" ]; then
-            echo "::error::簽章不一致：$release_tar（SHA256 $release_hash）與簽章實際簽的 $bundle_tar（SHA256 $bundle_hash）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
+            echo "::error::簽章不一致：${release_tar}（SHA256 ${release_hash}）與簽章實際簽的 ${bundle_tar}（SHA256 ${bundle_hash}）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
             exit 1
           fi
-          echo "簽章一致性確認：$release_tar 與 $bundle_tar 的 SHA256 相同（$release_hash）"
+          echo "簽章一致性確認：${release_tar} 與 ${bundle_tar} 的 SHA256 相同（${release_hash}）"
 
       # out/ 整包（含 package.mjs 順手複製進去的 .sig）交給 compose job：
       # latest.json 要合併雙平台，勢必得先把兩腿的產物集中到同一個 job。
