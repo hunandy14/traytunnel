@@ -17,3 +17,12 @@ pub fn home_dir() -> Option<PathBuf> {
 pub fn stem_marks_portable(exe_stem: &str) -> bool {
     matches!(exe_stem.chars().next_back(), Some(c) if c.eq_ignore_ascii_case(&'p'))
 }
+
+/// 可攜模式的第二個觸發條件：執行檔旁邊已經有 `traytunnel.toml`。
+///
+/// Windows 上單純看檔案存不存在；`config::resolve_location` 傳進來的 `path` 就是
+/// `exe_dir.join(TOML_NAME)`，這裡不重新拼路徑。行為原樣照舊（W3 只是把判斷收進
+/// platform，沒有改邏輯）——macOS 那邊這一支恆回 false（見同名函式的 macOS 版）。
+pub fn exe_toml_marks_portable(path: &std::path::Path) -> bool {
+    path.is_file()
+}

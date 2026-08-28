@@ -4876,6 +4876,7 @@ dependencies = [
  "ico",
  "libc",
  "log",
+ "notify-rust",
  "semver",
  "serde",
  "serde_json",

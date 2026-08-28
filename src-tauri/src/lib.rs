@@ -194,6 +194,13 @@ pub fn run() {
             commands::exit_app,
         ])
         .setup(|app| {
+            // 純 tray 常駐：不要 Dock 圖示、不要出現在 Cmd+Tab 切換器。traytunnel
+            // 是系統匣工具，沒有「一般 App」該有的存在感（對應 Windows 沒有工作列
+            // 圖示、只在系統匣的既有行為）。要趁還沒建視窗、建系統匣之前定調，
+            // 免得使用者先看到一閃而過的 Dock 圖示。
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             let handle = app.handle().clone();
             // 通知掛名要在任何 UI／toast 之前處理掉
             let aumid_notes = prepare_notifications(&handle);
