@@ -77,21 +77,23 @@ jobs:
           case "$platform" in
             windows)
               matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"}]}'
-              platform_keys="windows-x86_64"
               ;;
             macos)
               matrix='{"include":[{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
-              platform_keys="darwin-aarch64"
               ;;
             all)
               matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"},{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
-              platform_keys="windows-x86_64 darwin-aarch64"
               ;;
             *)
               echo "::error::未知的 platform 輸入：${platform}（要 all / windows / macos 其中之一）"
               exit 1
               ;;
           esac
+
+          # platform_keys 與 matrix 同源：從 matrix 本身推導，而不是各分支
+          # 各寫一份字面值——避免「新增平台進 matrix 卻忘了同步 platform_keys」
+          # 這種無聲遺漏。
+          platform_keys="$(printf '%s' "$matrix" | jq -r '[.include[].platform_key] | join(" ")')"
 
           echo "platform=${platform}  dry_run=${dry_run}  allow_stale_platforms=${allow_stale}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"

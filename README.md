@@ -63,6 +63,34 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 
 Free code signing provided by [SignPath.io](https://signpath.io/) , certificate by [SignPath Foundation](https://signpath.org/) .
 
+## macOS 支援
+
+macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機驗證的時間還沒有 Windows 版久，發佈時 Release 也會標記為 beta。
+
+### 需求
+
+- macOS 12（Monterey）以上
+- **僅支援 Apple Silicon（`arm64`）**，沒有 Intel（`x86_64`）版本
+- `ssh`（系統內建的 OpenSSH 用戶端即可，不必額外安裝）
+- 選配：`cloudflared`，若你的 SSH 主機需要透過 Cloudflare Access 存取
+
+### 安裝
+
+到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面下載其中一種：
+
+| 檔名 | 說明 |
+| --- | --- |
+| `traytunnel-<版本>-aarch64.dmg` | 安裝映像，掛載後把 `traytunnel.app` 拖進「應用程式」資料夾 |
+| `traytunnel-<版本>-aarch64.app.tar.gz` | 免安裝的 `.app` 壓縮包，解壓後一樣要拖進「應用程式」資料夾 |
+
+**不論哪一種，都務必先把 `traytunnel.app` 拖進「應用程式」資料夾再開啟**，不要直接從掛載的 dmg 視窗或 `~/Downloads` 裡雙擊執行。這不只是慣例：macOS 對「帶隔離標記、卻沒被搬進正式位置」的 app 會做 App Translocation（Gatekeeper 的路徑隨機化），直接執行的話系統會把它塞進一個唯讀的隨機路徑跑，應用內更新在那個路徑下必定失敗（寫入被拒絕）；搬進「應用程式」資料夾之後 macOS 才不會再套用這個機制。
+
+我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。
+
+### 已知限制
+
+- **開機自啟的偵測不含「使用者在系統設定裡手動停用」的狀態**：程式判斷開機自啟是否生效，看的是自己有沒有寫入 `~/Library/LaunchAgents` 底下的 plist；如果你在「系統設定 → 一般 → 登入項目」把它關掉，程式不會發現，畫面上的開關依然顯示為開啟。Windows 版有對齊「工作管理員」的停用紀錄，macOS 版目前還沒有對應的偵測。
+
 ## 介面
 
 介面上的用詞與設定檔的結構對應：一個 `[[sources]]` 在畫面上叫一條**連線**（connection），底下的每個 `[[sources.forwards]]` 叫一條**隧道**（tunnel）。
@@ -98,6 +126,10 @@ Free code signing provided by [SignPath.io](https://signpath.io/) , certificate 
 npm install
 npm run tauri dev
 ```
+
+要在 `src-tauri/src/platform/` 底下加平台相依功能，或想知道跨平台程式碼的規則，先看
+[`docs/platform-guide.md`](docs/platform-guide.md)（一頁內講完：資料夾結構、共用核心的
+可見性規則、新增功能的流程、CI 雙腿守門、live 測試慣例）。
 
 ### 瀏覽器 UI 開發模式
 
@@ -164,13 +196,15 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要一個指令：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別跑 `npm run build:all`，兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
 
 ```
 npm run release <x.y.z>
 ```
 
 它（`scripts/release.mjs`）會依序：建立 `release/<x.y.z>` 分支 → 跑 `npm run bump <x.y.z>` 同步版本號 → 同步 `Cargo.lock`／`package-lock.json` → commit → push → `gh pr create` 開 PR → `gh pr merge --auto --merge` 掛上 auto-merge → 切回 `main`。
+
+`release.yml` 也支援 `workflow_dispatch` 只重建其中一個平台（例如單獨補發 macOS）；`latest.json` 只有一個全域 `version` 欄位、沒有 per-platform 版本，因此單平台發佈有先天限制，用法與風險見 [`docs/release-risk-register.md`](docs/release-risk-register.md)。
 
 `main` 已開 branch protection，required status check 綁定的是 job 名稱，目前是 `.github/workflows/ci.yml` 裡的 `ci` 這個 job，要它綠燈才能合併（若之後改了這個 job 的 id，記得同步更新 branch protection 設定，否則 required check 會找不到對應狀態而永遠卡住）；`gh pr merge --auto` 會等 CI 通過後自動合併，合併進 `main` 後 `autotag.yml` 偵測到版號變動，自動建立並推送 tag `v<x.y.z>`，接著觸發 `release.yml` 建置發佈——全程不必再手動介入。
 

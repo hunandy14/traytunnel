@@ -1010,16 +1010,26 @@ mod tests {
         );
     }
 
-    /// release workflow 組出來的 latest.json 必須是 updater 外掛吃得下的形狀。
+    /// release 管線組出來的 latest.json 必須是 updater 外掛吃得下的形狀。
     ///
-    /// 這條路上完全沒有型別把關：workflow 是一段 PowerShell，外掛是外部相依，
+    /// 現行流程（release.yml）是雙平台 compose，不是單一 PowerShell 腳本：
+    /// build matrix 在 windows-latest 與 macos-14 兩腿各自建置、簽章，compose
+    /// job（ubuntu runner，bash）下載兩腿的 artifact，用
+    /// scripts/compose-latest-json.mjs（呼叫 scripts/lib/latest-json.mjs 的
+    /// `mergeLatestJson`）把 windows-x86_64 與 darwin-aarch64 兩個平台的
+    /// signature/url 合進同一份 latest.json；不屬於這次矩陣的平台則沿用底稿
+    /// 舊條目（見 mergeLatestJson 的陳舊條目斷言）。`pub_date` 是 compose job
+    /// 用 `date -u +%Y-%m-%dT%H:%M:%S.000Z` 產生，不再是 PowerShell 的
+    /// `[System.DateTime]::UtcNow.ToString("o")`。
+    ///
+    /// 這條路上依然完全沒有型別把關：compose 腳本是 JS，updater 外掛是外部相依，
     /// 中間只靠一份執行期才會下載的 JSON 對接。形狀一旦對不上，症狀是安裝版的
     /// 更新從此靜默失效——檢查失敗只會在活動日誌留一行，沒有人會注意到。
     ///
-    /// 最脆弱的是 `pub_date`：workflow 寫的是
-    /// `[System.DateTime]::UtcNow.ToString("o")`（7 位小數再接 Z），而外掛拿
-    /// RFC3339 去解析它，解不出來時是整份 release 反序列化失敗，不是忽略那個欄位。
-    /// 有人把它改成 `ToString()` 或別的格式，這裡就會紅。
+    /// 最脆弱的還是 `pub_date`：`date` 那行組出來的是固定 `.000Z` 尾碼（不是真的
+    /// 毫秒精度，秒以下永遠是 0），格式與舊 PowerShell 的 7 位小數不同，但一樣
+    /// 要能被外掛的 RFC3339 解析器吃下去，解不出來時是整份 release 反序列化
+    /// 失敗，不是忽略那個欄位。有人把這行的日期格式改掉，這裡就會紅。
     #[test]
     fn the_release_workflow_manifest_still_deserializes() {
         let raw = r#"{
@@ -1040,6 +1050,52 @@ mod tests {
         // 目標鍵要跟 tauri 對這個平台用的字串一致，否則會是 TargetNotFound
         assert!(release.download_url("windows-x86_64").is_ok());
         assert!(release.signature("windows-x86_64").is_ok());
+    }
+
+    /// 上面那條只釘了單平台的形狀；compose job 實際產出的 manifest 兩個平台
+    /// 的 key 同時存在（往既有 release 補另一條腿、或平常的 platform=all 發佈
+    /// 都是這個形狀）。這裡另外釘住：`platforms` 有兩個 key 時，updater 外掛
+    /// 仍然照各自的目標鍵把 windows-x86_64 與 darwin-aarch64 分開解析出正確的
+    /// download_url／signature，不會因為多一個 key 就互相干擾，也不會只認得
+    /// 排在前面的那個。
+    #[test]
+    fn a_dual_platform_manifest_resolves_each_platform_independently() {
+        let raw = r#"{
+            "version": "0.6.5",
+            "pub_date": "2026-08-29T09:41:07.000Z",
+            "platforms": {
+                "windows-x86_64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHdpbmRvd3Mgc2lnbmF0dXJlCg==",
+                    "url": "https://github.com/hunandy14/traytunnel/releases/download/v0.6.5/traytunnel-0.6.5-setup.exe"
+                },
+                "darwin-aarch64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IGRhcndpbiBzaWduYXR1cmUK",
+                    "url": "https://github.com/hunandy14/traytunnel/releases/download/v0.6.5/traytunnel-0.6.5-aarch64.app.tar.gz"
+                }
+            }
+        }"#;
+        let release: tauri_plugin_updater::RemoteRelease =
+            serde_json::from_str(raw).expect("雙平台 latest.json 必須解析得出來");
+
+        assert_eq!(release.version.to_string(), "0.6.5");
+        assert!(release.pub_date.is_some());
+
+        let windows_url =
+            release.download_url("windows-x86_64").expect("windows-x86_64 應該解析得出來");
+        assert!(windows_url.as_str().ends_with("traytunnel-0.6.5-setup.exe"));
+        assert!(release.signature("windows-x86_64").is_ok());
+
+        let darwin_url =
+            release.download_url("darwin-aarch64").expect("darwin-aarch64 應該解析得出來");
+        assert!(darwin_url.as_str().ends_with("traytunnel-0.6.5-aarch64.app.tar.gz"));
+        assert!(release.signature("darwin-aarch64").is_ok());
+
+        // 兩個平台的網址與簽章互不相同——確認不是巧合對到同一個值
+        assert_ne!(windows_url.as_str(), darwin_url.as_str());
+        assert_ne!(
+            release.signature("windows-x86_64").unwrap(),
+            release.signature("darwin-aarch64").unwrap()
+        );
     }
 
     /// 上面那條要能真的擋住格式改動，前提是外掛對 pub_date 嚴格。
