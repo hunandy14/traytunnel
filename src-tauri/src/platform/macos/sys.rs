@@ -70,6 +70,11 @@ pub fn pick_icon_layer(_sizes: &[u32], _want: u32) -> Option<usize> {
 // 模式（`RunAtLoad` + `launchctl load/unload`），零新增依賴。
 
 /// LaunchAgent plist 所在資料夾：`~/Library/LaunchAgents`。
+///
+/// 只有這一支（與 [`launchctl_load`]／[`launchctl_unload`]）會碰真的使用者家目錄
+/// 與真的 launchd——底下的 `*_at` 系列全部改吃呼叫端傳進來的 `base: &Path`，
+/// 測試才能打 tempdir 而不必污染實機或 CI runner（獨立審查 2026-08-29 阻擋缺陷：
+/// 預設測試輪不准碰真實系統）。
 fn launch_agents_dir() -> Option<PathBuf> {
     super::paths::home_dir().map(|h| h.join("Library").join("LaunchAgents"))
 }
@@ -86,9 +91,10 @@ fn plist_label(name: &str) -> String {
     format!("com.traytunnel.autostart.{slug}")
 }
 
-fn plist_path(name: &str) -> Option<PathBuf> {
-    let label = plist_label(name);
-    Some(launch_agents_dir()?.join(format!("{label}.plist")))
+/// plist 在給定 `base` 資料夾底下的完整路徑。純函式，`base` 是 `~/Library/LaunchAgents`
+/// 或測試用的 tempdir，這一層不知道也不在乎是哪一種。
+fn plist_path_in(base: &Path, name: &str) -> PathBuf {
+    base.join(format!("{}.plist", plist_label(name)))
 }
 
 /// plist 是 XML，這幾個字元在 `<string>` 內容裡必須轉義——執行檔路徑理論上不會
@@ -160,21 +166,71 @@ fn read_program_arguments(contents: &str) -> Option<String> {
     }
 }
 
-/// 開機自啟目前是不是真的登記著：plist 檔案在就算數。
+/// 開機自啟目前是不是真的登記著：plist 檔案在就算數。純檔案 I/O，不碰 launchctl，
+/// `base` 讓測試可以傳 tempdir。
 ///
 /// 與 Windows 的 `autostart_enabled` 不完全對稱：Windows 那邊還會再看工作管理員
 /// 的 StartupApproved 停用紀錄，macOS（13 起）的「登入項目」系統設定也有等價的
 /// 使用者停用機制，但要偵測它得挖 `SMAppService` 的狀態或系統的背景任務管理
 /// 資料庫，複雜度與這一輪的範疇不成比例，先留給之後補（見 PR 說明的偏離事項）。
-pub fn autostart_enabled(name: &str) -> bool {
-    plist_path(name).is_some_and(|p| p.is_file())
+fn autostart_enabled_at(base: &Path, name: &str) -> bool {
+    plist_path_in(base, name).is_file()
 }
 
 /// 讀 plist 裡的 `ProgramArguments`，用來判斷開機自啟項是不是還指向這支執行檔。
-pub fn read_autostart_command(name: &str) -> Option<String> {
-    let path = plist_path(name)?;
-    let contents = std::fs::read_to_string(path).ok()?;
+/// 純檔案 I/O，不碰 launchctl。
+fn read_autostart_command_at(base: &Path, name: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(plist_path_in(base, name)).ok()?;
     read_program_arguments(&contents)
+}
+
+/// 把 LaunchAgent plist 寫進 `base` 資料夾，回傳寫出去的路徑。純檔案 I/O，
+/// 不碰 launchctl——要不要、什麼時候 `load` 是呼叫端（[`enable_autostart`]）的事。
+fn write_autostart_plist_at(base: &Path, name: &str, exe: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(base)?;
+    let label = plist_label(name);
+    let path = base.join(format!("{label}.plist"));
+    std::fs::write(&path, plist_contents(&label, exe))?;
+    Ok(path)
+}
+
+/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功）。純檔案 I/O，
+/// 不碰 launchctl。
+fn remove_autostart_plist_at(base: &Path, name: &str) -> io::Result<()> {
+    match std::fs::remove_file(plist_path_in(base, name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `launchctl load -w`，讓剛寫好的 plist 立即生效（不必等下次登入）。
+/// 薄函式，唯一目的是把「真的呼叫 launchctl」這件事收在一支好認的名字底下，
+/// 預設測試輪完全不呼叫它——只有 [`enable_autostart`] 與手動的 `#[ignore]`
+/// 實機測試會碰到。
+fn launchctl_load(path: &Path) -> io::Result<()> {
+    let status =
+        std::process::Command::new("launchctl").arg("load").arg("-w").arg(path).status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("launchctl load exited with {status}")));
+    }
+    Ok(())
+}
+
+/// `launchctl unload`，失敗（例如根本沒登記過）不當一回事——收尾用，
+/// 不該讓「本來就沒登記」變成錯誤。同樣是薄函式，預設測試輪不呼叫它。
+fn launchctl_unload(path: &Path) {
+    let _ = std::process::Command::new("launchctl").arg("unload").arg(path).output();
+}
+
+/// 開機自啟目前是不是真的登記著。
+pub fn autostart_enabled(name: &str) -> bool {
+    launch_agents_dir().is_some_and(|dir| autostart_enabled_at(&dir, name))
+}
+
+/// 讀登記的命令，用來判斷開機自啟項是不是還指向這支執行檔。
+pub fn read_autostart_command(name: &str) -> Option<String> {
+    read_autostart_command_at(&launch_agents_dir()?, name)
 }
 
 /// 寫出 LaunchAgent plist 並 `launchctl load` 讓它立即生效（不必等下次登入）。
@@ -186,36 +242,23 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
 pub fn enable_autostart(name: &str, exe: &Path) -> io::Result<()> {
     let dir = launch_agents_dir()
         .ok_or_else(|| io::Error::other("could not resolve $HOME for ~/Library/LaunchAgents"))?;
-    std::fs::create_dir_all(&dir)?;
-    let label = plist_label(name);
-    let path = dir.join(format!("{label}.plist"));
-
-    let _ = std::process::Command::new("launchctl").arg("unload").arg(&path).output();
-    std::fs::write(&path, plist_contents(&label, exe))?;
-    let status =
-        std::process::Command::new("launchctl").arg("load").arg("-w").arg(&path).status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("launchctl load exited with {status}")));
-    }
-    Ok(())
+    launchctl_unload(&plist_path_in(&dir, name));
+    let path = write_autostart_plist_at(&dir, name, exe)?;
+    launchctl_load(&path)
 }
 
-/// `launchctl unload` 並刪掉 plist；兩者都是冪等操作（本來就沒有登記／沒有檔案
-/// 也算成功），跟 Windows `disable_autostart` 刪 Run 值的冪等語意一致。
+/// `launchctl unload` 並刪掉 plist；兩者都是冪等操作，跟 Windows
+/// `disable_autostart` 刪 Run 值的冪等語意一致。
 pub fn disable_autostart(name: &str) -> io::Result<()> {
-    let Some(path) = plist_path(name) else {
+    let Some(dir) = launch_agents_dir() else {
         // 問不到 $HOME，沒有地方可能登記過，視同已經是關的
         return Ok(());
     };
+    let path = plist_path_in(&dir, name);
     if path.is_file() {
-        let _ = std::process::Command::new("launchctl").arg("unload").arg(&path).status();
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        launchctl_unload(&path);
     }
-    Ok(())
+    remove_autostart_plist_at(&dir, name)
 }
 
 // ---------------------------------------------------------------- 開外部程式
@@ -319,12 +362,56 @@ mod tests {
         assert_eq!(reveal_target(Path::new("traytunnel.toml"), false), Path::new("."));
     }
 
-    /// 開機自啟的登記本身是一輪完整的實機操作：寫 plist、`launchctl load`、
-    /// 讀回命令、`launchctl unload`、刪檔——比照 Windows 的
-    /// `hkcu_value_round_trip`，測試名稱帶 pid 避免撞到使用者真正的登記項，
-    /// 收尾一定會把測試用的 plist 清掉。
+    /// 開機自啟的檔案管理（不含 launchctl）走一輪完整往返：寫 plist、讀出已登記、
+    /// 讀回命令、刪檔、讀出未登記——全部打 tempdir。**不碰真的
+    /// `~/Library/LaunchAgents`，也不呼叫 launchctl**（獨立審查 2026-08-29 阻擋
+    /// 缺陷：預設測試輪不准碰真實系統，只有手動的 `live_autostart_round_trips_
+    /// through_launchd` 才准）。
     #[test]
-    fn autostart_round_trips_through_a_real_launch_agent() {
+    fn autostart_files_round_trip_in_a_tempdir() {
+        let base = std::env::temp_dir().join(format!(
+            "traytunnel-test-launchagents-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let name = "traytunnel-test";
+        let exe = Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel");
+
+        // 乾淨狀態：tempdir 一開始就是空的
+        assert!(!autostart_enabled_at(&base, name));
+        assert_eq!(read_autostart_command_at(&base, name), None);
+
+        let path = write_autostart_plist_at(&base, name, exe).expect("寫 plist 應該要成功");
+        assert!(path.is_file());
+        assert!(autostart_enabled_at(&base, name));
+        let cmd = read_autostart_command_at(&base, name).expect("寫完要讀得回登記的命令");
+        assert_eq!(cmd, format!("{} --tray", exe.display()));
+
+        remove_autostart_plist_at(&base, name).expect("刪除應該要成功");
+        assert!(!autostart_enabled_at(&base, name));
+        assert_eq!(read_autostart_command_at(&base, name), None);
+
+        // 刪除是冪等的，重複呼叫不算錯
+        remove_autostart_plist_at(&base, name).expect("重複刪除仍要成功");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 開機自啟一輪完整的實機操作：寫真的 `~/Library/LaunchAgents/<label>.plist`、
+    /// `launchctl load -w`、讀回命令、`launchctl unload`、刪檔。**會動真的
+    /// launchd**（`-w` 還會在 launchd 的 override 資料庫留下紀錄），比照
+    /// `wg_live_tests`／`exits::live_probe` 的慣例刻意 `#[ignore]`，預設測試輪
+    /// 不跑，只有手動指定才會跑：
+    ///
+    /// cargo test --lib -- --ignored --nocapture live_autostart
+    ///
+    /// 比照 Windows `hkcu_value_round_trip`，測試名稱帶 pid 避免撞到使用者真正
+    /// 的登記項，收尾一定會把測試用的 plist 清掉；但中途 assert 失敗仍可能跳過
+    /// 收尾，這正是這條不准留在預設測試輪的理由。
+    #[test]
+    #[ignore]
+    fn live_autostart_round_trips_through_launchd() {
         let name = format!("traytunnel-test-{}", std::process::id());
         let exe = std::env::current_exe().expect("測試需要拿得到自己的執行檔路徑");
 
