@@ -393,12 +393,24 @@ jobs:
             out/*.dmg
             out/*.tar.gz
 
+      # body 與 generate_release_notes 並用時，GitHub API 會把 body 放在前面、
+      # 自動生成的變更記錄接在後面（不是互斥，兩者都會出現在最終 release
+      # 說明）。這裡固定附上 macOS 安裝說明：把 app 拖進「應用程式」資料夾
+      # 再開啟不是慣例，是避開 App Translocation 的必要條件——macOS 會讓
+      # 還沒搬進「應用程式」的下載檔跑在唯讀的隨機掛載點上，updater 在那裡
+      # 寫不了檔案會直接失敗。單平台（僅 Windows）發佈時這段說明依然會
+      # 出現在說明文字裡，但無害——它描述的是「若你要用 macOS 版」的固定
+      # 步驟，不代表這次 release 一定有新的 macOS 資產。
       - name: Create GitHub Release
         if: needs.plan.outputs.dry_run != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.resolve.outputs.release_tag }}
           name: v${{ steps.resolve.outputs.version }}
+          body: |
+            ## macOS 安裝說明
+
+            下載 `.dmg` 打開後，請把 `traytunnel.app` 拖進「應用程式」資料夾再開啟——這不只是慣例，而是避開 App Translocation 的必要步驟：macOS 會讓還沒搬進「應用程式」的下載檔案在唯讀的隨機掛載點上執行，自動更新機制在那裡寫不了檔案會直接失敗。
           files: |
             out/*.exe
             out/*.dmg
