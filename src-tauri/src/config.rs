@@ -118,8 +118,11 @@ pub const DEFAULT_AUTOMATIC_UPDATES: bool = true;
 /// 刻意不走 `load_from_path`：那一支會做遷移判定、壞檔備份、必要時建檔，全都是
 /// 這個時間點不該發生的副作用（正常的載入流程幾毫秒後就會在 setup 裡完整跑一次）。
 /// 這裡只讀一個鍵，讀不到就用預設值。
-// TODO(W3)：macOS 的更新車道接上之後這個 cfg_attr 就可以拿掉——目前唯一的呼叫端
-// 是 `platform::update::apply_pending_at_startup`，而它在 macOS 上還是 stub
+// 這個 cfg_attr 要長期留著，不是等哪一個車道接上就能拿掉的過渡措施：唯一的呼叫端
+// 是 `platform::update::apply_pending_at_startup`，而 macOS 那一支是**刻意的 no-op**
+// ——macOS 沒有 NSIS 那種「暫存一顆安裝程式、下次啟動再交棒」的機制（理由整段寫在
+// `platform/macos/update.rs` 的模組說明），沒有東西可以交棒，也就沒有理由去讀這個鍵。
+// 拿掉的話 macOS 那一腿會 dead_code 撞上 `-D warnings` 紅燈。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn automatic_updates_enabled() -> bool {
     let (dir, stem) = exe_parts();
