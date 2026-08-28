@@ -5,16 +5,24 @@
  * tauri.conf.json 省略 "version" 時 Tauri v2 的官方 fallback 來源，跟
  * exe 內嵌的版本、NSIS 安裝檔名用的是同一個值，這裡不另外維護一份。
  *
- * 依 process.platform 分流（跟 release.yml 的 build matrix 一一對應；
- * Windows 這條路徑維持原樣一字不動，新增的是 macOS 分支）：
+ * 依 process.platform 分流（跟 release.yml 的 build matrix 一一對應）。
  *
- * Windows（process.platform === "win32"）產出三個檔案（來源不存在的那項會
+ * Windows 分支多出一筆 .sig：舊管線是 Windows 單平台，compose 那步就跑在同一個
+ * job 裡，直接從 src-tauri/target/release/bundle/nsis/ 讀簽章，不需要經過 out/。
+ * 雙平台化之後 compose 被拆成獨立 job，兩腿只靠 out/ 打包成 artifact 交接——
+ * 簽章沒被複製進 out/ 就等於在 compose 端不存在，Windows 條目會靜默沿用底稿舊值。
+ *
+ * Windows（process.platform === "win32"）產出四個檔案（來源不存在的那項會
  * 跳過並印一行提示，所以只編 exe 不打包 NSIS 的 build:exe 也能照跑）：
  *
- *   traytunnel-<v>.exe        一般單檔，設定檔走 %USERPROFILE%\.traytunnel.toml
- *   traytunnel-<v>p.exe       可攜版，與上面同一顆二進位，差別只在檔名結尾的 p
- *                             會讓程式改用 exe 旁邊的 traytunnel.toml
- *   traytunnel-<v>-setup.exe  NSIS 安裝檔
+ *   traytunnel-<v>.exe            一般單檔，設定檔走 %USERPROFILE%\.traytunnel.toml
+ *   traytunnel-<v>p.exe           可攜版，與上面同一顆二進位，差別只在檔名結尾的 p
+ *                                 會讓程式改用 exe 旁邊的 traytunnel.toml
+ *   traytunnel-<v>-setup.exe      NSIS 安裝檔
+ *   traytunnel-<v>-setup.exe.sig  上面那顆的 minisign 簽章內容——latest.json 的
+ *                                 windows-x86_64 signature 就是讀這顆；漏了它，
+ *                                 compose 會抓不到簽章（見 release.yml 的
+ *                                 fail-closed 檢查）。
  *
  * macOS（process.platform === "darwin"）只出 aarch64（Apple Silicon），
  * 產出：
@@ -82,6 +90,11 @@ const jobs =
           from: join(release, "bundle", "nsis", `traytunnel_${version}_x64-setup.exe`),
           to: `traytunnel-${version}-setup.exe`,
           note: "NSIS 安裝檔",
+        },
+        {
+          from: join(release, "bundle", "nsis", `traytunnel_${version}_x64-setup.exe.sig`),
+          to: `traytunnel-${version}-setup.exe.sig`,
+          note: "updater 安裝檔的 minisign 簽章",
         },
       ];
 

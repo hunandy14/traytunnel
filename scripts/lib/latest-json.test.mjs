@@ -144,3 +144,219 @@ test("邊界：baseline 是壞掉的形狀（platforms 不是物件、或整個�
     "windows-x86_64": WINDOWS_ENTRY_NEW,
   });
 });
+
+// --- 保留條目的形狀驗證（壞條目原樣傳播會讓 updater 整份 manifest 反序列化
+// --- 失敗，兩個平台的更新一起無聲死掉，所以要在 CI 擋下來）
+
+test("保留條目缺 url → 丟錯（不可原樣傳播）", () => {
+  const baseline = {
+    version: "0.6.4",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": { signature: "windows-old-signature" } },
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  assert.throws(() => mergeLatestJson(baseline, current), /windows-x86_64/);
+});
+
+test("保留條目缺 signature、或欄位不是字串／是空字串 → 丟錯", () => {
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+  const withWindows = (entry) => ({
+    version: "0.6.4",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": entry },
+  });
+
+  assert.throws(() => mergeLatestJson(withWindows({ url: WINDOWS_ENTRY.url }), current));
+  assert.throws(() =>
+    mergeLatestJson(withWindows({ signature: 12345, url: WINDOWS_ENTRY.url }), current),
+  );
+  assert.throws(() => mergeLatestJson(withWindows({ signature: "sig", url: "" }), current));
+  assert.throws(() => mergeLatestJson(withWindows({ signature: "   ", url: WINDOWS_ENTRY.url }), current));
+  assert.throws(() => mergeLatestJson(withWindows(null), current));
+});
+
+test("這次有建置的平台，底稿裡對應的壞條目不該擋路（反正會被覆寫）", () => {
+  const baseline = {
+    version: "0.6.4",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": { signature: null } },
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
+  };
+
+  assert.deepEqual(mergeLatestJson(baseline, current).platforms, {
+    "windows-x86_64": WINDOWS_ENTRY_NEW,
+  });
+});
+
+// --- 陳舊條目斷言（options.tag）
+
+test("陳舊條目：保留的 windows 條目 url 不含這次的 tag → 預設硬失敗", () => {
+  const baseline = {
+    version: "0.6.4",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY }, // url 是 v0.6.4
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  assert.throws(
+    () => mergeLatestJson(baseline, current, { tag: "v0.6.5" }),
+    /allow_stale_platforms/,
+    "危險情境（全新版本只發一個平台）必須擋下來，並指出逃生門",
+  );
+});
+
+test("陳舊條目：allow_stale_platforms=true → 放行，但要吐警告且結果正確", () => {
+  const baseline = {
+    version: "0.6.4",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY },
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  const warnings = [];
+  const merged = mergeLatestJson(baseline, current, {
+    tag: "v0.6.5",
+    allowStalePlatforms: true,
+    onWarning: (msg) => warnings.push(msg),
+  });
+
+  assert.equal(warnings.length, 1, "放行也要留下警告，不能靜悄悄");
+  assert.match(warnings[0], /windows-x86_64/);
+  assert.deepEqual(merged.platforms["windows-x86_64"], WINDOWS_ENTRY);
+  assert.deepEqual(merged.platforms["darwin-aarch64"], MAC_ENTRY_NEW);
+});
+
+test("陳舊條目：安全情境（往既有 release 補另一條腿，url 已含同一個 tag）→ 自動通過", () => {
+  const baseline = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW }, // url 已經是 v0.6.5
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T01:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  const warnings = [];
+  const merged = mergeLatestJson(baseline, current, {
+    tag: "v0.6.5",
+    onWarning: (msg) => warnings.push(msg),
+  });
+
+  assert.deepEqual(warnings, [], "安全情境不該有任何警告");
+  assert.deepEqual(Object.keys(merged.platforms).sort(), ["darwin-aarch64", "windows-x86_64"]);
+});
+
+test("陳舊條目：tag 比對是整段路徑，v0.6.5 不該誤判成 v0.6.50 的前綴", () => {
+  const baseline = {
+    version: "0.6.50",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: {
+      "windows-x86_64": {
+        signature: "windows-old-signature",
+        url: "https://github.com/hunandy14/traytunnel/releases/download/v0.6.50/traytunnel-0.6.50-setup.exe",
+      },
+    },
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  assert.throws(() => mergeLatestJson(baseline, current, { tag: "v0.6.5" }));
+});
+
+test("陳舊條目：這次有建置的平台不受斷言影響（它的 url 由呼叫端用本次 tag 組出來）", () => {
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: {
+      "windows-x86_64": WINDOWS_ENTRY_NEW,
+      "darwin-aarch64": MAC_ENTRY_NEW,
+    },
+  };
+
+  const merged = mergeLatestJson({ platforms: { "windows-x86_64": WINDOWS_ENTRY } }, current, {
+    tag: "v0.6.5",
+  });
+  assert.deepEqual(merged.platforms["windows-x86_64"], WINDOWS_ENTRY_NEW);
+});
+
+// --- version 單調性（取捨：警告不硬擋，理由見 latest-json.mjs）
+
+test("version 單調性：這次比底稿舊 → 警告（不丟錯）", () => {
+  const baseline = {
+    version: "0.7.0",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: {},
+  };
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  const warnings = [];
+  const merged = mergeLatestJson(baseline, current, { onWarning: (msg) => warnings.push(msg) });
+
+  assert.equal(merged.version, "0.6.5");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /0\.7\.0/);
+});
+
+test("version 單調性：前進或同版（重發同一個 release）不該有警告", () => {
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  for (const baselineVersion of ["0.6.4", "0.6.5"]) {
+    const warnings = [];
+    mergeLatestJson(
+      { version: baselineVersion, pub_date: "2026-01-01T00:00:00.000Z", platforms: {} },
+      current,
+      { onWarning: (msg) => warnings.push(msg) },
+    );
+    assert.deepEqual(warnings, [], `底稿 ${baselineVersion} 不該觸發警告`);
+  }
+});
+
+test("version 單調性：底稿版本不是嚴格 semver 就跳過比較，不該炸掉", () => {
+  const current = {
+    version: "0.6.5",
+    pub_date: "2026-08-29T00:00:00.000Z",
+    platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
+  };
+
+  const warnings = [];
+  for (const baselineVersion of ["v0.7.0", "1.2.3-beta.1", "", 42, undefined]) {
+    mergeLatestJson({ version: baselineVersion, platforms: {} }, current, {
+      onWarning: (msg) => warnings.push(msg),
+    });
+  }
+  assert.deepEqual(warnings, []);
+});

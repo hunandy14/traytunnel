@@ -7,6 +7,13 @@ name: Release
 # 不要為了「看看跑不跑得動」而拿掉 dry_run=true，也不要在 dry_run 分支之外
 # 動這條防線。
 
+# 單平台發佈的先天限制（platform=windows / macos 時務必理解）：Tauri 的
+# latest.json manifest 只有一個全域 version 欄位，沒有 per-platform 版本。所以
+# 「只發某一個平台的新版本」在語意上必然讓另一個平台的使用者看到 version 前進、
+# 卻拿到上一版的 url——甚至是這個新 release 上根本不存在的資產。這條路徑因此
+# 預設被擋下來（見下面 allow_stale_platforms 與 scripts/lib/latest-json.mjs 的
+# 陳舊條目斷言）。真正安全的單平台用法只有一種：往「已經發過、tag 相同」的
+# release 補另一條腿，此時另一平台的條目本來就指向同一個 tag，斷言自然通過。
 on:
   push:
     tags:
@@ -21,6 +28,10 @@ on:
           - windows
           - macos
         default: all
+      allow_stale_platforms:
+        description: "顯式扛責：允許 latest.json 保留「url 不屬於這次 release tag」的舊平台條目。單平台發佈全新版本時會擋下來（另一平台的使用者會被通知有新版卻抓到舊檔）；往既有 release 補另一條腿則本來就會通過，不需要這個開關"
+        type: boolean
+        default: false
       dry_run:
         description: "true＝只建置＋組出 latest.json 當 workflow artifact；不檢查 tag、不建 GitHub Release、不 attest，不會動到 releases/latest（演練/測試一律要開）"
         type: boolean
@@ -42,7 +53,12 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
+      # 這次「應該建置成功」的平台 key 清單（空白分隔），與 matrix 同源。
+      # compose job 拿它做 fail-closed 檢查：任何一個應建平台缺 .sig 就中止，
+      # 不會靜默沿用底稿舊值（舊管線本來就有這道防呆，重構時掉了，補回來）。
+      platform_keys: ${{ steps.set.outputs.platform_keys }}
       dry_run: ${{ steps.set.outputs.dry_run }}
+      allow_stale_platforms: ${{ steps.set.outputs.allow_stale_platforms }}
     steps:
       - name: Compute build matrix and dry_run flag
         id: set
@@ -51,20 +67,25 @@ jobs:
           set -euo pipefail
           platform="all"
           dry_run="false"
+          allow_stale="false"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             platform="${{ inputs.platform }}"
             dry_run="${{ inputs.dry_run }}"
+            allow_stale="${{ inputs.allow_stale_platforms }}"
           fi
 
           case "$platform" in
             windows)
               matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"}]}'
+              platform_keys="windows-x86_64"
               ;;
             macos)
               matrix='{"include":[{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              platform_keys="darwin-aarch64"
               ;;
             all)
               matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"},{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              platform_keys="windows-x86_64 darwin-aarch64"
               ;;
             *)
               echo "::error::未知的 platform 輸入：${platform}（要 all / windows / macos 其中之一）"
@@ -72,9 +93,11 @@ jobs:
               ;;
           esac
 
-          echo "platform=$platform  dry_run=$dry_run"
+          echo "platform=${platform}  dry_run=${dry_run}  allow_stale_platforms=${allow_stale}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "platform_keys=$platform_keys" >> "$GITHUB_OUTPUT"
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "allow_stale_platforms=$allow_stale" >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.os }})
@@ -288,63 +311,136 @@ jobs:
           DRY_RUN: ${{ needs.plan.outputs.dry_run }}
         run: node scripts/resolve-release.mjs
 
+      # merge-multiple: true 直接把每一腿的內容攤平進 out/，不建以 artifact
+      # 命名的子目錄。這不是省事而已：download-artifact 在「只比對到一個
+      # artifact」時本來就不會建子目錄，單平台模式下自己組裝子目錄的迴圈會
+      # 撈不到東西、out/ 全空，compose 隨即死在找不到簽章。交給 action 自己
+      # 攤平，單平台與雙平台走同一條路徑。兩腿的檔名各自帶平台後綴，不會相撞。
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
-          path: artifacts
+          path: out
+          merge-multiple: true
 
-      - name: Assemble out/ from downloaded legs
+      - name: List downloaded artifacts
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-          for dir in artifacts/release-*/; do
-            [ -d "$dir" ] || continue
-            cp -v "$dir"* out/
-          done
           echo "-- out/ 內容 --"
           ls -la out/
 
       # 底稿合併的核心前提：先抓現行 releases/latest/download/latest.json。
-      # 404／首發／目前完全沒有任何 release 都當空底稿，不擋流程。純讀公開
-      # 資料，dry_run 與否都做——這樣 dry-run 才能真實驗證合併邏輯，而不是
-      # 每次都只測「空底稿」這一種情境。
+      # 純讀公開資料，dry_run 與否都做——這樣 dry-run 才能真實驗證合併邏輯，
+      # 而不是每次都只測「空底稿」這一種情境。
+      #
+      # 關鍵：必須區分「確定沒有底稿」與「這次沒抓到」。
+      #   HTTP 404      → 真的沒有（首發，或最新 release 上沒有 latest.json
+      #                   這個資產）。視為空底稿，不擋流程。
+      #   其他任何失敗  → 暫時性（網路抖動、5xx、rate limit、被攔截的錯誤頁）。
+      #                   重試；重試用盡仍失敗就硬失敗。
+      # 把後者靜默當成「沒有底稿」的話，單平台發佈會直接把另一個平台的條目
+      # 從 latest.json 抹掉，那個平台的使用者從此收不到更新——而且整條流程
+      # 全綠，沒有人會發現。
       - name: Fetch current latest.json as merge baseline
         shell: bash
         run: |
           set -euo pipefail
           url="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
-          if curl -fsSL -o baseline-latest.json "$url"; then
+          attempts=5
+          status="failed"
+          code="000"
+
+          for i in $(seq 1 "${attempts}"); do
+            code="$(curl -sSL --connect-timeout 10 --max-time 60 \
+              -o baseline-latest.json.tmp -w '%{http_code}' "${url}")" || code="000"
+
+            if [ "${code}" = "200" ]; then
+              # 200 也可能拿到半截／被中間層換掉的內容，解得開才算數，
+              # 否則一樣當暫時性失敗重試（總比拿壞底稿去合併好）。
+              if node --input-type=module \
+                -e 'import{readFileSync}from"node:fs";JSON.parse(readFileSync("baseline-latest.json.tmp","utf8"))'; then
+                mv baseline-latest.json.tmp baseline-latest.json
+                status="ok"
+                break
+              fi
+              echo "第 ${i} 次：HTTP 200 但內容不是合法 JSON，視為暫時性失敗"
+            elif [ "${code}" = "404" ]; then
+              status="absent"
+              break
+            else
+              echo "第 ${i} 次：HTTP ${code}，視為暫時性失敗"
+            fi
+
+            if [ "${i}" -lt "${attempts}" ]; then
+              sleep $(( i * 5 ))
+            fi
+          done
+
+          if [ "${status}" = "ok" ]; then
             echo "抓到現行 latest.json 當底稿："
             cat baseline-latest.json
-          else
-            echo "抓不到現行 latest.json（可能是首發，或目前還沒有任何 release）——視為空底稿"
+          elif [ "${status}" = "absent" ]; then
+            echo "HTTP 404：線上沒有 latest.json（首發，或目前還沒有任何 release）——視為空底稿"
             echo '{}' > baseline-latest.json
+          else
+            echo "::error::連續 ${attempts} 次都拿不到現行 latest.json（最後一次 HTTP ${code}），且不是 404。無法確認線上底稿內容，繼續下去可能把其他平台的條目從 latest.json 抹掉，因此中止。請稍後重跑。"
+            exit 1
           fi
 
-      # 只把「這次矩陣有建置」的平台 key 餵給 compose-latest-json.mjs——
-      # 單平台 workflow_dispatch 時，另一平台的 .sig 不存在，該 --platform
-      # 旗標就不會被加進去，底稿裡對應的 key 因此原樣保留。
+      # 要餵給 compose-latest-json.mjs 的平台清單，直接來自 plan job 算出來的
+      # build matrix（needs.plan.outputs.platform_keys），不是「out/ 底下剛好
+      # 有哪些 .sig」。
+      #
+      # 差別很要命：用「檔案在不在」推導的話，簽章因為任何原因沒被產出／沒被
+      # 複製進 out/ 時，該平台會被靜默跳過，latest.json 於是沿用底稿的舊條目，
+      # 整條流程全綠——使用者拿到的是上一版的簽章配新版的 url，更新直接壞掉，
+      # 而且沒有任何訊號。所以這裡反過來：這次矩陣說要建的平台，簽章就必須在，
+      # 缺一個就中止（fail-closed）。底稿沿用只保留給「這次根本沒排進矩陣」的
+      # 平台，那才是單平台可控發佈的本意。
       - name: Compose merged latest.json
         shell: bash
+        env:
+          EXPECTED_PLATFORMS: ${{ needs.plan.outputs.platform_keys }}
+          ALLOW_STALE: ${{ needs.plan.outputs.allow_stale_platforms }}
         run: |
           set -euo pipefail
           version="${{ steps.resolve.outputs.version }}"
           tag="${{ steps.resolve.outputs.release_tag }}"
+          repo="${{ github.repository }}"
           pub_date="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
-          args=(--version "$version" --pub-date "$pub_date" --baseline baseline-latest.json --out out/latest.json)
-
-          win_sig="out/traytunnel-${version}-setup.exe.sig"
-          if [ -f "$win_sig" ]; then
-            args+=(--platform "windows-x86_64=${win_sig}=https://github.com/${{ github.repository }}/releases/download/${tag}/traytunnel-${version}-setup.exe")
+          args=(--version "${version}" --tag "${tag}" --pub-date "${pub_date}"
+                --baseline baseline-latest.json --out out/latest.json)
+          if [ "${ALLOW_STALE}" = "true" ]; then
+            echo "::warning::allow_stale_platforms=true：latest.json 允許保留不屬於 ${tag} 的舊平台條目"
+            args+=(--allow-stale-platforms)
           fi
 
-          mac_sig="out/traytunnel-${version}-aarch64.app.tar.gz.sig"
-          if [ -f "$mac_sig" ]; then
-            args+=(--platform "darwin-aarch64=${mac_sig}=https://github.com/${{ github.repository }}/releases/download/${tag}/traytunnel-${version}-aarch64.app.tar.gz")
-          fi
+          echo "這次應建置的平台：${EXPECTED_PLATFORMS}"
+          for key in ${EXPECTED_PLATFORMS}; do
+            case "${key}" in
+              windows-x86_64)
+                sig="out/traytunnel-${version}-setup.exe.sig"
+                asset="traytunnel-${version}-setup.exe"
+                ;;
+              darwin-aarch64)
+                sig="out/traytunnel-${version}-aarch64.app.tar.gz.sig"
+                asset="traytunnel-${version}-aarch64.app.tar.gz"
+                ;;
+              *)
+                echo "::error::未知的平台 key ${key}，plan job 與 compose job 對不起來"
+                exit 1
+                ;;
+            esac
+
+            if [ ! -f "${sig}" ]; then
+              echo "::error::這次 build matrix 排了 ${key}，但簽章檔 ${sig} 不存在。latest.json 的 ${key} 條目無法產生，若放行會靜默沿用底稿舊簽章，因此中止。檢查 scripts/package.mjs 有沒有把 .sig 複製進 out/，以及該腿的 upload/download artifact。"
+              exit 1
+            fi
+
+            args+=(--platform "${key}=${sig}=https://github.com/${repo}/releases/download/${tag}/${asset}")
+          done
 
           node scripts/compose-latest-json.mjs "${args[@]}"
 
