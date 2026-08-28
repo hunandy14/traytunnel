@@ -50,8 +50,14 @@ ureq = { version = "3", features = ["socks-proxy", "json"] }
 log = "0.4"
 # 系統匣圖示要照 SM_CXSMICON 從多層 ICO 挑層，得自己解 ICO
 ico = "0.5"
-# 應用內更新（安裝版車道）。zip 特性只有 macOS／Linux 的 .tar.gz／.zip 更新包用得到，
-# Windows 的 NSIS 更新是直接下載並執行簽好章的 setup.exe，關掉可以少拖 zip／tar／flate2
+# 應用內更新。Windows 的 NSIS 更新是直接下載並執行簽好章的 setup.exe，不需要解壓，
+# 關掉 zip 特性可以少拖 zip／tar／flate2。
+#
+# W4-U 查證：關掉它**不影響 macOS**。外掛的 `zip` 特性打開的是
+# `dep:zip`（Windows 的 .zip 更新包）與 Linux 那兩顆 `optional` 的 flate2／tar；
+# macOS 的 flate2 與 tar 是 `[target.'cfg(target_os = "macos")'.dependencies]`
+# 底下**沒有 optional** 的必要相依，`install_inner` 解 .app.tar.gz 那段也沒有任何
+# feature 閘（見 2.10.1 的 updater.rs）。macOS 的 bundle 替換照樣走得通。
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 # 可攜版車道自己比版本，用的就是 updater 外掛在用的那一顆，規則保證一致
 semver = "1"

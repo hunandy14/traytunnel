@@ -1,6 +1,7 @@
 //! macOS 實作。
 //!
-//! W1 只做搬移（整包 `todo!()` stub）；W3 依車道逐步補上實作。這裡的原則寫死不商量：
+//! W1 只做搬移（整包 `todo!()` stub）；W3／W4 依車道逐步補上實作。這裡的原則寫死
+//! 不商量：
 //!
 //! * 型別與簽章要湊齊，`cargo check` 必須過——不然共用核心根本編不起來，
 //!   後面的車道就無從開工；
@@ -10,9 +11,13 @@
 //!   它們回 `false` 是 W3 的既定決議（macOS 不做可攜模式），不是佔位。
 //!
 //! W3-B（系統整合車道）已落地：`paths`（家目錄、可攜模式兩個觸發條件）、
-//! `notify`（系統通知）、`sys` 的時間戳／開機自啟／`reveal_in_file_manager`。
+//! `notify`（系統通知）、`sys` 的時間戳／開機自啟／`reveal_in_file_manager`／`open_url`。
 //! A 車道也已落地：`sys` 的 `is_listening`、`spawn`（`ProcessSupervisor`）。
-//! C 車道也已落地：`sys` 的圖示尺寸／挑層。只剩 `update` 是 W4 車道的範疇，仍是 stub。
+//! C 車道也已落地：`sys` 的圖示尺寸／挑層。
+//! W4-U 車道也已落地：`update` 整條路（走 tauri-plugin-updater 的 `.app` bundle
+//! 原地替換）。其中三支暫存相關的函式是**語意正確的 no-op** 而不是佔位——macOS
+//! 的更新是即時下載安裝制，沒有 NSIS 那種暫存交棒，理由整段寫在 [`update`] 的
+//! 模組說明裡。
 
 mod notify;
 mod paths;
