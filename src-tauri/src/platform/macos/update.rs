@@ -39,28 +39,59 @@
 //! 這道閘不是可有可無的：外掛的 `extract_path` 在非 bundle 情形下會退成「執行檔
 //! 所在的資料夾」，真讓它裝下去等於把 `target/debug/` 整個 rename 掉。
 //!
-//! ## 3. ad-hoc 簽章的現實
+//! ## 3. ad-hoc 簽章的現實（查證過，別憑印象改）
 //!
-//! 我們目前出的是 ad-hoc 簽章（`codesign -s -`）、未公證的 bundle。標準流程照走，
-//! 但有兩個已知的坎要寫在這裡，不是靠實機踩到才知道：
+//! 我們出的是 ad-hoc 簽章（`codesign -s -`）、未公證的 bundle。查證結論是
+//! **機制上走得通**，但踩得到的坑跟簽章沒什麼關係，寫在這裡免得下一個人靠實機
+//! 一個個撞出來（出處見 PR 說明）：
 //!
-//! * **App Management（macOS 14 Sonoma 起）**：修改別的 app bundle 需要同一組
-//!   Team ID 或使用者在「隱私權與安全性 → App 管理」放行。app 更新自己有豁免，
-//!   但豁免建立在有效簽章上；ad-hoc 沒有 Team ID，`.app` 若位在
-//!   `/Applications`，`std::fs::rename` 很可能拿到 `PermissionDenied`。
-//! * **外掛的退路是彈一次管理員密碼**：拿到 `PermissionDenied` 時它會走
-//!   AppleScript 的 `with administrator privileges` 把替換做完（見外掛
-//!   `updater.rs` 的 macOS `install_inner`）。那是一個當面的密碼提示——這正是
-//!   macOS 這條路**絕不在背景自動下載安裝**的另一個理由：背景跳密碼框是不可接受的。
+//! * **Tauri 官方文件從沒說 macOS 更新需要 Apple 簽章**——updater 那一頁提到
+//!   macOS 只有 `.tar.gz` 產物路徑，簽章那一頁一次都沒提到更新。它要的簽章是
+//!   minisign 的更新金鑰，與 codesign 是兩回事。
+//! * **App Management（macOS 14 起）擋的是「就地改別人 bundle 裡的檔案」，
+//!   不是「整包換掉」。** 外掛做的是 `rename` 舊 bundle 去備份、`rename` 新的
+//!   進來，屬於後者，預期不會撞上這道 TCC——`tauri-apps` 整個組織搜不到一則
+//!   提到 App Management 的 issue，這條路要是常態失敗不可能四年零回報。
+//!   （順帶：ad-hoc 沒有 Team ID，「同一組 Team ID 可互改」那條豁免對我們本來
+//!   就不成立，但如上，這條路根本不需要它。）
+//! * **真正會失敗的是 POSIX 權限**：外掛第一步 `rename` 拿到 `PermissionDenied`
+//!   時，會用 AppleScript 的 `with administrator privileges` 把替換做完（見外掛
+//!   `updater.rs` 的 macOS `install_inner`）。條件是「`.app` 這個目錄自己寫不動」
+//!   ——標準（非 admin）使用者，或 bundle 是 root 所有（用 `.pkg` 裝的、
+//!   或曾經 `sudo cp` 過）。一般 admin 帳號 + 自己拖進 `/Applications` 的 bundle
+//!   是純 `rename`，不會跳密碼。這正是外掛那條提權路的來源（`tauri#8104`）。
+//! * **App Translocation**：bundle 還帶著 `com.apple.quarantine`（從瀏覽器抓下來
+//!   的 dmg／zip）而且直接從 `~/Downloads` 或掛載的 dmg 裡啟動時，macOS 會把它
+//!   搬到一個唯讀的隨機路徑執行，更新當場死在 `EROFS`
+//!   （`plugins-workspace#2148`）。使用者用 Finder 把 app 搬進 `/Applications`
+//!   之後就不再 translocate——這是「請先拖進應用程式資料夾」那句安裝指示真正的
+//!   技術理由，不只是慣例。
+//! * **解壓那一步會掉東西**：外掛的 tar 解壓不還原 xattr，symlink 與執行位元
+//!   出過事（`tauri#7480` 的 framework symlink 變成 0 byte 檔案）。而且它是
+//!   **先把舊 bundle 搬走再解**，中途失敗留下的是一顆開不起來的 app
+//!   （`plugins-workspace#1129`）。
 //!
-//! 把 `.app` 放在使用者自己寫得動的位置（`~/Applications`）時整段替換是純
-//! `rename`，不會碰到上面任何一個坎。查證與出處見 PR 說明。
+//! 兩件與直覺相反、但查證過的事：自己用 HTTP 下載回來的 bytes **不會**被打上
+//! `com.apple.quarantine`（那是 LaunchServices 才會做的事，`LSFileQuarantineEnabled`
+//! 預設 false 而 Tauri 從沒設過它），所以替換完首次啟動不會跳 Gatekeeper；
+//! 而 tar 來回一趟**不會**弄壞 ad-hoc 簽章（簽章存在 Mach-O 的
+//! `LC_CODE_SIGNATURE` 與 `_CodeSignature/CodeResources` 這些一般檔案裡，不在 xattr）。
 //!
 //! ## 背景車道做什麼
 //!
-//! 只查、只填狀態、只記一行日誌，**不下載、不安裝**（理由見上面第 3 點）。
-//! 所以 Windows 那套「下載失敗就退避重試」的排程在這裡沒有對應物，間隔是固定的
-//! ——這條路上根本沒有會失敗的下載可以退避。
+//! 只查、只填狀態、只記一行日誌，**不下載、不安裝**。這是這條路上最重要的一個
+//! 決定，理由不是上面那些坑，而是第 1 節那件事：macOS 沒有暫存交棒，「安裝」與
+//! 「把使用者正在用的程式關掉」是同一個動作。背景自動安裝只有兩種收場——
+//! 換完 bundle 卻不重啟（使用者一直跑著已經不存在的舊映像），或替使用者決定
+//! 現在就重啟（隧道連同他手上的工作一起斷掉）。Windows 那條路之所以敢在背景
+//! 做完整套，正是因為它有暫存：安裝發生在**下一次啟動**，使用者不在場。
+//! 這裡沒有那個中間態，所以最後一步只能由使用者按下去。
+//!
+//! 附帶的兩個好處：上面那顆管理員密碼框、以及解壓失敗留下一顆壞掉的 app，
+//! 都只會發生在使用者按了鈕、正看著畫面的時候，不會在他不在場時發生。
+//!
+//! 連帶的，Windows 那套「下載失敗就退避重試」的排程在這裡沒有對應物，間隔是
+//! 固定的——這條路上根本沒有會失敗的下載可以退避。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -268,10 +299,10 @@ async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
 /// 背景檢查的排程：啟動延遲一次，之後每 24 小時一次，跟著程式活到結束。
 ///
 /// 對照 Windows：那邊下載失敗會把間隔縮成退避序列，因為它的背景車道**會下載**。
-/// macOS 的背景車道只查不下載（本檔開頭第 3 節：背景自動安裝可能跳出管理員密碼
-/// 提示，那是不能在使用者不在場時發生的事），沒有會失敗的下載可以退避，
-/// 所以間隔固定。查詢本身失敗就等下一輪，與 Windows 的
-/// `Outcome::Settled` 同一個處置。
+/// macOS 的背景車道只查不下載（理由見本檔開頭「背景車道做什麼」那一節：
+/// 沒有暫存交棒，安裝與「把使用者正在用的程式關掉」是同一個動作），
+/// 沒有會失敗的下載可以退避，所以間隔固定。查詢本身失敗就等下一輪，
+/// 與 Windows 的 `Outcome::Settled` 同一個處置。
 pub fn spawn_checker(state: &Shared) {
     let st = state.clone();
     tauri::async_runtime::spawn(async move {
