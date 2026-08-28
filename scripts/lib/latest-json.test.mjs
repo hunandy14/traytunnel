@@ -35,7 +35,9 @@ test("案例 1：底稿有 windows 條目，本次只建 mac → 兩條都在（
     platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
   };
 
-  const merged = mergeLatestJson(baseline, current);
+  // windows 條目留著 v0.6.4 的舊 url，這次的 tag 是 v0.6.5，本來就是陳舊條目
+  // 斷言要擋的情境——這裡顯式 allowStalePlatforms 只是為了單獨驗證合併邏輯本身。
+  const merged = mergeLatestJson(baseline, current, { tag: "v0.6.5", allowStalePlatforms: true });
 
   assert.equal(merged.version, "0.6.5");
   assert.equal(merged.pub_date, "2026-08-29T00:00:00.000Z");
@@ -51,7 +53,7 @@ test("案例 2：首發，無底稿（undefined）→ 只有本次平台", () =>
     platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
   };
 
-  const merged = mergeLatestJson(undefined, current);
+  const merged = mergeLatestJson(undefined, current, { tag: "v0.1.0" });
 
   assert.deepEqual(Object.keys(merged.platforms), ["windows-x86_64"]);
   assert.deepEqual(merged.platforms["windows-x86_64"], WINDOWS_ENTRY_NEW);
@@ -64,7 +66,7 @@ test("案例 2b：首發，底稿是空物件 {} → 只有本次平台", () => 
     platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
   };
 
-  const merged = mergeLatestJson({}, current);
+  const merged = mergeLatestJson({}, current, { tag: "v0.1.0" });
 
   assert.deepEqual(Object.keys(merged.platforms), ["darwin-aarch64"]);
 });
@@ -87,7 +89,7 @@ test("案例 3：兩平台齊發 → 兩條都是這次的新值（即使底稿�
     },
   };
 
-  const merged = mergeLatestJson(baseline, current);
+  const merged = mergeLatestJson(baseline, current, { tag: "v0.6.5" });
 
   assert.deepEqual(Object.keys(merged.platforms).sort(), ["darwin-aarch64", "windows-x86_64"]);
   assert.deepEqual(merged.platforms["windows-x86_64"], WINDOWS_ENTRY_NEW);
@@ -109,7 +111,10 @@ test("案例 4：底稿含這次沒建置的第三個平台 key（例如未來�
     platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
   };
 
-  const merged = mergeLatestJson(baseline, current);
+  // linux-x86_64 的 url 不屬於這次的 tag（本來就不是這次 release 建置出來的），
+  // 顯式 allowStalePlatforms 只是為了單獨驗證「原樣保留」這件事，不是在測陳舊
+  // 條目斷言本身（那部分見下面「陳舊條目」區塊）。
+  const merged = mergeLatestJson(baseline, current, { tag: "v0.6.5", allowStalePlatforms: true });
 
   assert.deepEqual(Object.keys(merged.platforms).sort(), ["linux-x86_64", "windows-x86_64"]);
   assert.deepEqual(merged.platforms["linux-x86_64"], baseline.platforms["linux-x86_64"]);
@@ -117,17 +122,39 @@ test("案例 4：底稿含這次沒建置的第三個平台 key（例如未來�
 });
 
 test("邊界：current 缺 platforms（或空物件）要丟錯，不能靜默生出空的 latest.json", () => {
-  assert.throws(() => mergeLatestJson(null, { version: "0.1.0", pub_date: "2026-01-01T00:00:00.000Z" }));
   assert.throws(() =>
-    mergeLatestJson(null, { version: "0.1.0", pub_date: "2026-01-01T00:00:00.000Z", platforms: {} }),
+    mergeLatestJson(null, { version: "0.1.0", pub_date: "2026-01-01T00:00:00.000Z" }, { tag: "v0.1.0" }),
+  );
+  assert.throws(() =>
+    mergeLatestJson(
+      null,
+      { version: "0.1.0", pub_date: "2026-01-01T00:00:00.000Z", platforms: {} },
+      { tag: "v0.1.0" },
+    ),
   );
 });
 
 test("邊界：current 缺 version 或 pub_date 要丟錯", () => {
   assert.throws(() =>
-    mergeLatestJson(null, { pub_date: "2026-01-01T00:00:00.000Z", platforms: { x: WINDOWS_ENTRY } }),
+    mergeLatestJson(
+      null,
+      { pub_date: "2026-01-01T00:00:00.000Z", platforms: { x: WINDOWS_ENTRY } },
+      { tag: "v0.1.0" },
+    ),
   );
-  assert.throws(() => mergeLatestJson(null, { version: "0.1.0", platforms: { x: WINDOWS_ENTRY } }));
+  assert.throws(() =>
+    mergeLatestJson(null, { version: "0.1.0", platforms: { x: WINDOWS_ENTRY } }, { tag: "v0.1.0" }),
+  );
+});
+
+test("邊界：options.tag 缺省要丟錯（陳舊條目斷言不能被靜默停用）", () => {
+  const current = {
+    version: "0.1.0",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
+  };
+  assert.throws(() => mergeLatestJson(null, current), /tag/);
+  assert.throws(() => mergeLatestJson(null, current, {}), /tag/);
 });
 
 test("邊界：baseline 是壞掉的形狀（platforms 不是物件、或整個是字串）不應炸掉，視同無底稿", () => {
@@ -137,10 +164,10 @@ test("邊界：baseline 是壞掉的形狀（platforms 不是物件、或整個�
     platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
   };
 
-  assert.deepEqual(mergeLatestJson({ platforms: "not-an-object" }, current).platforms, {
+  assert.deepEqual(mergeLatestJson({ platforms: "not-an-object" }, current, { tag: "v0.1.0" }).platforms, {
     "windows-x86_64": WINDOWS_ENTRY_NEW,
   });
-  assert.deepEqual(mergeLatestJson("garbage", current).platforms, {
+  assert.deepEqual(mergeLatestJson("garbage", current, { tag: "v0.1.0" }).platforms, {
     "windows-x86_64": WINDOWS_ENTRY_NEW,
   });
 });
@@ -160,7 +187,7 @@ test("保留條目缺 url → 丟錯（不可原樣傳播）", () => {
     platforms: { "darwin-aarch64": MAC_ENTRY_NEW },
   };
 
-  assert.throws(() => mergeLatestJson(baseline, current), /windows-x86_64/);
+  assert.throws(() => mergeLatestJson(baseline, current, { tag: "v0.6.5" }), /windows-x86_64/);
 });
 
 test("保留條目缺 signature、或欄位不是字串／是空字串 → 丟錯", () => {
@@ -175,13 +202,17 @@ test("保留條目缺 signature、或欄位不是字串／是空字串 → 丟�
     platforms: { "windows-x86_64": entry },
   });
 
-  assert.throws(() => mergeLatestJson(withWindows({ url: WINDOWS_ENTRY.url }), current));
+  assert.throws(() => mergeLatestJson(withWindows({ url: WINDOWS_ENTRY.url }), current, { tag: "v0.6.5" }));
   assert.throws(() =>
-    mergeLatestJson(withWindows({ signature: 12345, url: WINDOWS_ENTRY.url }), current),
+    mergeLatestJson(withWindows({ signature: 12345, url: WINDOWS_ENTRY.url }), current, { tag: "v0.6.5" }),
   );
-  assert.throws(() => mergeLatestJson(withWindows({ signature: "sig", url: "" }), current));
-  assert.throws(() => mergeLatestJson(withWindows({ signature: "   ", url: WINDOWS_ENTRY.url }), current));
-  assert.throws(() => mergeLatestJson(withWindows(null), current));
+  assert.throws(() =>
+    mergeLatestJson(withWindows({ signature: "sig", url: "" }), current, { tag: "v0.6.5" }),
+  );
+  assert.throws(() =>
+    mergeLatestJson(withWindows({ signature: "   ", url: WINDOWS_ENTRY.url }), current, { tag: "v0.6.5" }),
+  );
+  assert.throws(() => mergeLatestJson(withWindows(null), current, { tag: "v0.6.5" }));
 });
 
 test("這次有建置的平台，底稿裡對應的壞條目不該擋路（反正會被覆寫）", () => {
@@ -196,7 +227,7 @@ test("這次有建置的平台，底稿裡對應的壞條目不該擋路（反�
     platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
   };
 
-  assert.deepEqual(mergeLatestJson(baseline, current).platforms, {
+  assert.deepEqual(mergeLatestJson(baseline, current, { tag: "v0.6.5" }).platforms, {
     "windows-x86_64": WINDOWS_ENTRY_NEW,
   });
 });
@@ -320,7 +351,10 @@ test("version 單調性：這次比底稿舊 → 警告（不丟錯）", () => {
   };
 
   const warnings = [];
-  const merged = mergeLatestJson(baseline, current, { onWarning: (msg) => warnings.push(msg) });
+  const merged = mergeLatestJson(baseline, current, {
+    tag: "v0.6.5",
+    onWarning: (msg) => warnings.push(msg),
+  });
 
   assert.equal(merged.version, "0.6.5");
   assert.equal(warnings.length, 1);
@@ -339,7 +373,7 @@ test("version 單調性：前進或同版（重發同一個 release）不該有�
     mergeLatestJson(
       { version: baselineVersion, pub_date: "2026-01-01T00:00:00.000Z", platforms: {} },
       current,
-      { onWarning: (msg) => warnings.push(msg) },
+      { tag: "v0.6.5", onWarning: (msg) => warnings.push(msg) },
     );
     assert.deepEqual(warnings, [], `底稿 ${baselineVersion} 不該觸發警告`);
   }
@@ -355,6 +389,7 @@ test("version 單調性：底稿版本不是嚴格 semver 就跳過比較，不�
   const warnings = [];
   for (const baselineVersion of ["v0.7.0", "1.2.3-beta.1", "", 42, undefined]) {
     mergeLatestJson({ version: baselineVersion, platforms: {} }, current, {
+      tag: "v0.6.5",
       onWarning: (msg) => warnings.push(msg),
     });
   }

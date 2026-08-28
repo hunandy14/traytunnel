@@ -20,7 +20,7 @@
  *    序列化整份 RemoteRelease 會直接失敗，等於**兩個平台的更新一起無聲死掉**。
  *    寧可在 CI 擋下來。
  *
- * 2. 陳舊條目斷言（需要呼叫端傳 options.tag）：被保留的條目，其 url 必須指向
+ * 2. 陳舊條目斷言（options.tag 必填）：被保留的條目，其 url 必須指向
  *    這次的 release tag，否則預設硬失敗。語意分野：
  *      - 安全情境：往「既有的 release」補另一條腿（例如 v0.6.6 已經發過
  *        Windows，現在補 macOS）。此時底稿裡 Windows 的 url 本來就含 v0.6.6，
@@ -79,8 +79,9 @@ function checkVersionMonotonicity(baselineVersion, currentVersion, warn) {
  * @param {unknown} baseline 現行 latest.json 的內容（首發或確定沒有就傳 null / undefined / {}）
  * @param {{ version: string, pub_date: string, platforms: Record<string, { signature: string, url: string }> }} current
  *   這次發佈實際建置出來的內容，platforms 只包含「這次有建置」的平台 key
- * @param {{ tag?: string, allowStalePlatforms?: boolean, onWarning?: (msg: string) => void }} [options]
- *   tag                  這次的 release tag（例如 v0.6.6）。有傳才會做陳舊條目斷言
+ * @param {{ tag: string, allowStalePlatforms?: boolean, onWarning?: (msg: string) => void }} options
+ *   tag                  這次的 release tag（例如 v0.6.6）。必填——陳舊條目斷言
+ *                         （見上方防線 2）永遠會執行，不能靠漏傳 tag 靜默停用它
  *   allowStalePlatforms  true＝陳舊條目只警告不擋（顯式扛責的逃生門）
  *   onWarning            警告輸出管道，預設 console.warn
  * @returns {{ version: string, pub_date: string, platforms: Record<string, { signature: string, url: string }> }}
@@ -88,6 +89,9 @@ function checkVersionMonotonicity(baselineVersion, currentVersion, warn) {
 export function mergeLatestJson(baseline, current, options = {}) {
   const { tag, allowStalePlatforms = false, onWarning = (msg) => console.warn(msg) } = options;
 
+  if (!tag || typeof tag !== "string") {
+    throw new Error("options.tag 必填（字串），陳舊條目斷言需要它才能判斷保留的條目是否屬於這次的 release");
+  }
   if (!current || typeof current !== "object") {
     throw new Error("current 必填，且需含 version / pub_date / platforms");
   }
@@ -127,7 +131,7 @@ export function mergeLatestJson(baseline, current, options = {}) {
           `反序列化失敗，連有效平台的更新一起壞掉，因此中止。請改成連該平台一起建置。`,
       );
     }
-    if (tag && !entry.url.includes(`/${tag}/`)) {
+    if (!entry.url.includes(`/${tag}/`)) {
       const detail =
         `現行 latest.json 的 platforms["${key}"] 是這次沒建置、從底稿沿用的條目，` +
         `但它的 url 不屬於這次的 release ${tag}：${entry.url}。合併後 version 會變成 ` +
