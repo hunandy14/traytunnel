@@ -1,17 +1,17 @@
 mod appicon;
-mod aumid;
 mod commands;
 mod config;
 mod exits;
+// 平台抽象層：Windows／macOS 專屬的東西全在這底下，共用核心只准走
+// `crate::platform::*` 這個門面（子模組不是 pub，走不進去）
+mod platform;
 mod ssh;
 mod state;
 mod traymenu;
-mod update;
 mod watchdog;
 // WireGuard → 本地 SOCKS5（行程內使用者態隧道）
 mod wg;
 mod winstate;
-mod winsys;
 
 use std::sync::Arc;
 
@@ -20,7 +20,10 @@ pub use ssh::tunnel;
 
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
-use tauri_winrt_notification::{IconCrop, Toast};
+
+// 更新整條路由平台提供（封裝格式綁死在各自的安裝器上），這裡轉個名字，
+// 底下的呼叫端維持 `update::...` 不必改
+use crate::platform::update;
 
 use config::{Config, LoadOutcome};
 use state::{AppState, MAIN_WINDOW, TRAY_ID};
@@ -43,18 +46,10 @@ fn show_main(app: &AppHandle) {
     }
 }
 
-/// 系統匣氣泡通知：直接組 Toast 而不是走 tauri-plugin-notification 的 builder，
-/// 因為那個 builder 在 Windows 分支沒接圖示（icon()/attachment() 都到不了 notify-rust
-/// 底層），要讓 toast 內文左側出現大 logo（appLogoOverride）只有 Toast::icon() 這條路。
+/// 系統匣氣泡通知。掛名（Windows 的 AUMID）與實際怎麼彈都在平台層，
+/// 這裡只決定「掛在誰名下、標題寫什麼」。
 fn balloon(app: &AppHandle, body: &str) {
-    let aumid = app.config().identifier.clone();
-    let mut toast = Toast::new(&aumid).title("Traytunnel").text1(body);
-    if let Some(icon) = aumid::icon_file_path(&aumid) {
-        toast = toast.icon(&icon, IconCrop::Square, "Traytunnel");
-    }
-    if let Err(e) = toast.show() {
-        log::warn!("failed to show toast notification: {e}");
-    }
+    platform::show_notification(&app.config().identifier, "Traytunnel", body);
 }
 
 fn hide_to_tray(state: &Shared) {
@@ -81,22 +76,22 @@ fn close_main(state: &Shared) {
     }
 }
 
-/// 開機自啟自癒：Run 登錄值未指向目前執行檔時，於啟動時重寫一次。
+/// 開機自啟自癒：登記的那一行命令未指向目前執行檔時，於啟動時重寫一次。
 /// 涵蓋路徑失效與非本程式寫入的殘留格式——這兩種情況下 toggle 都會顯示 ON，
 /// 實際卻啟動不到這支程式。
 fn heal_autostart(app: &AppHandle, state: &Shared) {
     let name = state::autostart_name(app);
-    if !winsys::autostart_enabled(&name) {
+    if !platform::autostart_enabled(&name) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let current = winsys::read_run_value(&name).unwrap_or_default().to_lowercase();
+    let current = platform::read_autostart_command(&name).unwrap_or_default().to_lowercase();
     if current.contains(exe.to_string_lossy().to_lowercase().as_str()) {
         return;
     }
-    match winsys::enable_autostart(&name, &exe) {
+    match platform::enable_autostart(&name, &exe) {
         Ok(()) => state.log("autostart entry refreshed"),
         Err(e) => state.log(format!("autostart entry refresh failed: {e}")),
     }
@@ -111,7 +106,7 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
     let Ok(exe) = std::env::current_exe() else {
         return vec!["could not resolve the executable path for notifications".into()];
     };
-    aumid::prepare(&aumid, &product, &exe)
+    platform::prepare_notifications(&aumid, &product, &exe)
 }
 
 // ---------------------------------------------------------------- 進入點

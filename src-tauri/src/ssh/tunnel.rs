@@ -11,11 +11,9 @@ use tokio::process::{Child, Command};
 
 use crate::config::{Forward, Source};
 use crate::exits::{probe, Detected, ExitTest, Resolution};
+use crate::platform::{is_listening, ProcessSupervisor};
 use crate::state::{status, test_state, AppState, TestView};
-use crate::winsys::{is_listening, Job};
 
-/// CREATE_NO_WINDOW，避免主控台視窗一閃而過
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 連線偵測輪詢間隔
 const POLL: Duration = Duration::from_millis(2000);
 /// 斷線後固定重連間隔，無退避無上限；埠被佔用時也是每 5 秒重查一次
@@ -91,22 +89,16 @@ pub fn port_busy_detail(local: u16, listening: bool) -> Option<String> {
     }
 }
 
-fn spawn_ssh(src: &Source, f: &Forward) -> std::io::Result<(Child, Job, u32)> {
-    let job = Job::new()?;
+fn spawn_ssh(src: &Source, f: &Forward) -> std::io::Result<(Child, ProcessSupervisor, u32)> {
+    let job = ProcessSupervisor::new()?;
     let mut cmd = Command::new("ssh");
     cmd.args(build_exit_args(src, f))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true);
-    let child = cmd.spawn()?;
+    let child = job.spawn(&mut cmd, "")?;
     let pid = child.id().unwrap_or(0);
-    if let Some(handle) = child.raw_handle() {
-        if let Err(e) = job.assign(handle as isize) {
-            log::warn!("assign ssh to job object failed: {e}");
-        }
-    }
     Ok((child, job, pid))
 }
 
@@ -145,7 +137,7 @@ async fn last_meaningful_line(stderr: tokio::process::ChildStderr) -> String {
 /// 用來讓使用者在存檔前就知道 host／user／ProxyCommand 對不對。
 /// 探測程序一樣掛進 Job Object，函式結束（含逾時）時隨著 Job 一起收掉，不留孤兒。
 pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> TestConnectionResult {
-    let job = match Job::new() {
+    let job = match ProcessSupervisor::new() {
         Ok(j) => j,
         Err(e) => return TestConnectionResult::fail(format!("failed to prepare job object: {e}")),
     };
@@ -155,18 +147,12 @@ pub async fn test_connection(user: &str, host: &str, proxy_command: &str) -> Tes
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true);
 
-    let mut child = match cmd.spawn() {
+    let mut child = match job.spawn(&mut cmd, "test_connection: ") {
         Ok(c) => c,
         Err(e) => return TestConnectionResult::fail(format!("failed to start ssh: {e}")),
     };
-    if let Some(handle) = child.raw_handle() {
-        if let Err(e) = job.assign(handle as isize) {
-            log::warn!("test_connection: assign ssh to job object failed: {e}");
-        }
-    }
 
     let stderr_task =
         child.stderr.take().map(|s| tauri::async_runtime::spawn(last_meaningful_line(s)));

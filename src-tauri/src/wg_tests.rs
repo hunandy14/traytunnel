@@ -102,7 +102,7 @@ fn a_stale_worker_is_dropped_instead_of_overwriting_the_new_one() {
 fn draining_covers_both_ssh_and_wg_workers() {
     let wg_token = tokio_util::sync::CancellationToken::new();
     let mut slots: BTreeMap<u16, Option<(u64, Worker)>> = BTreeMap::new();
-    slots.insert(1080, Some((1, Worker::Ssh(crate::winsys::Job::new().unwrap()))));
+    slots.insert(1080, Some((1, Worker::Ssh(crate::platform::ProcessSupervisor::new().unwrap()))));
     slots.insert(1085, Some((2, Worker::Wg(CancelGuard(wg_token.clone())))));
     // 本來就沒人在跑的列不必回報
     slots.insert(2222, None);

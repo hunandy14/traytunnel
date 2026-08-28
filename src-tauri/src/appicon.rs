@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use tauri::image::Image;
 
-use crate::winsys;
+use crate::platform;
 
 /// 多層 ICO 直接內嵌，才不必依賴磁碟上有沒有圖示檔。
 /// 系統匣與視窗圖示都從這一顆挑層，assets/gen-tray-icons.py 產生。
@@ -21,7 +21,7 @@ const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
     let dir = ico::IconDir::read(Cursor::new(APP_ICO)).ok()?;
     let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
-    let idx = winsys::pick_icon_layer(&sizes, want)?;
+    let idx = platform::pick_icon_layer(&sizes, want)?;
     let img = dir.entries()[idx].decode().ok()?;
     log::info!("{purpose} icon: system wants {want}px, using the {}px layer", img.width());
     Some(Image::new_owned(img.rgba_data().to_vec(), img.width(), img.height()))
@@ -29,13 +29,13 @@ fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
 
 /// 系統匣圖示：照 SM_CXSMICON（100% 是 16、175% 是 28）挑層
 pub fn tray_icon() -> Option<Image<'static>> {
-    ico_layer(winsys::small_icon_size().0, "tray")
+    ico_layer(platform::small_icon_size().0, "tray")
 }
 
 /// 主視窗圖示：照 SM_CXICON（100% 是 32、175% 是 56）挑層。
 /// 這是工作列的視窗按鈕與 Alt+Tab 取的尺寸。
 pub fn window_icon() -> Option<Image<'static>> {
-    ico_layer(winsys::large_icon_size().0, "window")
+    ico_layer(platform::large_icon_size().0, "window")
 }
 
 #[cfg(test)]
@@ -69,8 +69,8 @@ mod tests {
     /// 這台機器實際要的兩個尺寸都要挑得到層
     #[test]
     fn picks_layers_for_this_machine() {
-        let (small, _) = winsys::small_icon_size();
-        let (large, _) = winsys::large_icon_size();
+        let (small, _) = platform::small_icon_size();
+        let (large, _) = platform::large_icon_size();
         assert!(small >= 16, "SM_CXSMICON = {small}");
         assert!(large >= small, "SM_CXICON {large} 不該小於 SM_CXSMICON {small}");
         assert!(tray_icon().is_some(), "系統匣挑不到層");

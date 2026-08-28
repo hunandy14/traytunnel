@@ -769,7 +769,7 @@ async fn rows_are_announced_before_the_engine_reports_connected() {
         vec![crate::state::status::CONNECTING, "engine-connected"],
         "列必須先宣告，引擎的 connected 才能來——反過來的話列永遠卡在 connecting"
     );
-    assert!(crate::winsys::is_listening(local), "快樂路徑上本地埠要真的在聽");
+    assert!(crate::platform::is_listening(local), "快樂路徑上本地埠要真的在聽");
     cancel.cancel();
 }
 
@@ -794,5 +794,5 @@ async fn a_cancelled_round_binds_nothing() {
             panic!("已取消的一輪不可以還去綁埠：{port} → {st}");
         }
     }
-    assert!(!crate::winsys::is_listening(local), "已取消的一輪不可以佔住本地埠");
+    assert!(!crate::platform::is_listening(local), "已取消的一輪不可以佔住本地埠");
 }

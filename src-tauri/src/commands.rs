@@ -8,8 +8,9 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
+use crate::platform::{self, update};
 use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
-use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
+use crate::{close_main, do_exit, tunnel, wg, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
 const SAVE_FAILED: &str = "Failed to save settings";
@@ -638,7 +639,7 @@ pub fn upsert_wg_proxy(
     //     不是查到「空」；真撞上了會在附贈的列上以 port_busy 現形，那條路徑本來
     //     就有完整的錯誤顯示。
     let socks_port_listening =
-        original_name.is_none() && winsys::is_listening(config::DEFAULT_SOCKS_PORT);
+        original_name.is_none() && platform::is_listening(config::DEFAULT_SOCKS_PORT);
 
     let written = st.update_config_checked(|c| {
         // 便宜的重驗，理由同 upsert_source：這一次是在 cfg 鎖裡做的
@@ -881,9 +882,9 @@ pub fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Resu
     let st = state.inner();
     let name = autostart_name(&app);
     let result = if on {
-        std::env::current_exe().and_then(|exe| winsys::enable_autostart(&name, &exe))
+        std::env::current_exe().and_then(|exe| platform::enable_autostart(&name, &exe))
     } else {
-        winsys::disable_autostart(&name)
+        platform::disable_autostart(&name)
     };
     result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
     st.log(if on { "autostart enabled" } else { "autostart disabled" });
@@ -901,7 +902,7 @@ pub fn get_config_path(state: State<'_, Shared>) -> String {
 #[tauri::command]
 pub fn open_config_dir(state: State<'_, Shared>) {
     let st = state.inner();
-    if let Err(e) = winsys::reveal_in_explorer(&st.path) {
+    if let Err(e) = platform::reveal_in_file_manager(&st.path) {
         st.log(format!("could not open the config folder: {e}"));
     }
 }

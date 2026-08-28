@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::platform::is_listening;
 use crate::state::{status, AppState, Worker};
-use crate::winsys::is_listening;
 
 /// 引擎斷線後的重連間隔，與 `ssh::tunnel::RETRY` 同值同理由
 pub const RETRY: Duration = Duration::from_secs(5);

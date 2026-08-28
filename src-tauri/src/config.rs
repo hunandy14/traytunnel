@@ -53,15 +53,12 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-/// 執行檔主檔名裡的可攜記號：沿用 Rufus 的 `rufus-4.5p.exe` 慣例，記號是**結尾**的 p。
-///
-/// 只認結尾而不是任意位置，否則 Windows 複製檔案自動取的
-/// 「traytunnel - Copy.exe」（Copy 裡有 p）會莫名其妙變成可攜模式。
-/// `traytunnel` 本身不是 p 結尾，所以結尾的 p 一定是使用者刻意加的，
-/// 例如 `traytunnel-p.exe`、`traytunnel-0.2.0p.exe`。大小寫不敏感。
-pub fn stem_marks_portable(exe_stem: &str) -> bool {
-    matches!(exe_stem.chars().next_back(), Some(c) if c.eq_ignore_ascii_case(&'p'))
-}
+// 執行檔主檔名裡的可攜記號。記號長什麼樣是平台的事——Windows 沿用 Rufus 的
+// 「結尾 p」慣例（`rufus-4.5p.exe`），macOS 則一律不算可攜（程式包在 .app bundle
+// 裡發佈，設定檔放不進執行檔旁邊），因此判定在 `platform::stem_marks_portable`。
+// 底下 `resolve_location` 的第二個觸發條件（exe 旁已有 traytunnel.toml）是純檔案
+// 判斷，不分平台，仍留在這裡。
+use crate::platform::stem_marks_portable;
 
 /// 路徑優先序的純邏輯，實機與測試共用。可攜模式兩個觸發條件**任一成立**即可，
 /// 兩者都指向執行檔旁邊的 `traytunnel.toml`：
@@ -98,10 +95,8 @@ fn exe_parts() -> (PathBuf, String) {
     (dir, stem)
 }
 
-/// 使用者家目錄；空字串視同沒有
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()).map(PathBuf::from)
-}
+// 使用者家目錄。問的是哪一個環境變數、空值算不算數，都是平台的事
+use crate::platform::home_dir;
 
 /// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
 /// 全程式只有這一個入口，讀寫與備份都從回傳值派生。
@@ -123,6 +118,9 @@ pub const DEFAULT_AUTOMATIC_UPDATES: bool = true;
 /// 刻意不走 `load_from_path`：那一支會做遷移判定、壞檔備份、必要時建檔，全都是
 /// 這個時間點不該發生的副作用（正常的載入流程幾毫秒後就會在 setup 裡完整跑一次）。
 /// 這裡只讀一個鍵，讀不到就用預設值。
+// TODO(W3)：macOS 的更新車道接上之後這個 cfg_attr 就可以拿掉——目前唯一的呼叫端
+// 是 `platform::update::apply_pending_at_startup`，而它在 macOS 上還是 stub
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn automatic_updates_enabled() -> bool {
     let (dir, stem) = exe_parts();
     let loc = resolve_location(&dir, &stem, home_dir().as_deref());
@@ -137,6 +135,7 @@ pub fn automatic_updates_enabled() -> bool {
 ///
 /// 壞檔回預設是對的方向：設定檔壞掉時整支程式本來就是用預設值在跑
 /// （見 `LoadOutcome::Broken`），這一個鍵沒有理由自成一格。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn read_automatic_updates(raw: &str) -> bool {
     raw.parse::<DocumentMut>()
         .ok()
