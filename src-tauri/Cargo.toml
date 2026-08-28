@@ -120,3 +120,17 @@ windows = { version = "0.62", features = [
 # 註：這裡是 0.8（用 windows 0.62，跟本檔上面的 windows 對齊），而 notify-rust 4.18 還鎖在
 # 0.7.3，鎖檔會同時存在兩個版本；notify-rust 出新版鎖到 0.8 之後即可自然收斂
 tauri-winrt-notification = "0.8.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 本地時間戳（HH:mm:ss）走 libc 的 localtime_r，對應 Windows 那邊的 GetLocalTime。
+# 不新拉一顆時間 crate：libc 本來就已經在相依樹裡（tokio 等間接帶進來），這裡只是
+# 把它升成直接依賴。
+libc = "0.2"
+# 系統通知：tauri-plugin-notification 的桌面後端在 macOS 上就是直接組一顆
+# notify_rust::Notification 再呼叫 notify_rust::set_application 掛名（見該外掛
+# src/desktop.rs），而外掛自己對外的 Rust API（NotificationExt／ManagerExt）需要
+# AppHandle，這與 platform 介面 show_notification(aumid, title, body) 的自由函式
+# 簽章（Windows 那邊也是同一種簽章，且不得更動）對不上。因此直接依賴外掛底層在用
+# 的這顆 crate，等於是同一條 macOS 通知路徑，只是繞過外掛那層 Manager 綁定。
+# 版本對齊 tauri-plugin-notification 2.3.3 目前鎖的 4.18。
+notify-rust = "4.18"

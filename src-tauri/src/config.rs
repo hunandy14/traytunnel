@@ -53,25 +53,25 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-// 執行檔主檔名裡的可攜記號。記號長什麼樣是平台的事——Windows 沿用 Rufus 的
-// 「結尾 p」慣例（`rufus-4.5p.exe`），macOS 則一律不算可攜（程式包在 .app bundle
-// 裡發佈，設定檔放不進執行檔旁邊），因此判定在 `platform::stem_marks_portable`。
-// 底下 `resolve_location` 的第二個觸發條件（exe 旁已有 traytunnel.toml）是純檔案
-// 判斷，不分平台，仍留在這裡。
-use crate::platform::stem_marks_portable;
+// 可攜模式的兩個觸發條件都是平台的事——Windows 沿用 Rufus 的「結尾 p」慣例
+// （`rufus-4.5p.exe`）加上「exe 旁已有 traytunnel.toml」；macOS 兩條都恆 false
+// （程式包在 .app bundle 裡發佈，設定檔放不進執行檔旁邊，W3 決議不做可攜模式）。
+// 判定分別在 `platform::stem_marks_portable` 與 `platform::exe_toml_marks_portable`。
+use crate::platform::{exe_toml_marks_portable, stem_marks_portable};
 
 /// 路徑優先序的純邏輯，實機與測試共用。可攜模式兩個觸發條件**任一成立**即可，
 /// 兩者都指向執行檔旁邊的 `traytunnel.toml`：
 ///
 /// 1. 執行檔主檔名以 p 結尾（[`stem_marks_portable`]）→ 可攜模式；檔案還不存在也算，
 ///    後面 `load_from_path` 會就地建一份預設檔（Rufus 建 ini 的行為）；
-/// 2. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
+/// 2. 執行檔旁邊已經有 `traytunnel.toml`（[`exe_toml_marks_portable`]）→ 可攜模式，
+///    直接用它；
 /// 3. 都不成立就用家目錄的 `.traytunnel.toml`；
 /// 4. 連家目錄都問不出來時退回執行檔目錄，檔名仍維持點檔，
 ///    才不會反過來把自己變成可攜模式。
 pub fn resolve_location(exe_dir: &Path, exe_stem: &str, home: Option<&Path>) -> ConfigLocation {
     let portable = exe_dir.join(TOML_NAME);
-    if stem_marks_portable(exe_stem) || portable.is_file() {
+    if stem_marks_portable(exe_stem) || exe_toml_marks_portable(&portable) {
         return ConfigLocation { path: portable, portable: true };
     }
     let base = home.unwrap_or(exe_dir);

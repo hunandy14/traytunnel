@@ -67,8 +67,11 @@ pub use imp::{prepare_notifications, show_notification};
 
 // ---------------------------------------------------------------- 設定檔位置
 //
-// `home_dir` 是家目錄模式的落腳處；`stem_marks_portable` 是可攜模式的檔名記號。
-pub use imp::{home_dir, stem_marks_portable};
+// `home_dir` 是家目錄模式的落腳處；可攜模式兩個觸發條件都在這裡：
+// `stem_marks_portable` 是檔名記號，`exe_toml_marks_portable` 是「exe 旁已有
+// traytunnel.toml」。兩支是不是都成立由平台自己決定——Windows 兩條都用，
+// macOS 兩條都恆 false（W3 決議：macOS 不做可攜模式）。
+pub use imp::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 
 // ---------------------------------------------------------------- 開外部程式
 //
