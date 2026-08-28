@@ -28,7 +28,9 @@ use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{IShellLinkW, SetCurrentProcessExplicitAppUserModelID, ShellLink};
 
-use super::winsys::wide;
+// 連模組本身一起帶進來：底下 `mod tests` 是 `use super::*`，在那裡
+// `super::` 指的是 aumid 自己，走不到 platform::windows 的 winsys
+use super::winsys::{self, wide};
 
 /// PKEY_AppUserModel_ID，propkey.h 裡的固定值，windows crate 的 metadata 沒有生出來
 const PKEY_APP_USER_MODEL_ID: PROPERTYKEY =
@@ -209,7 +211,7 @@ pub fn ensure_shortcut(lnk: &Path, exe: &Path, aumid: &str, description: &str) -
 /// 整段註冊失敗。
 pub fn register_aumid(aumid: &str, display_name: &str, exe: &Path) -> io::Result<()> {
     let subkey = format!("{AUMID_CLASS_ROOT}\\{aumid}");
-    super::winsys::write_hkcu_string(&subkey, "DisplayName", display_name)?;
+    winsys::write_hkcu_string(&subkey, "DisplayName", display_name)?;
     let icon_uri = match icon_file_path(aumid) {
         Some(path) => {
             write_icon_file(&path, APP_ICON_PNG)?;
@@ -217,7 +219,7 @@ pub fn register_aumid(aumid: &str, display_name: &str, exe: &Path) -> io::Result
         }
         None => exe.to_string_lossy().into_owned(),
     };
-    super::winsys::write_hkcu_string(&subkey, "IconUri", &icon_uri)?;
+    winsys::write_hkcu_string(&subkey, "IconUri", &icon_uri)?;
     Ok(())
 }
 
@@ -304,11 +306,11 @@ mod tests {
 
         let sub = format!("{AUMID_CLASS_ROOT}\\{id}");
         assert_eq!(
-            super::winsys::read_hkcu_string(&sub, "DisplayName").as_deref(),
+            winsys::read_hkcu_string(&sub, "DisplayName").as_deref(),
             Some("Traytunnel Test")
         );
         assert_eq!(
-            super::winsys::read_hkcu_string(&sub, "IconUri").as_deref(),
+            winsys::read_hkcu_string(&sub, "IconUri").as_deref(),
             Some(icon_path.to_string_lossy().as_ref())
         );
         assert!(icon_path.exists(), "IconUri 指到的圖示檔要真的寫出來");
@@ -318,8 +320,8 @@ mod tests {
             "落地的圖示內容要跟內嵌的 PNG 一致"
         );
 
-        super::winsys::delete_hkcu_key(&sub).expect("測試收尾要刪得掉");
-        assert!(super::winsys::read_hkcu_string(&sub, "DisplayName").is_none());
+        winsys::delete_hkcu_key(&sub).expect("測試收尾要刪得掉");
+        assert!(winsys::read_hkcu_string(&sub, "DisplayName").is_none());
         let _ = std::fs::remove_dir_all(icon_path.parent().unwrap());
     }
 
