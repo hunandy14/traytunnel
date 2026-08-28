@@ -32,14 +32,25 @@ pub fn apply_pending_at_startup(_tray: bool) -> Vec<String> {
 }
 
 /// 把暫存區裡那份就緒的更新認回狀態。
-pub fn restore_staged(_st: &Shared) {
-    todo!("W3: macOS 的更新暫存區尚未實作")
-}
+///
+/// PM 授權（啟動路徑 update stub 安全化・續）：安全 no-op，不碰 `_st`。
+/// macOS 還沒有任何東西會往暫存區寫入（見 [`Pending`] 的說明），也就沒有格式可讀、
+/// 沒有目錄可找——「沒有東西可以認回」本身就是語意正確的答案，`AppState` 建構時
+/// `pending` 欄位預設就是 `None`，這裡什麼都不做，狀態自然停在「沒有就緒的更新」，
+/// 不是拿一個假值去頂著。
+/// TODO(W4)：macOS 有暫存格式與落地目錄之後，這裡要照那份格式讀回並
+/// `st.set_staged(..)`。
+pub fn restore_staged(_st: &Shared) {}
 
 /// 背景檢查的排程。
-pub fn spawn_checker(_st: &Shared) {
-    todo!("W3: macOS 的更新檢查尚未實作")
-}
+///
+/// PM 授權（啟動路徑 update stub 安全化・續）：安全 no-op——不啟動任何輪詢，直接
+/// 返回。呼叫端（`lib.rs::run` 的 `setup` 收尾）本來就是「排一個背景任務，成不成
+/// 功不影響啟動」的位置，macOS 還沒有任何下載／驗章／落地的實作可供輪詢，啟動一顆
+/// 什麼都做不了的迴圈沒有意義，「不排」就是目前唯一正確的行為，不是先頂著。
+/// TODO(W4)：macOS 的下載／驗章／暫存整條路都有了之後，這裡照 Windows 版
+/// （`platform::windows::update::spawn_checker`）的排程骨架接上。
+pub fn spawn_checker(_st: &Shared) {}
 
 /// 使用者剛把「Automatic updates」打開時立刻查一次。
 pub fn check_now(_st: &Shared) {
