@@ -642,6 +642,8 @@ async fn a_probed_forward_to_a_dead_backend_says_it_is_not_a_proxy() {
 // --------------------------------- 握手韌性（PM 裁決 2026-08-24）
 
 use crate::wg::conf::{SecretKey, WgConf};
+// EngineEvent／EngineHealth 目前只有 cfg(windows) 的那兩條測試用得到
+#[cfg_attr(not(windows), allow(unused_imports))]
 use crate::wg::engine::{self, EngineEvent, EngineHealth, EngineSpec, RowSpec};
 
 /// W4.17 首次握手的寬限期**與 `stale_after` 分家**：對端從頭到尾沒回話時，
@@ -704,6 +706,7 @@ fn engine_spec(conf: WgConf, peer_port: u16, rows: Vec<(String, RowSpec)>) -> En
 }
 
 /// 一條 ⑤ 型（SOCKS5）的列，埠交給 OS 配
+#[cfg_attr(not(windows), allow(dead_code))]
 async fn one_free_socks_row() -> (u16, Vec<(String, RowSpec)>) {
     let probe = tokio::net::TcpListener::bind((crate::wg::socks5::BIND_ADDR, 0)).await.unwrap();
     let local = probe.local_addr().unwrap().port();
@@ -739,6 +742,8 @@ async fn the_engine_never_resolves_the_endpoint_itself() {
 /// connected」，緊接著晚到的 `Row(connecting)` 又把它們壓回 connecting——而
 /// device 只在**變化時**推事件，不會再有第二顆 connected 來救，快樂路徑上
 /// 每一條列就這樣永遠卡在 connecting。用空列測不到這件事，所以這裡是非空列。
+// 斷言用 platform::is_listening 驗本地埠，macOS 那一支還是 stub（W3）
+#[cfg(windows)]
 #[tokio::test]
 async fn rows_are_announced_before_the_engine_reports_connected() {
     let (pa, pb) = two_free_udp_ports();
@@ -778,6 +783,8 @@ async fn rows_are_announced_before_the_engine_reports_connected() {
 /// 綁下去的話就是替一棵已經死掉的任務樹佔住本地埠，而下一輪起來時會發現
 /// 自己的埠被「自己」佔著，於是那一條列變成 port_busy——一個看起來像
 /// 「別的程式搶了我的埠」、其實是自己殭屍代綁的故障（覆審實錘 R5）。
+// 斷言用 platform::is_listening 驗本地埠，macOS 那一支還是 stub（W3）
+#[cfg(windows)]
 #[tokio::test]
 async fn a_cancelled_round_binds_nothing() {
     let (pa, pb) = two_free_udp_ports();

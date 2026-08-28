@@ -1406,6 +1406,8 @@ mod tests {
     }
 
     /// 日誌行格式：源底下的事件帶 [源名]，app 級事件不帶
+    // 時間戳走 platform::local_time_hms，macOS 那一支還是 stub（W3）
+    #[cfg(windows)]
     #[test]
     fn log_line_carries_source_name_only_when_it_has_one() {
         let with = format_log(Some("hk"), "exit-a : up");

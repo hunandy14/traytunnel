@@ -23,3 +23,12 @@ impl ProcessSupervisor {
         todo!("W3: macOS 的受監督 spawn 尚未實作")
     }
 }
+
+/// 「丟掉它就等於收掉整棵程序樹」是這個型別的契約，不是實作細節——呼叫端
+/// （`tunnel::test_connection` 的 `drop(job)`）靠的就是它。macOS 這邊先把位子
+/// 佔著，W3 補上「對整個行程群組送 SIGTERM，逾時再 SIGKILL」。
+///
+/// 目前 `new()` 是 `todo!()`，所以實際上永遠不會有實例走到這裡。
+impl Drop for ProcessSupervisor {
+    fn drop(&mut self) {}
+}

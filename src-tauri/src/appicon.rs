@@ -67,6 +67,9 @@ mod tests {
     }
 
     /// 這台機器實際要的兩個尺寸都要挑得到層
+    // 問的是系統實際要的圖示尺寸（Windows 的 SM_CXSMICON／SM_CXICON），
+    // macOS 的圖示方案還沒定案（W3）
+    #[cfg(windows)]
     #[test]
     fn picks_layers_for_this_machine() {
         let (small, _) = platform::small_icon_size();
