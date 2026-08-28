@@ -1,6 +1,7 @@
 //! 系統查詢與系統動作。對照組是 `platform/windows/winsys.rs`。
 //!
-//! `is_listening`／圖示尺寸與挑層是 A／C 車道的範疇，仍是 stub。
+//! `is_listening` 是 A 車道的範疇，仍是 stub；圖示尺寸與挑層是 C 車道的範疇，
+//! 已在 `agent/feature/macos` 落地（見 `feat/macos-tray-window` 合併）。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -469,11 +470,6 @@ mod tests {
         // 停用是冪等的，重複呼叫不算錯
         disable_autostart(&name).expect("重複停用仍要成功");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// 圖示工廠產出的層序，測試照著它走（與 `appicon.rs` 內嵌的那顆 ICO 同一份）
     const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];

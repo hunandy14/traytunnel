@@ -11,8 +11,8 @@
 //!
 //! W3-B（系統整合車道）已落地：`paths`（家目錄、可攜模式兩個觸發條件）、
 //! `notify`（系統通知）、`sys` 的時間戳／開機自啟／`reveal_in_file_manager`。
-//! `sys` 的 `is_listening`／圖示尺寸／挑層是 A／C 車道的範疇，`spawn`／`update`
-//! 是 A／W4 車道的範疇，仍是 stub。
+//! C 車道也已落地：`sys` 的圖示尺寸／挑層。`sys` 的 `is_listening`、`spawn`、
+//! `update` 分別是 A／A／W4 車道的範疇，仍是 stub。
 
 mod notify;
 mod paths;
