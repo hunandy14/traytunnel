@@ -43,18 +43,29 @@ impl ProcessSupervisor {
     /// 一律原樣尊重，這裡只多加 `process_group(0)` 這一道旗標，不碰其他任何
     /// 已經在 `cmd` 上設定好的東西。
     ///
-    /// `log_context` 語意比照 Windows 版：只是為了兩個呼叫點（監看迴圈與存檔前
-    /// 的連線測試）在日誌裡分得出來的前綴。Windows 版在「掛進 Job Object失敗」
-    /// 時只 warn 不失敗，因為程序本身已經起來了；macOS 這邊沒有對應的「掛失敗」
-    /// 分支——`process_group(0)` 是 spawn 前就設定好的旗標，`spawn()` 一旦成功，
-    /// pgid 必定等於子程序自己的 pid，不會有「起來了但沒記到 pgid」的中間狀態。
-    /// 這裡仍保留 `log_context` 參數只是讓兩個平台的簽章、呼叫端維持一致。
-    pub fn spawn(&self, cmd: &mut Command, _log_context: &str) -> io::Result<Child> {
+    /// `log_context` 語意比照 Windows 版：兩個呼叫點（監看迴圈與存檔前的連線
+    /// 測試）在日誌裡分得出來的前綴，也是這裡「記不到 pgid」那一行 warn 的前綴。
+    /// Windows 版在「掛進 Job Object 失敗」時只 warn 不失敗，因為程序本身已經
+    /// 起來了；macOS 這邊剛 spawn 成功的當下 `child.id()` 理論上一定是
+    /// `Some`——`tokio::process::Child::id` 只有在子程序被 poll 到結束、pid
+    /// 已經回收之後才會變成 `None`，而這裡連第一次 poll 都還沒發生——所以
+    /// `None` 分支實務上不該被打到。保留它、而不是假設它不會發生，是不讓
+    /// 「萬一這個保證哪天變了」變成一個悄悄不記 pgid、Drop 也悄悄殺不到東西的
+    /// 靜默失敗：程序本身已經起來了，讓它跑總比為了收尾機制炸掉呼叫端好，
+    /// 但至少要在日誌上留一筆讓人查得到。
+    pub fn spawn(&self, cmd: &mut Command, log_context: &str) -> io::Result<Child> {
         cmd.process_group(0);
         let child = cmd.spawn()?;
-        if let Some(pid) = child.id() {
-            let mut pgids = self.pgids.lock().unwrap_or_else(|e| e.into_inner());
-            pgids.push(pid as i32);
+        match child.id() {
+            Some(pid) => {
+                let mut pgids = self.pgids.lock().unwrap_or_else(|e| e.into_inner());
+                pgids.push(pid as i32);
+            }
+            None => {
+                log::warn!(
+                    "{log_context}spawned child has no pid; its process group cannot be tracked, so the supervisor will not be able to kill it later"
+                );
+            }
         }
         Ok(child)
     }
@@ -72,6 +83,16 @@ impl Drop for ProcessSupervisor {
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         for pgid in pgids {
+            // 下界保護：`kill(2)` 對 pid 參數的意義不是「越界就沒事」而是
+            // 「換一種完全不同的廣播範圍」——`-pgid == 0` 代表對呼叫者自己所在
+            // 的行程群組送訊號（自砍，因為這整支程式本身就跑在某個 pgid 底下）；
+            // `-pgid == -1` 更嚴重，代表對呼叫者有權限送訊號的**所有**行程送
+            // SIGKILL。兩者都不該發生（pgid 是 `child.id()` 給的，理論上一定是
+            // 正整數），但既然這裡要放進迴圈裡對外部輸入（子程序回報的 pid）
+            // 送 kill，就不能只靠「理論上不會是 0 或 1」這種假設頂著。
+            if pgid <= 1 {
+                continue;
+            }
             // 對整個群組送 SIGKILL，一次收掉子程序與它底下所有繼承同一個 pgid
             // 的孫程序。`ESRCH`（群組裡已經沒有任何程序）當正常收尾看待，不是
             // 錯誤——子程序自己先退掉、或整棵樹早就自然結束的情況都會走到這裡，

@@ -101,7 +101,7 @@ fn a_stale_worker_is_dropped_instead_of_overwriting_the_new_one() {
 
 /// W6.3 收全部：ssh 與 wg 兩種 worker 都要被收掉，兩邊的埠都要回報成 stopped
 // 要有一個真的 Worker::Ssh 才測得到，而它得先建出 platform::ProcessSupervisor
-// （Windows 的 Job Object），macOS 的行程群組看管還是 stub（W3）
+// （Windows 是 Job Object，macOS 是行程群組看管，兩邊都已實作，W3-A），兩平台都會跑
 #[test]
 fn draining_covers_both_ssh_and_wg_workers() {
     let wg_token = tokio_util::sync::CancellationToken::new();

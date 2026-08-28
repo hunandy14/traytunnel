@@ -29,19 +29,50 @@ use std::path::Path;
 /// 每輪都會呼叫的輪詢熱路徑，不值得為了問一個埠的狀態付出那個代價；後者要手刻
 /// unsafe 的 `xinpgen`／`xtcpcb` 結構體解析，對應的是 Apple 沒有公開穩定文件的
 /// 核心內部格式，維護風險遠高於一組標準函式庫就能做到的 `bind` 探測。
+///
+/// **與 Windows 版語意上的落差**：`GetExtendedTcpTable` 列的是系統上所有
+/// LISTEN 項目，含綁在 `0.0.0.0`／`[::]`（wildcard，涵蓋所有介面）的那些；
+/// 這裡的 bind 探測只精確比對 `127.0.0.1`／`::1` 這兩個字面位址，**看不到**
+/// 綁在 wildcard 位址上、但同樣會接受 loopback 連線的佔用者——本專案自己的
+/// 監聽器（SOCKS5、ssh `-L`）一律只綁字面 loopback，不受影響，但如果哪天
+/// 有別的程式改成綁 `0.0.0.0` 佔住同一個埠，這支函式會誤判成「沒人聽」。
+///
+/// 這個誤判不是沒有安全網：`ssh::tunnel::build_exit_args` 固定帶
+/// `ExitOnForwardFailure=yes`（見 `tunnel.rs`），埠真的被佔住時 ssh 自己
+/// `bind` 會失敗、直接退出，監看迴圈照樣會在下一輪判定成 disconnected 並重試
+/// ——不會是「顯示 connected 但其實沒轉發」這種更難查的錯。這條結論**依賴**
+/// 那個 ssh 參數；拿掉它，這裡漏掉的 wildcard 佔用就會變成真正的靜默失敗。
 pub fn is_listening(port: u16) -> bool {
     bound_by_someone_else(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         || bound_by_someone_else(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
 }
 
 /// 對單一位址做一次 bind 探測。`Ok` 代表沒人佔，探測用的 listener 隨函式結束
-/// 一起 drop 掉；`AddrInUse` 代表已經有人在 LISTEN；其餘錯誤（例如這台機器根本
-/// 沒有可用的 IPv6 堆疊）一律當「沒有偵測到 LISTEN」，不要把不相干的錯誤誤判成
-/// 佔用，害 spawn 前的埠檢查卡住一條原本可以走的隧道。
+/// 一起 drop 掉；`AddrInUse` 代表已經有人在 LISTEN；其餘錯誤一律當「沒有偵測到
+/// LISTEN」，不要把不相干的錯誤誤判成佔用，害 spawn 前的埠檢查卡住一條原本可以
+/// 走的隧道。
+///
+/// 這個「其餘錯誤一律當沒偵測到」本身是一個已知的限制，不是隨手忽略：
+/// `AddrNotAvailable`（例如這台機器根本沒有可用的 IPv6 堆疊）是預期中會出現
+/// 的訊號，不必聲張；但如果呼叫端把本地埠設在 1024 以下的特權範圍
+/// （例如 443／80），這個沒有 root 權限的行程去 `bind` 會拿到
+/// `PermissionDenied`，而不是 `AddrInUse`——那個埠即使真的有人在 LISTEN，
+/// 這裡也一樣會回 false，讓 `CONNECTED` 判定永遠不觸發。這種錯誤仍然值得
+/// 留一筆 `debug` 級的紀錄，讓排查的人查得到「這裡其實沒判斷出結果」，
+/// 而不是無聲無息地當成「沒人聽」。
 fn bound_by_someone_else(addr: SocketAddr) -> bool {
     match TcpListener::bind(addr) {
         Ok(_listener) => false,
-        Err(e) => e.kind() == io::ErrorKind::AddrInUse,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => true,
+        Err(e) => {
+            if e.kind() != io::ErrorKind::AddrNotAvailable {
+                log::debug!(
+                    "is_listening: probing {addr} failed with {e} ({:?}), treating as not listening",
+                    e.kind()
+                );
+            }
+            false
+        }
     }
 }
 
