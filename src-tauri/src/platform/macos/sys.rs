@@ -192,7 +192,8 @@ pub fn enable_autostart(name: &str, exe: &Path) -> io::Result<()> {
 
     let _ = std::process::Command::new("launchctl").arg("unload").arg(&path).output();
     std::fs::write(&path, plist_contents(&label, exe))?;
-    let status = std::process::Command::new("launchctl").arg("load").arg("-w").arg(&path).status()?;
+    let status =
+        std::process::Command::new("launchctl").arg("load").arg("-w").arg(&path).status()?;
     if !status.success() {
         return Err(io::Error::other(format!("launchctl load exited with {status}")));
     }
@@ -314,10 +315,7 @@ mod tests {
     fn reveal_target_falls_back_to_the_parent_folder() {
         let file = Path::new("/Users/bob/Library/Application Support/traytunnel.toml");
         assert_eq!(reveal_target(file, true), file);
-        assert_eq!(
-            reveal_target(file, false),
-            Path::new("/Users/bob/Library/Application Support")
-        );
+        assert_eq!(reveal_target(file, false), Path::new("/Users/bob/Library/Application Support"));
         assert_eq!(reveal_target(Path::new("traytunnel.toml"), false), Path::new("."));
     }
 
