@@ -21,8 +21,14 @@ pub struct Pending {
 }
 
 /// 啟動最早期的交棒判定。回傳要補進活動日誌的行。
+///
+/// PM 授權（啟動路徑 update stub 安全化）：這裡不是「餵綠」的假值，是語意正確的
+/// no-op——macOS 完全沒有 Windows 那種「暫存區裡躺著一顆 setup.exe，啟動時先把它
+/// 交棒出去、自己 exit(0)」的機制（見本檔開頭的說明），沒有東西可以交棒，所以
+/// 「什麼都沒做，也沒有日誌要補」正是這一支目前唯一正確的答案，不是佔位。
+/// TODO(W4)：macOS 有暫存格式之後，這裡要照那份格式判斷是否有交棒動作。
 pub fn apply_pending_at_startup(_tray: bool) -> Vec<String> {
-    todo!("W3: macOS 的更新交棒尚未實作")
+    Vec::new()
 }
 
 /// 把暫存區裡那份就緒的更新認回狀態。

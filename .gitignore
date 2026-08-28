@@ -23,6 +23,10 @@ traytunnel.json.bak
 traytunnel-error.log
 config.yml
 
+# assets/gen-tray-template.py 用 importlib 載入同目錄的 gen-tray-icons.py，
+# 執行一次就會留下這個 bytecode 快取
+__pycache__/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

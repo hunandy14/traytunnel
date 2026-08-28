@@ -18,7 +18,11 @@ use std::sync::Arc;
 // tunnel 搬進 ssh 模組後在此轉口，讓既有呼叫端維持 `tunnel::...` 不必改路徑
 pub use ssh::tunnel;
 
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
+// Windows 專屬的點擊行為（雙擊左鍵開主視窗）才用得到這兩個型別，
+// macOS 分支整個不碰它們——見 build_tray 的 cfg 分支（D4：macOS 點擊一律開選單）
+#[cfg(windows)]
+use tauri::tray::{MouseButton, TrayIconEvent};
 use tauri::{AppHandle, Manager, WindowEvent};
 
 // 更新整條路由平台提供（封裝格式綁死在各自的安裝器上），這裡轉個名字，
@@ -403,9 +407,16 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     let model = traymenu::menu_model(&shared.source_views(), &shared.wg_views(), ready.as_deref());
     let menu = traymenu::build(app, &model)?;
 
-    // 挑不到層就退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來
-    // 也不要讓整支程式 panic，圖示之後照樣可以補
+    // 圖示來源分平台：Windows 從內嵌 ICO 挑層（一字不動）；macOS 要一份純黑＋透明
+    // 的 template PNG，彩色 ICO 硬套 icon_as_template 只會走樣。兩邊都挑不到層時
+    // 一路退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來也不要讓整支
+    // 程式 panic，圖示之後照樣可以補
+    #[cfg(windows)]
     let icon = appicon::tray_icon().or_else(|| app.default_window_icon().cloned());
+    #[cfg(target_os = "macos")]
+    let icon = appicon::tray_icon_template()
+        .or_else(appicon::tray_icon)
+        .or_else(|| app.default_window_icon().cloned());
     if icon.is_none() {
         log::warn!("no tray icon available, building the tray without one");
     }
@@ -414,16 +425,35 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     if let Some(icon) = icon {
         builder = builder.icon(icon);
     }
-    builder
+    // macOS 依明暗模式（與選取狀態）自動套色只認 template image；Windows 沒有這個
+    // 概念，這個呼叫在 Windows 上是 no-op，但仍限定在 macOS 分支讓意圖清楚
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(true);
+    }
+    builder = builder
         .tooltip("Traytunnel")
         .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(move |app, event| on_tray_menu(app, &st, event.id().as_ref()))
-        .on_tray_icon_event(|tray, event| {
+        .on_menu_event(move |app, event| on_tray_menu(app, &st, event.id().as_ref()));
+
+    // 點擊行為（D4）：Windows 維持現行「左鍵開主視窗、右鍵開選單」一字不動；
+    // macOS 採平台慣例——左右鍵一律開選單，開主視窗只留在選單的「Open window」項
+    // （traymenu::menu_model 一律附上這一項，見 traymenu.rs），不額外接雙擊處理常式
+    #[cfg(windows)]
+    {
+        builder = builder.show_menu_on_left_click(false).on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = event {
                 show_main(tray.app_handle());
             }
-        })
-        .build(app)?;
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 與預設值相同，寫出來是為了讓這個平台分支自我說明，不必回頭翻
+        // tray-icon 的 default() 才知道 mac 這邊「什麼都沒做」其實是刻意的
+        builder = builder.show_menu_on_left_click(true);
+    }
+
+    builder.build(app)?;
     Ok(())
 }
