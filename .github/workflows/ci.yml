@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - main
+      # macOS 移植的整合分支與其下各車道分支，PR 一樣要跑完整 CI
+      - "agent/**"
   push:
     branches:
       - main

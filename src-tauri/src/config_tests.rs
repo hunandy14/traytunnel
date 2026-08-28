@@ -153,6 +153,9 @@ fn the_product_name_itself_does_not_end_with_p() {
 }
 
 /// 記號是結尾的 p，大小寫不敏感（Rufus 本尊就是 rufus-4.5p.exe 這種寫法）
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn a_trailing_p_marks_portable() {
     assert!(stem_marks_portable("traytunnel-0.2.0p"));
@@ -187,6 +190,9 @@ fn a_windows_copy_is_not_portable() {
 }
 
 /// 檔名含 p 時，設定檔就在 exe 旁邊，即使檔案還不存在、家目錄也問得出來
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn p_in_the_stem_wins_over_the_home_dotfile() {
     let exe = tmp_dir("loc-pstem");
@@ -199,6 +205,9 @@ fn p_in_the_stem_wins_over_the_home_dotfile() {
 }
 
 /// 檔名含 p 但檔案還不存在時，load 要就地建一份預設檔（Rufus 建 ini 的行為）
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn p_in_the_stem_creates_the_file_next_to_the_exe() {
     let exe = tmp_dir("loc-pstem-create");

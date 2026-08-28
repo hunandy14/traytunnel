@@ -13,7 +13,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::Config;
-use crate::winsys::Job;
+use crate::platform::ProcessSupervisor;
 
 /// 活動日誌保留的行數上限
 const LOG_CAPACITY: usize = 500;
@@ -432,7 +432,7 @@ pub fn autostart_name(app: &AppHandle) -> String {
 
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
 fn format_log(source: Option<&str>, msg: &str) -> String {
-    let ts = crate::winsys::local_time_hms();
+    let ts = crate::platform::local_time_hms();
     match source {
         Some(s) => format!("{ts}  [{s}] {msg}"),
         None => format!("{ts}  {msg}"),
@@ -479,7 +479,7 @@ pub(crate) enum Worker {
     // 兩個欄位都**只為了 Drop 而持有**，沒有讀取端是刻意的：handle 一關，
     // 整棵 ssh 程序樹（含 ProxyCommand 的孫程序）就結束；權杖一取消，
     // 整棵 wg 任務樹（引擎 + 所有列的監聽器）就結束
-    Ssh(#[allow(dead_code)] Job),
+    Ssh(#[allow(dead_code)] ProcessSupervisor),
     Wg(#[allow(dead_code)] crate::wg::CancelGuard),
 }
 
@@ -605,7 +605,7 @@ pub struct AppState {
     /// 背景更新檢查的結果，None 代表目前沒有新版可用
     update: Mutex<Option<UpdateInfo>>,
     /// 已經下載好、等下一次啟動才安裝的那一版，None 代表暫存區是空的
-    pending: Mutex<Option<crate::update::Pending>>,
+    pending: Mutex<Option<crate::platform::update::Pending>>,
     /// 「知道有新版，但下載失敗了、正在退避等下一次試」。
     ///
     /// 沒有這一格的話，介面只看得到「有新版」與「有東西就緒」兩個事實，
@@ -1197,7 +1197,7 @@ impl AppState {
     }
 
     pub fn autostart(&self) -> bool {
-        crate::winsys::autostart_enabled(&autostart_name(&self.app))
+        crate::platform::autostart_enabled(&autostart_name(&self.app))
     }
 
     /// 這次執行要不要自動更新。設定檔沒寫的話兩種模式都算開，
@@ -1231,7 +1231,7 @@ impl AppState {
     ///
     /// 變了就全量推一次：設定頁那顆鈕與系統匣的「Restart to update」都吃這一份，
     /// 而它們平常是靠 config-changed 更新的，這裡沿用同一條路就不必再多一種事件。
-    pub fn set_staged(&self, pending: Option<crate::update::Pending>) {
+    pub fn set_staged(&self, pending: Option<crate::platform::update::Pending>) {
         {
             let mut slot = self.pending.lock().unwrap();
             if *slot == pending {
@@ -1406,6 +1406,8 @@ mod tests {
     }
 
     /// 日誌行格式：源底下的事件帶 [源名]，app 級事件不帶
+    // 時間戳走 platform::local_time_hms，macOS 那一支還是 stub（W3）
+    #[cfg(windows)]
     #[test]
     fn log_line_carries_source_name_only_when_it_has_one() {
         let with = format_log(Some("hk"), "exit-a : up");

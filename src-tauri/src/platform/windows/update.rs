@@ -93,7 +93,7 @@ const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 /// 那時還沒有 `AppHandle` 可以問設定，所以產品名與識別碼只能自己拿。
 /// 直接讀這份檔案而不是各抄一份常數：抄的話兩邊會漂，而漂掉的症狀是
 /// 安裝版被誤判成可攜版（更新整條路靜默失效）或暫存區寫進一個沒人會讀的資料夾。
-const TAURI_CONF: &str = include_str!("../tauri.conf.json");
+const TAURI_CONF: &str = include_str!("../../../tauri.conf.json");
 
 /// tauri.conf.json 裡的一個頂層字串欄位。解析不出來就 panic——那代表出貨的設定
 /// 檔壞了或改了形狀，是編譯期就該被發現的事，絕不能默默退回一個猜的值。
@@ -192,7 +192,7 @@ pub fn is_installed() -> bool {
         return false;
     };
     let subkey = uninstall_subkey(&PRODUCT_NAME);
-    crate::winsys::read_hkcu_string(&subkey, "InstallLocation")
+    super::winsys::read_hkcu_string(&subkey, "InstallLocation")
         .is_some_and(|loc| location_matches(&loc, &exe))
 }
 
@@ -465,7 +465,7 @@ pub fn open_releases_page(st: &Shared) {
 }
 
 fn open_page(st: &Shared, url: &str) {
-    if let Err(e) = crate::winsys::open_url(url) {
+    if let Err(e) = super::winsys::open_url(url) {
         st.log(format!("could not open {url}: {e}"));
     }
 }
@@ -621,7 +621,7 @@ fn another_instance_is_running() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 
-    let name = crate::winsys::wide(&single_instance_mutex_name());
+    let name = super::winsys::wide(&single_instance_mutex_name());
     // SAFETY: name 是 NUL 結尾的寬字串，OpenMutexW 只讀它；回傳的 handle 立刻關掉
     unsafe {
         let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
@@ -1002,7 +1002,7 @@ mod tests {
     /// 的做法直接讀它，把這條全域規則擋在 CI，避免它被刪掉。
     #[test]
     fn the_stylesheet_makes_the_hidden_attribute_actually_hide() {
-        let css = include_str!("../../src/styles.css");
+        let css = include_str!("../../../../src/styles.css");
         let normalized: String = css.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             normalized.contains("[hidden]{display:none!important;}"),
@@ -1226,7 +1226,7 @@ mod tests {
     /// `the_stylesheet_makes_the_hidden_attribute_actually_hide` 的做法。
     #[test]
     fn the_update_button_is_always_in_the_settings_page() {
-        let html = include_str!("../../index.html").replace("\r\n", "\n");
+        let html = include_str!("../../../../index.html").replace("\r\n", "\n");
         let start = html.find(r#"id="btn-update""#).expect("版本列一定要有主鈕");
         let tag = &html[start..start + html[start..].find('>').expect("標籤沒有結尾")];
         assert!(!tag.contains("hidden"), "主鈕不可以預設藏起來：{tag}");
@@ -1241,7 +1241,7 @@ mod tests {
     /// 跳一句看不懂的錯誤），型別系統完全管不到——指令函式本身照樣編得過。
     #[test]
     fn the_manual_update_commands_are_registered() {
-        let lib = include_str!("lib.rs");
+        let lib = include_str!("../../lib.rs");
         for cmd in ["check_for_updates_now", "install_update"] {
             assert!(
                 lib.contains(&format!("commands::{cmd}")),
@@ -1290,7 +1290,7 @@ mod tests {
     /// 把它擋在 CI。
     #[test]
     fn the_shipped_updater_config_parses() {
-        let raw = include_str!("../tauri.conf.json");
+        let raw = include_str!("../../../tauri.conf.json");
         let conf: serde_json::Value =
             serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
 
@@ -1329,7 +1329,7 @@ mod tests {
     /// 這也正是 `is_installed` 讀 HKCU（而不是 HKLM）解除安裝機碼的前提。
     #[test]
     fn the_installer_stays_in_the_current_user_scope() {
-        let raw = include_str!("../tauri.conf.json");
+        let raw = include_str!("../../../tauri.conf.json");
         let conf: serde_json::Value =
             serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
         assert_eq!(
