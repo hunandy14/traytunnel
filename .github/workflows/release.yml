@@ -1,10 +1,41 @@
 name: Release
 
+# 安全紅線：任何演練/測試性質的執行都要走 dry_run=true。dry_run=false（含
+# autotag.yml 觸發的 tag push，以及手動 workflow_dispatch 沒勾 dry_run 的
+# 情況）都會建立/覆寫真實 GitHub Release，並改動 releases/latest 這個固定
+# 指標——它就是應用程式 updater 查詢的 endpoint，直接影響線上使用者。
+# 不要為了「看看跑不跑得動」而拿掉 dry_run=true，也不要在 dry_run 分支之外
+# 動這條防線。
+
+# 單平台發佈的先天限制（platform=windows / macos 時務必理解）：Tauri 的
+# latest.json manifest 只有一個全域 version 欄位，沒有 per-platform 版本。所以
+# 「只發某一個平台的新版本」在語意上必然讓另一個平台的使用者看到 version 前進、
+# 卻拿到上一版的 url——甚至是這個新 release 上根本不存在的資產。這條路徑因此
+# 預設被擋下來（見下面 allow_stale_platforms 與 scripts/lib/latest-json.mjs 的
+# 陳舊條目斷言）。真正安全的單平台用法只有一種：往「已經發過、tag 相同」的
+# release 補另一條腿，此時另一平台的條目本來就指向同一個 tag，斷言自然通過。
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "要建置/發佈的平台（單平台可控發佈的逃生門；合併邏輯會保留另一平台在 latest.json 裡的既有條目）"
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+        default: all
+      allow_stale_platforms:
+        description: "顯式扛責：允許 latest.json 保留「url 不屬於這次 release tag」的舊平台條目。單平台發佈全新版本時會擋下來（另一平台的使用者會被通知有新版卻抓到舊檔）；往既有 release 補另一條腿則本來就會通過，不需要這個開關"
+        type: boolean
+        default: false
+      dry_run:
+        description: "true＝只建置＋組出 latest.json 當 workflow artifact；不檢查 tag、不建 GitHub Release、不 attest，不會動到 releases/latest（演練/測試一律要開）"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,23 +45,90 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
+  # 把 workflow_dispatch 的 platform 輸入換算成實際要跑的 matrix。
+  # tag push（autotag.yml 觸發，不帶參數）一律視為 all、dry_run=false。
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      # 這次「應該建置成功」的平台 key 清單（空白分隔），與 matrix 同源。
+      # compose job 拿它做 fail-closed 檢查：任何一個應建平台缺 .sig 就中止，
+      # 不會靜默沿用底稿舊值（舊管線本來就有這道防呆，重構時掉了，補回來）。
+      platform_keys: ${{ steps.set.outputs.platform_keys }}
+      dry_run: ${{ steps.set.outputs.dry_run }}
+      allow_stale_platforms: ${{ steps.set.outputs.allow_stale_platforms }}
+    steps:
+      - name: Compute build matrix and dry_run flag
+        id: set
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform="all"
+          dry_run="false"
+          allow_stale="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            platform="${{ inputs.platform }}"
+            dry_run="${{ inputs.dry_run }}"
+            allow_stale="${{ inputs.allow_stale_platforms }}"
+          fi
+
+          case "$platform" in
+            windows)
+              matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"}]}'
+              platform_keys="windows-x86_64"
+              ;;
+            macos)
+              matrix='{"include":[{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              platform_keys="darwin-aarch64"
+              ;;
+            all)
+              matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"},{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              platform_keys="windows-x86_64 darwin-aarch64"
+              ;;
+            *)
+              echo "::error::未知的 platform 輸入：${platform}（要 all / windows / macos 其中之一）"
+              exit 1
+              ;;
+          esac
+
+          echo "platform=${platform}  dry_run=${dry_run}  allow_stale_platforms=${allow_stale}"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "platform_keys=$platform_keys" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "allow_stale_platforms=$allow_stale" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: plan
+    strategy:
+      # 發佈建置不比 CI：一腿失敗就沒必要繼續燒另一腿的建置時間，直接讓
+      # 整個 workflow 停下來，人工確認後再重跑。
+      fail-fast: true
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
 
       # 版本防呆：tag 觸發時比對 tag（去 v）與 Cargo.toml version，
       # workflow_dispatch 則以 Cargo.toml 為準，並用 git ls-remote 向遠端
       # 確認對應 tag 已存在（不吃本地 checkout 深度，對齊 autotag.yml 的作法）。
       # windows-latest 預設 shell 是 pwsh，這裡明定 shell 並用 PowerShell 語法。
-      - name: Resolve release version and tag
-        id: resolve
+      #
+      # dry_run=true 時（僅限 workflow_dispatch 演練）略過遠端 tag 存在性
+      # 檢查——這是本檔案唯一新增的分支，其餘邏輯與訊息原封不動。
+      - name: Resolve release version and tag (windows)
+        if: matrix.os == 'windows-latest'
+        id: resolve_windows
         shell: pwsh
         run: |
           $cargoTomlPath = "src-tauri/Cargo.toml"
@@ -61,29 +159,49 @@ jobs:
             $releaseTag = $tagName
           } else {
             $releaseTag = "v$version"
-            $exists = git ls-remote --tags origin "refs/tags/$releaseTag"
-            if ([string]::IsNullOrWhiteSpace($exists)) {
-              Write-Error "workflow_dispatch 手動觸發，但 tag $releaseTag 不存在——請先 npm run bump、commit、git tag $releaseTag 並 git push --tags，再重新執行本 workflow"
-              exit 1
+            if ("${{ needs.plan.outputs.dry_run }}" -eq "true") {
+              Write-Host "dry_run=true：workflow_dispatch 手動觸發，略過遠端 tag 存在性檢查（僅供演練，不建立/發佈任何東西）"
+            } else {
+              $exists = git ls-remote --tags origin "refs/tags/$releaseTag"
+              if ([string]::IsNullOrWhiteSpace($exists)) {
+                Write-Error "workflow_dispatch 手動觸發，但 tag $releaseTag 不存在——請先 npm run bump、commit、git tag $releaseTag 並 git push --tags，再重新執行本 workflow"
+                exit 1
+              }
+              Write-Host "workflow_dispatch：沿用既有 tag $releaseTag"
             }
-            Write-Host "workflow_dispatch：沿用既有 tag $releaseTag"
           }
 
           Write-Host "Release tag：$releaseTag"
           "version=$version" >> $env:GITHUB_OUTPUT
           "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
 
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-          cache: "npm"
+      # macOS 腿與下面 compose job 共用 scripts/resolve-release.mjs（同一套
+      # 版本/tag 解析邏輯，語意對齊上面 windows 腿的 PowerShell 版本）。
+      - name: Resolve release version and tag (macos)
+        if: matrix.os != 'windows-latest'
+        id: resolve_macos
+        shell: bash
+        env:
+          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+        run: node scripts/resolve-release.mjs
 
-      - name: Setup Rust (stable-msvc)
+      # 兩條 resolve 分支裡永遠只有一條真的跑，另一條的 outputs 是空字串，
+      # 直接串接即可拿到有值的那一份——避免下游步驟還要各自寫平台判斷。
+      - name: Normalize resolved version/tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.resolve_windows.outputs.version }}${{ steps.resolve_macos.outputs.version }}"
+          release_tag="${{ steps.resolve_windows.outputs.release_tag }}${{ steps.resolve_macos.outputs.release_tag }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust (stable, ${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -94,58 +212,33 @@ jobs:
         run: npm ci
 
       # tauri.conf.json 開了 createUpdaterArtifacts，打包時會用這把私鑰替
-      # setup.exe 簽出 .sig；缺了它 bundler 會直接失敗（本地不帶私鑰要建置的話
-      # 用 npm run build:exe，--no-bundle 不會走到簽章那一步）。
-      # 產私鑰時沒有設密碼，但環境變數仍要給空字串，否則 tauri 會停下來問。
+      # 更新產物（Windows 的 setup.exe／macOS 的 .app.tar.gz）簽出 .sig；
+      # 缺了它 bundler 會直接失敗。產私鑰時沒有設密碼，但環境變數仍要給
+      # 空字串，否則 tauri 會停下來問。
+      #
+      # macOS 這條腿走同一顆 npm script：tauri.conf.json 的
+      # beforeBuildCommand 本來就會先跑 npm run build（前端），"tauri build"
+      # 依平台自動合併 src-tauri/tauri.macos.conf.json（bundle targets
+      # app+dmg、minimumSystemVersion、ad-hoc 簽章 signingIdentity "-"——
+      # 沒有 Apple 開發者憑證，才能在 CI 上出包），接著 minisign 用同一把
+      # TAURI_SIGNING_PRIVATE_KEY 簽 updater 產物，最後 package.mjs 依
+      # process.platform 分流改名進 out/。跟 Windows 腿完全對稱，不必拆成
+      # 多個步驟。
       - name: Build app and bundles
         run: npm run build:all
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
-      # 應用內更新查的就是這一份：endpoint 是 releases/latest/download/latest.json，
-      # 也就是「最新一版的 release 上叫 latest.json 的那個資產」。
-      - name: Compose latest.json
-        shell: pwsh
-        run: |
-          $version = "${{ steps.resolve.outputs.version }}"
-          $tag = "${{ steps.resolve.outputs.release_tag }}"
-
-          # createUpdaterArtifacts 產出的簽章檔就落在 NSIS 安裝檔旁邊，
-          # 檔名是安裝檔全名再接 .sig；latest.json 要的是它的「內容」
-          $sig = "src-tauri/target/release/bundle/nsis/traytunnel_${version}_x64-setup.exe.sig"
-          if (-not (Test-Path $sig)) {
-            Write-Error "找不到更新簽章檔 $sig——請確認 TAURI_SIGNING_PRIVATE_KEY 有設，且 tauri.conf.json 的 bundle.createUpdaterArtifacts 是 true"
-            exit 1
-          }
-
-          # 下載網址指向 release 上的資產名，也就是 scripts/package.mjs 改好名的那一顆
-          $setup = "traytunnel-$version-setup.exe"
-          if (-not (Test-Path "out/$setup")) {
-            Write-Error "找不到 out/$setup，latest.json 的下載網址會指向不存在的資產"
-            exit 1
-          }
-
-          $latest = [ordered]@{
-            version   = $version
-            pub_date  = [System.DateTime]::UtcNow.ToString("o")
-            platforms = [ordered]@{
-              "windows-x86_64" = [ordered]@{
-                signature = (Get-Content $sig -Raw).Trim()
-                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$setup"
-              }
-            }
-          }
-          $latest | ConvertTo-Json -Depth 5 | Set-Content -Path out/latest.json -Encoding utf8
-          Get-Content out/latest.json
-
-      # latest.json 的 signature 簽的是 bundle/nsis 底下的原始安裝檔，
+      # latest.json 的 signature 簽的是 bundle 目錄底下的原始 updater 產物，
       # 但 url 指向的是 scripts/package.mjs 複製改名到 out/ 的另一顆檔案。
-      # 現在 package.mjs 用 copyFileSync 位元組全同，所以能對得上，但這是
-      # 隱性假設——日後 package.mjs 若改成重新打包、加簽名戳或任何非位元組
-      # 複製的動作，這兩顆檔案就會分岔，簽章也就簽不到真正要發布的那顆，
-      # 而且沒有這關卡的話 CI 完全抓不到。這裡用 SHA256 比對兩者，不一致就讓 CI 紅。
-      - name: Verify updater signature matches release asset
+      # package.mjs 用 copyFileSync 位元組全同，所以能對得上，但這是隱性
+      # 假設——日後 package.mjs 若改成重新打包、加簽名戳或任何非位元組複製
+      # 的動作，這兩顆檔案就會分岔，簽章也就簽不到真正要發布的那顆，而且
+      # 沒有這關卡的話 CI 完全抓不到。這裡用 SHA256 比對兩者，不一致就讓
+      # CI 紅。
+      - name: Verify updater signature matches release asset (windows)
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $version = "${{ steps.resolve.outputs.version }}"
@@ -160,28 +253,264 @@ jobs:
           }
           Write-Host "簽章一致性確認：$releaseSetup 與 $bundleSetup 的 SHA256 相同（$releaseHash）"
 
-      - name: Generate SHA256SUMS
-        shell: pwsh
+      # 同一個防呆，macOS 版本：比對 out/ 的 .app.tar.gz 與 bundle/macos 底下
+      # minisign 實際簽的那顆是否位元組相同。dmg 不是 updater 產物、latest.json
+      # 不會提到它，不必比對。
+      - name: Verify updater signature matches release asset (macos)
+        if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
-          $files = Get-ChildItem -Path out -Filter *.exe | Sort-Object Name
-          $lines = foreach ($f in $files) {
-            $hash = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash  $($f.Name)"
-          }
-          Set-Content -Path out/SHA256SUMS.txt -Value $lines -Encoding utf8
+          set -euo pipefail
+          version="${{ steps.resolve.outputs.version }}"
+          bundle_tar="src-tauri/target/release/bundle/macos/traytunnel.app.tar.gz"
+          release_tar="out/traytunnel-${version}-aarch64.app.tar.gz"
 
+          bundle_hash=$(shasum -a 256 "$bundle_tar" | awk '{print $1}')
+          release_hash=$(shasum -a 256 "$release_tar" | awk '{print $1}')
+          if [ "$bundle_hash" != "$release_hash" ]; then
+            echo "::error::簽章不一致：${release_tar}（SHA256 ${release_hash}）與簽章實際簽的 ${bundle_tar}（SHA256 ${bundle_hash}）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
+            exit 1
+          fi
+          echo "簽章一致性確認：${release_tar} 與 ${bundle_tar} 的 SHA256 相同（${release_hash}）"
+
+      # out/ 整包（含 package.mjs 順手複製進去的 .sig）交給 compose job：
+      # latest.json 要合併雙平台，勢必得先把兩腿的產物集中到同一個 job。
+      - name: Upload build artifact (${{ matrix.platform_key }})
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.platform_key }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  # 彙總 job：下載兩腿（或單平台逃生門時的那一腿）產物，組出「單平台可控
+  # 發佈」語意下的 latest.json（底稿合併——見 scripts/lib/latest-json.mjs），
+  # 彙總 SHA256SUMS、attest、單一 gh-release 上傳全部產物。
+  compose:
+    name: compose (latest.json + release)
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Resolve release version and tag
+        id: resolve
+        shell: bash
+        env:
+          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+        run: node scripts/resolve-release.mjs
+
+      # merge-multiple: true 直接把每一腿的內容攤平進 out/，不建以 artifact
+      # 命名的子目錄。這不是省事而已：download-artifact 在「只比對到一個
+      # artifact」時本來就不會建子目錄，單平台模式下自己組裝子目錄的迴圈會
+      # 撈不到東西、out/ 全空，compose 隨即死在找不到簽章。交給 action 自己
+      # 攤平，單平台與雙平台走同一條路徑。兩腿的檔名各自帶平台後綴，不會相撞。
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: out
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "-- out/ 內容 --"
+          ls -la out/
+
+      # 底稿合併的核心前提：先抓現行 releases/latest/download/latest.json。
+      # 純讀公開資料，dry_run 與否都做——這樣 dry-run 才能真實驗證合併邏輯，
+      # 而不是每次都只測「空底稿」這一種情境。
+      #
+      # 關鍵：必須區分「確定沒有底稿」與「這次沒抓到」。
+      #   HTTP 404      → 真的沒有（首發，或最新 release 上沒有 latest.json
+      #                   這個資產）。視為空底稿，不擋流程。
+      #   其他任何失敗  → 暫時性（網路抖動、5xx、rate limit、被攔截的錯誤頁）。
+      #                   重試；重試用盡仍失敗就硬失敗。
+      # 把後者靜默當成「沒有底稿」的話，單平台發佈會直接把另一個平台的條目
+      # 從 latest.json 抹掉，那個平台的使用者從此收不到更新——而且整條流程
+      # 全綠，沒有人會發現。
+      - name: Fetch current latest.json as merge baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+          attempts=5
+          status="failed"
+          code="000"
+
+          for i in $(seq 1 "${attempts}"); do
+            code="$(curl -sSL --connect-timeout 10 --max-time 60 \
+              -o baseline-latest.json.tmp -w '%{http_code}' "${url}")" || code="000"
+
+            if [ "${code}" = "200" ]; then
+              # 200 也可能拿到半截／被中間層換掉的內容，解得開才算數，
+              # 否則一樣當暫時性失敗重試（總比拿壞底稿去合併好）。
+              if node --input-type=module \
+                -e 'import{readFileSync}from"node:fs";JSON.parse(readFileSync("baseline-latest.json.tmp","utf8"))'; then
+                mv baseline-latest.json.tmp baseline-latest.json
+                status="ok"
+                break
+              fi
+              echo "第 ${i} 次：HTTP 200 但內容不是合法 JSON，視為暫時性失敗"
+            elif [ "${code}" = "404" ]; then
+              status="absent"
+              break
+            else
+              echo "第 ${i} 次：HTTP ${code}，視為暫時性失敗"
+            fi
+
+            if [ "${i}" -lt "${attempts}" ]; then
+              sleep $(( i * 5 ))
+            fi
+          done
+
+          if [ "${status}" = "ok" ]; then
+            echo "抓到現行 latest.json 當底稿："
+            cat baseline-latest.json
+          elif [ "${status}" = "absent" ]; then
+            echo "HTTP 404：線上沒有 latest.json（首發，或目前還沒有任何 release）——視為空底稿"
+            echo '{}' > baseline-latest.json
+          else
+            echo "::error::連續 ${attempts} 次都拿不到現行 latest.json（最後一次 HTTP ${code}），且不是 404。無法確認線上底稿內容，繼續下去可能把其他平台的條目從 latest.json 抹掉，因此中止。請稍後重跑。"
+            exit 1
+          fi
+
+      # 要餵給 compose-latest-json.mjs 的平台清單，直接來自 plan job 算出來的
+      # build matrix（needs.plan.outputs.platform_keys），不是「out/ 底下剛好
+      # 有哪些 .sig」。
+      #
+      # 差別很要命：用「檔案在不在」推導的話，簽章因為任何原因沒被產出／沒被
+      # 複製進 out/ 時，該平台會被靜默跳過，latest.json 於是沿用底稿的舊條目，
+      # 整條流程全綠——使用者拿到的是上一版的簽章配新版的 url，更新直接壞掉，
+      # 而且沒有任何訊號。所以這裡反過來：這次矩陣說要建的平台，簽章就必須在，
+      # 缺一個就中止（fail-closed）。底稿沿用只保留給「這次根本沒排進矩陣」的
+      # 平台，那才是單平台可控發佈的本意。
+      - name: Compose merged latest.json
+        shell: bash
+        env:
+          EXPECTED_PLATFORMS: ${{ needs.plan.outputs.platform_keys }}
+          ALLOW_STALE: ${{ needs.plan.outputs.allow_stale_platforms }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.resolve.outputs.version }}"
+          tag="${{ steps.resolve.outputs.release_tag }}"
+          repo="${{ github.repository }}"
+          pub_date="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+
+          args=(--version "${version}" --tag "${tag}" --pub-date "${pub_date}"
+                --baseline baseline-latest.json --out out/latest.json)
+          if [ "${ALLOW_STALE}" = "true" ]; then
+            echo "::warning::allow_stale_platforms=true：latest.json 允許保留不屬於 ${tag} 的舊平台條目"
+            args+=(--allow-stale-platforms)
+          fi
+
+          echo "這次應建置的平台：${EXPECTED_PLATFORMS}"
+          for key in ${EXPECTED_PLATFORMS}; do
+            case "${key}" in
+              windows-x86_64)
+                sig="out/traytunnel-${version}-setup.exe.sig"
+                asset="traytunnel-${version}-setup.exe"
+                ;;
+              darwin-aarch64)
+                sig="out/traytunnel-${version}-aarch64.app.tar.gz.sig"
+                asset="traytunnel-${version}-aarch64.app.tar.gz"
+                ;;
+              *)
+                echo "::error::未知的平台 key ${key}，plan job 與 compose job 對不起來"
+                exit 1
+                ;;
+            esac
+
+            if [ ! -f "${sig}" ]; then
+              echo "::error::這次 build matrix 排了 ${key}，但簽章檔 ${sig} 不存在。latest.json 的 ${key} 條目無法產生，若放行會靜默沿用底稿舊簽章，因此中止。檢查 scripts/package.mjs 有沒有把 .sig 複製進 out/，以及該腿的 upload/download artifact。"
+              exit 1
+            fi
+
+            args+=(--platform "${key}=${sig}=https://github.com/${repo}/releases/download/${tag}/${asset}")
+          done
+
+          node scripts/compose-latest-json.mjs "${args[@]}"
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          files=()
+          for pattern in '*.exe' '*.dmg' '*.tar.gz'; do
+            for f in $pattern; do
+              [ -e "$f" ] && files+=("$f")
+            done
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::out/ 底下沒有任何要發佈的二進位檔（*.exe / *.dmg / *.tar.gz）"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # dry_run 與否都上傳這個 artifact：這是驗證「合併邏輯 + 建置」整條路徑
+      # 有沒有真的兜起來的證據，不必開真 release 也能下載回來檢查
+      # latest.json 結構。
+      - name: Upload compose output as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-compose-output
+          path: |
+            out/*.exe
+            out/*.dmg
+            out/*.tar.gz
+            out/SHA256SUMS.txt
+            out/latest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      # dry_run=true 時到此為止：不 attest、不建立/覆寫真實 GitHub Release，
+      # 不動 releases/latest 這個 updater endpoint 指標。
       - name: Attest build provenance
+        if: needs.plan.outputs.dry_run != 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: out/*.exe
+          subject-path: |
+            out/*.exe
+            out/*.dmg
+            out/*.tar.gz
 
+      # body 與 generate_release_notes 並用時，GitHub API 會把 body 放在前面、
+      # 自動生成的變更記錄接在後面（不是互斥，兩者都會出現在最終 release
+      # 說明）。這裡固定附上 macOS 安裝說明：把 app 拖進「應用程式」資料夾
+      # 再開啟不是慣例，是避開 App Translocation 的必要條件——macOS 會讓
+      # 還沒搬進「應用程式」的下載檔跑在唯讀的隨機掛載點上，updater 在那裡
+      # 寫不了檔案會直接失敗。單平台（僅 Windows）發佈時這段說明依然會
+      # 出現在說明文字裡，但無害——它描述的是「若你要用 macOS 版」的固定
+      # 步驟，不代表這次 release 一定有新的 macOS 資產。
       - name: Create GitHub Release
+        if: needs.plan.outputs.dry_run != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ steps.resolve.outputs.release_tag }}
           name: v${{ steps.resolve.outputs.version }}
+          body: |
+            ## macOS 安裝說明
+
+            下載 `.dmg` 打開後，請把 `traytunnel.app` 拖進「應用程式」資料夾再開啟——這不只是慣例，而是避開 App Translocation 的必要步驟：macOS 會讓還沒搬進「應用程式」的下載檔案在唯讀的隨機掛載點上執行，自動更新機制在那裡寫不了檔案會直接失敗。
           files: |
             out/*.exe
+            out/*.dmg
+            out/*.tar.gz
             out/SHA256SUMS.txt
             out/latest.json
           generate_release_notes: true
