@@ -120,3 +120,10 @@ windows = { version = "0.62", features = [
 # 註：這裡是 0.8（用 windows 0.62，跟本檔上面的 windows 對齊），而 notify-rust 4.18 還鎖在
 # 0.7.3，鎖檔會同時存在兩個版本；notify-rust 出新版鎖到 0.8 之後即可自然收斂
 tauri-winrt-notification = "0.8.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# W3：ProcessSupervisor 收尾要對整個行程群組送 SIGKILL（`kill(-pgid, SIGKILL)`），
+# std 沒有對應的 API（`Child::kill` 只殺得到單一 pid）。已經是 tokio 在 unix 上
+# 的間接相依（見 Cargo.lock），這裡只是把它升成直接相依，不會讓相依樹多長一顆新的
+# 版本；版本號跟著 tokio 目前鎖定的 0.2 系列走。
+libc = "0.2"
