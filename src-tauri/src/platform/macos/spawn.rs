@@ -1,34 +1,109 @@
-//! 受監督 spawn 的 stub。
+//! 受監督 spawn：Unix 行程群組（process group）版本。對照組是
+//! `platform/windows/spawn.rs` 的 Job Object。
 //!
-//! W3：macOS 沒有 Job Object，對應物是行程群組——spawn 前
-//! `pre_exec` 呼叫 `setsid()`／`setpgid()`，收尾時對整個 group 送 SIGTERM／SIGKILL。
-//! 這件事一定要做：ssh 的 ProxyCommand 會再生出孫程序，只殺 ssh 會留孤兒。
+//! macOS 沒有 Job Object，對應物是行程群組：spawn 前用 `process_group(0)`
+//! 讓子程序自成一個新群組（新群組的 pgid 就等於子程序自己的 pid，這是
+//! `process_group(0)` 的定義，不必事後另外查詢），子程序自己再 spawn 出來的
+//! 孫程序預設會**繼承同一個 pgid**（除非孫程序自己又呼叫 `setpgid`／`setsid`，
+//! 契約測試 §2(ii) 的 `sh -c "sleep N & wait"` 沒有這麼做，這正是「一群」的
+//! 前提）。Drop 時對這個 pgid 送 `SIGKILL`，一次收掉整棵樹，不必知道底下究竟
+//! 有幾層、生了幾支——這件事一定要做：ssh 的 ProxyCommand 會再生出孫程序，
+//! 只殺 ssh 本身會留下孤兒。
+//!
+//! 直接送 `SIGKILL`、不先 `SIGTERM` 給對方收拾的機會：`Drop::drop` 是同步的，
+//! 沒有地方能 await「等一下看它有沒有自己退」，呼叫端（`tunnel::test_connection`
+//! 的 `drop(job)`）要的就是「這一行過去之後，程序樹保證已經死了」這個更強的
+//! 保證，契約測試 §2(i)(ii) 驗的正是這個。
 
 use std::io;
+use std::sync::Mutex;
 
 use tokio::process::{Child, Command};
 
-/// 一組子程序的看管者。丟掉它就等於收掉底下整棵程序樹。
+/// 一組子程序的看管者。丟掉它就等於收掉底下整棵程序樹
+/// （對每一個記下來的 pgid 送 `SIGKILL`）。
 #[derive(Debug)]
-pub struct ProcessSupervisor(());
+pub struct ProcessSupervisor {
+    /// 正常情況下只會有一筆：呼叫端一個 supervisor 對一次 `spawn`。型別留
+    /// `Vec` 是因為簽章上不禁止呼叫多次——`spawn` 拿的是 `&self`，Drop 得對得起
+    /// 這個簽章允許的所有用法，不能假設呼叫端只會叫一次。
+    pgids: Mutex<Vec<i32>>,
+}
 
 impl ProcessSupervisor {
-    /// 刻意 `todo!()` 而不是回一個什麼都不做的空殼：空殼會讓 tunnel 照常
-    /// spawn 出 ssh，然後在沒有人負責收屍的情況下留下孤兒程序。
+    /// 先把看管者準備好，才去 spawn——順序反過來的話，spawn 與掛進去之間
+    /// 會有一段「已經在跑但沒人管」的空窗。
     pub fn new() -> io::Result<ProcessSupervisor> {
-        todo!("W3: macOS 的行程群組看管尚未實作")
+        Ok(ProcessSupervisor { pgids: Mutex::new(Vec::new()) })
     }
 
-    pub fn spawn(&self, _cmd: &mut Command, _log_context: &str) -> io::Result<Child> {
-        todo!("W3: macOS 的受監督 spawn 尚未實作")
+    /// 讓子程序 spawn 前自成一個新的行程群組，spawn 之後記下它的 pgid。
+    ///
+    /// 呼叫端已經設好的 stdio（見契約測試：`Stdio::null()`／`Stdio::piped()`）
+    /// 一律原樣尊重，這裡只多加 `process_group(0)` 這一道旗標，不碰其他任何
+    /// 已經在 `cmd` 上設定好的東西。
+    ///
+    /// `log_context` 語意比照 Windows 版：兩個呼叫點（監看迴圈與存檔前的連線
+    /// 測試）在日誌裡分得出來的前綴，也是這裡「記不到 pgid」那一行 warn 的前綴。
+    /// Windows 版在「掛進 Job Object 失敗」時只 warn 不失敗，因為程序本身已經
+    /// 起來了；macOS 這邊剛 spawn 成功的當下 `child.id()` 理論上一定是
+    /// `Some`——`tokio::process::Child::id` 只有在子程序被 poll 到結束、pid
+    /// 已經回收之後才會變成 `None`，而這裡連第一次 poll 都還沒發生——所以
+    /// `None` 分支實務上不該被打到。保留它、而不是假設它不會發生，是不讓
+    /// 「萬一這個保證哪天變了」變成一個悄悄不記 pgid、Drop 也悄悄殺不到東西的
+    /// 靜默失敗：程序本身已經起來了，讓它跑總比為了收尾機制炸掉呼叫端好，
+    /// 但至少要在日誌上留一筆讓人查得到。
+    pub fn spawn(&self, cmd: &mut Command, log_context: &str) -> io::Result<Child> {
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        match child.id() {
+            Some(pid) => {
+                let mut pgids = self.pgids.lock().unwrap_or_else(|e| e.into_inner());
+                pgids.push(pid as i32);
+            }
+            None => {
+                log::warn!(
+                    "{log_context}spawned child has no pid; its process group cannot be tracked, so the supervisor will not be able to kill it later"
+                );
+            }
+        }
+        Ok(child)
     }
 }
 
 /// 「丟掉它就等於收掉整棵程序樹」是這個型別的契約，不是實作細節——呼叫端
-/// （`tunnel::test_connection` 的 `drop(job)`）靠的就是它。macOS 這邊先把位子
-/// 佔著，W3 補上「對整個行程群組送 SIGTERM，逾時再 SIGKILL」。
-///
-/// 目前 `new()` 是 `todo!()`，所以實際上永遠不會有實例走到這裡。
+/// （`tunnel::test_connection` 的 `drop(job)`）靠的就是它。
 impl Drop for ProcessSupervisor {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Drop 不可以 panic：鎖萬一中毒（某次 `spawn` 在持鎖期間 panic，理論上
+        // 不會發生，因為鎖住的區間裡沒有任何會 panic 的呼叫，但這裡不賭這件事）
+        // 一樣要能繼續往下送 signal，不能讓中毒直接炸穿 Drop。
+        let pgids = match self.pgids.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for pgid in pgids {
+            // 下界保護：`kill(2)` 對 pid 參數的意義不是「越界就沒事」而是
+            // 「換一種完全不同的廣播範圍」——`-pgid == 0` 代表對呼叫者自己所在
+            // 的行程群組送訊號（自砍，因為這整支程式本身就跑在某個 pgid 底下）；
+            // `-pgid == -1` 更嚴重，代表對呼叫者有權限送訊號的**所有**行程送
+            // SIGKILL。兩者都不該發生（pgid 是 `child.id()` 給的，理論上一定是
+            // 正整數），但既然這裡要放進迴圈裡對外部輸入（子程序回報的 pid）
+            // 送 kill，就不能只靠「理論上不會是 0 或 1」這種假設頂著。
+            if pgid <= 1 {
+                continue;
+            }
+            // 對整個群組送 SIGKILL，一次收掉子程序與它底下所有繼承同一個 pgid
+            // 的孫程序。`ESRCH`（群組裡已經沒有任何程序）當正常收尾看待，不是
+            // 錯誤——子程序自己先退掉、或整棵樹早就自然結束的情況都會走到這裡，
+            // 這時候「殺不到東西」正是我們要的結果，不必當一回事往外 warn。
+            let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    log::warn!("kill process group {pgid} failed: {err}");
+                }
+            }
+        }
+    }
 }
