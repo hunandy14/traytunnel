@@ -5,10 +5,15 @@
 //! 只更新記憶體快取，因此與我們 prevent_close＋hide_to_tray 的視窗事件處理並不衝突：
 //! 一般關到系統匣不會誤觸落地，真正退出（`app.exit(0)`）時 Exit 事件照樣會發。
 //!
-//! 就地更新那條路是例外——`tauri-plugin-updater` 在 Windows 上裝完新版是直接
-//! `std::process::exit(0)`，繞過 `RunEvent::Exit`，外掛的存檔 hook 因此不會跑。
-//! 這個落差在 `update::install` 裡用 `updater_builder().on_before_exit(..)` 補：
-//! 交棒給安裝程式之前自己呼叫一次 `save_window_state`。
+//! 就地更新那條路兩個平台的收尾不一樣，但都不必再多掛一層 hook：
+//!
+//! * **Windows**：`update::apply_now` 起完 NSIS 安裝程式之後是直接
+//!   `std::process::exit(0)`，繞過 `RunEvent::Exit`，外掛的存檔 hook 不會跑
+//!   ——那正是「更新後視窗歸零置中」的成因。所以那一支在 spawn 成功之後
+//!   **自己呼叫一次** `save_window_state`（見 `platform/windows/update.rs`）。
+//! * **macOS**：`update::install` 換完 bundle 走的是 `AppHandle::restart()`，
+//!   而它在非主執行緒上是「請事件迴圈正常退出、退完再重新執行自己」，
+//!   `RunEvent::Exit` 照發、外掛照存，因此那一條**不需要**補這一手。
 
 use tauri::{PhysicalPosition, PhysicalSize, Runtime, WebviewWindow};
 use tauri_plugin_window_state::StateFlags;

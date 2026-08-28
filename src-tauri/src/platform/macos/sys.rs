@@ -384,6 +384,24 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     cmd.arg(&target).spawn().map(|_| ())
 }
 
+/// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteW）。
+///
+/// 刻意**不**放進 `platform::mod` 那份跨平台門面：唯一的呼叫端是更新那條路
+/// （`update::open_release_page`／`open_releases_page`），而 update 整個子模組本來
+/// 就是平台各自提供的，門面上再開一個沒有共用核心會用的洞只是多一個死角
+/// （`platform/mod.rs` 的 `reveal_in_file_manager` 那一段就是在講這件事）。
+///
+/// 只放行 `https://`：`open` 的第一個位置參數什麼都收——`file:///`、
+/// 自訂 scheme、甚至一個本地路徑都會照開，而網址在這條路上是拼出來的
+/// （版本號來自遠端的 latest.json）。呼叫端已經有 [`super::update::release_url`]
+/// 那一層過濾，這裡是第二道，兩道都在才擋得住「有人日後多開一個呼叫端」。
+pub fn open_url(url: &str) -> io::Result<()> {
+    if !url.starts_with("https://") {
+        return Err(io::Error::other(format!("refusing to open a non-https url: {url}")));
+    }
+    std::process::Command::new("open").arg(url).spawn().map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
