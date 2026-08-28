@@ -125,9 +125,13 @@ windows = { version = "0.62", features = [
 tauri-winrt-notification = "0.8.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# 本地時間戳（HH:mm:ss）走 libc 的 localtime_r，對應 Windows 那邊的 GetLocalTime。
-# 不新拉一顆時間 crate：libc 本來就已經在相依樹裡（tokio 等間接帶進來），這裡只是
-# 把它升成直接依賴。
+# libc 在這裡有兩個獨立用途：
+# 1. 本地時間戳（HH:mm:ss）走 `libc::localtime_r`，對應 Windows 那邊的 GetLocalTime；
+# 2. ProcessSupervisor 收尾要對整個行程群組送 SIGKILL（`kill(-pgid, SIGKILL)`），
+#    std 沒有對應的 API（`Child::kill` 只殺得到單一 pid）。
+# 兩者都不是新拉一顆 crate：libc 本來就已經在相依樹裡（tokio 在 unix 上的間接相依），
+# 這裡只是把它升成直接依賴，不會讓相依樹多長一顆新的版本；版本號跟著 tokio 目前
+# 鎖定的 0.2 系列走。
 libc = "0.2"
 # 系統通知：tauri-plugin-notification 的桌面後端在 macOS 上就是直接組一顆
 # notify_rust::Notification 再呼叫 notify_rust::set_application 掛名（見該外掛

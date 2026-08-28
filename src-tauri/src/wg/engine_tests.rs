@@ -742,8 +742,7 @@ async fn the_engine_never_resolves_the_endpoint_itself() {
 /// connected」，緊接著晚到的 `Row(connecting)` 又把它們壓回 connecting——而
 /// device 只在**變化時**推事件，不會再有第二顆 connected 來救，快樂路徑上
 /// 每一條列就這樣永遠卡在 connecting。用空列測不到這件事，所以這裡是非空列。
-// 斷言用 platform::is_listening 驗本地埠，macOS 那一支還是 stub（W3）
-#[cfg(windows)]
+// 斷言用 platform::is_listening 驗本地埠；macOS 那一支已經實作（W3-A），兩平台都會跑
 #[tokio::test]
 async fn rows_are_announced_before_the_engine_reports_connected() {
     let (pa, pb) = two_free_udp_ports();
@@ -783,8 +782,7 @@ async fn rows_are_announced_before_the_engine_reports_connected() {
 /// 綁下去的話就是替一棵已經死掉的任務樹佔住本地埠，而下一輪起來時會發現
 /// 自己的埠被「自己」佔著，於是那一條列變成 port_busy——一個看起來像
 /// 「別的程式搶了我的埠」、其實是自己殭屍代綁的故障（覆審實錘 R5）。
-// 斷言用 platform::is_listening 驗本地埠，macOS 那一支還是 stub（W3）
-#[cfg(windows)]
+// 斷言用 platform::is_listening 驗本地埠；macOS 那一支已經實作（W3-A），兩平台都會跑
 #[tokio::test]
 async fn a_cancelled_round_binds_nothing() {
     let (pa, pb) = two_free_udp_ports();

@@ -81,3 +81,13 @@ pub use imp::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 /// （`update::open_release_page`／`open_releases_page`），而整個 update 子模組本來
 /// 就是平台各自提供的，跨平台門面上再開一個沒有共用核心會用的洞只是多一個死角。
 pub use imp::reveal_in_file_manager;
+
+// ---------------------------------------------------------------- 介面契約測試
+//
+// W3-A：`is_listening` 與 `ProcessSupervisor` 的跨平台不變量。掛在門面這一層而
+// 不是各自的實作底下，是因為要測的正是「兩邊都必須成立的那些話」——放進任何一邊
+// 都會變成在測那一邊的作法。整份不帶平台閘（只有「拿什麼命令生一支長睡程序」
+// 需要 cfg 挑，斷言邏輯共用）。
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod process_tests;
