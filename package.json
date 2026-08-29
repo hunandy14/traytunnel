@@ -14,6 +14,7 @@
     "build:exe": "tauri build --no-bundle && node scripts/package.mjs",
     "build:setup": "tauri build --bundles nsis && node scripts/package.mjs",
     "build:all": "tauri build && node scripts/package.mjs",
+    "build:mac": "tauri build --bundles app && node scripts/copy-app-bundle.mjs",
     "bump": "node scripts/bump.mjs",
     "release": "node scripts/release.mjs",
     "test:release": "node --test scripts/lib/*.test.mjs"
