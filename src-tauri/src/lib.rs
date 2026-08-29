@@ -82,9 +82,18 @@ fn show_main(app: &AppHandle) {
 // 分兩條路：
 //
 // * **視窗可見**：真的有人在看那片白屏，立刻 reload，這是原本的行為。
-// * **視窗藏著**：只立旗標（外加一行 warn），什麼都不畫。下次 `show_main`
-//   （系統匣的 Open window、第二實例喚醒、雙擊圖示……）把視窗拿出來時才
-//   reload，那時使用者本來就在等畫面，重生一個 WebContent 行程是划算的。
+// * **視窗藏著**：只立旗標（外加一行 warn），什麼都不畫。等視窗真的回到使用者
+//   面前才 reload，那時他本來就在等畫面，重生一個 WebContent 行程是划算的。
+//
+// 欠下的那次 reload 有**兩個**還款點，缺一不可，兩邊都靠
+// [`take_pending_reload`]（`swap(false)`）保證只還一次：
+//
+// * `show_main`——系統匣的 Open window、第二實例喚醒、Windows 的雙擊圖示。
+// * 主視窗的 `WindowEvent::Focused(true)`（見 `setup` 裡那顆處理常式）——
+//   補的是**最小化**這一格。`is_visible()` 對最小化的視窗回 false，所以那時
+//   被回收只會立旗標；但從 Dock 圖示或 Mission Control 還原一扇最小化的視窗
+//   完全不經過 `show_main`（它沒有被 `hide_to_tray` 收起來過，policy 一直是
+//   Regular）。只靠 `show_main` 的話那次 reload 永遠還不掉。
 static WEBVIEW_NEEDS_RELOAD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -94,8 +103,8 @@ static WEBVIEW_NEEDS_RELOAD: std::sync::atomic::AtomicBool =
 /// 掛 `cfg(target_os = "macos")` 不是因為這條規則有平台特性，是因為
 /// `on_web_content_process_terminate` 這顆掛鉤本身只有 macOS／iOS 有
 /// （Windows 的 WebView2 沒有對應事件），Windows 上連呼叫端都不存在。旗標與
-/// [`take_pending_reload`] 反而是跨平台的：`show_main` 兩邊都會問一次，
-/// Windows 上那顆旗標永遠是 false，行為零變化。
+/// [`take_pending_reload`] 反而是跨平台的：`show_main` 與視窗的 `Focused(true)`
+/// 兩邊都會問一次，Windows 上那顆旗標永遠是 false，行為零變化。
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReloadPlan {
@@ -193,9 +202,16 @@ static FRONTEND_READY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// 記一行 info 是刻意的——它與上面那行 `main webview url:` 湊成一對，使用者
 /// 回報白屏時，traytunnel.log 有沒有這一行就是「前端根本沒載進來」與「載進來
 /// 但沒畫出來」的分界線，而那正是整段診斷存在的理由。
+///
+/// 但**只在 false → true 那一次記**：這支指令是前端每載入一次就叫一次，而
+/// 頁面重載不只使用者按得到——`WEBVIEW_NEEDS_RELOAD` 的自癒、content process
+/// 被回收後的重生都會再跑一輪啟動鏈。旗標本來就冪等（第二次起 `swap` 回
+/// `true`，狀態不變），日誌不該跟著重複；那行字要維持「這次執行前端起來過」
+/// 的分界線語意，不是計次器。
 pub(crate) fn mark_frontend_ready() {
-    FRONTEND_READY.store(true, std::sync::atomic::Ordering::Relaxed);
-    log::info!("the frontend reported ready");
+    if !FRONTEND_READY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!("the frontend reported ready");
+    }
 }
 
 /// 前端回報就緒的寬限時間。dev 走的是本機 http，遠遠用不到這麼久；訂得寬是
@@ -839,11 +855,40 @@ pub fn run() {
 
                 // 主視窗關閉請求（例如 Alt+F4）也走 closeToTray 規則
                 let st = shared.clone();
+                let focus_target = win.clone();
                 win.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         if !st.is_exiting() {
                             api.prevent_close();
                             close_main(&st);
+                        }
+                    }
+                    // 視窗重新拿到焦點時把欠下的那次 reload 還掉。
+                    //
+                    // `show_main` 已經有一份同樣的檢查，這一條補的是**繞過
+                    // `show_main` 的那條路**：`is_visible()` 對**最小化**的視窗
+                    // 回 false，content process 若在那時被回收就只會立旗標
+                    // （見 `WEBVIEW_NEEDS_RELOAD` 那段）；而從 Dock 圖示或
+                    // Mission Control 還原一扇最小化的視窗**不會經過我們任何
+                    // 一支函式**——它沒有被 `hide_to_tray` 收起來過，policy 也
+                    // 一直是 Regular，`show_main` 根本不會被呼叫。少了這一條，
+                    // 那次 reload 就永遠還不掉，畫面一路留白到使用者去系統匣
+                    // 點「Open window」為止（舊碼在這一格是立刻 reload，這是
+                    // 延後 reload 之後才開出來的窄縫）。
+                    //
+                    // 兩條路各領一次不會重複 reload：`take_pending_reload` 是
+                    // `swap(false)`，`show_main` 先領走的話這裡拿到的就是 false。
+                    //
+                    // 用 `matches!` 併成一個條件、不寫成 match arm 加 guard：
+                    // `take_pending_reload` 會改狀態，藏進 match guard 就變成
+                    // 「條件沒過但旗標已經被領走」，那是最不該放在 guard 裡的
+                    // 那種副作用。
+                    if matches!(event, WindowEvent::Focused(true))
+                        && take_pending_reload(&WEBVIEW_NEEDS_RELOAD)
+                    {
+                        log::info!("reloading the webview that was reclaimed while hidden");
+                        if let Err(e) = focus_target.reload() {
+                            log::warn!("could not reload the webview on focus: {e}");
                         }
                     }
                 });
@@ -1122,12 +1167,18 @@ mod tests {
         assert!(!take_pending_reload(&flag), "領過就該清掉，不可以每次開窗都重載");
     }
 
-    /// 前端旗標的預設是「還沒就緒」，而且 `mark_frontend_ready` 之後就是就緒。
+    /// 前端旗標的預設是「還沒就緒」，`mark_frontend_ready` 之後就是就緒，
+    /// 而且**重複叫是冪等的**——頁面重載（使用者自己、或
+    /// `WEBVIEW_NEEDS_RELOAD` 的自癒）會讓前端再叫一次，狀態不能被搞亂，
+    /// 那行 info 也只該在第一次出現（見 `mark_frontend_ready` 的說明）。
+    ///
     /// 這顆旗標是行程全域的，所以只在這一條測試裡碰它（`verdict` 那條走的是
     /// 純函式，不依賴全域狀態）。
     #[test]
     fn the_frontend_ready_beacon_flips_the_flag() {
         assert!(!FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed));
+        mark_frontend_ready();
+        assert!(FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed));
         mark_frontend_ready();
         assert!(FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed));
     }
