@@ -5,6 +5,251 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------- GUI 啟動的 PATH
+//
+// **這一節在 Windows 上沒有對應物，也不需要**：Windows 的 GUI 行程是由
+// Explorer／登錄檔的 Run 值啟動的，環境變數（含 `PATH`）一路從使用者的 session
+// 繼承下來，跟從 `cmd` 敲一次指令拿到的是同一份。macOS 不是——launchd 給 GUI
+// 行程（Finder 雙擊、`open`、我們自己寫的 LaunchAgent）的 `PATH` 是一份最小集
+// `/usr/bin:/bin:/usr/sbin:/sbin`，使用者在 `.zshrc`／`.zprofile` 裡加的東西
+// 一概不在裡面。
+//
+// 這對本程式是**致命**的，不是「有點不方便」：ssh 的 `ProxyCommand`（預設值就是
+// `cloudflared access ssh --hostname %h`）是交給 `/bin/sh -c` 跑的，而 Homebrew
+// 把 `cloudflared` 裝在 `/opt/homebrew/bin`——不在最小集裡。於是 GUI 啟動的實例
+// 每一條隧道都在 `sh: cloudflared: not found` 上失敗、進五秒一輪的重連迴圈，
+// 而從終端機啟動（繼承使用者 PATH）的同一支執行檔卻完全正常，兩者症狀差異大到
+// 使用者根本不會往 PATH 想。實測見 PR 說明。
+//
+// 社群標準解是 tauri-apps 自己的 `fix-path-env` crate：啟動時跑一次登入 shell、
+// 把使用者真正的環境變數讀回來。**這裡不用那顆 crate**，改用它的同一套手法自己
+// 做一小份，理由三條：
+//
+//   1. 它**沒有發布到 crates.io**（`cargo` 只能用 `git = "https://github.com/
+//      tauri-apps/fix-path-env-rs"` 拉），版本號還停在 `0.0.0`。把一顆 git 依賴
+//      放進發佈用的相依樹，等於放棄版本語意、`cargo audit` 與可重現建置。
+//   2. 它**沒有逾時保護**：一路 `Command::output()` 等下去，登入 shell 的 rc
+//      檔卡住（oh-my-zsh 的自動更新是最有名的一例，它自己還特地設
+//      `DISABLE_AUTO_UPDATE` 來擋）就等於整支 app 永遠停在啟動的第一行。
+//   3. 它把**整份環境**（`env` 的每一行）都灌回行程裡，我們只需要 `PATH` 一個鍵。
+//
+// 於是這裡只保留那套手法真正有價值的部分（登入 shell ＋ 標記夾出結果），另外補上
+// 它缺的三件事：逾時（連同殺掉整個行程群組）、「只動 `PATH`」，以及**輸出不走管線**
+// ——那顆 crate 的 `Command::output()` 會在使用者 rc 檔有 `some-daemon &` 時一路等到
+// 那支背景程序死掉（管線的 EOF 要所有寫端關閉），逾時預算完全被繞過，詳見
+// [`ask_shell_for_path`]。
+
+/// launchd 沒有另外設定時，給 GUI 行程的預設 `PATH`（`man launchd.plist` 的
+/// `EnvironmentVariables`／`launchctl config user path` 都是在改它）。
+/// 現在的 `PATH` 完全落在這一組裡面，就是「這次是 GUI 啟動」的訊號。
+const LAUNCHD_DEFAULT_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// 等登入 shell 回答的上限。給得寬（rc 檔厚的機器上一次互動式登入要好幾百毫秒），
+/// 但一定要有——這是 `fix-path-env` 缺的那一格。逾時就放棄修正，維持原樣啟動：
+/// 隧道會失敗，但 app 起得來、日誌上有話說，比永遠卡在第一行好。
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 輪詢登入 shell 有沒有結束的間隔。
+const LOGIN_SHELL_TICK: Duration = Duration::from_millis(20);
+
+/// 問不到 `SHELL`（或它不是絕對路徑）時要跑哪一支。macOS 10.15 起的預設登入 shell。
+const DEFAULT_LOGIN_SHELL: &str = "/bin/zsh";
+
+/// 把 `PATH` 從互動式 shell 的雜訊（rc 檔自己的 echo、提示字元、顏色碼）裡夾出來的標記。
+///
+/// 首字元刻意是 `>`／`<` 這種**不可能出現在識別字裡**的字元：標記若以底線或字母
+/// 開頭，任何把它接在變數後面的寫法（`$PATH__traytunnel_path_end__`）都會被 shell
+/// 當成一個更長的變數名。現在的取法根本不讓 shell 展開變數（見
+/// [`ask_shell_for_path`] 用的是 `printenv`），這一層是第二道保險，擋的是「日後
+/// 有人把腳本改回 `$PATH` 拼接」。
+const PATH_BEGIN: &str = ">>>traytunnel-path>>>";
+const PATH_END: &str = "<<<traytunnel-path<<<";
+
+/// 目前這個 `PATH` 是不是「GUI 啟動才會拿到的那份最小集」——每一段都落在
+/// [`LAUNCHD_DEFAULT_PATH`] 裡面就算。
+///
+/// 有這道閘，從終端機／`cargo run` 啟動（PATH 已經是使用者的那一份）時整段
+/// 修正完全不會跑，省下一次登入 shell 的開銷，也不會在開發流程上多出任何變數。
+/// 空的 `PATH`（連最小集都沒有）同樣回 `true`：那比最小集更該修。
+fn path_is_the_gui_minimum(path: &str) -> bool {
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .all(|d| LAUNCHD_DEFAULT_PATH.contains(&d.trim_end_matches('/')))
+}
+
+/// 從登入 shell 的輸出裡把兩個標記中間那一段夾出來。
+///
+/// 互動式 shell（`-i`）的 rc 檔什麼都可能往 stdout 印，所以不能直接把整份輸出
+/// 當成 `PATH`。夾出來之後再濾掉控制字元：合法的路徑不含它們，而 rc 檔的顏色碼
+/// 有機會黏在標記外圍以外的地方。
+fn extract_marked_path(stdout: &str) -> Option<String> {
+    let start = stdout.find(PATH_BEGIN)? + PATH_BEGIN.len();
+    let end = stdout[start..].find(PATH_END)? + start;
+    let value: String = stdout[start..end].chars().filter(|c| !c.is_control()).collect();
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 登入 shell 給的 `PATH` 補上系統目錄，缺哪個補哪個（接在後面，使用者自己的
+/// 順序優先）。
+///
+/// 這是一道「不准把事情弄得更糟」的保險：正常的登入 shell 一定會從 `/etc/paths`
+/// 拿到這四個目錄，但這裡吃的是使用者 rc 檔的輸出——真的有人把 `PATH` 整個覆寫掉
+/// 的話，我們不可以因為「修正」而讓 `ssh`（`/usr/bin/ssh`）本身也找不到。
+fn with_system_dirs(login_path: &str) -> String {
+    let mut out: Vec<&str> = login_path.split(':').filter(|d| !d.is_empty()).collect();
+    for dir in LAUNCHD_DEFAULT_PATH {
+        if !out.iter().any(|d| d.trim_end_matches('/') == dir) {
+            out.push(dir);
+        }
+    }
+    out.join(":")
+}
+
+/// 要問哪一支 shell：`SHELL` 有值**而且是絕對路徑**才用它，否則退回
+/// [`DEFAULT_LOGIN_SHELL`]。純函式。
+///
+/// 絕對路徑這一關不是形式主義：`Command::new` 拿到一個相對名字時會照 `PATH` 去找，
+/// 而這支函式的整個存在理由就是「現在的 `PATH` 是壞的」——用一份壞掉的 `PATH` 去
+/// 解析要跑哪支 shell，最好的情況是找不到，最壞的情況是找到當前工作目錄底下同名的
+/// 別的東西。問不出一個可信的絕對路徑時，跑系統預設的那一支才是對的。
+fn resolve_login_shell(from_env: Option<&str>) -> String {
+    match from_env {
+        Some(s) if Path::new(s).is_absolute() => s.to_string(),
+        _ => DEFAULT_LOGIN_SHELL.to_string(),
+    }
+}
+
+/// 跑一次使用者的登入 shell，把它的 `PATH` 問回來。逾時或任何一步失敗都回 `None`。
+fn login_shell_path() -> Option<String> {
+    ask_shell_for_path(&resolve_login_shell(std::env::var("SHELL").ok().as_deref()))
+}
+
+/// [`login_shell_path`] 的本體，shell 由呼叫端指定（測試才餵得進一支假的）。
+///
+/// `-ilc`（互動＋登入＋執行一行）是 `fix-path-env` 用的同一組旗標，也是這件事的
+/// 社群慣例：`.zprofile`（登入）與 `.zshrc`（互動）兩份都得跑過，使用者的 `PATH`
+/// 才會完整——大多數人是在 `.zshrc` 裡加 Homebrew 的。
+///
+/// ## stdout 一定要導到檔案，不可以是管線
+///
+/// 這是覆審擋下來的一個真缺陷。管線的讀端要等**所有**寫端關閉才收得到 EOF，而
+/// 子程序 spawn 出來的孫程序會繼承同一支寫端：使用者的 rc 檔只要有一句
+/// `some-daemon &`（或 `nohup … &`），登入 shell 自己秒退，`wait_with_output()`
+/// 卻會一路等到那支背景程序死掉為止——覆審者實測 25.3 秒，而預算是 5 秒。
+/// 這條路跑在**任何 UI 之前**，症狀就是「雙擊圖示，什麼都沒發生」。
+///
+/// （這裡原本的註解寫「輸出遠小於管線緩衝區，不會死鎖」——那句話診斷錯了病因：
+/// 卡住的不是緩衝區滿，是**寫端沒關**。輸出再小也一樣卡。）
+///
+/// 導到一個暫存檔就沒有這回事：檔案沒有 EOF 語意，`read_to_string` 讀的是「此刻
+/// 檔案裡有什麼」，於是**逾時迴圈就是唯一的上界**。rc 檔生出來的背景程序照樣繼承
+/// 那支 fd，但它之後往一個已經被我們刪掉的 inode 寫，誰都不影響。
+///
+/// ## 為什麼是 `printenv` 而不是 `"$PATH"`
+///
+/// 讓 shell 展開變數會被 shell 的語法綁死：`${PATH}` 在 fish 直接是語法錯誤，
+/// 而 `"$PATH"` 在 fish 是**用空白**接起來的（`PATH` 在 fish 是 list 變數），
+/// 拿回來的字串根本不是冒號分隔的 `PATH`——這種失敗還是靜默的。改成讓 shell 去
+/// 跑 `/usr/bin/printenv PATH`，印的是它**匯出給子程序**的那一份，sh／bash／zsh／
+/// ksh／dash／fish 一律是冒號分隔的同一個答案，我們這邊一個字都不必展開。
+///
+/// （已知例外：`tcsh` 不收合併寫的 `-ilc`，它要求 `-l` 單獨當第一個參數。那是
+/// `-ilc` 這個社群慣例本身的限制，`fix-path-env` 也一樣；`SHELL` 是 tcsh 的人
+/// 會走到「問不到」那一支——照原樣啟動、日誌留一行，不會卡住也不會更糟。）
+///
+/// 成敗只看「標記在不在」，不看退出碼：互動式 shell 的退出碼是它 rc 檔最後一個
+/// 命令的結果，跟「我們有沒有問到答案」沒有關係。
+fn ask_shell_for_path(shell: &str) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "traytunnel-login-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let found = ask_shell_for_path_into(shell, &tmp);
+    // 成功、逾時、失敗都要清掉，暫存檔不留在 /tmp
+    let _ = std::fs::remove_file(&tmp);
+    found
+}
+
+/// [`ask_shell_for_path`] 扣掉暫存檔清理的那一段，拆開只為了讓清理有唯一一個出口。
+fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
+    let script =
+        format!("/bin/echo '{PATH_BEGIN}'; /usr/bin/printenv PATH; /bin/echo '{PATH_END}'");
+
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args(["-ilc", &script])
+        // oh-my-zsh 的自動更新會在互動式啟動時停下來問人（`fix-path-env` 也特地
+        // 設這個變數擋它）。逾時保護接得住，但能不觸發就不要觸發
+        .env("DISABLE_AUTO_UPDATE", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::fs::File::create(tmp).ok()?))
+        .stderr(Stdio::null());
+    // 自成一個行程群組，逾時時才收得掉「shell 自己＋它 rc 檔生出來的東西」整棵樹
+    // ——只 kill shell 的話，卡住它的那支孫程序會留下來
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+
+    let mut child = cmd.spawn().ok()?;
+    let pgid = child.id() as i32;
+    let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // 整組收掉再 wait，不留殭屍也不留孤兒
+                    super::pgids::kill_group(pgid);
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(LOGIN_SHELL_TICK);
+            }
+            Err(_) => return None,
+        }
+    }
+    extract_marked_path(&std::fs::read_to_string(tmp).ok()?)
+}
+
+/// GUI（Finder／`open`／LaunchAgent）啟動時把 `PATH` 換成使用者登入 shell 的那一份。
+///
+/// 回傳要補進活動日誌的行——這支函式跑在 `tauri_plugin_log` 裝上全域 logger
+/// **之前**（它必須是整支程式最早的動作之一，見下面那段），那時 `log::info!`
+/// 是丟進黑洞的，所以比照 `prepare_notifications` 的作法把話帶回去給 `setup` 記。
+///
+/// **呼叫時機是規格的一部分**：`std::env::set_var` 改的是整個行程共用的環境區塊，
+/// 而 `getenv`／`setenv` 不是執行緒安全的。必須在**任何執行緒被生出來之前**呼叫，
+/// 也就是 `tauri::Builder` 之前——`lib.rs::run()` 的最前面。這也剛好是「在任何
+/// 一次 spawn ssh 之前」的必要條件。
+pub fn fix_gui_launch_path() -> Vec<String> {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if !path_is_the_gui_minimum(&current) {
+        // 終端機／開發啟動：PATH 本來就是使用者的那一份，什麼都不必做，也不必記
+        return Vec::new();
+    }
+    let Some(login) = login_shell_path() else {
+        return vec![
+            "PATH is the launchd default; asking the login shell for the real one failed, \
+             tools installed by Homebrew (e.g. cloudflared for ProxyCommand) may not be found"
+                .into(),
+        ];
+    };
+    let fixed = with_system_dirs(&login);
+    if fixed == current {
+        return Vec::new();
+    }
+    std::env::set_var("PATH", &fixed);
+    vec![format!("PATH was the launchd default, replaced with the login shell PATH: {fixed}")]
+}
 
 // ---------------------------------------------------------------- 本地埠偵測
 
@@ -97,7 +342,7 @@ pub fn local_time_hms() -> String {
 /// 給一張解析度夠高的正方形圖即可：Apple 選單列圖示的建議尺寸是 22×22pt，
 /// 2x（Retina）算下來是 44×44px，這裡就回這個目標尺寸。
 ///
-/// macOS 系統匣現在的主要圖示是 [`crate::appicon::tray_icon_template`]（另外
+/// macOS 系統匣現在的主要圖示是 [`super::trayicon::tray_icon_template`]（另外
 /// 一份純黑＋透明的 template PNG，見 `assets/gen-tray-template.py`），不會走這裡的
 /// ICO 挑層；這一支純粹是 `appicon::tray_icon()`（template 圖載不到時的退路）要用
 /// 的「想要哪個 ICO 層」目標尺寸。
@@ -201,6 +446,27 @@ fn xml_unescape(s: &str) -> String {
 
 /// `--tray` 讓開機啟動直接縮在系統匣、不彈主視窗——與 Windows
 /// `winsys::autostart_command` 的 `--tray` 是同一個約定。
+///
+/// ## 為什麼一定要有 `AbandonProcessGroup`
+///
+/// `launchd.plist(5)` 對這個鍵的原文是：
+///
+/// > **AbandonProcessGroup** \<boolean\>
+/// > When a job dies, launchd kills any remaining processes with the same
+/// > process group ID as the job. Setting this key to true disables that
+/// > behavior.
+///
+/// 也就是說**預設**行為是「job 一死，launchd 順手把同 pgid 的殘餘程序也殺掉」。
+/// 這條規則會直接砸掉應用內更新：開機自啟進來的那個實例就是這個 job 的行程，
+/// 更新走到最後是 `app.restart()`——先 `spawn` 一個新實例、再讓自己 `exit`。
+/// 新實例是從舊實例 fork 出來的，**繼承同一個 pgid**，於是舊實例一 exit，
+/// launchd 就把剛生出來、還在初始化的新實例一起連坐殺掉：使用者按下
+/// 「Restart to update」之後，程式直接消失，而且只有「這一次是開機自啟進來的」
+/// 才會這樣，從 Finder 手動開的那次完全正常——症狀差異大到極難查。
+///
+/// 設成 true 只關掉 launchd 那一手連坐，不影響本程式自己的收尾：ssh 程序樹是由
+/// [`super::spawn::ProcessSupervisor`] 明確 `killpg` 收的（自成 pgid，本來就不
+/// 屬於這個 job 的 pgid），三道防線一個都沒少。
 fn plist_contents(label: &str, exe: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -215,6 +481,8 @@ fn plist_contents(label: &str, exe: &Path) -> String {
          \t\t<string>--tray</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>AbandonProcessGroup</key>\n\
          \t<true/>\n\
          </dict>\n\
          </plist>\n",
@@ -298,12 +566,65 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
     read_autostart_command_at(&launch_agents_dir()?, name)
 }
 
+/// App Translocation 的掛載點記號。
+///
+/// macOS（10.12 起）對「帶著隔離標記、又還沒被搬進正式位置」的 app 會做
+/// Gatekeeper 路徑隨機化：從 dmg 視窗或 `~/Downloads` 直接雙擊時，系統不是原地
+/// 執行那顆 app，而是把它掛成一份**唯讀的隨機路徑影本**再跑，`current_exe()`
+/// 於是長成
+///
+/// ```text
+/// /private/var/folders/<x>/<y>/T/AppTranslocation/<uuid>/d/Traytunnel.app/Contents/MacOS/traytunnel
+/// ```
+///
+/// 這個路徑是**這一次執行才存在的**：app 結束、掛載點消失，下次登入時它不存在。
+/// 比對整段 `/AppTranslocation/` 而不是只比 `AppTranslocation`，是為了確保比到的
+/// 是一整層路徑元件，不會被某個剛好叫 `MyAppTranslocationTool` 的資料夾騙過去。
+fn is_app_translocated(exe: &Path) -> bool {
+    exe.to_string_lossy().contains("/AppTranslocation/")
+}
+
+/// 從 App Translocation 的唯讀影本跑起來時，寫開機自啟一律拒絕，錯誤訊息直接
+/// 是給使用者看的處理方式（`commands::set_autostart` 原樣往前端送）。
+fn translocation_refusal() -> io::Error {
+    io::Error::other(
+        "Traytunnel is running from a temporary read-only copy made by macOS App Translocation, \
+         so the path it would record here no longer exists at the next login. Move Traytunnel.app \
+         into the Applications folder, open it from there, and turn this on again.",
+    )
+}
+
 /// 寫出（或覆寫）LaunchAgent plist，**下次登入生效**。
 ///
 /// 不呼叫 `launchctl load`：`RunAtLoad = true` 的 job 一被 load 就會當場再跑一次
 /// `<exe> --tray`，多開一個實例（理由整段寫在本節開頭）。覆寫檔案本身就足以更新
 /// 登記內容——launchd 是在下次登入時才讀這個資料夾的。
+///
+/// **App Translocation 底下一律拒絕寫入**（見 [`is_app_translocated`]）。呼叫端
+/// 傳進來的 `exe` 一律是 `current_exe()`，而在那個模式下它是一條這次執行才存在的
+/// 隨機掛載點路徑：寫進 plist 等於登記一個下次登入必定不存在的執行檔，開關顯示
+/// ON、實際永遠啟動不到任何東西。更糟的是自癒那條路（`lib.rs::heal_autostart`）
+/// ——使用者本來有一份指向 `/Applications` 的**好** plist，只要哪天從 dmg 直接
+/// 開一次，自癒就會「發現登記的命令跟現在的執行檔對不上」而主動把它覆寫成那條
+/// 暫時路徑，把原本好好的自啟弄壞。所以拒絕要放在這一層：`heal_autostart` 走的
+/// 也是這支函式，這一擋同時關掉手動開關與自癒兩條路，共用核心那邊不必加 cfg，
+/// 只要照原樣把錯誤往上送。
+///
+/// 為什麼不「自己還原成真正的原始路徑」：把 translocated 路徑換算回原始位置只有
+/// Security.framework 的 `SecTranslocateCreatePathForURL`／
+/// `SecTranslocateCreateOriginalPathForURL` 那一組 SPI 做得到，它們不在公開 API
+/// 裡；而且就算換算得回來，那個位置（`~/Downloads`、dmg 掛載點）本來就不是 app
+/// 該長住的地方。老實回一句「請先搬進應用程式資料夾」才是對的答案，README 的
+/// 安裝說明講的也是同一件事。
 pub fn enable_autostart(name: &str, exe: &Path) -> io::Result<()> {
+    if is_app_translocated(exe) {
+        log::warn!(
+            "refusing to write the login item: this run is an App Translocation copy ({}), \
+             the path would not exist at the next login",
+            exe.display()
+        );
+        return Err(translocation_refusal());
+    }
     let dir = launch_agents_dir()
         .ok_or_else(|| io::Error::other("could not resolve $HOME for ~/Library/LaunchAgents"))?;
     write_autostart_plist_at(&dir, name, exe).map(|_| ())
@@ -422,6 +743,144 @@ mod tests {
         );
     }
 
+    /// 「這次是不是 GUI 啟動」的判定：launchd 的最小集（含順序打亂、少幾個、
+    /// 尾隨斜線、完全空的）都算，一旦冒出任何一個不在最小集裡的目錄就不算。
+    #[test]
+    fn the_launchd_default_path_is_recognised() {
+        assert!(path_is_the_gui_minimum("/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(path_is_the_gui_minimum("/bin:/usr/bin"), "少幾個、順序不同一樣是最小集");
+        assert!(path_is_the_gui_minimum("/usr/bin/:/bin"), "尾隨斜線不該讓判定失手");
+        assert!(path_is_the_gui_minimum(""), "連 PATH 都沒有比最小集更該修");
+
+        assert!(
+            !path_is_the_gui_minimum("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "使用者的 PATH（Homebrew 在裡面）不可以被當成 GUI 啟動，否則每次從終端機\
+             啟動都要多跑一次登入 shell"
+        );
+        assert!(!path_is_the_gui_minimum("/usr/local/bin:/usr/bin"));
+    }
+
+    /// 互動式 shell 的 rc 檔什麼都可能往 stdout 印，標記中間那一段才是答案。
+    #[test]
+    fn the_login_shell_path_is_extracted_from_the_noise() {
+        let noisy = format!(
+            "Last login: Fri\n\u{1b}[32mwelcome\u{1b}[0m\n{PATH_BEGIN}/opt/homebrew/bin:/usr/bin{PATH_END}\n"
+        );
+        assert_eq!(
+            extract_marked_path(&noisy).as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin"),
+            "rc 檔的問候語與顏色碼都不可以混進 PATH"
+        );
+
+        // 沒有標記（shell 根本沒跑到我們那一行）就老實回 None，不要拿雜訊當 PATH
+        assert_eq!(extract_marked_path("zsh: command not found"), None);
+        assert_eq!(extract_marked_path(&format!("{PATH_BEGIN}   {PATH_END}")), None, "空的不算");
+    }
+
+    /// 要跑哪一支 shell：`SHELL` 必須是**絕對路徑**才採信。相對名字會讓
+    /// `Command::new` 照 `PATH` 去找，而這條路存在的理由就是「現在的 `PATH`
+    /// 是壞的」——用壞掉的 `PATH` 去找 shell，最壞會找到工作目錄底下同名的
+    /// 別的東西。
+    #[test]
+    fn only_an_absolute_shell_path_is_trusted() {
+        assert_eq!(resolve_login_shell(Some("/bin/bash")), "/bin/bash");
+        assert_eq!(resolve_login_shell(Some("/opt/homebrew/bin/fish")), "/opt/homebrew/bin/fish");
+
+        for bogus in [Some("zsh"), Some("./zsh"), Some(""), None] {
+            assert_eq!(
+                resolve_login_shell(bogus),
+                DEFAULT_LOGIN_SHELL,
+                "{bogus:?} 不是絕對路徑，必須退回系統預設的 shell"
+            );
+        }
+    }
+
+    /// **逾時必須涵蓋整段**（覆審擋下的缺陷）。
+    ///
+    /// 假的登入 shell 模擬使用者 rc 檔裡一句 `some-daemon &`：先把一支 `sleep 25`
+    /// 丟到背景（它繼承同一支 stdout），再印出標記、正常退出。
+    ///
+    /// stdout 若是管線，`wait_with_output()` 要等**所有**寫端關閉才收得到 EOF，
+    /// 於是這裡會卡滿 25 秒——遠超過 5 秒預算，而且這條路跑在任何 UI 之前，
+    /// 症狀是「雙擊圖示什麼都沒發生」。導到暫存檔之後沒有 EOF 這回事，
+    /// 逾時迴圈就是唯一的上界，shell 一退出就讀得到答案。
+    ///
+    /// 兩個斷言缺一不可：**沒有卡住**（< 6 秒），而且**真的問到了 PATH**
+    /// （不是靠逾時放棄換來的快）。
+    #[test]
+    fn a_background_process_in_the_rc_file_cannot_blow_the_timeout() {
+        let dir = std::env::temp_dir().join(format!(
+            "traytunnel-test-fakeshell-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("要建得起 tempdir");
+        let shell = dir.join("fake-login-shell");
+        let bg_pid = dir.join("background.pid");
+
+        // 忽略 -ilc 與腳本，照自己的劇本跑：背景程序 → 印標記 → 退出
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n\
+                 sleep 25 &\n\
+                 echo $! > '{pid}'\n\
+                 echo '{PATH_BEGIN}'\n\
+                 echo '/opt/homebrew/bin:/usr/bin'\n\
+                 echo '{PATH_END}'\n\
+                 exit 0\n",
+                pid = bg_pid.display(),
+            ),
+        )
+        .expect("寫得出假 shell");
+        std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("要設得起執行權限");
+
+        let started = Instant::now();
+        let found = ask_shell_for_path(&shell.to_string_lossy());
+        let elapsed = started.elapsed();
+
+        // 先把背景那支收掉再斷言，測試失敗也不會在機器上留一支 sleep
+        if let Ok(pid) = std::fs::read_to_string(&bg_pid) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "rc 檔留下的背景程序把逾時預算撐爆了（花了 {elapsed:?}，上限是 \
+             {LOGIN_SHELL_TIMEOUT:?}）——stdout 又走回管線了嗎？"
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin"),
+            "不能只是『沒卡住』，還要真的問到 PATH；問不到代表是逾時放棄換來的快"
+        );
+    }
+
+    /// 修正過的 PATH 一定要含系統目錄：使用者把 PATH 整個覆寫掉時，不可以因為
+    /// 「修正」反而讓 `/usr/bin/ssh` 自己都找不到。
+    #[test]
+    fn the_fixed_path_always_keeps_the_system_directories() {
+        let fixed = with_system_dirs("/opt/homebrew/bin");
+        for dir in LAUNCHD_DEFAULT_PATH {
+            assert!(fixed.split(':').any(|d| d == dir), "{dir} 應該被補回來：{fixed}");
+        }
+        assert!(fixed.starts_with("/opt/homebrew/bin"), "使用者自己的順序要在前面：{fixed}");
+
+        // 本來就齊全時不重複補，也不改順序
+        let already = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        assert_eq!(with_system_dirs(already), already);
+        // 尾隨斜線的寫法算同一個目錄，不該再補一份
+        assert_eq!(
+            with_system_dirs("/usr/bin/:/bin/:/usr/sbin/:/sbin/"),
+            "/usr/bin/:/bin/:/usr/sbin/:/sbin/"
+        );
+    }
+
     // `local_time_is_a_fixed_width_hms` 與 Windows 逐字相同，已搬到
     // `platform::process_tests`（跨平台契約容器），不在這裡重複一份。
 
@@ -443,11 +902,32 @@ mod tests {
         let exe = Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel");
         let xml = plist_contents("com.traytunnel.autostart.traytunnel", exe);
         assert!(xml.contains("<key>Label</key>"));
-        assert!(xml.contains("<true/>"), "RunAtLoad 要是 true");
+        // 兩個布林鍵各自釘住，不再只斷言「檔案裡有一個 <true/>」——現在有兩個，
+        // 那種寫法會讓其中一個掉了也照樣綠
+        assert!(
+            xml.contains("<key>RunAtLoad</key>\n\t<true/>"),
+            "RunAtLoad 要是 true，否則登入時根本不會被啟動：{xml}"
+        );
 
         let cmd = read_program_arguments(&xml).expect("要讀得回 ProgramArguments");
         assert_eq!(cmd, format!("{} --tray", exe.display()));
         assert!(cmd.ends_with(" --tray"), "少了 --tray 就會開機彈主視窗：{cmd}");
+    }
+
+    /// `AbandonProcessGroup` 是規格，不是可有可無的調味：`launchd.plist(5)` 明定
+    /// 「job 一死，launchd 會把同 pgid 的殘餘程序也殺掉」，而應用內更新的
+    /// `app.restart()` 正是「spawn 一個同 pgid 的新實例、然後自己 exit」——沒有
+    /// 這個鍵，開機自啟進來的那個實例一更新，新舊兩個實例會一起被 launchd 收走。
+    #[test]
+    fn the_plist_tells_launchd_not_to_kill_the_process_group() {
+        let xml = plist_contents(
+            "com.traytunnel.autostart.traytunnel",
+            Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel"),
+        );
+        assert!(
+            xml.contains("<key>AbandonProcessGroup</key>\n\t<true/>"),
+            "少了 AbandonProcessGroup，自啟實例做應用內更新時會被 launchd 連坐殺掉：{xml}"
+        );
     }
 
     /// 路徑含 XML 特殊字元時要轉義，讀回來又要能正確還原——不然使用者裝在
@@ -469,6 +949,100 @@ mod tests {
     fn read_program_arguments_is_none_for_unrelated_content() {
         assert_eq!(read_program_arguments("<plist></plist>"), None);
         assert_eq!(read_program_arguments(""), None);
+    }
+
+    /// 把一份 plist 餵給系統自己的 `plutil`，回 (成功嗎, stdout)。
+    /// `-` 代表從 stdin 讀（見 `plutil(1)`）。
+    fn plutil(args: &[&str], xml: &str) -> (bool, String) {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("plutil")
+            .args(args)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("macOS 上一定有 plutil");
+        child
+            .stdin
+            .take()
+            .expect("剛設成 piped")
+            .write_all(xml.as_bytes())
+            .expect("plist 很小，寫得進去");
+        let out = child.wait_with_output().expect("plutil 要回得來");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// 這份 plist 的 XML 是**手寫**的（[`plist_contents`] 是一串 `format!`，
+    /// 刻意不拉一顆 plist 解析／產生 crate，理由在 [`read_program_arguments`]）。
+    /// 手寫就要有人替它把關格式，而最權威的把關者就是系統自己的 `plutil`
+    /// ——launchd 讀這個檔案用的是同一套解析器。
+    ///
+    /// 兩段：整份 lint 過得了，以及讓 `plutil` 自己把那三個鍵讀出來（不是我們
+    /// 用 `contains` 看字串長得像不像，而是真的被解析成正確的型別與值）。
+    #[test]
+    fn the_plist_is_what_launchd_will_actually_parse() {
+        let exe = Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel");
+        let xml = plist_contents("com.traytunnel.autostart.traytunnel", exe);
+
+        let (ok, _) = plutil(&["-lint"], &xml);
+        assert!(ok, "plutil 認不得我們寫出來的 plist：\n{xml}");
+
+        // `raw` 讓布林印成 true／false 而不是 <true/>
+        assert_eq!(
+            plutil(&["-extract", "AbandonProcessGroup", "raw", "-o", "-"], &xml).1,
+            "true",
+            "AbandonProcessGroup 要真的被解析成布林 true（M3）"
+        );
+        assert_eq!(plutil(&["-extract", "RunAtLoad", "raw", "-o", "-"], &xml).1, "true");
+        assert_eq!(
+            plutil(&["-extract", "ProgramArguments.1", "raw", "-o", "-"], &xml).1,
+            "--tray",
+            "第二個 argv 要是 --tray，否則開機會彈主視窗"
+        );
+    }
+
+    /// App Translocation 的偵測：路徑裡有整整一層 `AppTranslocation` 才算，
+    /// 名字裡剛好含這個字串的一般資料夾不算。
+    #[test]
+    fn app_translocation_paths_are_recognised() {
+        assert!(is_app_translocated(Path::new(
+            "/private/var/folders/9x/abc/T/AppTranslocation/8B1F-4/d/Traytunnel.app/Contents/MacOS/traytunnel"
+        )));
+
+        assert!(!is_app_translocated(Path::new(
+            "/Applications/Traytunnel.app/Contents/MacOS/traytunnel"
+        )));
+        assert!(
+            !is_app_translocated(Path::new("/Users/bob/AppTranslocationNotes/traytunnel")),
+            "只是名字裡含這個字串的資料夾不是掛載點"
+        );
+        assert!(!is_app_translocated(Path::new(
+            "/Users/bob/dev/traytunnel/target/debug/traytunnel"
+        )));
+    }
+
+    /// 從 App Translocation 的唯讀影本跑起來時，`enable_autostart` 一定要拒絕：
+    /// 那條路徑下次登入不存在，寫進去等於「開關顯示 ON、其實永遠啟動不到」。
+    /// 自癒（`lib.rs::heal_autostart`）走的也是這支函式，因此同一擋也讓它不會把
+    /// 使用者原本指向 /Applications 的好 plist 覆寫掉。
+    ///
+    /// 這一條不碰檔案系統：拒絕發生在解析 `~/Library/LaunchAgents` 之前，
+    /// 所以就算 `$HOME` 是真的家目錄也不會寫出任何東西。
+    #[test]
+    fn autostart_is_refused_under_app_translocation() {
+        let translocated = Path::new(
+            "/private/var/folders/9x/abc/T/AppTranslocation/8B1F-4/d/Traytunnel.app/Contents/MacOS/traytunnel",
+        );
+        let err = enable_autostart("traytunnel-test-translocation", translocated)
+            .expect_err("App Translocation 底下必須拒絕寫入");
+        let msg = err.to_string();
+        assert!(msg.contains("App Translocation"), "訊息要說得出原因：{msg}");
+        assert!(
+            msg.contains("Applications folder"),
+            "訊息要直接告訴使用者怎麼處理（搬進應用程式資料夾）：{msg}"
+        );
     }
 
     /// 檔案存在就選中它本身；不存在就退而開啟上層資料夾；

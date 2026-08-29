@@ -550,6 +550,12 @@ fn close_main(state: &Shared) {
 /// 開機自啟自癒：登記的那一行命令未指向目前執行檔時，於啟動時重寫一次。
 /// 涵蓋路徑失效與非本程式寫入的殘留格式——這兩種情況下 toggle 都會顯示 ON，
 /// 實際卻啟動不到這支程式。
+///
+/// 「目前執行檔的路徑本身就不該被登記」這一格由 `platform::enable_autostart`
+/// 自己擋（macOS 的 App Translocation：從 dmg／`~/Downloads` 直接開啟時
+/// `current_exe()` 是一條這次執行才存在的隨機掛載點路徑，覆寫進去等於把使用者
+/// 原本好好的自啟弄壞）。這裡刻意不重複那道判斷、也不加任何平台 cfg：拒絕會以
+/// `Err` 回來，走下面既有的「refresh failed」那一支，訊息原樣進活動日誌。
 fn heal_autostart(app: &AppHandle, state: &Shared) {
     let name = state::autostart_name(app);
     if !platform::autostart_enabled(&name) {
@@ -624,6 +630,25 @@ pub fn run() {
     //
     // 回來的是要補進活動日誌的行——AppState 這時還不存在，先收著，setup 裡再記。
     let update_notes = update::apply_pending_at_startup(is_tray_start());
+
+    // ---------------------------------------------------------------- GUI 啟動的 PATH
+    //
+    // macOS 專屬。launchd 給 GUI 行程（Finder 雙擊、`open`、我們的 LaunchAgent）
+    // 的 `PATH` 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 裝的 `cloudflared`
+    // （ssh `ProxyCommand` 的預設值）不在裡面，於是 GUI 啟動的實例每一條隧道都在
+    // `sh: cloudflared: not found` 上失敗。整段理由與作法在
+    // `platform::macos::sys` 的「GUI 啟動的 PATH」那一節。
+    //
+    // **位置也是規格**：`set_var` 改的是行程共用的環境區塊，必須在任何執行緒生出來
+    // 之前（`tauri::Builder` 之前）跑完。排在更新交棒之後不衝突——macOS 沒有那套
+    // 暫存交棒，上面那一行在這個平台是語意正確的 no-op。
+    //
+    // Windows 不需要也沒有這支函式（GUI 行程本來就繼承使用者 `PATH`），因此門面
+    // 上整段 cfg，這裡給一個空的清單讓底下的日誌重播不必分平台。
+    #[cfg(target_os = "macos")]
+    let path_notes = platform::fix_gui_launch_path();
+    #[cfg(not(target_os = "macos"))]
+    let path_notes: Vec<String> = Vec::new();
 
     let builder = tauri::Builder::default()
         // single-instance 必須第一個註冊：第二個實例只負責喚醒主視窗
@@ -896,6 +921,10 @@ pub fn run() {
 
             shared.refresh_tray();
             shared.log("Traytunnel started");
+            // PATH 修正跑在 logger 裝上之前（見 `run()` 開頭），它的話要在這裡才記得到
+            for note in path_notes {
+                shared.log(note);
+            }
             for note in update_notes {
                 shared.log(note);
             }

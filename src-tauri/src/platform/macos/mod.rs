@@ -59,7 +59,8 @@ pub use pgids::sweep_leftovers as sweep_supervised_leftovers;
 pub use policy::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
 pub use spawn::{install_termination_handler, ProcessSupervisor};
 pub use sys::{
-    autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
-    local_time_hms, read_autostart_command, reveal_in_file_manager, small_icon_size,
+    autostart_enabled, disable_autostart, enable_autostart, fix_gui_launch_path, is_listening,
+    large_icon_size, local_time_hms, read_autostart_command, reveal_in_file_manager,
+    small_icon_size,
 };
 pub use trayicon::{tray_icon, TRAY_OPEN_GESTURE_HINT};

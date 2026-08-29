@@ -59,9 +59,6 @@ use crate::platform::update_common::IDENTIFIER;
 /// 登記簿檔名。
 const FILE_NAME: &str = "supervised-pgids.json";
 
-/// 原子寫入用的暫存檔名（同一個資料夾，`rename` 才保證是原子的）。
-const TMP_FILE_NAME: &str = "supervised-pgids.json.tmp";
-
 /// 讀改寫的整段互斥。
 ///
 /// `register`／`unregister` 會被多條 tokio 工作執行緒同時呼叫（每個出口一條
@@ -70,8 +67,9 @@ const TMP_FILE_NAME: &str = "supervised-pgids.json.tmp";
 /// 的那個 pgid 就再也不會被收屍。
 ///
 /// 這把鎖只管**行程內部**的並行。跨行程（兩個實例同時在跑，見 [`Entry::owner_pid`]
-/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個
-/// [`TMP_FILE_NAME`]，最壞情況是其中一邊 `rename` 過去的是另一邊寫到一半的內容，
+/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個暫存檔
+/// （[`crate::config::write_atomic`] 的 `<檔名>.tmp`），最壞情況是其中一邊
+/// `rename` 過去的是另一邊寫到一半的內容，
 /// [`parse`] 讀不懂就退成空的登記簿。後果是**漏殺**（下一次啟動少收幾具屍體），
 /// 不是誤殺，方向可接受；為了一個「single-instance 失手才會發生」的情境去背一套
 /// 跨行程鎖的複雜度（還得處理鎖檔本身的殘留與死鎖）划不來。
@@ -126,10 +124,25 @@ pub(super) fn to_json(reg: &Registry) -> String {
 
 /// 登記的命令列與 `ps` 現在報回來的命令列算不算同一件事。
 ///
-/// 判定是「其中一邊是另一邊的前綴」而不是嚴格相等：`ps` 在極端長的命令列上
-/// 可能截斷，某些程式也會在啟動後改寫自己的 argv 尾巴。前綴關係已經足夠嚴格
-/// ——登記的那一行從 `ssh` 一路到 `user@host` 都在裡面，一個不相干的行程要
-/// 湊出這段前綴實務上等於不可能。
+/// 判定只有一個方向：**`ps` 回報的那一行要以登記的那一行開頭**（相等是它的
+/// 特例）。登記的那一行從 `ssh` 一路到 `user@host` 全都得出現在 `ps` 的輸出裡，
+/// 一個不相干的行程要湊出這段前綴實務上等於不可能。允許尾巴多出東西，是因為
+/// 有些程式會在啟動後改寫自己的 argv 尾端。
+///
+/// **反方向（`recorded.starts_with(actual)`）已經移除**，那是一個真的會誤殺的
+/// 缺口：它讓「`ps` 只印得出 `ssh` 這幾個字」的任何行程匹配上我們每一筆登記。
+/// 這不是假想——本機實證，一支 argv[0] 被改成 `ssh` 的 `cat`：
+///
+/// ```text
+/// $ ps -ww -o command= -p <pid>
+/// ssh
+/// recorded.starts_with("ssh") -> true   ← 這個群組會被整組 SIGKILL
+/// ```
+///
+/// pid（＝pgid）會回收，登記簿裡一個舊 pgid 剛好對上今天別人的群組時，這一條
+/// 就是「拿一個舊數字去砍不相干的程式」。當初放行反方向的理由是「`ps` 在極端長
+/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`commands_by_pgid`]），
+/// 截斷這件事根本不會發生，等於用一個不存在的問題換來一個真的誤殺面。
 ///
 /// 空字串一律不算相符：`ps` 問不到東西（行程已經不在）會回空字串，那時候
 /// 什麼都不該殺。
@@ -139,7 +152,7 @@ pub(super) fn commands_match(recorded: &str, actual: &str) -> bool {
     if recorded.is_empty() || actual.is_empty() {
         return false;
     }
-    recorded.starts_with(actual) || actual.starts_with(recorded)
+    actual.starts_with(recorded)
 }
 
 /// 一次收屍要做的兩件事。
@@ -171,7 +184,7 @@ pub(super) struct SweepPlan {
 ///   數字去砍今天不相干的行程群組。
 ///
 /// 比對的是「群組裡**任何一支**行程」而不是只看群組領袖：領袖已經被回收、
-/// `ps -g` 卻仍列得出同組其他行程的情形照樣要收。
+/// 但 `ps` 全表裡仍有同 pgid 的其他行程，這種情形照樣要收。
 ///
 /// **已知漏殺**：ssh 自己先退掉、只剩 ProxyCommand 生出來的孫程序（例如
 /// `cloudflared`）還在的話，那一支的命令列與登記的 ssh 互不為前綴，比對不到，
@@ -209,6 +222,23 @@ pub(super) fn plan_sweep(
         }
     }
     plan
+}
+
+/// `ps` 報回來的那一行有沒有提到我們這支執行檔的檔名。
+///
+/// **兩邊都轉小寫再比**，不是原樣 `contains`。macOS 的預設檔案系統（APFS 與
+/// 舊的 HFS+）是**不分大小寫**的，同一支執行檔在不同的路徑寫法下都跑得起來，
+/// 而「打包出來的那一份」與「`cargo build` 出來的那一份」檔名大小寫本來就不必
+///一致（bundle 的執行檔名跟著 `productName` 走，開發產物跟著 crate 名走）。
+/// 原樣比對的話，正式版與 dev 版並存時兩邊會互相判定「對方那個 pid 不是我們的
+/// 程式、主人已死」，接著把對方**現役**的隧道全部 SIGKILL——正是這個機制最不該
+/// 做的事（同一段推演見 [`owner_still_running`] 裡「為什麼比檔名不比完整路徑」）。
+///
+/// 不分大小寫是往「主人還活著」偏的方向（多認、不少認），與這個模組
+/// 「寧可漏殺不誤殺」的總原則一致。同一份紀律在 `lib.rs::heal_autostart` 比對
+/// 自啟命令列時也是這樣寫的（兩邊 `to_lowercase` 再 `contains`）。
+fn ps_output_mentions(ps_output: &str, exe_name: &str) -> bool {
+    ps_output.to_lowercase().contains(&exe_name.to_lowercase())
 }
 
 /// 一行命令列：program 與每個 argv 用單一空白接起來，對齊 `ps -o command=`。
@@ -250,23 +280,19 @@ fn read_at(path: &Path) -> Registry {
 /// 於是「寫到一半被 SIGKILL 打斷」留下的是完整的舊版，不是半截的新版。
 /// 半截的 JSON 雖然 [`parse`] 讀不懂會退成空的（不會炸），但那等於整份登記
 /// 一次全丟，比舊版差得多。
-/// 兩種失敗都要把暫存檔清掉，不是只有 `rename` 那一種：寫到一半失敗（最典型的
-/// 是磁碟寫滿）時暫存檔已經開出來而且是半截的。與 `config::write_atomic`
-/// 的兩處 `remove_file` 同一個形狀。
+///
+/// 原子寫入本身**不再自己做一份**：這裡要的每一個性質（同資料夾的 `.tmp`、
+/// 兩種失敗都把暫存檔清掉、`rename` 蓋上去）都跟 [`crate::config::write_atomic`]
+/// 一字不差，那邊也是設定檔的落檔路徑。原本兩邊各維護一份逐字相同的實作，
+/// 正是 `platform/mod.rs` 開頭第四條規則不准的事。這一層只剩下自己真正的責任：
+/// 序列化，以及「資料夾可能還不存在」（`~/Library/Application Support/<id>/`
+/// 第一次寫入時就是這樣；設定檔那條路由 `config_location` 事先建好資料夾，
+/// `write_atomic` 因此不管這件事）。
 fn write_at(path: &Path, reg: &Registry) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_file_name(TMP_FILE_NAME);
-    if let Err(e) = std::fs::write(&tmp, to_json(reg)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    crate::config::write_atomic(path, &to_json(reg))
 }
 
 /// 檔案沒有東西可留時就刪掉，不留一份空殼在使用者的資料夾裡。
@@ -322,27 +348,67 @@ pub(super) fn kill_group(pgid: i32) {
     }
 }
 
-/// 問 `ps` 這個行程群組裡現在有哪些行程，回它們各自的命令列。
+/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成「pgid → 這一組裡每一支的
+/// 命令列」。純函式，`ps` 的實際執行在 [`commands_by_pgid`]。
 ///
-/// `-g` 收的是行程群組 id，`-ww` 關掉「照終端機寬度截斷」的預設行為（截斷會
-/// 讓命令列比對無謂地失手）。用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者
-/// 要解一份 Apple 沒有公開穩定文件的核心緩衝格式，還得整段 unsafe，而這條路
-/// 一輩子只在啟動時跑一次、每個殘留 pgid 一次，完全不在乎那一次 fork/exec。
-fn group_commands(pgid: i32) -> Vec<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-g"])
-        .arg(pgid.to_string())
-        .output();
-    match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
+/// 每一行的形狀固定是「pid、pgid、命令列」，前兩欄是**靠右對齊、寬度不定**的
+/// 數字（欄與欄之間可能有好幾個空白），第三欄開始整個都是命令，而命令本身含
+/// 空白。所以是「切掉前兩個欄位、剩下的整段就是命令」，不可以
+/// `split_whitespace` 全切開再用單一空白拼回去——那樣會把命令列裡連續的空白
+/// 壓掉，`ps -o command=` 印的是什麼就不再是什麼，而 [`commands_match`] 是逐字
+/// 前綴比對，壓掉就對不上了。解不開的行（`ps` 哪天多印了什麼）整行跳過，
+/// 不要瞎猜。
+fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<String>> {
+    /// 切掉開頭的空白與第一個欄位，回 (那個欄位, 剩下的整段)。
+    fn split_first_field(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        let end = s.find(char::is_whitespace)?;
+        Some((&s[..end], &s[end..]))
+    }
+
+    let mut table: std::collections::HashMap<i32, Vec<String>> = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        // 第一欄是 pid，這裡用不到（比對只看命令列），但一定要切掉才輪得到 pgid
+        let Some((_pid, rest)) = split_first_field(line) else {
+            continue;
+        };
+        let Some((pgid, command)) = split_first_field(rest) else {
+            continue;
+        };
+        let Ok(pgid) = pgid.parse::<i32>() else {
+            continue;
+        };
+        // 只去頭尾：命令列**內部**的空白原樣留著
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        table.entry(pgid).or_default().push(command.to_string());
+    }
+    table
+}
+
+/// 問 `ps` 一次，把系統上每一個行程按 pgid 分好組。
+///
+/// **一次就好**。這條路的呼叫端只有 [`sweep_leftovers`]，而它要問的是登記簿裡
+/// 每一筆 pgid「這一組現在有誰」——原本是逐筆 `ps -g <pgid>`，登記簿有 N 筆就
+/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建
+/// 成 `HashMap` 完全等價，而且是啟動路徑上唯一一次外部程序。
+///
+/// `-ww` 一定要在：它關掉「照終端機寬度截斷」的預設行為，截斷會讓命令列比對
+/// 無謂地失手——[`commands_match`] 只認一個方向（`ps` 至少要印出我們登記的
+/// 那一整行）正是建立在「不會截斷」這個前提上。
+///
+/// 用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者要解一份 Apple 沒有公開穩定
+/// 文件的核心緩衝格式，還得整段 unsafe，而這條路一輩子只在啟動時跑這一次。
+fn commands_by_pgid() -> std::collections::HashMap<i32, Vec<String>> {
+    match std::process::Command::new("ps").args(["-axww", "-o", "pid=,pgid=,command="]).output() {
+        Ok(out) => parse_ps_pgid_table(&String::from_utf8_lossy(&out.stdout)),
         Err(e) => {
-            log::warn!("could not ask ps about process group {pgid}: {e}");
-            Vec::new()
+            log::warn!("could not ask ps about the running process groups: {e}");
+            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺。
+            // 方向是漏殺不是誤殺，與整個模組的原則一致
+            std::collections::HashMap::new()
         }
     }
 }
@@ -375,6 +441,8 @@ fn owner_still_running(owner_pid: i32) -> bool {
     // `traytunnel` 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆
     // 不掃。代價只是那一輪少收一具屍體，下一次啟動再收；而且要湊齊
     // 「pid 剛好被回收」＋「新主人剛好也叫這個名字」兩件事，機率本來就極低。
+    //
+    // 比對本身不分大小寫，理由見 [`ps_output_mentions`]。
     let name = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -388,7 +456,7 @@ fn owner_still_running(owner_pid: i32) -> bool {
         .arg(owner_pid.to_string())
         .output();
     match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&name),
+        Ok(out) => ps_output_mentions(&String::from_utf8_lossy(&out.stdout), &name),
         // 連 ps 都跑不起來時同樣往「主人還活著」偏
         Err(_) => true,
     }
@@ -424,18 +492,21 @@ pub(super) fn unregister(pgid: i32) {
 /// 「另一個實例現役的連線」不靠呼叫時機保護，而是靠逐筆的 `ownerPid`
 /// （見 [`Entry::owner_pid`]）——single-instance 外掛有一條會讓兩個實例並存的
 /// 錯誤分支，時機本身擋不住它。
+///
+/// 沒有「檔案不在就早退」「登記簿是空的就刪檔早退」這兩道分支，是刻意的：
+/// [`read_at`] 讀不到檔案本來就回一份空的登記簿，空登記簿的 [`plan_sweep`] 回
+/// 一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），最後 [`write_or_clear_at`]
+/// 對空的登記簿做的正是「把檔案刪掉，本來就沒有也算成功」。兩道早退跟這條主線
+/// 一字不差地等價，留著只是同一件事寫兩遍。
 pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !path.is_file() {
-        return;
-    }
     let reg = read_at(&path);
-    if reg.entries.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return;
-    }
-    let plan = plan_sweep(&reg, &mut owner_still_running, &mut group_commands);
+    // 一次把全表拿回來，登記簿有幾筆都只問 `ps` 這一次（見 `commands_by_pgid`）
+    let by_pgid = commands_by_pgid();
+    let plan = plan_sweep(&reg, &mut owner_still_running, &mut |pgid| {
+        by_pgid.get(&pgid).cloned().unwrap_or_default()
+    });
     for pgid in &plan.doomed {
         log::warn!(
             "killing a process group left behind by a previous run (pgid {pgid}); the last run \
@@ -535,6 +606,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `sweep_leftovers` 拿掉的那兩道早退（「檔案不在」「登記簿是空的」）之所以
+    /// 跟主線等價，靠的就是這裡的三件事：讀不到檔案回一份空的登記簿、空的登記簿
+    /// 規劃不出任何動作、清空的寫入就是「刪掉檔案，本來沒有也算成功」，而且不會
+    /// 順手建出任何東西。
+    #[test]
+    fn an_absent_registry_reads_as_empty_and_clears_to_nothing() {
+        let dir = tempdir("absent");
+        let path = dir.join(FILE_NAME);
+        assert!(!path.exists(), "前提：這個路徑一開始就沒有檔案");
+
+        assert_eq!(read_at(&path), Registry::default(), "讀不到檔案要回一份空的登記簿");
+
+        let mut never = |_: i32| panic!("空的登記簿不該問任何人");
+        let plan =
+            plan_sweep(&Registry::default(), &mut never, &mut |_| panic!("空的登記簿不該問 ps"));
+        assert_eq!(plan, SweepPlan::default(), "空的登記簿規劃不出任何動作");
+
+        write_or_clear_at(&path, &Registry::default()).expect("清空一份本來就不存在的檔案不算錯");
+        assert!(!path.exists(), "不可以憑空生出一份空殼：{}", path.display());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 兩個實例並存時（single-instance 的錯誤分支）的檔案語意：各改各的條目。
     /// 這是 [`Entry::owner_pid`] 那條誤殺鏈第 2、3 步不成立的地方。
     #[test]
@@ -566,30 +660,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 寫完不可以留下 `.tmp`——留著的話使用者的資料夾裡永遠躺著一顆看不懂的
-    /// 半成品，而且下一次 `write_at` 才會把它覆寫掉。
+    /// 寫完（成功或失敗）都不可以在登記簿的資料夾裡留下半成品——留著的話
+    /// 使用者的資料夾裡永遠躺著一顆看不懂的東西，而且要等下一次寫入才會被覆寫。
     ///
-    /// 兩段：成功那一條，以及 **`rename` 失敗**那一條。
+    /// 「不留半成品」這件事本身現在是 [`crate::config::write_atomic`] 的責任
+    /// （原子寫入已經上提到那一份共用實作，見 [`write_at`]），那邊有自己的
+    /// 測試釘兩處 `remove_file`。這一條留著、而且**不再寫死暫存檔名**，測的是
+    /// 這一層自己的東西：登記簿這條路（含它自己那一段 `create_dir_all`）走完
+    /// 之後，這個資料夾裡除了登記簿本身不該多出任何檔案。改成掃整個資料夾而
+    /// 不是 `dir.join("supervised-pgids.json.tmp")`，是因為暫存檔怎麼命名已經
+    /// 是共用函式的實作細節了，這一層不該再假設它長什麼樣。
     ///
-    /// 只宣稱 `rename` 這一支是刻意的：`write_at` 的另一個失敗點是
-    /// `fs::write` 寫到一半失敗（典型是磁碟寫滿），那個沒有辦法在單元測試裡
-    /// 穩定重現——製造得出來的「寫不出去」（例如父路徑是一個檔案）會更早在
-    /// `create_dir_all` 就以 `AlreadyExists` 失敗，**根本走不到暫存檔那一行**，
-    /// 斷言會恆真。這一版之前正是那個形狀，等於什麼都沒測到。
-    ///
-    /// 這裡改成讓**目的地**是一個資料夾：`create_dir_all(parent)` 看到父資料夾
-    /// 已經在就直接成功、`fs::write` 也真的把暫存檔寫出來了，失敗的是最後那一步
-    /// 「把一個檔案 rename 蓋到一個資料夾上」（`ENOTDIR`）。兩處 `remove_file`
-    /// 是同一個形狀，釘住走得到的這一處就擋得住「順手刪掉一行」。
+    /// 兩段：成功那一條，以及 **`rename` 失敗**那一條。`fs::write` 寫到一半失敗
+    /// （典型是磁碟寫滿）沒有辦法在單元測試裡穩定重現，因此只走得到 rename 這支：
+    /// 讓**目的地**是一個資料夾——`create_dir_all(parent)` 看到父資料夾已經在就
+    /// 直接成功、`fs::write` 也真的把暫存檔寫出來了，失敗的是最後「把一個檔案
+    /// rename 蓋到一個資料夾上」。
     #[test]
-    fn writing_leaves_no_tmp_file_behind() {
+    fn writing_leaves_no_leftovers_behind() {
         let dir = tempdir("notmp");
-        let tmp = dir.join(TMP_FILE_NAME);
-
         let path = dir.join(FILE_NAME);
+
+        /// 這個資料夾裡（不含子資料夾）現在有哪些檔案。
+        fn files_in(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("tempdir 要讀得到")
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
         register_at(&path, 900, 111, "ssh -N bob@a").unwrap();
         assert!(path.is_file());
-        assert!(!tmp.exists(), "寫完不該留下暫存檔：{}", tmp.display());
+        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "寫完只該有登記簿本身");
 
         // rename 失敗那一支：目的地是一個資料夾，前面兩步都會成功
         let dest_is_a_dir = dir.join("dest-is-a-directory");
@@ -598,9 +704,40 @@ mod tests {
             write_at(&dest_is_a_dir, &Registry::default()).is_err(),
             "把檔案 rename 蓋到一個資料夾上本來就該失敗——失敗不了的話這一條測不到東西"
         );
-        assert!(!tmp.exists(), "rename 失敗也不可以留下暫存檔：{}", tmp.display());
+        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "寫入失敗也不可以留下半成品");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 命令列比對只認一個方向：`ps` 回報的那一行要以登記的那一行開頭。
+    ///
+    /// 最後一段是這一版真正要擋的那個誤殺面：`ps` 只印得出 `ssh` 幾個字的
+    /// 行程（本機實證：argv[0] 被改成 `ssh` 的 `cat`，`ps -ww -o command=`
+    /// 就是一行 `ssh`）**不可以**匹配任何一筆登記——pid 會回收，匹配上就等於
+    /// 拿一個舊數字去 SIGKILL 別人的行程群組。
+    #[test]
+    fn a_command_only_matches_when_ps_shows_at_least_what_we_recorded() {
+        let recorded = "ssh -N -o ServerAliveInterval=10 -L 1080:127.0.0.1:1080 bob@example.com";
+
+        // 一模一樣：相符
+        assert!(commands_match(recorded, recorded));
+        // 前後空白不算差異（`ps` 的欄位會補空白）
+        assert!(commands_match(recorded, &format!("  {recorded}  ")));
+        // 尾巴多出東西：相符（有些程式會改寫自己的 argv 尾端）
+        assert!(commands_match(recorded, &format!("{recorded} extra")));
+
+        // `ps` 只印得出 `ssh`：**不可以**相符
+        assert!(
+            !commands_match(recorded, "ssh"),
+            "ps 只印 ssh 的無關程序若匹配得上，每一筆登記都會被它對到，pid 回收時就是誤殺"
+        );
+        assert!(!commands_match(recorded, "ssh -N"), "印到一半同樣不算");
+
+        // 完全不相干的行程
+        assert!(!commands_match(recorded, "/usr/libexec/some-daemon --serve"));
+        // 空字串（`ps` 問不到東西）兩個方向都不算
+        assert!(!commands_match(recorded, ""));
+        assert!(!commands_match("", "ssh -N bob@a"));
     }
 
     /// 收屍決策：命令列對得上才殺，對不上或群組已空一律留著。
@@ -629,8 +766,8 @@ mod tests {
         assert!(plan.keep.is_empty());
     }
 
-    /// 比對的是「群組裡任何一支」而不是只看群組領袖：領袖已經被回收、`ps -g`
-    /// 卻仍列得出同組其他行程時照樣要收。
+    /// 比對的是「群組裡任何一支」而不是只看群組領袖：領袖已經被回收、但
+    /// `ps` 全表裡仍有同 pgid 的其他行程時，照樣要收。
     #[test]
     fn a_group_is_killed_when_any_of_its_processes_still_matches() {
         let reg = Registry { entries: vec![entry(111, 900, "ssh -N bob@a")] };
@@ -720,6 +857,28 @@ mod tests {
         assert!(plan_sweep(&reg, &mut dead, &mut ps).doomed.is_empty());
     }
 
+    /// 「主人還在不在」的 `ps` 比對必須**不分大小寫**。macOS 的預設檔案系統不分
+    /// 大小寫，而打包產物與 `cargo build` 產物的執行檔名大小寫本來就不必一致
+    /// （前者跟 `productName` 走、後者跟 crate 名走）。原樣比對的話，正式版與
+    /// dev 版並存時兩邊會互相判定「對方的主人已死」，接著把對方**現役**的隧道
+    /// 全部 SIGKILL。
+    #[test]
+    fn the_owner_check_ignores_executable_name_case() {
+        let prod_line = "/Applications/Traytunnel.app/Contents/MacOS/Traytunnel --tray";
+        assert!(
+            ps_output_mentions(prod_line, "traytunnel"),
+            "dev 版（檔名 traytunnel）必須認得出正式版（檔名 Traytunnel）還活著，\
+             否則會把正式版現役的隧道當成殘骸掃掉"
+        );
+        let dev_line = "/Users/bob/dev/tt/target/debug/traytunnel";
+        assert!(ps_output_mentions(dev_line, "Traytunnel"), "反方向同樣要成立");
+
+        // 不分大小寫不等於「什麼都算」：完全不相干的行仍然不可以匹配
+        assert!(!ps_output_mentions("/usr/libexec/some-daemon --serve", "traytunnel"));
+        // `ps` 問不到東西（行程已經不在）會回空字串，那時候不該認為主人還在
+        assert!(!ps_output_mentions("", "traytunnel"));
+    }
+
     /// 登記下來的命令列格式必須就是 `ps -o command=` 的格式（program 與 argv
     /// 用單一空白接起來），不然收屍時永遠比對不到。
     #[test]
@@ -733,6 +892,49 @@ mod tests {
 
         // 沒有參數的情況也要是乾淨的一個 token，不要留下尾隨空白
         assert_eq!(command_line(&std::process::Command::new("ssh")), "ssh");
+    }
+
+    /// `ps -axww -o pid=,pgid=,command=` 的輸出要按 pgid 分好組，而且命令列
+    /// 必須**原樣**保留（含裡面的連續空白）——`commands_match` 是逐字前綴比對，
+    /// 把空白壓掉就再也對不上我們登記的那一行。
+    #[test]
+    fn the_ps_table_groups_commands_by_pgid() {
+        // 前兩欄靠右對齊、寬度不定，這是 `ps -o pid=,pgid=` 真的會印出來的樣子
+        let out = "    1     1 /sbin/launchd\n\
+                   \x20 900   900 ssh -N  -L 1080:127.0.0.1:1080 bob@a\n\
+                   \x209001   900 cloudflared access ssh --hostname a\n\
+                   \x209100  9100 /usr/libexec/some-daemon --serve\n";
+        let table = parse_ps_pgid_table(out);
+
+        assert_eq!(
+            table.get(&900).map(Vec::as_slice),
+            Some(
+                &[
+                    "ssh -N  -L 1080:127.0.0.1:1080 bob@a".to_string(),
+                    "cloudflared access ssh --hostname a".to_string(),
+                ][..]
+            ),
+            "同一個 pgid 的兩支（ssh 與它 ProxyCommand 生的孫程序）要收在一起，\
+             而且 `ssh -N  -L` 中間那兩個空白不可以被壓成一個"
+        );
+        assert_eq!(table.get(&9100).map(Vec::len), Some(1));
+        assert_eq!(table.get(&12345), None, "沒出現過的 pgid 就是沒有");
+
+        // 解不開的行整行跳過，不要瞎猜也不要炸掉
+        assert!(parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n").is_empty());
+    }
+
+    /// 這台機器上真的跑一次 `ps`，確認上面那支解析器吃的格式沒有猜錯：
+    /// **本行程自己**一定要出現在自己的 pgid 底下。純唯讀查詢，不動任何東西。
+    #[test]
+    fn the_ps_table_can_find_this_very_process() {
+        let table = commands_by_pgid();
+        let me = std::process::id() as i32;
+        let my_pgid = unsafe { libc::getpgid(me) };
+        assert!(
+            table.contains_key(&my_pgid),
+            "ps 的全表裡找不到本行程自己的 pgid {my_pgid}——解析器跟真實輸出對不上了"
+        );
     }
 
     // `the_identifier_matches_tauri_conf`：登記簿的資料夾名以前是另外寫死一份

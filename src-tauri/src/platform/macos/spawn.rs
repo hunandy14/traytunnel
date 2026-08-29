@@ -1,14 +1,47 @@
 //! 受監督 spawn：Unix 行程群組（process group）版本。對照組是
 //! `platform/windows/spawn.rs` 的 Job Object。
 //!
-//! macOS 沒有 Job Object，對應物是行程群組：spawn 前用 `process_group(0)`
-//! 讓子程序自成一個新群組（新群組的 pgid 就等於子程序自己的 pid，這是
-//! `process_group(0)` 的定義，不必事後另外查詢），子程序自己再 spawn 出來的
-//! 孫程序預設會**繼承同一個 pgid**（除非孫程序自己又呼叫 `setpgid`／`setsid`，
-//! 契約測試 §2(ii) 的 `sh -c "sleep N & wait"` 沒有這麼做，這正是「一群」的
-//! 前提）。Drop 時對這個 pgid 送 `SIGKILL`，一次收掉整棵樹，不必知道底下究竟
-//! 有幾層、生了幾支——這件事一定要做：ssh 的 ProxyCommand 會再生出孫程序，
-//! 只殺 ssh 本身會留下孤兒。
+//! macOS 沒有 Job Object，對應物是行程群組：spawn 前在 `pre_exec` 裡呼叫
+//! `setsid()`，讓子程序自成一個新的 **session**（連帶自成一個新群組，pgid 就
+//! 等於子程序自己的 pid，這是 `setsid(2)` 的定義，不必事後另外查詢），子程序
+//! 自己再 spawn 出來的孫程序預設會**繼承同一個 pgid**（除非孫程序自己又呼叫
+//! `setpgid`／`setsid`，契約測試 §2(ii) 的 `sh -c "sleep N & wait"` 沒有這麼
+//! 做，這正是「一群」的前提）。Drop 時對這個 pgid 送 `SIGKILL`，一次收掉整棵樹，
+//! 不必知道底下究竟有幾層、生了幾支——這件事一定要做：ssh 的 ProxyCommand 會
+//! 再生出孫程序，只殺 ssh 本身會留下孤兒。
+//!
+//! ## 為什麼是 `setsid()` 而不是 `process_group(0)`
+//!
+//! 兩者在「自成一個 pgid、pgid ＝ 子程序的 pid」這件事上完全等價，Drop 的
+//! `killpg` 語意一個字都不用改。差別在**控制終端**：`process_group(0)` 只換
+//! 群組，子程序仍留在原本的 session 裡——從終端機啟動時（`cargo run`、
+//! 直接跑執行檔），那就是**終端機的 session**，而且是一個非前景的行程群組。
+//!
+//! POSIX 的作業控制規定：非前景群組的行程一旦要從控制終端**讀**，核心就對它
+//! 整組送 `SIGTTIN`（寫是 `SIGTTOU`），預設動作是**停住**（`ps` 的 state 變
+//! `T`）。ssh 需要 tty 輸入的場合很常見——密碼、passphrase、host key 確認——
+//! 而且它走的是 `readpassphrase(3)`，**直接開 `/dev/tty`**，跟我們把 stdin 設成
+//! `Stdio::null()` 完全無關。於是那條 ssh 不是失敗、也不是活著，而是永遠停在
+//! `T`：`supervise` 的 `try_wait()` 永遠回 `Ok(None)`（停住不是結束），埠永遠不會
+//! 進 listen，這個出口就卡在 connecting 直到使用者自己去 `kill`。
+//!
+//! 本機實證（同一支程式，只差 preexec，在一支 pty 底下跑）：
+//!
+//! ```text
+//! process_group(0) → ps: 87548 87548 T  …  （停住，exit code 是 None，永遠不動）
+//! setsid()         → OSError: [Errno 6] Device not configured: '/dev/tty'，exit 1
+//! ```
+//!
+//! `setsid()` 之後子程序沒有控制終端，開 `/dev/tty` 直接拿 `ENXIO` 失敗，ssh 印
+//! 一行錯誤就退出——那正是我們要的：走完 `supervise` 既有的「ssh 退了 → 記一行
+//! → 五秒後重試」那條正常路徑，日誌上看得到原因，而不是靜靜地卡死。
+//!
+//! 刻意**不**在共用核心的 `build_exit_args` 加 `BatchMode=yes`（那會一併改掉
+//! Windows 的行為，是跨平台的產品決策，不屬於這條修正）。
+//!
+//! `setsid()` 在剛 `fork` 出來的子程序裡不可能失敗成 `EPERM`：`EPERM` 只發生在
+//! 呼叫者已經是行程群組領袖的時候，而新 fork 出來的子程序 pid 是全新的、pgid
+//! 繼承自父行程，兩者不相等，因此它不是領袖。
 //!
 //! 直接送 `SIGKILL`、不先 `SIGTERM` 給對方收拾的機會：`Drop::drop` 是同步的，
 //! 沒有地方能 await「等一下看它有沒有自己退」，呼叫端（`tunnel::test_connection`
@@ -55,11 +88,13 @@ impl ProcessSupervisor {
         Ok(ProcessSupervisor { pgids: Mutex::new(Vec::new()) })
     }
 
-    /// 讓子程序 spawn 前自成一個新的行程群組，spawn 之後記下它的 pgid。
+    /// 讓子程序 spawn 前自成一個新的 session（連帶自成一個新的行程群組），
+    /// spawn 之後記下它的 pgid。
     ///
     /// 呼叫端已經設好的 stdio（見契約測試：`Stdio::null()`／`Stdio::piped()`）
-    /// 一律原樣尊重，這裡只多加 `process_group(0)` 這一道旗標，不碰其他任何
-    /// 已經在 `cmd` 上設定好的東西。
+    /// 一律原樣尊重，這裡只多掛 `pre_exec` 裡那一次 `setsid()`，不碰其他任何
+    /// 已經在 `cmd` 上設定好的東西。為什麼是 `setsid()` 而不是
+    /// `process_group(0)`（SIGTTIN 那一段）寫在模組開頭。
     ///
     /// `log_context` 語意比照 Windows 版：兩個呼叫點（監看迴圈與存檔前的連線
     /// 測試）在日誌裡分得出來的前綴，也是這裡「記不到 pgid」那一行 warn 的前綴。
@@ -72,7 +107,27 @@ impl ProcessSupervisor {
     /// 靜默失敗：程序本身已經起來了，讓它跑總比為了收尾機制炸掉呼叫端好，
     /// 但至少要在日誌上留一筆讓人查得到。
     pub fn spawn(&self, cmd: &mut Command, log_context: &str) -> io::Result<Child> {
-        cmd.process_group(0);
+        // SAFETY：`pre_exec` 的閉包跑在 `fork` 與 `exec` 之間的子程序裡，那個
+        // 環境只准呼叫 async-signal-safe 的東西（不能配置記憶體、不能取鎖）。
+        // 這裡只呼叫 `setsid()` 一支系統呼叫，沒有配置、沒有鎖、沒有 Rust 端的
+        // 狀態，符合要求。
+        //
+        // **前提：同一個 `cmd` 只會被交給這支函式一次。** `pre_exec` 是**追加**
+        // 的（每呼叫一次就多掛一個閉包，spawn 時依序全跑），所以同一個 `Command`
+        // 走第二趟就會執行第二次 `setsid()`——那一次一定拿 `EPERM`（第一次成功
+        // 之後子程序已經是 session 領袖了），閉包回 `Err`，`spawn()` 直接失敗。
+        // 目前兩個呼叫端（`tunnel::supervise` 的監看迴圈、`tunnel::test_connection`）
+        // 都是「一個 `Command` 配一次 spawn」，重連是重新組一個新的 `Command`，
+        // 前提成立。日後若有人想重複使用同一個 `Command`，要改的是這裡（把
+        // `pre_exec` 換成只掛一次），不是把這段註解刪掉。
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         // 命令列要在 spawn **之前**取：spawn 之後 `cmd` 照樣讀得到，但先取好
         // 才不會在「spawn 成功了、記登記簿時卻少一半資訊」之間留下順序上的疑問。
         let command = pgids::command_line(cmd.as_std());
@@ -174,5 +229,50 @@ fn signal_name(signal: i32) -> &'static str {
         signal_hook::consts::SIGHUP => "SIGHUP",
         signal_hook::consts::SIGINT => "SIGINT",
         _ => "an unexpected signal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 受監督的子程序必須是**新 session 的領袖**（`getsid(pid) == pid`），
+    /// 而且 pgid 仍然等於自己的 pid（`getpgid(pid) == pid`）。
+    ///
+    /// 兩個斷言各自釘住一件事：
+    ///
+    /// * `getsid == pid`：子程序脫離了呼叫端的 session，因此**沒有控制終端**。
+    ///   這是這一版真正要修的東西——留在終端機 session 的非前景群組裡時，ssh
+    ///   一去讀 `/dev/tty`（密碼／host key，走 `readpassphrase(3)`，跟 stdin 是
+    ///   不是 `/dev/null` 無關）就被 `SIGTTIN` 停住（`ps` state `T`），
+    ///   `try_wait()` 永遠回 `Ok(None)`，那條隧道從此卡死。理由整段在模組開頭。
+    /// * `getpgid == pid`：Drop 的 `killpg(-pgid)` 與登記簿記的 pgid 都建立在
+    ///   「pgid 就是子程序的 pid，不必事後查」這個前提上。從 `process_group(0)`
+    ///   換成 `setsid()` 之後這個前提**沒有變**，這一行就是釘死它。
+    ///
+    /// 整棵樹一起被收掉那一半是跨平台契約，測試在 `platform/process_tests.rs`，
+    /// 這裡只補 macOS 這一邊的 session 語意。
+    #[tokio::test]
+    async fn a_supervised_child_leads_its_own_session() {
+        let job = ProcessSupervisor::new().expect("supervisor 要建得起來");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        let child = job.spawn(&mut cmd, "").expect("spawn 要成功");
+        let pid = child.id().expect("剛 spawn 完一定拿得到 pid") as i32;
+
+        let sid = unsafe { libc::getsid(pid) };
+        let pgid = unsafe { libc::getpgid(pid) };
+        // 先把程序收乾淨再斷言，失敗時才不會留下一支 sleep 在機器上
+        drop(job);
+        drop(child);
+
+        assert_eq!(sid, pid, "子程序必須自成一個 session（沒有控制終端），否則會被 SIGTTIN 停住");
+        assert_eq!(pgid, pid, "pgid 仍然要等於子程序的 pid，Drop 的 killpg 與登記簿都靠這件事");
     }
 }
