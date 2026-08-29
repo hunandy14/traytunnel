@@ -41,6 +41,5 @@ pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 pub use spawn::ProcessSupervisor;
 pub use sys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
-    local_time_hms, pick_icon_layer, read_autostart_command, reveal_in_file_manager,
-    small_icon_size,
+    local_time_hms, read_autostart_command, reveal_in_file_manager, small_icon_size,
 };

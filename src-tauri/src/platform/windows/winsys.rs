@@ -210,26 +210,9 @@ fn metrics(cx: i32, cy: i32, fallback: (u32, u32)) -> (u32, u32) {
     }
 }
 
-/// 從多層 ICO 的尺寸清單裡挑一層，回傳索引。
-///
-/// 優先完全相符（完全不縮放）；沒有就取「大於它的最小一層」，讓系統縮小而不是
-/// 放大（縮小遠比放大乾淨）；再沒有就退而取最大的一層。
-pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
-    if sizes.is_empty() {
-        return None;
-    }
-    let exact = sizes.iter().position(|s| *s == want);
-    if exact.is_some() {
-        return exact;
-    }
-    let bigger = sizes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s > want)
-        .min_by_key(|(_, s)| **s)
-        .map(|(i, _)| i);
-    bigger.or_else(|| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i))
-}
+// 「從多層 ICO 的尺寸清單裡挑一層」（pick_icon_layer）不靠任何系統 API，是純
+// 數字邏輯，原本這裡與 macOS 版（`platform::macos::sys`）各自維護一份逐字相同的
+// 演算法，已上提到唯一的呼叫端 `crate::appicon`，不再由這個模組提供。
 
 /// 在 HKCU 底下寫一個字串值，subkey 不存在就建出來。
 pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()> {
@@ -497,29 +480,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// 圖示工廠產出的層序，測試照著它走
-    const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
-
-    /// 完全相符的層優先，這樣 GDI 完全不用縮放
-    #[test]
-    fn exact_layer_wins() {
-        assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
-        // 175% DPI 的 28px 有專用層
-        assert_eq!(pick_icon_layer(&LAYERS, 28), Some(3));
-        assert_eq!(pick_icon_layer(&LAYERS, 32), Some(4));
-    }
-
-    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層：
-    /// 放大會模糊，縮小不會
-    #[test]
-    fn large_icon_sizes_never_upscale() {
-        // 100%／125%／150%／175%／200%／250%／300% 的 SM_CXICON
-        let ladder = [(32, 32), (40, 48), (48, 48), (56, 64), (64, 64), (80, 128), (96, 128)];
-        for (want, expect) in ladder {
-            let idx = pick_icon_layer(&LAYERS, want).expect("一定挑得到一層");
-            assert_eq!(LAYERS[idx], expect, "{want}px 挑錯層");
-        }
-    }
+    // `pick_icon_layer` 本身的測試（完全相符優先、DPI 進位表、退讓方向、超過
+    // 最大層與空清單）已隨函式本體搬到 `crate::appicon`，與 macOS 版合併保留
+    // 兩邊的斷言資料，不在這裡重複一份。
 
     /// 這台機器兩種圖示尺寸的合理性：大圖示不會比小圖示小，也不會是 0
     #[test]
@@ -530,21 +493,6 @@ mod tests {
         assert_eq!(lw, lh, "大圖示應為正方");
         assert!(sw >= 16 && lw >= 32, "SM_CXSMICON={sw} SM_CXICON={lw}");
         assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
-    }
-
-    /// 沒有專用層時寧可讓系統縮小，也不要放大
-    #[test]
-    fn falls_back_to_the_next_size_up() {
-        let sizes = [16, 24, 32];
-        assert_eq!(pick_icon_layer(&sizes, 20), Some(1)); // 24 縮到 20
-        assert_eq!(pick_icon_layer(&sizes, 28), Some(2)); // 32 縮到 28
-    }
-
-    /// 要的比所有層都大時只能拿最大的那層
-    #[test]
-    fn falls_back_to_the_largest_layer() {
-        assert_eq!(pick_icon_layer(&[16, 32, 24], 64), Some(1));
-        assert_eq!(pick_icon_layer(&[], 16), None);
     }
 
     /// 取表那段是手寫 FFI，用一個真的 listener 釘住行為：
