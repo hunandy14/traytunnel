@@ -82,6 +82,12 @@ fn staging_dir() -> Option<PathBuf> {
 // 那句 `use super::normalize_version;` 不必改。
 pub(crate) use update_common::normalize_version;
 
+// `is_newer`：`staged.rs` 的 `apply_action`（標記是不是還新過目前這一版，決定
+// 要不要交棒／清掉）也要用，同樣用 `pub(crate) use` 重新匯出，讓 `staged.rs`
+// 那句 `use super::is_newer;` 不必改——C14 把這一支收進 [`accept`] 之後，
+// `update.rs` 自己已經不再直接呼叫它，但子模組這條線還在。
+pub(crate) use update_common::is_newer;
+
 /// 清掉暫存區並把狀態同步歸零。
 ///
 /// 「清檔案」與「清狀態」永遠要一起發生：只清檔案的話介面與系統匣會繼續顯示
