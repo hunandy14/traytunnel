@@ -1,9 +1,10 @@
 # 發佈與應用內更新——已知風險登記簿
 
-記錄兩類不是我們自己寫的 bug、卻會影響使用者的風險：上游 `tauri-plugin-updater`
-在 macOS 提權路徑上的缺陷，以及發佈管線本身（`latest.json` 的 manifest 格式）
-帶來的先天限制。兩者都已經在程式碼裡繞開或擋下，這裡集中記一份，避免下一個人
-重新踩一次才想起來。
+記錄三類不是我們自己寫的 bug、卻會影響使用者的風險：上游 `tauri-plugin-updater`
+在 macOS 提權路徑上的缺陷、macOS `WKWebView` content process 被系統回收的白屏
+風險，以及發佈管線本身（`latest.json` 的 manifest 格式）帶來的先天限制。三者
+都已經在程式碼裡繞開、防護或擋下，這裡集中記一份，避免下一個人重新踩一次才
+想起來。
 
 ## 上游 `tauri-plugin-updater` 的兩筆 macOS 缺陷
 
@@ -53,6 +54,46 @@ do shell script "rm -rf '{舊 bundle 路徑}' && mv -f '{新 bundle 路徑}' '{�
   權限，走的是非提權的 `rename`＋備份路徑，兩筆缺陷都碰不到。真正會撞上提權
   路徑的情境（bundle 是 root 所有、或曾經 `sudo cp` 過）超出一般使用者的操作
   習慣，不在我們的緩解範圍內。
+
+## macOS `WKWebView` content process 被系統回收後的白屏風險
+
+`WKWebView` 的渲染跑在獨立於本體行程的系統行程（`com.apple.WebKit.WebContent`），
+這個行程可以被系統獨立回收，不需要我們的 app 本身也被殺掉——這是 WebKit 本身
+有文件記載的行為，不是 tauri 特有的問題。真正的觸發條件是系統記憶體壓力
+（jetsam 式回收），不是單純隱藏視窗就會發生；但本專案的視窗語意是「隱藏到
+系統匣」而不是真的關閉（`lib.rs::hide_to_tray`），而且會在隱藏時把 activation
+policy 切到 `Accessory`（不進 Dock、不在前景，見 `show_main`／`hide_to_tray`
+那組動態 activation policy）——這樣一個長時間背景常駐、沒有可見視窗的 app，
+它的 WebContent 行程在系統真的碰上記憶體壓力時，會是優先被犧牲的對象。行程
+死掉後 `WKWebView` 不會自己重新載入，畫面會一直卡在白屏，直到使用者手動整個
+重開 app。
+
+### 本專案的防護
+
+`src-tauri/src/lib.rs` 的 `tauri::Builder` 鏈掛了官方原生的偵測掛鉤：
+`Builder::on_web_content_process_terminate`（macOS／iOS 專屬，已核對存在於我們
+釘死的 `tauri-v2.11.5` 標籤，`crates/tauri/src/app.rs` 第 1798 行；底層是 wry
+的 `wkwebview/navigation.rs` 把 `WKUIDelegate` 的 `webContentProcessDidTerminate:`
+轉呼叫上來）。content process 死掉時會先記一筆 `log::warn!`，接著呼叫
+`Webview::reload()` 自救——tauri 本身不會自動重載，這兩步都是我們自己接的。
+
+### 診斷指引：使用者若再遇到白屏
+
+第一步查 `traytunnel.log`（macOS 預設路徑
+`~/Library/Logs/<identifier>/traytunnel.log`）有沒有
+`webview content process terminated` 這行：
+
+- **有這行**：就是這個機制觸發了，`reload()` 應該已經自動處理掉；如果 reload
+  之後畫面還是白的，代表自救本身失敗，緊接著會多一行
+  `could not reload the webview after content process termination`，要往
+  「reload 當下時機不對」或「某些 macOS 版本 reload 不可靠」的方向查。
+- **沒有這行**：白屏另有原因，不是這個機制——先查資源載入路徑（絕對路徑／
+  自訂協定那類問題，見 `fix/macos-white-window` 的修正）或其他成因。
+
+這個防護目前無法在沒有真實記憶體壓力的情況下本機實測觸發（`memory_pressure`
+工具可以模擬，但屬於壓力測試，未列入本次交付範圍），靠型別檢查與 CI 守門；
+一旦有使用者真的在日誌裡看到這行 warn，就是這條防護第一次被證實在真實情境
+下觸發過，值得回頭補一筆記錄。
 
 ## 發佈管線：`latest.json` 的 `version` 全域語意限制
 

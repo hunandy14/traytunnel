@@ -148,7 +148,7 @@ pub fn run() {
     // 回來的是要補進活動日誌的行——AppState 這時還不存在，先收著，setup 裡再記。
     let update_notes = update::apply_pending_at_startup(is_tray_start());
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // single-instance 必須第一個註冊：第二個實例只負責喚醒主視窗
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
@@ -169,7 +169,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // 記住主視窗位置／大小，重啟不歸零置中。旗標不含 VISIBLE，
         // 還原完全不碰顯示狀態，理由見 winstate 模組開頭的說明
-        .plugin(tauri_plugin_window_state::Builder::new().with_state_flags(winstate::flags()).build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new().with_state_flags(winstate::flags()).build(),
+        )
         // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
         // 前端一律走我們自己的指令，不開它的 JS 權限
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -208,7 +210,34 @@ pub fn run() {
             commands::window_close,
             commands::window_minimize,
             commands::exit_app,
-        ])
+        ]);
+
+    // WKWebView 的渲染跑在獨立於本體行程的系統行程（com.apple.WebKit.WebContent），
+    // 這個行程可以被系統獨立回收——真正的觸發條件是系統記憶體壓力（jetsam 式回收），
+    // 不是單純隱藏視窗就會發生；但沒有可見視窗、又切到 Accessory（見 show_main／
+    // hide_to_tray 那組動態 activation policy）的 app，它的 WebContent 行程在記憶體
+    // 壓力發生時會是優先被犧牲的對象。行程死掉後 WKWebView 不會自己重新載入，
+    // 畫面會一直卡在白屏，直到使用者手動整個重開 app。
+    //
+    // tauri 有官方掛鉤能偵測這個事件並在這裡自救：`Builder::on_web_content_process_terminate`
+    // （macOS／iOS 專屬，已核對存在於我們釘死的 tauri-v2.11.5 標籤，
+    // crates/tauri/src/app.rs 第 1798 行；底層是 wry 的 wkwebview/navigation.rs
+    // 把 WKUIDelegate 的 webContentProcessDidTerminate: 轉呼叫上來）。tauri 本身
+    // 不會自動重載，要自己呼叫 `Webview::reload`；先記一筆 warn 才有辦法從日誌
+    // 回頭確認這件事真的發生過——使用者若再遇到白屏，第一步就是查
+    // traytunnel.log 有沒有這行，有就是這個機制，沒有就要往別的方向查。
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        log::warn!(
+            "webview content process terminated (label: {}), reloading to self-heal",
+            webview.label()
+        );
+        if let Err(e) = webview.reload() {
+            log::warn!("could not reload the webview after content process termination: {e}");
+        }
+    });
+
+    builder
         .setup(|app| {
             // 純 tray 常駐：不要 Dock 圖示、不要出現在 Cmd+Tab 切換器。traytunnel
             // 是系統匣工具，沒有「一般 App」該有的存在感（對應 Windows 沒有工作列
