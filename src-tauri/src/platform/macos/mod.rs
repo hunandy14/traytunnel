@@ -27,10 +27,17 @@
 //! 直接呼叫 tauri 的 `AppHandle::set_activation_policy`，屬於一行等級的
 //! 外部 API 呼叫，跟既有的初始 policy 設定同一種寫法，留在 `lib.rs` 裡
 //! `#[cfg(target_os = "macos")]` 內聯，沒有另外進這裡。
+//!
+//! `pgids`（受監督行程群組的磁碟登記簿與啟動時的收屍）與
+//! `spawn::install_termination_handler`（SIGTERM／SIGHUP／SIGINT）同樣是刻意
+//! **不對稱**的門面項目：Windows 的 Job Object 有核心層級的
+//! `KILL_ON_JOB_CLOSE`，那一整套補救在 Windows 上沒有對應語意，也沒有需要。
+//! 兩者的門面轉出（`platform/mod.rs`）都整段 `#[cfg(target_os = "macos")]`。
 
 mod menu;
 mod notify;
 mod paths;
+mod pgids;
 mod spawn;
 mod sys;
 pub mod update;
@@ -38,7 +45,8 @@ pub mod update;
 pub use menu::{build as build_menu, QUIT_ID as MENU_QUIT_ID};
 pub use notify::{prepare_notifications, show_notification};
 pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
-pub use spawn::ProcessSupervisor;
+pub use pgids::sweep_leftovers as sweep_supervised_leftovers;
+pub use spawn::{install_termination_handler, ProcessSupervisor};
 pub use sys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
     local_time_hms, pick_icon_layer, read_autostart_command, reveal_in_file_manager,

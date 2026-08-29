@@ -36,6 +36,27 @@ pub use imp::update;
 // 呼叫端只負責組命令列。
 pub use imp::ProcessSupervisor;
 
+// ---------------------------------------------------------------- 程序樹的收尾（僅 macOS）
+//
+// 這兩個名字**只有 macOS 有**，而且是刻意的不對稱（同 `build_menu` 那一段的
+// 理由）：Windows 的 Job Object 帶著核心層級的 `KILL_ON_JOB_CLOSE`——handle
+// 一關，不管行程是正常退出、當掉、被工作管理員結束還是登出，核心都會把整個
+// job 收乾淨，使用者空間一行程式碼都不必跑。
+//
+// macOS 沒有等價物：`ProcessSupervisor` 的收尾是 `Drop`，那是使用者空間的
+// 程式碼，被 SIGKILL／SIGTERM 帶走或當掉時一次都不會跑，於是 `ssh -N` 會變成
+// 孤兒繼續握著 `-L` 的本地埠。差額由這兩支補：
+//
+// * `install_termination_handler`：掛 SIGTERM／SIGHUP／SIGINT，讓那些路徑也走
+//   得到我們自己的收尾（呼叫端決定收尾要做什麼，這裡只負責「怎麼接住訊號」）。
+// * `sweep_supervised_leftovers`：啟動時把上一輪被 SIGKILL／當機留下的程序樹
+//   清掉——那一格沒有任何當下補救的辦法，只能事後收屍。
+//
+// Windows 編譯時這兩個名字根本不存在，呼叫端（`lib.rs`）也用同一個 cfg 包住，
+// 不會有「呼叫了但 Windows 沒實作」這種事。
+#[cfg(target_os = "macos")]
+pub use imp::{install_termination_handler, sweep_supervised_leftovers};
+
 // ---------------------------------------------------------------- 本地埠偵測
 //
 /// 本地是否有程序在該埠 Listen。連線判定與 spawn 前的埠檢查都靠它。

@@ -163,15 +163,34 @@ pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
 // 一個平台去動共用介面或 Windows 那半邊。往下挖一層會發現外掛自己也只是把
 // `auto_launch::AutoLaunch`（一顆完全不依賴 Manager 的 crate）包成 Tauri managed
 // state 而已；追加整顆外掛只換來一份用不到的 Tauri command／state 掛載，划不來。
-// 因此直接照 launchd 慣例管 plist：語意等同外掛的 `MacosLauncher::LaunchAgent`
-// 模式（`RunAtLoad` + `launchctl load/unload`），零新增依賴。
+//
+// **這一組只寫檔案，一次都不呼叫 `launchctl`**——這正是 `auto_launch` 0.5 的
+// `macos.rs`（也就是外掛底下真正在做事的那一層）在 LaunchAgent 模式下的作法：
+// enable 就是把 plist 寫進 `~/Library/LaunchAgents`，disable 就是把它刪掉，
+// 生效時機是**下一次登入**（launchd 登入時自己讀那個資料夾）。
+//
+// 為什麼不「順手 load 一下讓它立即生效」——那正是這一版修掉的兩個缺陷：
+//
+// 1. **`launchctl unload` 會殺掉 app 自己。** 這份 plist 的 `RunAtLoad` 是 true、
+//    `ProgramArguments` 就是 `[<exe>, --tray]`，所以「登入時自啟進來」的那個
+//    實例**本身就是這個 job 的行程**。對它 `unload`，launchd 會對我們自己送
+//    SIGTERM：app 無預警死亡，`do_exit`／`kill_all_jobs` 一行都不會跑，ssh 子程序
+//    （自成 pgid）當場變孤兒繼續佔著 `-L` 的本地埠，而 `unload` 之後那句刪檔
+//    也永遠執行不到——下次登入照樣自啟、開關照樣顯示 ON，等於這個「關閉自啟」
+//    的動作除了把 app 弄死以外什麼都沒做。
+// 2. **`launchctl load -w` 會當場多開一個實例。** `RunAtLoad = true` 的 job 一被
+//    load 就立刻執行 `<exe> --tray`，它被 single-instance 外掛轉成對主實例的
+//    `show_main`——使用者只是在設定頁打開一個開關，畫面卻自己跳出來。
+//
+// 立即生效換來的好處（省下一次登入）遠不值這兩個代價，何況「開機自啟」這件事
+// 本來就是在講下一次開機。Windows 那邊寫 HKCU 的 Run 值同樣是下次登入才生效，
+// 兩個平台的語意因此也是對齊的。
 
 /// LaunchAgent plist 所在資料夾：`~/Library/LaunchAgents`。
 ///
-/// 只有這一支（與 [`launchctl_load`]／[`launchctl_unload`]）會碰真的使用者家目錄
-/// 與真的 launchd——底下的 `*_at` 系列全部改吃呼叫端傳進來的 `base: &Path`，
-/// 測試才能打 tempdir 而不必污染實機或 CI runner（獨立審查 2026-08-29 阻擋缺陷：
-/// 預設測試輪不准碰真實系統）。
+/// 只有這一支會碰真的使用者家目錄——底下的 `*_at` 系列全部改吃呼叫端傳進來的
+/// `base: &Path`，測試才能打 tempdir 而不必污染實機或 CI runner（獨立審查
+/// 2026-08-29 阻擋缺陷：預設測試輪不准碰真實系統）。
 fn launch_agents_dir() -> Option<PathBuf> {
     super::paths::home_dir().map(|h| h.join("Library").join("LaunchAgents"))
 }
@@ -263,61 +282,42 @@ fn read_program_arguments(contents: &str) -> Option<String> {
     }
 }
 
-/// 開機自啟目前是不是真的登記著：plist 檔案在就算數。純檔案 I/O，不碰 launchctl，
+/// 開機自啟目前是不是真的登記著：plist 檔案在就算數。純檔案 I/O，
 /// `base` 讓測試可以傳 tempdir。
 ///
 /// 與 Windows 的 `autostart_enabled` 不完全對稱：Windows 那邊還會再看工作管理員
 /// 的 StartupApproved 停用紀錄，macOS（13 起）的「登入項目」系統設定也有等價的
 /// 使用者停用機制，但要偵測它得挖 `SMAppService` 的狀態或系統的背景任務管理
-/// 資料庫，複雜度與這一輪的範疇不成比例，先留給之後補（見 PR 說明的偏離事項）。
+/// 資料庫，複雜度與這一輪的範疇不成比例，先留給之後補（README「已知限制」
+/// 有對使用者的說明）。
 fn autostart_enabled_at(base: &Path, name: &str) -> bool {
     plist_path_in(base, name).is_file()
 }
 
 /// 讀 plist 裡的 `ProgramArguments`，用來判斷開機自啟項是不是還指向這支執行檔。
-/// 純檔案 I/O，不碰 launchctl。
+/// 純檔案 I/O。
 fn read_autostart_command_at(base: &Path, name: &str) -> Option<String> {
     let contents = std::fs::read_to_string(plist_path_in(base, name)).ok()?;
     read_program_arguments(&contents)
 }
 
-/// 把 LaunchAgent plist 寫進 `base` 資料夾，回傳寫出去的路徑。純檔案 I/O，
-/// 不碰 launchctl——要不要、什麼時候 `load` 是呼叫端（[`enable_autostart`]）的事。
+/// 把 LaunchAgent plist 寫進 `base` 資料夾，回傳寫出去的路徑。
+/// 覆寫既有檔案就是「更新登記內容」（自癒改寫 `ProgramArguments` 走的正是這條），
+/// launchd 下次登入讀到的自然是新的那一份。
 fn write_autostart_plist_at(base: &Path, name: &str, exe: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(base)?;
-    let label = plist_label(name);
-    let path = base.join(format!("{label}.plist"));
-    std::fs::write(&path, plist_contents(&label, exe))?;
+    let path = plist_path_in(base, name);
+    std::fs::write(&path, plist_contents(&plist_label(name), exe))?;
     Ok(path)
 }
 
-/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功）。純檔案 I/O，
-/// 不碰 launchctl。
+/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功）。
 fn remove_autostart_plist_at(base: &Path, name: &str) -> io::Result<()> {
     match std::fs::remove_file(plist_path_in(base, name)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-/// `launchctl load -w`，讓剛寫好的 plist 立即生效（不必等下次登入）。
-/// 薄函式，唯一目的是把「真的呼叫 launchctl」這件事收在一支好認的名字底下，
-/// 預設測試輪完全不呼叫它——只有 [`enable_autostart`] 與手動的 `#[ignore]`
-/// 實機測試會碰到。
-fn launchctl_load(path: &Path) -> io::Result<()> {
-    let status =
-        std::process::Command::new("launchctl").arg("load").arg("-w").arg(path).status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("launchctl load exited with {status}")));
-    }
-    Ok(())
-}
-
-/// `launchctl unload`，失敗（例如根本沒登記過）不當一回事——收尾用，
-/// 不該讓「本來就沒登記」變成錯誤。同樣是薄函式，預設測試輪不呼叫它。
-fn launchctl_unload(path: &Path) {
-    let _ = std::process::Command::new("launchctl").arg("unload").arg(path).output();
 }
 
 /// 開機自啟目前是不是真的登記著。
@@ -330,31 +330,27 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
     read_autostart_command_at(&launch_agents_dir()?, name)
 }
 
-/// 寫出 LaunchAgent plist 並 `launchctl load` 讓它立即生效（不必等下次登入）。
+/// 寫出（或覆寫）LaunchAgent plist，**下次登入生效**。
 ///
-/// 先 `unload` 舊的（若有）再覆寫再 `load`：直接覆寫檔案不會讓 launchd 認得
-/// 內容已經變了，重新登記才會讓新的 `ProgramArguments`（例如執行檔搬過位置後
-/// 的自癒）真正生效。`unload` 失敗（例如根本沒登記過）不當一回事，只有最後的
-/// `load` 失敗才回錯——那才是使用者真正在意的「自啟到底有沒有打開」。
+/// 不呼叫 `launchctl load`：`RunAtLoad = true` 的 job 一被 load 就會當場再跑一次
+/// `<exe> --tray`，多開一個實例（理由整段寫在本節開頭）。覆寫檔案本身就足以更新
+/// 登記內容——launchd 是在下次登入時才讀這個資料夾的。
 pub fn enable_autostart(name: &str, exe: &Path) -> io::Result<()> {
     let dir = launch_agents_dir()
         .ok_or_else(|| io::Error::other("could not resolve $HOME for ~/Library/LaunchAgents"))?;
-    launchctl_unload(&plist_path_in(&dir, name));
-    let path = write_autostart_plist_at(&dir, name, exe)?;
-    launchctl_load(&path)
+    write_autostart_plist_at(&dir, name, exe).map(|_| ())
 }
 
-/// `launchctl unload` 並刪掉 plist；兩者都是冪等操作，跟 Windows
-/// `disable_autostart` 刪 Run 值的冪等語意一致。
+/// 刪掉 plist，**下次登入生效**；冪等，跟 Windows `disable_autostart` 刪 Run 值的
+/// 冪等語意一致。
+///
+/// 同樣不呼叫 `launchctl unload`：這個行程很可能**就是**那個 job 的行程，unload
+/// 等於請 launchd 把我們自己殺掉（理由整段寫在本節開頭）。刪檔就夠了。
 pub fn disable_autostart(name: &str) -> io::Result<()> {
     let Some(dir) = launch_agents_dir() else {
         // 問不到 $HOME，沒有地方可能登記過，視同已經是關的
         return Ok(());
     };
-    let path = plist_path_in(&dir, name);
-    if path.is_file() {
-        launchctl_unload(&path);
-    }
     remove_autostart_plist_at(&dir, name)
 }
 
@@ -373,6 +369,25 @@ fn reveal_target(path: &Path, exists: bool) -> PathBuf {
     }
 }
 
+/// 跑一次 `open` 並等它結束。
+///
+/// **一定要 `status()`（等於 fork＋wait），不可以只 `spawn()`。** `open` 只是把
+/// 請求交給 LaunchServices 就立刻退出，本身不是長命程序；但這支程式沒有任何
+/// 地方會去 `wait` 它——tokio 的 reaper 只認得 `tokio::process` spawn 出來的
+/// 子程序，`std::process::Child` 被 drop 時預設**不**回收（`Child::drop` 明文
+/// 寫著「不會 wait，可能留下殭屍」）。於是每按一次「開啟設定檔資料夾」或
+/// 「Download from Releases」就在行程表裡積一隻 `<defunct>`，常駐幾天下來
+/// 就是一整排。等它退出還順帶換來一個好處：`open` 失敗（檔案不存在、沒有
+/// 對應的處理程式）現在會變成一個真的 `Err` 往上回，呼叫端本來就有記日誌的
+/// 分支，以前那條路是完全靜默的。
+fn run_open(cmd: &mut std::process::Command) -> io::Result<()> {
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("open exited with {status}")));
+    }
+    Ok(())
+}
+
 /// 在 Finder 裡開啟並選中一個檔案，對應 Windows 的 `explorer.exe /select,`。
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     let exists = path.exists();
@@ -381,7 +396,8 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     if exists {
         cmd.arg("-R");
     }
-    cmd.arg(&target).spawn().map(|_| ())
+    cmd.arg(&target);
+    run_open(&mut cmd)
 }
 
 /// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteW）。
@@ -399,7 +415,7 @@ pub fn open_url(url: &str) -> io::Result<()> {
     if !url.starts_with("https://") {
         return Err(io::Error::other(format!("refusing to open a non-https url: {url}")));
     }
-    std::process::Command::new("open").arg(url).spawn().map(|_| ())
+    run_open(std::process::Command::new("open").arg(url))
 }
 
 #[cfg(test)]
@@ -514,19 +530,26 @@ mod tests {
     }
 
     /// 開機自啟一輪完整的實機操作：寫真的 `~/Library/LaunchAgents/<label>.plist`、
-    /// `launchctl load -w`、讀回命令、`launchctl unload`、刪檔。**會動真的
-    /// launchd**（`-w` 還會在 launchd 的 override 資料庫留下紀錄），比照
-    /// `wg_live_tests`／`exits::live_probe` 的慣例刻意 `#[ignore]`，預設測試輪
-    /// 不跑，只有手動指定才會跑：
+    /// 讀回命令、刪檔。**會動使用者真的家目錄**，比照 `wg_live_tests`／
+    /// `exits::live_probe` 的慣例刻意 `#[ignore]`，預設測試輪不跑，只有手動指定
+    /// 才會跑：
     ///
     /// cargo test --lib -- --ignored --nocapture live_autostart
+    ///
+    /// 這一條**不再往返 launchd**：`enable_autostart`／`disable_autostart` 現在
+    /// 只寫／刪檔案，一次都不呼叫 `launchctl`（理由見「開機自啟」那一節開頭
+    /// ——`unload` 會殺掉 app 自己，`load -w` 會當場多開一個實例）。因此能測、
+    /// 也只該測的就是檔案語意；沿用舊名字反而會讓人以為還有一段 launchd 往返
+    /// 沒被驗到，於是改名。留著它而不是刪掉，是因為它仍然是唯一一條會走
+    /// `launch_agents_dir()`（真的 `$HOME`）的路——`autostart_files_round_trip_in_a_tempdir`
+    /// 打的是 tempdir，驗不到「家目錄解析＋建資料夾」這一段。
     ///
     /// 比照 Windows `hkcu_value_round_trip`，測試名稱帶 pid 避免撞到使用者真正
     /// 的登記項，收尾一定會把測試用的 plist 清掉；但中途 assert 失敗仍可能跳過
     /// 收尾，這正是這條不准留在預設測試輪的理由。
     #[test]
     #[ignore]
-    fn live_autostart_round_trips_through_launchd() {
+    fn live_autostart_round_trips_through_the_launch_agents_folder() {
         let name = format!("traytunnel-test-{}", std::process::id());
         let exe = std::env::current_exe().expect("測試需要拿得到自己的執行檔路徑");
 
