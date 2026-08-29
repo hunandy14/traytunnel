@@ -380,6 +380,11 @@ fn reveal_target(path: &Path, exists: bool) -> PathBuf {
 /// 就是一整排。等它退出還順帶換來一個好處：`open` 失敗（檔案不存在、沒有
 /// 對應的處理程式）現在會變成一個真的 `Err` 往上回，呼叫端本來就有記日誌的
 /// 分支，以前那條路是完全靜默的。
+///
+/// **代價：這支函式會阻塞**——`open` 自己雖然很快就退出，但它退出前要等
+/// LaunchServices 把目標程式叫起來，冷啟一個 Finder 視窗或瀏覽器要一到三秒。
+/// 因此呼叫端不可以在主執行緒上等它，`commands.rs` 那三支指令一律把它丟進
+/// `spawn_blocking`（同一份紀律的完整說明寫在那裡）。
 fn run_open(cmd: &mut std::process::Command) -> io::Result<()> {
     let status = cmd.status()?;
     if !status.success() {

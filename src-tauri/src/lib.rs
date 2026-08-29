@@ -272,29 +272,73 @@ fn kill_jobs_on_final_exit(app: &AppHandle, event: &tauri::RunEvent) {
 /// 開的那條普通執行緒上，不是訊號處理常式裡，所以拿鎖、寫日誌、呼叫
 /// `AppHandle::exit` 都是安全的（見 `platform::install_termination_handler`）。
 ///
-/// 後面那段寬限＋硬退出是給「事件迴圈根本沒有回應」準備的：那時候
-/// `AppHandle::exit` 送出去的訊息沒人處理，行程會就這樣掛著，而送訊號的人
-/// （使用者、launchd）等的是它結束。程序樹在 `do_exit` 那一行就已經收乾淨了，
-/// 所以這裡直接離開不會留下任何東西。
+/// 三道保險，順序本身就是規格：
+///
+/// 1. **寬限計時器要在 `do_exit` 之前起跑**，而且是從「收到訊號」那一刻起算，
+///    不是從「收尾做完」起算。送訊號的人（使用者、launchd 的登出流程）等的是
+///    行程結束，`do_exit` 自己卡住（例如某把鎖被別的執行緒抓著不放）也一樣要
+///    有人把行程帶走；排在後面的話這個計時器根本不會被建立。
+/// 2. **`do_exit` 用 `catch_unwind` 包住**。`kill_all_jobs` 裡有好幾處
+///    `.lock().unwrap()`，鎖一旦中毒（別的執行緒持鎖時 panic）這裡就會跟著
+///    panic；沒有這層包裝的話 panic 會直接把訊號執行緒炸掉，`signals.forever()`
+///    的迴圈就沒了——之後每一顆 SIGTERM 都被 signal-hook 的 handler 吃掉、
+///    卻再也沒有人處理，行程從此殺不死（`kill` 沒反應，只剩 `kill -9`）。
+///    `AssertUnwindSafe` 在這裡是誠實的：唯一跨越邊界的是 `Arc<AppState>`，
+///    而它內部的狀態就算被 panic 留在半途，我們接下來也只是要退出而已。
+/// 3. **第二次訊號直接硬退出**（`130` 是 shell 對 `SIGINT` 終止的慣例碼）。
+///    保留「按不動就再按一次 Ctrl+C」這個所有人都有的肌肉記憶，不必等寬限跑完。
+///
+/// ## 硬退出這條路會少做什麼
+///
+/// `process::exit` 不會發 `RunEvent::Exit`，所以兩顆外掛的收尾都不會跑，
+/// 明列在這裡免得日後有人以為它是無損的：
+///
+/// * **single-instance 的 `/tmp/<id>_si.sock` 會留在磁碟上。** 無害：那顆
+///   socket 沒有人在 listen，下一次啟動 `connect` 會拿到 `ConnectionRefused`，
+///   外掛自己就把它清掉再重新 listen（見該外掛 `platform_impl/macos.rs`）。
+/// * **這一次的視窗位置／大小不會被存下來**，下次開窗回到上一次存過的幾何。
+///
+/// 刻意**不**在這裡補一句「存一下視窗狀態」：`tauri-plugin-window-state` 的
+/// `save_window_state` 要去問每一扇視窗的位置與大小，那些呼叫會被派回主執行緒
+/// ——而走到硬退出這條路的前提就是主執行緒已經不回應了，補這一句只會讓收尾
+/// 卡在同一個地方，把「至少會結束」也一起賠掉。
 #[cfg(target_os = "macos")]
 fn install_signal_exit(state: &Shared) {
-    /// 從「已經收完程序樹」到「還是不肯結束」之間給事件迴圈的寬限。
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 從**收到訊號**起算，給收尾與事件迴圈的寬限。
     const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+    static SIGNALS_SEEN: AtomicUsize = AtomicUsize::new(0);
 
     let st = state.clone();
     let installed = platform::install_termination_handler(move |name| {
+        if SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst) > 0 {
+            log::warn!("received {name} again, leaving immediately");
+            std::process::exit(130);
+        }
         log::warn!("received {name}, killing every supervised process tree before exiting");
-        st.log(format!("received {name}, exiting"));
-        do_exit(&st);
+
+        // (1) 先起跑再收尾——理由見上面那段
         std::thread::spawn(|| {
             std::thread::sleep(GRACE);
-            log::warn!(
-                "the event loop did not exit within {}s of the signal; leaving the hard way \
-                 (every supervised process tree is already gone)",
-                GRACE.as_secs()
-            );
+            log::warn!("still here {}s after the signal; leaving the hard way", GRACE.as_secs());
             std::process::exit(0);
         });
+
+        // (2) 收尾 panic 不可以把這條訊號執行緒帶走
+        let st = st.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            st.log(format!("received {name}, exiting"));
+            do_exit(&st);
+        }))
+        .is_err()
+        {
+            log::error!(
+                "the shutdown path panicked while handling {name} (a poisoned lock?); \
+                 the grace timer will take the process down"
+            );
+        }
     });
     if let Err(e) = installed {
         log::warn!("could not install the termination signal handler: {e}");
