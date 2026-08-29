@@ -21,10 +21,11 @@ use std::path::Path;
 
 /// 彈一顆系統通知。失敗只記一行警告——通知從來不是關鍵路徑，
 /// 與 Windows `show_notification` 的失敗處理原則一致。
-pub fn show_notification(aumid: &str, title: &str, body: &str) {
-    if let Err(e) = notify_rust::set_application(aumid) {
-        log::warn!("could not set the notification application id: {e}");
-    }
+///
+/// 應用身分掛名（`set_application`）只在 `prepare_notifications` 做一次：
+/// `mac-notification-sys` 底層用 `Once` 實作，第二次起呼叫必回
+/// `AlreadySet` 錯誤——這裡若還跟著呼叫，每顆通知都會白噴一行假警告。
+pub fn show_notification(_aumid: &str, title: &str, body: &str) {
     if let Err(e) = notify_rust::Notification::new().summary(title).body(body).show() {
         log::warn!("failed to show notification: {e}");
     }
