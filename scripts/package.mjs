@@ -114,8 +114,20 @@ function parseCliTarget() {
 }
 
 const version = readVersion();
-const release = join(root, "src-tauri", "target", "release");
 const target = parseCliTarget();
+
+// Cargo／Tauri 的建置輸出目錄規則：完全不帶 --target 時，輸出在
+// target/release/（host 三元組隱含在路徑之外）；只要明確帶了 --target
+// （不管是不是剛好等於 host 的三元組），輸出一律搬進 target/<triple>/release/
+// 這一層額外的子目錄——這是 rustc／cargo 本身的行為，tauri 的 bundler 照樣
+// 沿用（見 tauri build 實際印出的 Bundling .../target/<triple>/release/bundle/...
+// 路徑）。M9 把 --target 從「不傳」改成「一律明確傳」之後，這裡如果還沿用
+// 舊的 target/release/ 路徑，會導致所有來源檔案都找不到——而且 M10 的
+// fail-closed 檢查會忠實地把這個路徑錯誤回報成「產物缺失」，看起來像建置
+// 失敗，其實只是這裡沒跟著 --target 調整路徑。
+const release = target
+  ? join(root, "src-tauri", "target", target, "release")
+  : join(root, "src-tauri", "target", "release");
 
 let platformKey;
 let osFamily; // "darwin" | "windows"
