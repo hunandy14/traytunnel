@@ -29,10 +29,31 @@ function htmlVersionPlugin(version: string): Plugin {
   };
 }
 
+/**
+ * <html data-platform="..."> 的建置期替換：mac 原生視窗風格（圓角＋紅綠燈）
+ * 對前端來說只是一個 CSS 分歧點（見 styles.css 的 [data-platform="macos"]
+ * 規則），不需要引入 @tauri-apps/plugin-os 這類執行期偵測——CI 的 build
+ * matrix 本來就是 windows-latest／macos-latest 各自原生編譯（見
+ * docs/platform-guide.md），建置機的 process.platform 跟執行機的 OS
+ * 保證一致，`npm run dev` 也是同一台機器，建置期判斷完全夠用。
+ */
+function htmlPlatformPlugin(nodePlatform: string): Plugin {
+  const platform = nodePlatform === "darwin" ? "macos" : "windows";
+  return {
+    name: "html-platform-placeholder",
+    transformIndexHtml(html) {
+      return html.replace("__PLATFORM_PLACEHOLDER__", platform);
+    },
+  };
+}
+
+// @ts-expect-error process 是 nodejs 全域變數
+const nodePlatform: string = process.platform;
+
 export default defineConfig(async () => ({
   // 不要蓋掉 rust 端的錯誤訊息
   clearScreen: false,
-  plugins: [htmlVersionPlugin(pkgVersion)],
+  plugins: [htmlVersionPlugin(pkgVersion), htmlPlatformPlugin(nodePlatform)],
   define: {
     __APP_VERSION__: JSON.stringify(pkgVersion),
   },

@@ -827,9 +827,11 @@ function requestDelete(local: number) {
 
 /**
  * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
- * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
- * 與 Alt+F4 都是不經過這顆按鈕的關窗路徑（前者是 Rust 端直接處理，後者是
- * 視窗系統直接關閉），前端這裡一律攔不到，是已知限制。
+ * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit、
+ * Alt+F4、mac 原生紅綠燈的關閉鈕（mac 上這顆按鈕本來就藏起來，紅綠燈接手同一份
+ * window_close 語意，見 styles.css 的 [data-platform="macos"] 規則）都是不經過
+ * 這顆按鈕的關窗路徑（前兩者是 Rust 端／視窗系統直接處理，後者是 AppKit 標準的
+ * performClose 直接觸發 CloseRequested），前端這裡一律攔不到，是已知限制。
  *
  * 回傳 Promise.allSettled，讓呼叫端能等所有 commit 真的送出去再繼續往下
  * 呼叫 windowClose——這是裁決採納的廉價保險：目前驗證過同一 tick 內派送

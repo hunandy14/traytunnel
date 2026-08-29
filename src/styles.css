@@ -156,6 +156,35 @@ body {
   color: #fff;
 }
 
+/* 純排版用的包裹層，讓 −/× 兩顆鈕在 mac 上可以整組一次隱藏（見下方
+   [data-platform="macos"] 規則）。flex 屬性照抄 .titlebar 本來的排列方式，
+   多這層 wrapper 不能改變 Windows 那邊的既有間距。 */
+.win-controls {
+  display: flex;
+  align-items: center;
+}
+
+/* ------------------------------------------------------------ macOS 原生視窗風格
+   data-platform 由 vite.config.ts 在建置期寫進 <html>（見 index.html 開頭註解），
+   兩邊唯一的視覺分歧收在這裡：
+   - 藏掉 Windows 風格的自繪 −/×，原生紅綠燈接手同樣的語意（見 lib.rs 的
+     window_close／window_minimize，兩邊呼叫的是同一批指令）。
+   - 標題列讓出左上角，紅綠燈（trafficLightPosition 用 tauri.macos.conf.json
+     的預設值）才不會被 app icon／標題文字蓋住或疊在一起。72px 是先抓一個
+     略寬於原生三顆燈＋內距的估計值，實機跑起來偏了再調。 */
+html[data-platform="macos"] .win-controls {
+  display: none;
+}
+
+html[data-platform="macos"] .titlebar {
+  height: 38px;
+  padding-left: 72px;
+}
+
+html[data-platform="macos"] .titlebar .app-icon {
+  margin-left: 0;
+}
+
 /* ------------------------------------------------------------ 骨架 */
 
 .shell {

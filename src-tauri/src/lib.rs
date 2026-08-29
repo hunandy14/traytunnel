@@ -42,7 +42,17 @@ fn is_tray_start() -> bool {
     })
 }
 
+/// 視窗要出現之前先把 activation policy 切回 Regular：選單列／Dock 圖示
+/// 才會跟著視窗一起接管（純系統匣的 Accessory 沒有選單列，也不進 Dock／
+/// Cmd+Tab）。刻意排在 `w.show()` 之前而不是之後——Apple Developer Forums
+/// 對這顆 API 的長年迴響是「切完 policy 立刻操作視窗容易撞到第一次開啟
+/// 閃一下」，讓 AppKit 先吃到 policy 變更、視窗操作晚一步跟上，比兩者
+/// 同一瞬間做完更穩。
 fn show_main(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+        log::warn!("could not switch to the Regular activation policy: {e}");
+    }
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
         let _ = w.show();
         let _ = w.unminimize();
@@ -59,6 +69,12 @@ fn balloon(app: &AppHandle, body: &str) {
 fn hide_to_tray(state: &Shared) {
     if let Some(w) = state.app.get_webview_window(MAIN_WINDOW) {
         let _ = w.hide();
+    }
+    // 視窗收起來就回 Accessory：Dock 圖示與選單列跟著消失，回到純系統匣常駐
+    // 的樣子，跟 show_main 的 Regular 對稱。
+    #[cfg(target_os = "macos")]
+    if let Err(e) = state.app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
+        log::warn!("could not switch to the Accessory activation policy: {e}");
     }
     if state.take_tray_hint() {
         balloon(&state.app, "Closed to tray, still running. Double-click the tray icon to reopen.");
@@ -227,6 +243,24 @@ pub fn run() {
             update::restore_staged(&shared);
 
             build_tray(&handle, &shared)?;
+
+            // macOS 標準選單列（App／Edit／Window）：沒有這份選單，WKWebView
+            // 的輸入框連 Cmd+C／Cmd+V／Cmd+A 都按不動（macOS 的快捷鍵走選單系統
+            // 分派，不是直接進 responder chain），見 platform::macos::menu 模組
+            // 開頭的說明。Quit 項目自訂了 id，事件路由到這裡呼叫 `do_exit`，
+            // 語意對齊系統匣選單既有的 Exit（`PredefinedMenuItem::quit` 會直接
+            // `exit(0)`，繞過 `kill_all_jobs`，同一份模組註解裡也記了原因）。
+            #[cfg(target_os = "macos")]
+            {
+                let menu = platform::build_menu(&handle)?;
+                app.set_menu(menu)?;
+                let quit_state = shared.clone();
+                app.on_menu_event(move |_app_handle, event| {
+                    if event.id().as_ref() == platform::MENU_QUIT_ID {
+                        do_exit(&quit_state);
+                    }
+                });
+            }
 
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
                 // 工作列的視窗按鈕吃的是 SM_CXICON（175% 下 56px），codegen 給的是
