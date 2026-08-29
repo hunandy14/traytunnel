@@ -342,7 +342,7 @@ pub fn local_time_hms() -> String {
 /// 給一張解析度夠高的正方形圖即可：Apple 選單列圖示的建議尺寸是 22×22pt，
 /// 2x（Retina）算下來是 44×44px，這裡就回這個目標尺寸。
 ///
-/// macOS 系統匣現在的主要圖示是 [`crate::appicon::tray_icon_template`]（另外
+/// macOS 系統匣現在的主要圖示是 [`super::trayicon::tray_icon_template`]（另外
 /// 一份純黑＋透明的 template PNG，見 `assets/gen-tray-template.py`），不會走這裡的
 /// ICO 挑層；這一支純粹是 `appicon::tray_icon()`（template 圖載不到時的退路）要用
 /// 的「想要哪個 ICO 層」目標尺寸。
