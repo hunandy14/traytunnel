@@ -494,8 +494,15 @@ def to_svg(n: int, hint: bool, gradient: bool, note: str) -> str:
 # ---------------------------------------------------------------- 容器
 
 
-def png_bytes(n: int, rgba: bytes) -> bytes:
-    raw = b"".join(b"\x00" + bytes(rgba[y * n * 4 : (y + 1) * n * 4]) for y in range(n))
+def png_bytes(n: int, pixels: bytes, color_type: int = 6) -> bytes:
+    """組出最小可用的 PNG 容器。
+
+    `color_type` 預設 6（RGBA，8 位／通道，4 bytes/px）維持既有行為；
+    `gen-tray-template.py` 的灰底預覽圖沒有 alpha，改傳 2（RGB，3 bytes/px）
+    重用同一支編碼器，不必再另外維護一份 `rgb_png_bytes`。
+    """
+    bpp = 3 if color_type == 2 else 4
+    raw = b"".join(b"\x00" + bytes(pixels[y * n * bpp : (y + 1) * n * bpp]) for y in range(n))
 
     def chunk(tag, data):
         return (
@@ -507,7 +514,7 @@ def png_bytes(n: int, rgba: bytes) -> bytes:
 
     return (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 6, 0, 0, 0))
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, color_type, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(raw, 9))
         + chunk(b"IEND", b"")
     )
