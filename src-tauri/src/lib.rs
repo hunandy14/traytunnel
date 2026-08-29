@@ -294,6 +294,28 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
     platform::prepare_notifications(&aumid, &product, &exe)
 }
 
+// ---------------------------------------------------------------- 前端平台旗標
+//
+// `<html data-platform="...">` 是前端唯一的平台視覺分歧點（見 styles.css 的
+// `[data-platform="macos"]` 規則：mac 上藏自繪的 −/× 換原生紅綠燈、幫紅綠燈
+// 留左上角空間）。舊做法是 vite.config.ts 的 htmlPlatformPlugin 在**建置期**
+// 依 Node 的 `process.platform` 蓋進 `dist/index.html`——建置機的 OS 跟執行機
+// 保證一致這個前提，只在「每次都重新建置」時成立；`dist` 產物一旦跨機重用
+// （例如把 CI 產物搬到別台機器、或重複利用舊建置目錄），蓋進去的值就是錯的，
+// 而且沒有任何訊號會告訴你錯了。
+//
+// 改成**執行期**由 Rust 端決定：值來自 `cfg(target_os = "macos")`，跟執行機
+// 保證一致，不必像 `@tauri-apps/plugin-os` 那樣引入新依賴或執行期偵測。用官方
+// 的 webview initialization script（`tauri::plugin::Builder::js_init_script`，
+// 語意等同各別 webview 的 `initialization_script`：在全域物件建立後、HTML
+// 文件被解析之前、任何頁面自己的 script 執行之前跑）在頁面載入前把值寫進
+// `<html data-platform>`，vite.config.ts 的 htmlPlatformPlugin 與 index.html
+// 的佔位字串因此可以整段刪掉。
+#[cfg(target_os = "macos")]
+const PLATFORM_FLAG: &str = "macos";
+#[cfg(windows)]
+const PLATFORM_FLAG: &str = "windows";
+
 // ---------------------------------------------------------------- 進入點
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -340,6 +362,17 @@ pub fn run() {
         // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
         // 前端一律走我們自己的指令，不開它的 JS 權限
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 前端平台旗標（見上方 PLATFORM_FLAG 說明）：頁面解析前把
+        // data-platform 寫進 <html>，取代建置期蓋章。這是一個只帶 init
+        // script、沒有 invoke handler 的迷你外掛，不是真的要接 JS 那一側的
+        // 訊息——`tauri::plugin::Builder` 本身就是官方 API，不算新依賴。
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("platform-flag")
+                .js_init_script(format!(
+                    "document.documentElement.dataset.platform = {PLATFORM_FLAG:?};"
+                ))
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::start_exit,
