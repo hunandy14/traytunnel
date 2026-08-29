@@ -21,7 +21,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # image-png：macOS 系統匣的 template PNG（assets/gen-tray-template.py 產生）要在
-# 執行期解成 RGBA，見 appicon::tray_icon_template。Windows 路徑仍走 ico crate 手解
+# 執行期解成 RGBA，見 platform::macos::trayicon。Windows 路徑仍走 ico crate 手解
 # ICO，不吃這個 feature，加這個 feature 對 Windows 沒有行為影響
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"

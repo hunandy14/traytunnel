@@ -102,6 +102,33 @@ pub use imp::local_time_hms;
 // 呼叫端 `crate::appicon`，不再由這裡分派。
 pub use imp::{large_icon_size, small_icon_size};
 
+// ---------------------------------------------------------------- 系統匣圖示
+//
+/// 系統匣圖示，連同「這張圖是不是 template image」的旗標一起回。
+///
+/// 旗標與圖必須同源，這是這支門面存在的全部理由。舊做法在 `lib.rs::build_tray`
+/// 裡分兩段 `cfg`：一段挑圖（macOS 先試 template PNG，解不開就退回彩色 ICO），
+/// 另一段無條件 `icon_as_template(true)`。退路一旦踩到，彩色圖就被當成 template
+/// 交給 AppKit——它只讀 alpha 通道重畫剪影，顏色整個丟掉，系統匣上是一團走樣的
+/// 黑影。回傳 `(Image, bool)` 之後這個分岔在型別上就不成立了。
+///
+/// Windows 恆 `false`（沒有 template image 這個概念，圖示直接吃自己的顏色）；
+/// macOS 只有真的解出 template PNG 那一條回 `true`。兩邊都在挑不到任何圖時回
+/// `None`，呼叫端寧可先把系統匣建起來也不要 panic。
+pub use imp::tray_icon;
+
+// ---------------------------------------------------------------- 系統匣手勢文案
+//
+/// 通知裡「怎麼把視窗叫回來」那半句，只給動作、不含尾巴的
+/// 「to reopen.」／「to open.」（呼叫端接）。
+///
+/// **與 `lib.rs::build_tray` 的點擊政策綁定**：Windows 是
+/// `show_menu_on_left_click(false)` ＋ 左鍵雙擊開窗，所以文案講雙擊；macOS 依
+/// D4 決議左右鍵一律開選單、沒有雙擊語意，文案因此指向選單裡的「Open window」
+/// 項。兩者是同一件事的兩面，改一邊就要改另一邊——所以文案跟 `tray_icon` 一起
+/// 住在各平台的 `trayicon` 子模組，而不是留在 `lib.rs` 手抄一組 `cfg` 常數。
+pub use imp::TRAY_OPEN_GESTURE_HINT;
+
 // ---------------------------------------------------------------- 開機自啟
 //
 // Windows 是 HKCU 的 Run 登錄項（外加工作管理員的 StartupApproved）。
@@ -156,6 +183,14 @@ pub use imp::{build_menu, MENU_QUIT_ID};
 // `platform::macos::policy`（該模組說明有解釋為什麼這裡跟 `build_menu` 走
 // 不同的門面風格）。跟本檔其他跨平台項目同款：一行 `pub use imp::{...}`
 // 轉出去，不在門面這層另外分 cfg。
+//
+// `initial_policy_for_tray_start` 收 `&AppHandle`、而且在 `setup` 裡呼叫，
+// 這兩件事本輪 review（M1）當成回歸查過又否掉了：唯一能在 launch 之前寫進
+// tao aux state 的位置是 `Builder::build()` 與 `App::run()` 之間，搬過去確實
+// 少掉啟動時那一格 `Foreground`，但會讓 tao 無條件執行的
+// `activateIgnoringOtherApps` 生效並**永久搶走鍵盤焦點**。三個時機的
+// lsappinfo／NSWorkspace 實測數據與結論全記在 `platform::macos::policy`
+// 模組開頭，別再走一次。
 pub use imp::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
 
 // ---------------------------------------------------------------- 介面契約測試

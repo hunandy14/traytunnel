@@ -1,10 +1,14 @@
-//! 應用程式圖示：多層 ICO 的挑層與解碼（Windows），以及 template PNG 的解碼
-//! （macOS）。
+//! 應用程式圖示：多層 ICO 的挑層與解碼。
 //!
 //! 系統匣與主視窗要的像素尺寸不同（SM_CXSMICON 與 SM_CXICON），高 DPI 下又會
-//! 各自變大，因此兩邊都自己挑層而不是交給 Tauri codegen 的預設圖示。macOS 的
-//! 系統匣圖示走完全不同的機制（template image，見 [`tray_icon_template`]），
-//! 不吃這裡的 ICO 挑層，但仍共用同一個模組，方便對照兩邊的職責。
+//! 各自變大，因此兩邊都自己挑層而不是交給 Tauri codegen 的預設圖示。
+//!
+//! **整份沒有任何 `cfg`**，這是規格：這裡只有「從一顆多層 ICO 挑一層解出來」
+//! 這件純邏輯，兩個平台跑的是同一份程式碼（macOS 走的是 [`tray_icon`] 這條
+//! 退路，見下）。macOS 系統匣真正要的 template image 走完全不同的機制，連同
+//! 它的 PNG、解碼與測試一起住在 `platform::macos::trayicon`——那裡才是「這個
+//! 平台怎麼做」該待的地方，而且圖與 `icon_as_template` 旗標必須同源（理由見
+//! `crate::platform::tray_icon` 的門面說明）。
 
 use std::io::Cursor;
 
@@ -55,7 +59,11 @@ fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
     Some(Image::new_owned(img.rgba_data().to_vec(), img.width(), img.height()))
 }
 
-/// 系統匣圖示：照 SM_CXSMICON（100% 是 16、175% 是 28）挑層
+/// 系統匣圖示：照 SM_CXSMICON（100% 是 16、175% 是 28）挑層。
+///
+/// Windows 的正選；macOS 上是 template PNG 解不開時的退路，拿到的是彩色圖，
+/// 呼叫端（`platform::macos::trayicon::tray_icon`）會把 template 旗標一併回成
+/// `false`，絕不可以套 `icon_as_template`。
 pub fn tray_icon() -> Option<Image<'static>> {
     ico_layer(platform::small_icon_size().0, "tray")
 }
@@ -64,30 +72,6 @@ pub fn tray_icon() -> Option<Image<'static>> {
 /// 這是工作列的視窗按鈕與 Alt+Tab 取的尺寸。
 pub fn window_icon() -> Option<Image<'static>> {
     ico_layer(platform::large_icon_size().0, "window")
-}
-
-/// macOS 系統匣要的 template image：純黑＋透明的剪影，系統依明暗模式（與選取狀態）
-/// 自動套色，不像 Windows 版直接吃自己的顏色。這份 PNG 不是從 `icon.ico` 挑層來
-/// 的——彩色圖硬套 template 只會依 alpha 通道畫出走樣的剪影——而是
-/// `assets/gen-tray-template.py` 另外算的一份：22×22pt、Retina 2x＝44×44px，
-/// 盾形當實心剪影、中央的「通道」環挖成真的透明洞、洞裡留一顆實心節點。
-///
-/// 只在 macOS 編譯：Windows 的系統匣圖示路徑（[`tray_icon`]）完全不動，
-/// 兩邊二選一發生在 `lib.rs::build_tray` 的 `cfg` 分支。
-#[cfg(target_os = "macos")]
-const TRAY_TEMPLATE_PNG: &[u8] = include_bytes!("../icons/tray-template.png");
-
-/// 解出 macOS 的 template 圖。失敗時回 `None`，呼叫端會退回 [`tray_icon`]
-/// （再退回 codegen 內建圖示），不會讓系統匣整個起不來。
-#[cfg(target_os = "macos")]
-pub fn tray_icon_template() -> Option<Image<'static>> {
-    match Image::from_bytes(TRAY_TEMPLATE_PNG) {
-        Ok(img) => Some(img),
-        Err(e) => {
-            log::warn!("could not decode the macOS tray template icon: {e}");
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -181,20 +165,5 @@ mod tests {
         assert!(large >= small, "SM_CXICON {large} 不該小於 SM_CXSMICON {small}");
         assert!(tray_icon().is_some(), "系統匣挑不到層");
         assert!(window_icon().is_some(), "視窗挑不到層");
-    }
-
-    /// macOS 的 template PNG 要解得開，而且是張正方形、真的帶透明像素的圖——
-    /// 全不透明的話就不是剪影，套上 `icon_as_template` 只會變成一塊實心色塊
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn tray_template_decodes_with_transparency() {
-        let img = tray_icon_template().expect("template PNG 要解得開");
-        assert_eq!(img.width(), img.height(), "template 圖應為正方");
-        assert!(img.width() >= 32, "解析度太低，Retina 下會模糊：{}", img.width());
-        let rgba = img.rgba();
-        assert_eq!(rgba.len(), (img.width() * img.height() * 4) as usize);
-        let (pixels, _) = rgba.as_chunks::<4>();
-        assert!(pixels.iter().any(|px| px[3] < 250), "整張圖都不透明，不像是剪影");
-        assert!(pixels.iter().any(|px| px[3] > 5), "整張圖都透明，畫不出東西");
     }
 }

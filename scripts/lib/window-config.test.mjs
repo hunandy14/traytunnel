@@ -69,6 +69,36 @@ test("tauri.macos.conf.json 的 windows[0] 除了刻意覆寫的欄位，其餘�
   );
 });
 
+test("tauri.macos.conf.json 的 windows[0] 不可以有主檔沒有、又不在 INTENTIONAL_OVERRIDE_KEYS 裡的多餘鍵", () => {
+  // 上面那個 test 只走「主檔 → mac 檔」單向：逐一檢查主檔的每一個鍵在 mac 檔
+  // 裡存不存在、值是否相等，抓得到「主檔改了、mac 檔忘記同步」，但抓不到
+  // 反過來的漂移——mac 檔自己多長出一個主檔沒有、也不是刻意覆寫的鍵（例如
+  // 手滑打錯字造出一個新鍵，或複製貼上留下的殘留欄位）。這種多餘鍵不影響
+  // 「跟主檔一致」的檢查（主檔本來就沒有這個鍵，forward 迴圈壓根不會走到
+  // 它），會在完全沒有測試訊號的情況下留在 mac 檔裡，直到 Tauri 因為不認得
+  // 這個欄位而報錯，或更糟：欄位剛好是 Tauri 認得但這裡沒設計要覆寫的合法
+  // 鍵，行為悄悄跟 Windows 分岔。這個 test 補上反向迴圈把這個缺口毒回去。
+  const mainConf = loadJson(MAIN_CONF_PATH);
+  const macConf = loadJson(MACOS_CONF_PATH);
+  const mainWindow = mainConf.app.windows[0];
+  const macWindow = macConf.app.windows[0];
+
+  const extra = [];
+  for (const [key, value] of Object.entries(macWindow)) {
+    if (INTENTIONAL_OVERRIDE_KEYS.has(key)) continue;
+    if (!(key in mainWindow)) {
+      extra.push(`  - ${key}: mac 檔多出 ${JSON.stringify(value)}，主檔沒有這個鍵`);
+    }
+  }
+
+  assert.deepEqual(
+    extra,
+    [],
+    `tauri.macos.conf.json 的 windows[0] 有主檔沒有、又不在 INTENTIONAL_OVERRIDE_KEYS ` +
+      `裡的多餘鍵，若是刻意覆寫請補進 INTENTIONAL_OVERRIDE_KEYS，否則刪掉：\n${extra.join("\n")}`,
+  );
+});
+
 test("刻意覆寫的欄位在主檔與 mac 檔裡至少有一邊真的定義了（不是打錯字打成兩邊都沒有）", () => {
   const mainConf = loadJson(MAIN_CONF_PATH);
   const macConf = loadJson(MACOS_CONF_PATH);

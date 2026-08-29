@@ -171,7 +171,7 @@ npm run web:dev
 | `npm run build:win:exe` | 只編 Windows 免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
 | `npm run build:win:setup` | Windows 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
 | `npm run build:mac` | macOS `.app`（`tauri build --bundles app`），建完複製一份到 `bin/` 方便本機直接雙擊試跑 |
-| `npm run build:dist` | 走設定檔裡列的全部 bundle 目標（`tauri build`），當前平台的完整發佈建置＋打包，要發佈時用，CI 的 `release.yml` 雙腿共用這顆指令 |
+| `npm run build:dist` | 走設定檔裡列的全部 bundle 目標（`tauri build`），當前平台的完整發佈建置＋打包，要發佈時用；CI 的 `release.yml` 走的是同一套邏輯，但直接呼叫 `tauri build --target <matrix.rust_target>` + `node scripts/package.mjs --target <matrix.rust_target>`（見該檔 build job），`build:dist` 是本機等價流程，不帶 `--target` |
 
 沒有裸的 `npm run build`：光看這個名字猜不出是要建前端還是建整個 app，改名後打錯字會直接得到明確的 `missing script` 錯誤（腳本命名規則見 [`docs/platform-guide.md`](docs/platform-guide.md#scripts-命名規則)）。
 
@@ -205,7 +205,7 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別跑 `npm run build:dist`，兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別呼叫 `tauri build --target <matrix.rust_target>` + `node scripts/package.mjs --target <matrix.rust_target>`（`build:dist` 是本機等價流程，不帶 `--target`），兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
 
 ```
 npm run release <x.y.z>

@@ -67,10 +67,17 @@ src-tauri/src/platform/
 
 ### 前端目前的位置，與長大之後的升級路徑
 
-前端現在只有一處平台碼：`index.html` 的 `data-platform` 屬性（`vite.config.ts` 的
-`htmlPlatformPlugin` 在建置期依 `process.platform` 寫入）配 `styles.css` 的
+前端現在只有一處平台碼：`<html>` 的 `data-platform` 屬性配 `styles.css` 的
 `[data-platform="macos"]` CSS selector。這是單一一條 CSS 分歧點，平台碼佔比遠低於
 5%，目前的檔位就是對的，不必為此開資料夾。
+
+那個屬性的值**由 Rust 端在執行期寫入**，不是建置期蓋章：`lib.rs` 註冊了一顆只帶
+webview initialization script 的迷你外掛（`tauri::plugin::Builder::js_init_script`），
+在頁面被解析之前把 `std::env::consts::OS` 寫進 `document.documentElement.dataset.platform`。
+舊做法是 `vite.config.ts` 的 `htmlPlatformPlugin` 在建置期依 Node 的 `process.platform`
+蓋進 `dist/index.html`——那預設「建置機的 OS 與執行機一致」，`dist` 一旦跨機重用
+（CI 產物搬到別台、或重複利用舊建置目錄）值就是錯的，而且沒有任何訊號會告訴你。
+執行期取值不必引入 `@tauri-apps/plugin-os`，也不會漂。
 
 如果前端真的長出**平台邏輯**（不只是 CSS 分歧，而是不同平台要跑不同 TS
 程式碼），升級走兩步，不要一步跳到底：
@@ -194,7 +201,7 @@ URL（見 `lib.rs` 的 `DEV_BUILD_NOTICE_HTML`），所以裸執行檔不會一�
 
 ```
 build
-├── dist          build:dist        當前平台完整發佈建置＋打包，CI 雙腿共用
+├── dist          build:dist        當前平台完整發佈建置＋打包，本機等價於 CI 走法
 ├── mac           build:mac         單一變體，停在兩層
 └── win
     ├── exe       build:win:exe     只編免安裝執行檔，跳過打包
@@ -225,3 +232,11 @@ web:preview       純前端（vite preview）
   `missing script` 錯誤，逼你在 `web:build`、`build:dist`、`build:win:exe`、
   `build:win:setup`、`build:mac` 之間選一個實際存在的鍵，不會誤觸一個「看似
   合理但做錯事」的指令。
+- **`build:dist` 是 CI 建置的本機等價流程，不是 CI 實際呼叫的指令**：
+  `.github/workflows/release.yml` 的 build job 不跑 `npm run build:dist`，
+  而是直接呼叫 `tauri build --target <matrix.rust_target>` + `node
+  scripts/package.mjs --target <matrix.rust_target>`——多帶了明確的
+  `--target`，這樣 `platform_key` 才能從 target triple 推導，不必用
+  runner 架構猜。本機沒有多平台 matrix 好帶，`build:dist` 因此省略
+  `--target`，`package.mjs` 退回用 `process.platform`／`process.arch` 猜，
+  兩者邏輯一致、只差這個旗標。

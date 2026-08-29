@@ -49,6 +49,7 @@ mod pgids;
 mod policy;
 mod spawn;
 mod sys;
+mod trayicon;
 pub mod update;
 
 pub use menu::{build as build_menu, QUIT_ID as MENU_QUIT_ID};
@@ -62,3 +63,4 @@ pub use sys::{
     large_icon_size, local_time_hms, read_autostart_command, reveal_in_file_manager,
     small_icon_size,
 };
+pub use trayicon::{tray_icon, TRAY_OPEN_GESTURE_HINT};
