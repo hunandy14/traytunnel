@@ -71,6 +71,18 @@ pub use imp::ProcessSupervisor;
 #[cfg(target_os = "macos")]
 pub use imp::{install_termination_handler, sweep_supervised_leftovers};
 
+// ---------------------------------------------------------------- GUI 啟動的 PATH（僅 macOS）
+//
+// 同樣是刻意的不對稱，而且理由跟上面那組一樣強：**Windows 沒有這個問題**。
+// Windows 的 GUI 行程由 Explorer／登錄檔的 Run 值啟動，環境變數整份從使用者的
+// session 繼承，`PATH` 與從 `cmd` 敲指令拿到的是同一份。macOS 的 launchd 只給
+// GUI 行程一份最小集（`/usr/bin:/bin:/usr/sbin:/sbin`），使用者裝在
+// `/opt/homebrew/bin` 的 `cloudflared`（ssh `ProxyCommand` 的預設值就在用它）
+// 因此完全找不到。補一份 Windows no-op 只會讓人以為那邊也需要做這件事。
+// 實作與「為什麼不用 `fix-path-env` 那顆 crate」都在 `platform::macos::sys`。
+#[cfg(target_os = "macos")]
+pub use imp::fix_gui_launch_path;
+
 // ---------------------------------------------------------------- 本地埠偵測
 //
 /// 本地是否有程序在該埠 Listen。連線判定與 spawn 前的埠檢查都靠它。

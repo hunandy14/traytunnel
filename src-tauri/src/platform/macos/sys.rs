@@ -5,6 +5,184 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------- GUI 啟動的 PATH
+//
+// **這一節在 Windows 上沒有對應物，也不需要**：Windows 的 GUI 行程是由
+// Explorer／登錄檔的 Run 值啟動的，環境變數（含 `PATH`）一路從使用者的 session
+// 繼承下來，跟從 `cmd` 敲一次指令拿到的是同一份。macOS 不是——launchd 給 GUI
+// 行程（Finder 雙擊、`open`、我們自己寫的 LaunchAgent）的 `PATH` 是一份最小集
+// `/usr/bin:/bin:/usr/sbin:/sbin`，使用者在 `.zshrc`／`.zprofile` 裡加的東西
+// 一概不在裡面。
+//
+// 這對本程式是**致命**的，不是「有點不方便」：ssh 的 `ProxyCommand`（預設值就是
+// `cloudflared access ssh --hostname %h`）是交給 `/bin/sh -c` 跑的，而 Homebrew
+// 把 `cloudflared` 裝在 `/opt/homebrew/bin`——不在最小集裡。於是 GUI 啟動的實例
+// 每一條隧道都在 `sh: cloudflared: not found` 上失敗、進五秒一輪的重連迴圈，
+// 而從終端機啟動（繼承使用者 PATH）的同一支執行檔卻完全正常，兩者症狀差異大到
+// 使用者根本不會往 PATH 想。實測見 PR 說明。
+//
+// 社群標準解是 tauri-apps 自己的 `fix-path-env` crate：啟動時跑一次登入 shell、
+// 把使用者真正的環境變數讀回來。**這裡不用那顆 crate**，改用它的同一套手法自己
+// 做一小份，理由三條：
+//
+//   1. 它**沒有發布到 crates.io**（`cargo` 只能用 `git = "https://github.com/
+//      tauri-apps/fix-path-env-rs"` 拉），版本號還停在 `0.0.0`。把一顆 git 依賴
+//      放進發佈用的相依樹，等於放棄版本語意、`cargo audit` 與可重現建置。
+//   2. 它**沒有逾時保護**：一路 `Command::output()` 等下去，登入 shell 的 rc
+//      檔卡住（oh-my-zsh 的自動更新是最有名的一例，它自己還特地設
+//      `DISABLE_AUTO_UPDATE` 來擋）就等於整支 app 永遠停在啟動的第一行。
+//   3. 它把**整份環境**（`env` 的每一行）都灌回行程裡，我們只需要 `PATH` 一個鍵。
+//
+// 於是這裡只保留那套手法真正有價值的部分（登入 shell ＋ 標記夾出結果），另外補上
+// 它缺的兩件事：逾時（連同殺掉整個行程群組）與「只動 `PATH`」。
+
+/// launchd 沒有另外設定時，給 GUI 行程的預設 `PATH`（`man launchd.plist` 的
+/// `EnvironmentVariables`／`launchctl config user path` 都是在改它）。
+/// 現在的 `PATH` 完全落在這一組裡面，就是「這次是 GUI 啟動」的訊號。
+const LAUNCHD_DEFAULT_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// 等登入 shell 回答的上限。給得寬（rc 檔厚的機器上一次互動式登入要好幾百毫秒），
+/// 但一定要有——這是 `fix-path-env` 缺的那一格。逾時就放棄修正，維持原樣啟動：
+/// 隧道會失敗，但 app 起得來、日誌上有話說，比永遠卡在第一行好。
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 輪詢登入 shell 有沒有結束的間隔。
+const LOGIN_SHELL_TICK: Duration = Duration::from_millis(20);
+
+/// 把 `PATH` 從互動式 shell 的雜訊（rc 檔自己的 echo、提示字元、顏色碼）裡夾出來的標記。
+const PATH_BEGIN: &str = "__traytunnel_path_begin__";
+const PATH_END: &str = "__traytunnel_path_end__";
+
+/// 目前這個 `PATH` 是不是「GUI 啟動才會拿到的那份最小集」——每一段都落在
+/// [`LAUNCHD_DEFAULT_PATH`] 裡面就算。
+///
+/// 有這道閘，從終端機／`cargo run` 啟動（PATH 已經是使用者的那一份）時整段
+/// 修正完全不會跑，省下一次登入 shell 的開銷，也不會在開發流程上多出任何變數。
+/// 空的 `PATH`（連最小集都沒有）同樣回 `true`：那比最小集更該修。
+fn path_is_the_gui_minimum(path: &str) -> bool {
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .all(|d| LAUNCHD_DEFAULT_PATH.contains(&d.trim_end_matches('/')))
+}
+
+/// 從登入 shell 的輸出裡把兩個標記中間那一段夾出來。
+///
+/// 互動式 shell（`-i`）的 rc 檔什麼都可能往 stdout 印，所以不能直接把整份輸出
+/// 當成 `PATH`。夾出來之後再濾掉控制字元：合法的路徑不含它們，而 rc 檔的顏色碼
+/// 有機會黏在標記外圍以外的地方。
+fn extract_marked_path(stdout: &str) -> Option<String> {
+    let start = stdout.find(PATH_BEGIN)? + PATH_BEGIN.len();
+    let end = stdout[start..].find(PATH_END)? + start;
+    let value: String = stdout[start..end].chars().filter(|c| !c.is_control()).collect();
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 登入 shell 給的 `PATH` 補上系統目錄，缺哪個補哪個（接在後面，使用者自己的
+/// 順序優先）。
+///
+/// 這是一道「不准把事情弄得更糟」的保險：正常的登入 shell 一定會從 `/etc/paths`
+/// 拿到這四個目錄，但這裡吃的是使用者 rc 檔的輸出——真的有人把 `PATH` 整個覆寫掉
+/// 的話，我們不可以因為「修正」而讓 `ssh`（`/usr/bin/ssh`）本身也找不到。
+fn with_system_dirs(login_path: &str) -> String {
+    let mut out: Vec<&str> = login_path.split(':').filter(|d| !d.is_empty()).collect();
+    for dir in LAUNCHD_DEFAULT_PATH {
+        if !out.iter().any(|d| d.trim_end_matches('/') == dir) {
+            out.push(dir);
+        }
+    }
+    out.join(":")
+}
+
+/// 跑一次使用者的登入 shell，把它的 `PATH` 問回來。逾時或任何一步失敗都回 `None`。
+///
+/// `-ilc`（互動＋登入＋執行一行）是 `fix-path-env` 用的同一組旗標，也是這件事的
+/// 社群慣例：`.zprofile`（登入）與 `.zshrc`（互動）兩份都得跑過，使用者的 `PATH`
+/// 才會完整——大多數人是在 `.zshrc` 裡加 Homebrew 的。
+///
+/// `${PATH}` 一定要帶大括號：標記是底線開頭的，寫成 `$PATH__traytunnel_path_end__`
+/// 會被 shell 當成一個叫 `PATH__traytunnel_path_end__` 的變數（展開成空字串）。
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let script = format!("printf '%s' \"{PATH_BEGIN}${{PATH}}{PATH_END}\"");
+
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-ilc", &script])
+        // oh-my-zsh 的自動更新會在互動式啟動時停下來問人（`fix-path-env` 也特地
+        // 設這個變數擋它）。逾時保護接得住，但能不觸發就不要觸發
+        .env("DISABLE_AUTO_UPDATE", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // 自成一個行程群組，逾時時才收得掉「shell 自己＋它 rc 檔生出來的東西」整棵樹
+    // ——只 kill shell 的話，卡住它的那支孫程序會留下來
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+
+    let mut child = cmd.spawn().ok()?;
+    let pgid = child.id() as i32;
+    let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // 整組收掉再 wait，不留殭屍也不留孤兒
+                    super::pgids::kill_group(pgid);
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(LOGIN_SHELL_TICK);
+            }
+            Err(_) => return None,
+        }
+    }
+    // stdout 只有一行標記包起來的 PATH，遠小於管線緩衝區，先等結束再讀不會死鎖
+    let out = child.wait_with_output().ok()?;
+    extract_marked_path(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// GUI（Finder／`open`／LaunchAgent）啟動時把 `PATH` 換成使用者登入 shell 的那一份。
+///
+/// 回傳要補進活動日誌的行——這支函式跑在 `tauri_plugin_log` 裝上全域 logger
+/// **之前**（它必須是整支程式最早的動作之一，見下面那段），那時 `log::info!`
+/// 是丟進黑洞的，所以比照 `prepare_notifications` 的作法把話帶回去給 `setup` 記。
+///
+/// **呼叫時機是規格的一部分**：`std::env::set_var` 改的是整個行程共用的環境區塊，
+/// 而 `getenv`／`setenv` 不是執行緒安全的。必須在**任何執行緒被生出來之前**呼叫，
+/// 也就是 `tauri::Builder` 之前——`lib.rs::run()` 的最前面。這也剛好是「在任何
+/// 一次 spawn ssh 之前」的必要條件。
+pub fn fix_gui_launch_path() -> Vec<String> {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if !path_is_the_gui_minimum(&current) {
+        // 終端機／開發啟動：PATH 本來就是使用者的那一份，什麼都不必做，也不必記
+        return Vec::new();
+    }
+    let Some(login) = login_shell_path() else {
+        return vec![
+            "PATH is the launchd default; asking the login shell for the real one failed, \
+             tools installed by Homebrew (e.g. cloudflared for ProxyCommand) may not be found"
+                .into(),
+        ];
+    };
+    let fixed = with_system_dirs(&login);
+    if fixed == current {
+        return Vec::new();
+    }
+    std::env::set_var("PATH", &fixed);
+    vec![format!("PATH was the launchd default, replaced with the login shell PATH: {fixed}")]
+}
 
 // ---------------------------------------------------------------- 本地埠偵測
 
@@ -425,6 +603,60 @@ mod tests {
             "0.0.0.0:{port} 上有 TcpListener 在 LISTEN，is_listening 卻遲遲沒回 true\
              ——舊版的 bind 探測只精確比對字面 loopback 位址，看不到 wildcard 監聽者，\
              這正是這次要修的語意缺口"
+        );
+    }
+
+    /// 「這次是不是 GUI 啟動」的判定：launchd 的最小集（含順序打亂、少幾個、
+    /// 尾隨斜線、完全空的）都算，一旦冒出任何一個不在最小集裡的目錄就不算。
+    #[test]
+    fn the_launchd_default_path_is_recognised() {
+        assert!(path_is_the_gui_minimum("/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(path_is_the_gui_minimum("/bin:/usr/bin"), "少幾個、順序不同一樣是最小集");
+        assert!(path_is_the_gui_minimum("/usr/bin/:/bin"), "尾隨斜線不該讓判定失手");
+        assert!(path_is_the_gui_minimum(""), "連 PATH 都沒有比最小集更該修");
+
+        assert!(
+            !path_is_the_gui_minimum("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "使用者的 PATH（Homebrew 在裡面）不可以被當成 GUI 啟動，否則每次從終端機\
+             啟動都要多跑一次登入 shell"
+        );
+        assert!(!path_is_the_gui_minimum("/usr/local/bin:/usr/bin"));
+    }
+
+    /// 互動式 shell 的 rc 檔什麼都可能往 stdout 印，標記中間那一段才是答案。
+    #[test]
+    fn the_login_shell_path_is_extracted_from_the_noise() {
+        let noisy = format!(
+            "Last login: Fri\n\u{1b}[32mwelcome\u{1b}[0m\n{PATH_BEGIN}/opt/homebrew/bin:/usr/bin{PATH_END}\n"
+        );
+        assert_eq!(
+            extract_marked_path(&noisy).as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin"),
+            "rc 檔的問候語與顏色碼都不可以混進 PATH"
+        );
+
+        // 沒有標記（shell 根本沒跑到我們那一行）就老實回 None，不要拿雜訊當 PATH
+        assert_eq!(extract_marked_path("zsh: command not found"), None);
+        assert_eq!(extract_marked_path(&format!("{PATH_BEGIN}   {PATH_END}")), None, "空的不算");
+    }
+
+    /// 修正過的 PATH 一定要含系統目錄：使用者把 PATH 整個覆寫掉時，不可以因為
+    /// 「修正」反而讓 `/usr/bin/ssh` 自己都找不到。
+    #[test]
+    fn the_fixed_path_always_keeps_the_system_directories() {
+        let fixed = with_system_dirs("/opt/homebrew/bin");
+        for dir in LAUNCHD_DEFAULT_PATH {
+            assert!(fixed.split(':').any(|d| d == dir), "{dir} 應該被補回來：{fixed}");
+        }
+        assert!(fixed.starts_with("/opt/homebrew/bin"), "使用者自己的順序要在前面：{fixed}");
+
+        // 本來就齊全時不重複補，也不改順序
+        let already = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        assert_eq!(with_system_dirs(already), already);
+        // 尾隨斜線的寫法算同一個目錄，不該再補一份
+        assert_eq!(
+            with_system_dirs("/usr/bin/:/bin/:/usr/sbin/:/sbin/"),
+            "/usr/bin/:/bin/:/usr/sbin/:/sbin/"
         );
     }
 

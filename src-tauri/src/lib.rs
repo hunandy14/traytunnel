@@ -472,6 +472,25 @@ pub fn run() {
     // 回來的是要補進活動日誌的行——AppState 這時還不存在，先收著，setup 裡再記。
     let update_notes = update::apply_pending_at_startup(is_tray_start());
 
+    // ---------------------------------------------------------------- GUI 啟動的 PATH
+    //
+    // macOS 專屬。launchd 給 GUI 行程（Finder 雙擊、`open`、我們的 LaunchAgent）
+    // 的 `PATH` 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 裝的 `cloudflared`
+    // （ssh `ProxyCommand` 的預設值）不在裡面，於是 GUI 啟動的實例每一條隧道都在
+    // `sh: cloudflared: not found` 上失敗。整段理由與作法在
+    // `platform::macos::sys` 的「GUI 啟動的 PATH」那一節。
+    //
+    // **位置也是規格**：`set_var` 改的是行程共用的環境區塊，必須在任何執行緒生出來
+    // 之前（`tauri::Builder` 之前）跑完。排在更新交棒之後不衝突——macOS 沒有那套
+    // 暫存交棒，上面那一行在這個平台是語意正確的 no-op。
+    //
+    // Windows 不需要也沒有這支函式（GUI 行程本來就繼承使用者 `PATH`），因此門面
+    // 上整段 cfg，這裡給一個空的清單讓底下的日誌重播不必分平台。
+    #[cfg(target_os = "macos")]
+    let path_notes = platform::fix_gui_launch_path();
+    #[cfg(not(target_os = "macos"))]
+    let path_notes: Vec<String> = Vec::new();
+
     let builder = tauri::Builder::default()
         // single-instance 必須第一個註冊：第二個實例只負責喚醒主視窗
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -690,6 +709,10 @@ pub fn run() {
 
             shared.refresh_tray();
             shared.log("Traytunnel started");
+            // PATH 修正跑在 logger 裝上之前（見 `run()` 開頭），它的話要在這裡才記得到
+            for note in path_notes {
+                shared.log(note);
+            }
             for note in update_notes {
                 shared.log(note);
             }
