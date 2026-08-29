@@ -476,8 +476,20 @@ jobs:
 
       # dry_run 與否都上傳這個 artifact：這是驗證「合併邏輯 + 建置」整條路徑
       # 有沒有真的兜起來的證據，不必開真 release 也能下載回來檢查
-      # latest.json 結構。
-      - name: Upload compose output as workflow artifact
+      # latest.json／SHA256SUMS.txt 的結構。
+      #
+      # 內容量依 dry_run 分兩種：
+      #   dry_run=true   沒有真 release 可以核對，二進位檔本身也是要驗證的
+      #                   對象之一（例如確認建置出來的檔案真的存在、大小
+      #                   合理），連二進位檔一起上傳。
+      #   dry_run=false  二進位檔已經上傳到 GitHub Release 的資產（下面
+      #                   Create GitHub Release 那步），build job 也還留著
+      #                   per-platform 的 release-<platform_key> workflow
+      #                   artifact（7 天）——這裡沒有理由再存一份重複的
+      #                   二進位檔，只需要 latest.json／SHA256SUMS.txt 這兩
+      #                   個「合併結果」本身，減少 workflow artifact 儲存量。
+      - name: Upload compose output as workflow artifact (dry-run：含二進位檔，供驗證)
+        if: needs.plan.outputs.dry_run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-compose-output
@@ -485,6 +497,17 @@ jobs:
             out/*.exe
             out/*.dmg
             out/*.tar.gz
+            out/SHA256SUMS.txt
+            out/latest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload compose output as workflow artifact (正式發佈：二進位檔已在 release 資產上，不重複存)
+        if: needs.plan.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-compose-output
+          path: |
             out/SHA256SUMS.txt
             out/latest.json
           if-no-files-found: error
