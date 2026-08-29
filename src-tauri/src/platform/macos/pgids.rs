@@ -125,10 +125,25 @@ pub(super) fn to_json(reg: &Registry) -> String {
 
 /// 登記的命令列與 `ps` 現在報回來的命令列算不算同一件事。
 ///
-/// 判定是「其中一邊是另一邊的前綴」而不是嚴格相等：`ps` 在極端長的命令列上
-/// 可能截斷，某些程式也會在啟動後改寫自己的 argv 尾巴。前綴關係已經足夠嚴格
-/// ——登記的那一行從 `ssh` 一路到 `user@host` 都在裡面，一個不相干的行程要
-/// 湊出這段前綴實務上等於不可能。
+/// 判定只有一個方向：**`ps` 回報的那一行要以登記的那一行開頭**（相等是它的
+/// 特例）。登記的那一行從 `ssh` 一路到 `user@host` 全都得出現在 `ps` 的輸出裡，
+/// 一個不相干的行程要湊出這段前綴實務上等於不可能。允許尾巴多出東西，是因為
+/// 有些程式會在啟動後改寫自己的 argv 尾端。
+///
+/// **反方向（`recorded.starts_with(actual)`）已經移除**，那是一個真的會誤殺的
+/// 缺口：它讓「`ps` 只印得出 `ssh` 這幾個字」的任何行程匹配上我們每一筆登記。
+/// 這不是假想——本機實證，一支 argv[0] 被改成 `ssh` 的 `cat`：
+///
+/// ```text
+/// $ ps -ww -o command= -p <pid>
+/// ssh
+/// recorded.starts_with("ssh") -> true   ← 這個群組會被整組 SIGKILL
+/// ```
+///
+/// pid（＝pgid）會回收，登記簿裡一個舊 pgid 剛好對上今天別人的群組時，這一條
+/// 就是「拿一個舊數字去砍不相干的程式」。當初放行反方向的理由是「`ps` 在極端長
+/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`group_commands`]），
+/// 截斷這件事根本不會發生，等於用一個不存在的問題換來一個真的誤殺面。
 ///
 /// 空字串一律不算相符：`ps` 問不到東西（行程已經不在）會回空字串，那時候
 /// 什麼都不該殺。
@@ -138,7 +153,7 @@ pub(super) fn commands_match(recorded: &str, actual: &str) -> bool {
     if recorded.is_empty() || actual.is_empty() {
         return false;
     }
-    recorded.starts_with(actual) || actual.starts_with(recorded)
+    actual.starts_with(recorded)
 }
 
 /// 一次收屍要做的兩件事。
@@ -619,6 +634,37 @@ mod tests {
         assert!(!tmp.exists(), "rename 失敗也不可以留下暫存檔：{}", tmp.display());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 命令列比對只認一個方向：`ps` 回報的那一行要以登記的那一行開頭。
+    ///
+    /// 最後一段是這一版真正要擋的那個誤殺面：`ps` 只印得出 `ssh` 幾個字的
+    /// 行程（本機實證：argv[0] 被改成 `ssh` 的 `cat`，`ps -ww -o command=`
+    /// 就是一行 `ssh`）**不可以**匹配任何一筆登記——pid 會回收，匹配上就等於
+    /// 拿一個舊數字去 SIGKILL 別人的行程群組。
+    #[test]
+    fn a_command_only_matches_when_ps_shows_at_least_what_we_recorded() {
+        let recorded = "ssh -N -o ServerAliveInterval=10 -L 1080:127.0.0.1:1080 bob@example.com";
+
+        // 一模一樣：相符
+        assert!(commands_match(recorded, recorded));
+        // 前後空白不算差異（`ps` 的欄位會補空白）
+        assert!(commands_match(recorded, &format!("  {recorded}  ")));
+        // 尾巴多出東西：相符（有些程式會改寫自己的 argv 尾端）
+        assert!(commands_match(recorded, &format!("{recorded} extra")));
+
+        // `ps` 只印得出 `ssh`：**不可以**相符
+        assert!(
+            !commands_match(recorded, "ssh"),
+            "ps 只印 ssh 的無關程序若匹配得上，每一筆登記都會被它對到，pid 回收時就是誤殺"
+        );
+        assert!(!commands_match(recorded, "ssh -N"), "印到一半同樣不算");
+
+        // 完全不相干的行程
+        assert!(!commands_match(recorded, "/usr/libexec/some-daemon --serve"));
+        // 空字串（`ps` 問不到東西）兩個方向都不算
+        assert!(!commands_match(recorded, ""));
+        assert!(!commands_match("", "ssh -N bob@a"));
     }
 
     /// 收屍決策：命令列對得上才殺，對不上或群組已空一律留著。
