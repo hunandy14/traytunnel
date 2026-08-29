@@ -37,6 +37,55 @@ src-tauri/src/platform/
 `pub use imp::xxx`，兩邊各補一份實作；不需要跨平台共用的東西（例如某個平台特有的
 內部細節）就留在子模組裡，不要為了「以防萬一」也搬到門面上。
 
+## 平台碼歸屬規則
+
+三條規則，外加前端現況、資料夾長大的階梯，一次講完「平台碼該放哪裡」這件事在
+多大範圍內都成立。
+
+### 三條規則
+
+1. 共用核心只准寫 `use crate::platform::xxx`，不可以直接碰
+   `platform::windows::xxx`／`platform::macos::xxx`——子模組刻意不是 `pub`，這條
+   規則由可見性鎖死，不是靠自律，違反了根本編譯不過（細節見上一節）。
+2. `platform/` 只放「怎麼做」（OS 機制：呼叫哪個系統 API、用什麼格式交棒），不放
+   「做什麼」（業務邏輯：這項功能要不要做、對使用者代表什麼意思）——後者一律留在
+   共用核心。這條界線一旦鬆動，平台夾很容易長成第二套業務邏輯，同一條規則被兩邊
+   各抄一份，之後只會各自漂移、越改越對不齊。
+3. CI 雙平台腿守門：`windows-latest`／`macos-latest` 各自完整
+   build＋clippy＋test，平台碼放錯位置——例如該進 `platform/` 的東西留在共用核心
+   裡用 `cfg` 硬撐——本機單一平台的 build／test 往往看不出來，另一腿的 CI 才會
+   紅燈（見下文「CI 雙腿守門的意義」）。
+
+### 前端目前的位置，與長大之後的升級路徑
+
+前端現在只有一處平台碼：`index.html` 的 `data-platform` 屬性（`vite.config.ts` 的
+`htmlPlatformPlugin` 在建置期依 `process.platform` 寫入）配 `styles.css` 的
+`[data-platform="macos"]` CSS selector。這是單一一條 CSS 分歧點，平台碼佔比遠低於
+5%，目前的檔位就是對的，不必為此開資料夾。
+
+如果前端真的長出**平台邏輯**（不只是 CSS 分歧，而是不同平台要跑不同 TS
+程式碼），升級走兩步，不要一步跳到底：
+
+1. 先用檔名字尾區分，例如 `foo.macos.ts`／`foo.windows.ts`（仿 React Native、.NET
+   的平台檔慣例），建置工具依平台各選一份編譯進去。
+2. 等這類檔案多到需要一層共用抽象（例如統一介面、多個模組都要分流）才成立
+   `src/platform/` 小夾，對齊 `src-tauri/src/platform/` 現有的做法。
+
+跳過第一步直接開資料夾，在只有一兩個檔案分歧的階段只會多一層空目錄。
+
+### 演化階梯
+
+平台碼隨規模長大會踩過幾個台階，本專案現在站在第三階：
+
+1. **行內 `cfg`**：一兩處分歧，直接 `#[cfg(...)]` 包在原本的檔案裡。
+2. **平行單檔**：分歧多到一個檔案塞不下，拆成 `foo_windows.rs`／`foo_macos.rs`
+   兩份平行檔案。
+3. **`platform/` 資料夾（本專案現位）**：分歧橫跨多個模組，子模組化＋門面收斂，
+   見上文「資料夾結構」。
+4. **獨立 crate**：升到這一階有明確觸發條件，不是規模到了就自動升——需要混
+   Swift／Objective-C 之類的原生互操作（自己的建置工具鏈、FFI 邊界），或平台碼
+   佔比已經明顯膨脹到快要蓋過共用核心，才值得把 `platform/` 整層抽成獨立 crate。
+
 ## 新增一項 OS 相依功能的流程
 
 1. 決定這項功能要不要進共用門面。只有一個平台用得到、共用核心也不會呼叫，
@@ -104,3 +153,18 @@ main webview url: http://localhost:1420/   <- cargo build 的產物，要 Vite �
 的 warn。使用者回報白屏時，`traytunnel.log` 要先看這兩行，再看
 `webview content process terminated`（那是另一條成因，見 `lib.rs` 的
 `on_web_content_process_terminate`）。
+
+macOS 上這五秒逾時不只寫日誌：確認是 `build.devUrl` 又真的沒有任何 page load
+時，還會把空白的 webview `navigate` 到一個內嵌深色底、繁體中文說明的 `data:`
+URL（見 `lib.rs` 的 `DEV_BUILD_NOTICE_HTML`），所以裸執行檔不會一直維持完全
+空白——五秒內仍是白屏，五秒後會換成那頁說明；`tauri build` 的正式產物走
+`tauri://localhost`，不符合這個 URL 判斷，畫面不受影響。
+
+這裡刻意選 `navigate` 而不是 `eval`：實測過 `eval`／`eval_with_callback`，兩者
+在連線被拒絕的這個情境下完全沒有作用——wry 的 WKWebView 後端把
+`evaluateJavaScript` 呼叫閘在一個 `pending_scripts` 佇列後面，只有
+`didCommitNavigation` 才會把佇列送進 webview 真正執行；`http://localhost:1420`
+連不上是在 provisional navigation 階段就失敗，從來不會走到
+`didCommitNavigation`，佇列裡的 script 永遠卡在排隊狀態，`eval` 形同沒打中。
+`navigate` 是全新的一次導航請求，不吃這個佇列，`data:` URL 也不需要任何網路
+連線就能被直接當成一份完整文件載入。
