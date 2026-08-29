@@ -58,9 +58,6 @@ const IDENTIFIER: &str = "com.traytunnel.desktop";
 /// 登記簿檔名。
 const FILE_NAME: &str = "supervised-pgids.json";
 
-/// 原子寫入用的暫存檔名（同一個資料夾，`rename` 才保證是原子的）。
-const TMP_FILE_NAME: &str = "supervised-pgids.json.tmp";
-
 /// 讀改寫的整段互斥。
 ///
 /// `register`／`unregister` 會被多條 tokio 工作執行緒同時呼叫（每個出口一條
@@ -69,8 +66,9 @@ const TMP_FILE_NAME: &str = "supervised-pgids.json.tmp";
 /// 的那個 pgid 就再也不會被收屍。
 ///
 /// 這把鎖只管**行程內部**的並行。跨行程（兩個實例同時在跑，見 [`Entry::owner_pid`]
-/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個
-/// [`TMP_FILE_NAME`]，最壞情況是其中一邊 `rename` 過去的是另一邊寫到一半的內容，
+/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個暫存檔
+/// （[`crate::config::write_atomic`] 的 `<檔名>.tmp`），最壞情況是其中一邊
+/// `rename` 過去的是另一邊寫到一半的內容，
 /// [`parse`] 讀不懂就退成空的登記簿。後果是**漏殺**（下一次啟動少收幾具屍體），
 /// 不是誤殺，方向可接受；為了一個「single-instance 失手才會發生」的情境去背一套
 /// 跨行程鎖的複雜度（還得處理鎖檔本身的殘留與死鎖）划不來。
@@ -281,23 +279,19 @@ fn read_at(path: &Path) -> Registry {
 /// 於是「寫到一半被 SIGKILL 打斷」留下的是完整的舊版，不是半截的新版。
 /// 半截的 JSON 雖然 [`parse`] 讀不懂會退成空的（不會炸），但那等於整份登記
 /// 一次全丟，比舊版差得多。
-/// 兩種失敗都要把暫存檔清掉，不是只有 `rename` 那一種：寫到一半失敗（最典型的
-/// 是磁碟寫滿）時暫存檔已經開出來而且是半截的。與 `config::write_atomic`
-/// 的兩處 `remove_file` 同一個形狀。
+///
+/// 原子寫入本身**不再自己做一份**：這裡要的每一個性質（同資料夾的 `.tmp`、
+/// 兩種失敗都把暫存檔清掉、`rename` 蓋上去）都跟 [`crate::config::write_atomic`]
+/// 一字不差，那邊也是設定檔的落檔路徑。原本兩邊各維護一份逐字相同的實作，
+/// 正是 `platform/mod.rs` 開頭第四條規則不准的事。這一層只剩下自己真正的責任：
+/// 序列化，以及「資料夾可能還不存在」（`~/Library/Application Support/<id>/`
+/// 第一次寫入時就是這樣；設定檔那條路由 `config_location` 事先建好資料夾，
+/// `write_atomic` 因此不管這件事）。
 fn write_at(path: &Path, reg: &Registry) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_file_name(TMP_FILE_NAME);
-    if let Err(e) = std::fs::write(&tmp, to_json(reg)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    crate::config::write_atomic(path, &to_json(reg))
 }
 
 /// 檔案沒有東西可留時就刪掉，不留一份空殼在使用者的資料夾裡。
@@ -665,30 +659,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 寫完不可以留下 `.tmp`——留著的話使用者的資料夾裡永遠躺著一顆看不懂的
-    /// 半成品，而且下一次 `write_at` 才會把它覆寫掉。
+    /// 寫完（成功或失敗）都不可以在登記簿的資料夾裡留下半成品——留著的話
+    /// 使用者的資料夾裡永遠躺著一顆看不懂的東西，而且要等下一次寫入才會被覆寫。
     ///
-    /// 兩段：成功那一條，以及 **`rename` 失敗**那一條。
+    /// 「不留半成品」這件事本身現在是 [`crate::config::write_atomic`] 的責任
+    /// （原子寫入已經上提到那一份共用實作，見 [`write_at`]），那邊有自己的
+    /// 測試釘兩處 `remove_file`。這一條留著、而且**不再寫死暫存檔名**，測的是
+    /// 這一層自己的東西：登記簿這條路（含它自己那一段 `create_dir_all`）走完
+    /// 之後，這個資料夾裡除了登記簿本身不該多出任何檔案。改成掃整個資料夾而
+    /// 不是 `dir.join("supervised-pgids.json.tmp")`，是因為暫存檔怎麼命名已經
+    /// 是共用函式的實作細節了，這一層不該再假設它長什麼樣。
     ///
-    /// 只宣稱 `rename` 這一支是刻意的：`write_at` 的另一個失敗點是
-    /// `fs::write` 寫到一半失敗（典型是磁碟寫滿），那個沒有辦法在單元測試裡
-    /// 穩定重現——製造得出來的「寫不出去」（例如父路徑是一個檔案）會更早在
-    /// `create_dir_all` 就以 `AlreadyExists` 失敗，**根本走不到暫存檔那一行**，
-    /// 斷言會恆真。這一版之前正是那個形狀，等於什麼都沒測到。
-    ///
-    /// 這裡改成讓**目的地**是一個資料夾：`create_dir_all(parent)` 看到父資料夾
-    /// 已經在就直接成功、`fs::write` 也真的把暫存檔寫出來了，失敗的是最後那一步
-    /// 「把一個檔案 rename 蓋到一個資料夾上」（`ENOTDIR`）。兩處 `remove_file`
-    /// 是同一個形狀，釘住走得到的這一處就擋得住「順手刪掉一行」。
+    /// 兩段：成功那一條，以及 **`rename` 失敗**那一條。`fs::write` 寫到一半失敗
+    /// （典型是磁碟寫滿）沒有辦法在單元測試裡穩定重現，因此只走得到 rename 這支：
+    /// 讓**目的地**是一個資料夾——`create_dir_all(parent)` 看到父資料夾已經在就
+    /// 直接成功、`fs::write` 也真的把暫存檔寫出來了，失敗的是最後「把一個檔案
+    /// rename 蓋到一個資料夾上」。
     #[test]
-    fn writing_leaves_no_tmp_file_behind() {
+    fn writing_leaves_no_leftovers_behind() {
         let dir = tempdir("notmp");
-        let tmp = dir.join(TMP_FILE_NAME);
-
         let path = dir.join(FILE_NAME);
+
+        /// 這個資料夾裡（不含子資料夾）現在有哪些檔案。
+        fn files_in(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("tempdir 要讀得到")
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
         register_at(&path, 900, 111, "ssh -N bob@a").unwrap();
         assert!(path.is_file());
-        assert!(!tmp.exists(), "寫完不該留下暫存檔：{}", tmp.display());
+        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "寫完只該有登記簿本身");
 
         // rename 失敗那一支：目的地是一個資料夾，前面兩步都會成功
         let dest_is_a_dir = dir.join("dest-is-a-directory");
@@ -697,7 +703,7 @@ mod tests {
             write_at(&dest_is_a_dir, &Registry::default()).is_err(),
             "把檔案 rename 蓋到一個資料夾上本來就該失敗——失敗不了的話這一條測不到東西"
         );
-        assert!(!tmp.exists(), "rename 失敗也不可以留下暫存檔：{}", tmp.display());
+        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "寫入失敗也不可以留下半成品");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

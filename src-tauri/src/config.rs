@@ -1347,7 +1347,14 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
 /// `fs::write` 是「先截斷再寫」，中途斷電、磁碟滿或行程被砍都會留下一個半截的
 /// 設定檔，下次啟動就是壞檔。rename 在同一個資料夾內是原子的（Windows 的
 /// `MoveFileEx` 帶 REPLACE_EXISTING），使用者手上永遠只會看到完整的舊版或新版。
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+///
+/// 之所以是 `pub(crate)` 而不是這個模組私有：macOS 的受監督行程群組登記簿
+/// （`platform::macos::pgids`）要的是一模一樣的東西——同一份「兩種失敗都要把
+/// 暫存檔清掉」的形狀，連暫存檔命名慣例（[`tmp_path`]：生效檔名接上 `.tmp`，
+/// 一定落在同一個資料夾，`rename` 才是同磁碟區的原子換名）都一樣。那邊本來
+/// 各自維護一份逐字相同的實作，正是 `platform/mod.rs` 開頭第四條規則
+/// （不看平台的純邏輯不准兩邊各抄一份）在講的東西，因此上提到唯一一份。
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = tmp_path(path);
     // 寫到一半失敗（最典型的就是磁碟寫滿）時，暫存檔已經開出來而且是半截的，
     // 一樣要清掉——「不留半成品」的承諾得涵蓋兩種失敗，不是只有換名那一種
