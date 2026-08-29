@@ -785,6 +785,11 @@ function handle(cmd: string, args: Args): unknown {
       log(null, `(browser mock) ${cmd}`);
       return null;
 
+    // 白屏診斷的就緒信標。瀏覽器裡沒有 Rust 端可以通知，靜靜吃掉就好——
+    // 落到 default 會在活動區留一行「unhandled command」的假雜訊
+    case "frontend_ready":
+      return null;
+
     case "get_state":
       return structuredClone(state);
 

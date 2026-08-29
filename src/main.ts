@@ -4,6 +4,7 @@ import { el, h, setToggle } from "./dom";
 import { hydrateIcons, icon } from "./icons";
 import {
   deleteForward,
+  frontendReady,
   getState,
   onConfigChanged,
   onExitStatus,
@@ -1098,6 +1099,16 @@ initSourceSheet({
 initTunnelSheet({ onDelete: requestDelete });
 initSocksSheet({ onDelete: requestDelete });
 render();
+/**
+ * 就緒信標，Rust 端的白屏診斷等的就是這一下（見 ipc.ts 的 frontendReady）。
+ *
+ * 刻意排在 render() 之後、bootstrap() 之前：它要回答的是「這份 JS 到底有沒有
+ * 跑起來、畫面有沒有東西」，render() 一跑完答案就已經是「有」了。掛在
+ * bootstrap 那條非同步鏈的尾巴反而會答錯——loadSnapshot 最多重試 5 秒，
+ * 那正好是 Rust 端的寬限時間，慢啟動會被誤判成「前端沒載進來」而被說明頁
+ * 蓋掉。信標本身失敗不影響任何功能，catch 掉不必往上丟。
+ */
+void frontendReady().catch(() => {});
 /**
  * initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
  * 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，

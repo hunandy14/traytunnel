@@ -67,10 +67,17 @@ src-tauri/src/platform/
 
 ### 前端目前的位置，與長大之後的升級路徑
 
-前端現在只有一處平台碼：`index.html` 的 `data-platform` 屬性（`vite.config.ts` 的
-`htmlPlatformPlugin` 在建置期依 `process.platform` 寫入）配 `styles.css` 的
+前端現在只有一處平台碼：`<html>` 的 `data-platform` 屬性配 `styles.css` 的
 `[data-platform="macos"]` CSS selector。這是單一一條 CSS 分歧點，平台碼佔比遠低於
 5%，目前的檔位就是對的，不必為此開資料夾。
+
+那個屬性的值**由 Rust 端在執行期寫入**，不是建置期蓋章：`lib.rs` 註冊了一顆只帶
+webview initialization script 的迷你外掛（`tauri::plugin::Builder::js_init_script`），
+在頁面被解析之前把 `std::env::consts::OS` 寫進 `document.documentElement.dataset.platform`。
+舊做法是 `vite.config.ts` 的 `htmlPlatformPlugin` 在建置期依 Node 的 `process.platform`
+蓋進 `dist/index.html`——那預設「建置機的 OS 與執行機一致」，`dist` 一旦跨機重用
+（CI 產物搬到別台、或重複利用舊建置目錄）值就是錯的，而且沒有任何訊號會告訴你。
+執行期取值不必引入 `@tauri-apps/plugin-os`，也不會漂。
 
 如果前端真的長出**平台邏輯**（不只是 CSS 分歧，而是不同平台要跑不同 TS
 程式碼），升級走兩步，不要一步跳到底：

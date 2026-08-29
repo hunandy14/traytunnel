@@ -54,10 +54,76 @@ fn show_main(app: &AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        // 視窗藏著的時候被系統回收掉 content process 的話，reload 被延到
+        // 這裡才做——理由見 WEBVIEW_NEEDS_RELOAD 那段。
+        if take_pending_reload(&WEBVIEW_NEEDS_RELOAD) {
+            log::info!("reloading the webview that was reclaimed while hidden");
+            if let Err(e) = w.reload() {
+                log::warn!("could not reload the webview on show: {e}");
+            }
+        }
     }
 }
 
-// ------------------------------------------------- 白屏診斷（前端載入複查）
+// ------------------------------------------------- content process 回收後的自癒
+//
+// WKWebView 的渲染跑在獨立的系統行程（com.apple.WebKit.WebContent），系統在
+// 記憶體壓力下可以把它單獨回收掉；行程死了 WKWebView 不會自己重載，畫面就
+// 一直卡在白屏。tauri 的 `on_web_content_process_terminate` 掛鉤能接到這件事，
+// 我們在那裡呼叫 `Webview::reload` 自救。
+//
+// **但不可以無條件立刻 reload。** 觸發這顆掛鉤的前提就是系統正在缺記憶體，
+// 而被優先犧牲的又正是「沒有可見視窗、切到 Accessory」的 app（見
+// `show_main`／`hide_to_tray` 那組動態 activation policy）。視窗藏著的時候
+// 立刻 reload 等於馬上重新生一個 WebContent 行程出來畫一份沒有人在看的頁面
+// ——記憶體壓力沒有解除，系統再回收一次，掛鉤再 reload 一次，一路轉圈，
+// 把本來只是「下次打開要重載」的小事變成持續燒 CPU 與記憶體的迴圈。
+//
+// 分兩條路：
+//
+// * **視窗可見**：真的有人在看那片白屏，立刻 reload，這是原本的行為。
+// * **視窗藏著**：只立旗標（外加一行 warn），什麼都不畫。下次 `show_main`
+//   （系統匣的 Open window、第二實例喚醒、雙擊圖示……）把視窗拿出來時才
+//   reload，那時使用者本來就在等畫面，重生一個 WebContent 行程是划算的。
+static WEBVIEW_NEEDS_RELOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 回收發生時該怎麼辦。抽成純函式是為了能單獨測——這條分支就是上面那段
+/// 說明的全部內容，而它本身跟 webview 無關。
+///
+/// 掛 `cfg(target_os = "macos")` 不是因為這條規則有平台特性，是因為
+/// `on_web_content_process_terminate` 這顆掛鉤本身只有 macOS／iOS 有
+/// （Windows 的 WebView2 沒有對應事件），Windows 上連呼叫端都不存在。旗標與
+/// [`take_pending_reload`] 反而是跨平台的：`show_main` 兩邊都會問一次，
+/// Windows 上那顆旗標永遠是 false，行為零變化。
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadPlan {
+    /// 有人在看，立刻重載。
+    Now,
+    /// 沒人在看，立旗標等下次前景化。
+    Defer,
+}
+
+#[cfg(target_os = "macos")]
+fn plan_reload_after_terminate(window_visible: bool) -> ReloadPlan {
+    if window_visible {
+        ReloadPlan::Now
+    } else {
+        ReloadPlan::Defer
+    }
+}
+
+/// 領取「欠一次 reload」的旗標：有的話回 true 並就地清掉，重複呼叫只會生效
+/// 一次（`show_main` 每次開窗都會問，不能每次都重載）。
+///
+/// 收旗標的參數而不是直接讀 [`WEBVIEW_NEEDS_RELOAD`]，是為了讓測試能拿自己的
+/// 一顆來測，不必碰行程全域狀態。
+fn take_pending_reload(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+// ------------------------------------------------- 白屏診斷（前端就緒複查）
 //
 // 白屏這個症狀在日誌裡本來完全沒有痕跡：視窗開出來（macOS 紅綠燈畫得好好的，
 // Windows 自繪標題列也一樣），只有 webview 內容是一片白，Rust 這一側從頭到尾
@@ -76,23 +142,35 @@ fn show_main(app: &AppHandle) {
 //    單獨執行時 Vite 沒在跑，畫面**必然**一片白。README「建置」章節寫了這件
 //    事，但日誌看不出來，於是每次有人拿 `cargo build` 的執行檔驗 UI 就會
 //    重新踩一次。
-// 2. 寬限時間內沒有任何一次 page load 完成就記一行 warn，並把 URL 一起帶上。
-//    涵蓋上面那條 dev 路徑，也涵蓋正式版自訂協定真的取不到資源的情形。
+// 2. 寬限時間內前端一次都沒有回報就緒就記一行 warn，並把 URL 一起帶上。
+//    涵蓋上面那條 dev 路徑，也涵蓋前端載進來了卻沒能跑起來的情形。
 //
 // 與 macOS 專屬的 `on_web_content_process_terminate` 那個 warn 是同一套
 // 思路：使用者再回報白屏時，traytunnel.log 要能一行定位是哪一種成因（那顆
 // 掛鉤本身是 macOS／iOS 專屬的 tauri API，沒有 Windows 對應項，維持
-// `#[cfg(target_os = "macos")]`，不在這次改動範圍內）。
+// `#[cfg(target_os = "macos")]`）。
 //
 // 只記日誌對「拿到裸執行檔卻不知道要另外跑 Vite」的人幫助有限——他們十之八九
 // 不會去翻 traytunnel.log，只會看到一片白就回報成 bug。寬限時間到、確認是
-// dev URL（`build.devUrl`）又真的沒有任何 page load 時，額外把空白的 webview
+// dev URL（`build.devUrl`）又真的沒有前端回報就緒時，額外把空白的 webview
 // `navigate` 到一個內嵌好說明文字的 `data:` URL，把「這是預期行為」直接畫在
-// 畫面上。這裡刻意加一層「有沒有任何導航進度」的守衛：`on_page_load` 除了
-// `Finished` 也追蹤 `Started`（dev server 有回應、頁面真的開始載了，只是還
-// 沒畫完）——已經看到 `Started` 就代表白屏八成只是單純慢，不該把使用者正在
-// 等的頁面覆蓋掉；只有寬限時間內連 `Started` 都沒有（dev server 根本沒回應）
-// 才值得把說明頁蓋上去。
+// 畫面上。
+//
+// ## 守衛為什麼是「前端自己回報」，不是 page-load 事件
+//
+// 上一版的守衛是 `Builder::on_page_load` 立起來的 `Started`／`Finished` 兩顆
+// 旗標：看到 `Finished` 就算載成功，看到 `Started` 就算「dev server 有回應、
+// 只是還沒畫完」，兩者都不覆蓋畫面。這條守衛在 macOS 的 WKWebView 上成立，
+// 在 Windows 的 WebView2 上**不成立**：連線被拒絕時 WebView2 不是讓導航失敗，
+// 而是**自己畫一頁錯誤頁**——那一頁是真的載入了，`Started` 與 `Finished` 都
+// 會照發。`PAGE_LOAD_FINISHED` 於是恆為真，複查提早 return，說明頁在 Windows
+// 上永遠不會出現。原本註解宣稱的「平台中立」是假的：同一份程式碼在兩個平台
+// 上做的是兩件不同的事，而且壞掉的那一邊沒有任何訊號。
+//
+// 換成前端就緒信標之後就不再依賴 webview 後端的導航語意：`main.ts` 的啟動鏈
+// 跑完會 invoke 一次 `frontend_ready`（見 `commands::frontend_ready`），那是
+// **我們自己的前端真的跑起來了**的唯一證據——WebView2 的錯誤頁、WKWebView
+// 的空白頁都不可能發出這個 invoke。兩個平台這才真的走同一套語意。
 //
 // 選 `navigate` 而不是 `eval`：實測過 `eval`／`eval_with_callback`，兩者在
 // macOS 的 WKWebView 後端完全沒有作用（不報錯、callback 也不會觸發）——原因
@@ -104,21 +182,64 @@ fn show_main(app: &AppHandle) {
 // 排隊狀態，`eval` 形同沒打中。`navigate` 是全新的一次導航請求，不吃這個
 // 佇列，`data:` URL 也不需要任何網路連線就能被直接當成一份完整文件載入，
 // 兩邊實測都能穩定畫出來；`navigate` 本身是 tauri 的跨平台 API，不是
-// WKWebView 專屬能力，Windows 走同一份程式碼。也因此完全不影響
-// `tauri build` 產物：正式版走 `tauri://localhost` 自訂協定，這裡的 URL
-// 判斷直接跳過。
-static PAGE_LOAD_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PAGE_LOAD_FINISHED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// WKWebView 專屬能力，Windows 走同一份程式碼。
 
-/// 前端載入的寬限時間。正式版走的是本機自訂協定、dev 走的是本機 http，兩邊
-/// 都遠遠用不到這麼久；訂得寬是為了讓那行 warn 只在真的載不到時才出現。
+/// 前端就緒信標。`main.ts` 的啟動鏈跑完會 invoke `frontend_ready`
+/// （`commands::frontend_ready` → [`mark_frontend_ready`]），這裡是唯一落點。
+static FRONTEND_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `commands::frontend_ready` 的落點：前端說它已經跑起來了。
+///
+/// 記一行 info 是刻意的——它與上面那行 `main webview url:` 湊成一對，使用者
+/// 回報白屏時，traytunnel.log 有沒有這一行就是「前端根本沒載進來」與「載進來
+/// 但沒畫出來」的分界線，而那正是整段診斷存在的理由。
+pub(crate) fn mark_frontend_ready() {
+    FRONTEND_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+    log::info!("the frontend reported ready");
+}
+
+/// 前端回報就緒的寬限時間。dev 走的是本機 http，遠遠用不到這麼久；訂得寬是
+/// 為了讓那行 warn 只在真的載不到時才出現。
+///
+/// 跟著整條複查一起掛 `cfg(dev)`：正式產物不跑這條路，留著只會是一個沒有人
+/// 用的常數（`tauri build` 會如實報 dead_code）。
+#[cfg(dev)]
 const PAGE_LOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 寬限時間到時的三種結局。抽成純函式（[`verdict`]）是為了讓它可以單獨測——
+/// 這是整段診斷唯一真的有分支的地方，其餘都是 I/O。
+#[cfg(dev)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadVerdict {
+    /// 前端回報過就緒，什麼都不必做。
+    Ready,
+    /// 沒就緒，但 webview 指的不是 dev server：只記一行 warn。這種情況畫面上
+    /// 是什麼我們並不知道（可能正在慢慢載），不該擅自覆蓋掉。
+    WarnOnly,
+    /// 沒就緒又確實指著 `build.devUrl`：記 warn 並把說明頁蓋上去。
+    ShowDevNotice,
+}
+
+/// 寬限時間到之後要做什麼，只看兩顆布林。
+#[cfg(dev)]
+fn verdict(frontend_ready: bool, is_dev_url: bool) -> LoadVerdict {
+    if frontend_ready {
+        LoadVerdict::Ready
+    } else if is_dev_url {
+        LoadVerdict::ShowDevNotice
+    } else {
+        LoadVerdict::WarnOnly
+    }
+}
+
 /// 空白 webview 要 `navigate` 過去的說明頁。深色底、繁體中文，讓拿到裸執行檔的
-/// 人一看畫面就知道這是預期行為，不必先去翻日誌。只在下面
-/// `watch_first_page_load` 判斷「dev URL 且寬限時間內完全沒有任何導航進度」時
-/// 才會被組成 `data:` URL 用掉。
+/// 人一看畫面就知道這是預期行為，不必先去翻日誌。
+///
+/// `cfg(dev)` 與 `tauri::is_dev()` 是同一個述詞（兩者同源於 tauri 的
+/// `custom-protocol` feature：tauri-build 依 `DEP_TAURI_DEV` 設這個 cfg 別名，
+/// `tauri::is_dev()` 則是 `!cfg!(feature = "custom-protocol")`），所以正式產物
+/// 裡這份字串連同整條複查一起**根本不會被編進去**，不是靠執行期分支繞過。
+#[cfg(dev)]
 const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -143,8 +264,8 @@ const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
   <div class="card">
     <h1>這是開發用建置</h1>
     <p>
-      這支執行檔由「cargo build」直接產生，沒有內嵌前端，等了 5 秒仍未偵測到
-      任何畫面載入，代表 Vite 開發伺服器沒有在跑。
+      這支執行檔由「cargo build」直接產生，沒有內嵌前端，等了 5 秒仍未收到
+      前端的就緒回報，代表 Vite 開發伺服器沒有在跑。
     </p>
     <p style="color:#9cdcfe;">正確的驗證方式：</p>
     <ul>
@@ -157,14 +278,18 @@ const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 
-/// 記下主 webview 的來源，並在寬限時間後複查一次有沒有真的載完；載不完、又是
-/// dev URL、又完全沒有任何導航進度的話，順手把說明頁 `navigate` 進空白的
-/// webview。
+/// 記下主 webview 的來源，並在寬限時間後複查一次前端有沒有真的跑起來；沒有、
+/// 又指著 dev URL 的話，順手把說明頁 `navigate` 進空白的 webview。
 ///
 /// `dev_url` 的單一來源是 `app.config().build.dev_url`（呼叫端傳進來，見
 /// `setup()`），不在這裡寫死 `"http://localhost:1420"`——那是目前
 /// tauri.conf.json 的值，不是規格；改成比對 `Url::origin()`，不寫死字串也
 /// 不受路徑／查詢字串影響。
+///
+/// 那行 `main webview url:` 無論哪種建置都要記（它是白屏回報的第一條線索）；
+/// 複查本身只有 dev 建置才有意義，正式產物走的是內嵌資產的自訂協定，比對不上
+/// 任何 dev_url，整段連同說明頁的 HTML 一起編不進去（見
+/// [`DEV_BUILD_NOTICE_HTML`] 的說明：`cfg(dev)` 就是 `tauri::is_dev()`）。
 fn watch_first_page_load<R: tauri::Runtime>(
     win: &tauri::WebviewWindow<R>,
     dev_url: Option<tauri::Url>,
@@ -173,45 +298,53 @@ fn watch_first_page_load<R: tauri::Runtime>(
     let url_text =
         actual_url.as_ref().map(|u| u.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     log::info!("main webview url: {url_text}");
-    // 有沒有指向 dev server 這件事在啟動當下就能判斷完，搬進 async 區塊前先
-    // 算好，區塊裡不必再重新 parse 一次字串。
-    let is_dev_url = match (&actual_url, &dev_url) {
-        (Ok(actual), Some(dev)) => actual.origin() == dev.origin(),
-        _ => false,
-    };
-    let win = win.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(PAGE_LOAD_GRACE).await;
-        if PAGE_LOAD_FINISHED.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        log::warn!(
-            "the main webview has not finished loading {url_text} after {}s, the window will be blank; \
-             a binary from a plain `cargo build` points at build.devUrl and needs `npm run web:dev` \
-             running alongside it, build with `tauri build` for one that stands alone",
-            PAGE_LOAD_GRACE.as_secs()
-        );
-        // Started 代表 dev server 有回應、頁面真的開始載了（只是還沒
-        // Finished，可能單純是慢）——這種情況不該把使用者正在等的畫面覆蓋
-        // 掉。只有寬限時間內連 Started 都沒有（dev server 根本沒回應）又確認
-        // 是 build.devUrl 時，才值得把說明頁蓋上去；正式版的
-        // `tauri://localhost` 比對不上任何 dev_url，對 `tauri build` 產物
-        // 零影響。
-        if PAGE_LOAD_STARTED.load(std::sync::atomic::Ordering::Relaxed) || !is_dev_url {
-            return;
-        }
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
-        let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
-        match tauri::Url::parse(&data_url) {
-            Ok(notice_url) => {
-                if let Err(e) = win.navigate(notice_url) {
-                    log::warn!("could not navigate the blank webview to the dev-build notice: {e}");
-                }
+
+    #[cfg(not(dev))]
+    let _ = (actual_url, dev_url, url_text);
+
+    #[cfg(dev)]
+    {
+        // 有沒有指向 dev server 這件事在啟動當下就能判斷完，搬進 async 區塊前先
+        // 算好，區塊裡不必再重新 parse 一次字串。
+        let is_dev_url = match (&actual_url, &dev_url) {
+            (Ok(actual), Some(dev)) => actual.origin() == dev.origin(),
+            _ => false,
+        };
+        let win = win.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(PAGE_LOAD_GRACE).await;
+            let ready = FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed);
+            let verdict = verdict(ready, is_dev_url);
+            if verdict == LoadVerdict::Ready {
+                return;
             }
-            Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
-        }
-    });
+            log::warn!(
+                "the frontend has not reported ready {}s after start (webview url {url_text}), \
+                 the window will be blank; a binary from a plain `cargo build` points at \
+                 build.devUrl and needs `npm run web:dev` running alongside it, build with \
+                 `tauri build` for one that stands alone",
+                PAGE_LOAD_GRACE.as_secs()
+            );
+            // 只有真的指著 dev server 才覆蓋畫面：其餘情形我們並不知道畫面上
+            // 是什麼（可能正在慢慢載），蓋上去會把使用者正在等的頁面吃掉。
+            if verdict != LoadVerdict::ShowDevNotice {
+                return;
+            }
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
+            let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
+            match tauri::Url::parse(&data_url) {
+                Ok(notice_url) => {
+                    if let Err(e) = win.navigate(notice_url) {
+                        log::warn!(
+                            "could not navigate the blank webview to the dev-build notice: {e}"
+                        );
+                    }
+                }
+                Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
+            }
+        });
+    }
 }
 
 /// 系統匣氣泡通知。掛名（Windows 的 AUMID）與實際怎麼彈都在平台層，
@@ -220,19 +353,21 @@ fn balloon(app: &AppHandle, body: &str) {
     platform::show_notification(&app.config().identifier, "Traytunnel", body);
 }
 
-/// 通知裡「怎麼重新打開視窗」那句尾巴，平台各自的滑鼠慣例不同：Windows 維持
-/// 雙擊圖示的既有語意不動；macOS 沒有雙擊（D4 決議：左右鍵一律開選單，見
-/// `build_tray` 的 cfg 分支），改指向選單裡的「Open window」項
-/// （`traymenu::ID_OPEN` 的標籤）。
-#[cfg(windows)]
-const REOPEN_HINT: &str = "Double-click the tray icon to reopen.";
-#[cfg(target_os = "macos")]
-const REOPEN_HINT: &str = "Choose \"Open window\" from the tray icon's menu to reopen.";
+/// 通知裡「怎麼重新打開視窗」那句尾巴。
+///
+/// 手勢本身（雙擊圖示／從選單挑 Open window）由
+/// [`platform::TRAY_OPEN_GESTURE_HINT`] 提供，這裡只接尾巴。**兩個平台各抄一份
+/// 完整句子是不行的**：那句話描述的是 `build_tray` 的點擊政策，兩處分開放就會
+/// 漂——改了政策忘了改文案，通知就會教使用者做一個做不到的手勢，而且沒有任何
+/// 東西擋得住。門面常數與點擊政策同源（見門面那段說明），這裡拿到的一定是對的。
+fn reopen_hint() -> String {
+    format!("{} to reopen.", platform::TRAY_OPEN_GESTURE_HINT)
+}
 
-#[cfg(windows)]
-const OPEN_HINT: &str = "Double-click the tray icon to open.";
-#[cfg(target_os = "macos")]
-const OPEN_HINT: &str = "Choose \"Open window\" from the tray icon's menu to open.";
+/// 同 [`reopen_hint`]，給「本來就沒開過視窗」那條路徑用（`--tray` 啟動）。
+fn open_hint() -> String {
+    format!("{} to open.", platform::TRAY_OPEN_GESTURE_HINT)
+}
 
 fn hide_to_tray(state: &Shared) {
     if let Some(w) = state.app.get_webview_window(MAIN_WINDOW) {
@@ -242,13 +377,12 @@ fn hide_to_tray(state: &Shared) {
     // 的樣子，跟 show_main 的 Regular 對稱。
     platform::retire_to_tray(&state.app);
     if state.take_tray_hint() {
-        balloon(&state.app, &format!("Closed to tray, still running. {REOPEN_HINT}"));
+        balloon(&state.app, &format!("Closed to tray, still running. {}", reopen_hint()));
     }
 }
 
 fn do_exit(state: &Shared) {
-    state.mark_exiting();
-    state.kill_all_jobs();
+    state.shutdown();
     state.app.exit(0);
 }
 
@@ -296,8 +430,7 @@ fn kill_jobs_on_final_exit(app: &AppHandle, event: &tauri::RunEvent) {
         "the event loop is exiting without going through do_exit (Dock Quit or logout), \
          killing every supervised process tree now"
     );
-    state.mark_exiting();
-    state.kill_all_jobs();
+    state.shutdown();
 }
 
 /// 掛上 SIGTERM／SIGHUP／SIGINT 的收尾。
@@ -448,10 +581,14 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 // 文件被解析之前、任何頁面自己的 script 執行之前跑）在頁面載入前把值寫進
 // `<html data-platform>`，vite.config.ts 的 htmlPlatformPlugin 與 index.html
 // 的佔位字串因此可以整段刪掉。
-#[cfg(target_os = "macos")]
-const PLATFORM_FLAG: &str = "macos";
-#[cfg(windows)]
-const PLATFORM_FLAG: &str = "windows";
+//
+// 值直接用 `std::env::consts::OS`，不自己抄一組 `cfg` 常數：那組常數要抄的
+// 正是編譯目標本身，而標準函式庫已經有一份**由編譯器填的**同義字串，兩者
+// 不可能不一致。手抄版多了兩行 `cfg`、多了一個「哪天加第三個平台會忘記補」
+// 的洞，換不到任何東西。目前兩個目標的值分別是 `"macos"` 與 `"windows"`，
+// 與原本手抄的兩個字面值逐字相同，styles.css 的
+// `[data-platform="macos"]` 選擇器不必動。
+const PLATFORM_FLAG: &str = std::env::consts::OS;
 
 // ---------------------------------------------------------------- 進入點
 
@@ -545,6 +682,7 @@ pub fn run() {
             commands::window_close,
             commands::window_minimize,
             commands::exit_app,
+            commands::frontend_ready,
         ]);
 
     // WKWebView 的渲染跑在獨立於本體行程的系統行程（com.apple.WebKit.WebContent），
@@ -561,26 +699,39 @@ pub fn run() {
     // 不會自動重載，要自己呼叫 `Webview::reload`；先記一筆 warn 才有辦法從日誌
     // 回頭確認這件事真的發生過——使用者若再遇到白屏，第一步就是查
     // traytunnel.log 有沒有這行，有就是這個機制，沒有就要往別的方向查。
-    // Started／Finished 兩顆旗標立起來的時機，`watch_first_page_load` 的複查
-    // 靠它們決定要不要、以及能不能覆蓋畫面（見上面那段白屏診斷的說明）。
-    // 平台中立：裸 `cargo build` 在 Windows／macOS 兩邊都會踩到同一種白屏。
-    let builder = builder.on_page_load(|_webview, payload| match payload.event() {
-        tauri::webview::PageLoadEvent::Started => {
-            PAGE_LOAD_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        tauri::webview::PageLoadEvent::Finished => {
-            PAGE_LOAD_FINISHED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
-
+    //
+    // **reload 的時機由視窗可不可見決定**，不是無條件立刻做：觸發這顆掛鉤的
+    // 前提就是系統缺記憶體，藏著的時候立刻重生一個 WebContent 行程去畫沒有人
+    // 在看的頁面，只會被系統再回收一次，一路轉圈。規則整段寫在
+    // `plan_reload_after_terminate` 上面。
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(|webview| {
-        log::warn!(
-            "webview content process terminated (label: {}), reloading to self-heal",
-            webview.label()
-        );
-        if let Err(e) = webview.reload() {
-            log::warn!("could not reload the webview after content process termination: {e}");
+        let visible = webview
+            .window()
+            .is_visible()
+            // 問不到就當作看得見：立刻重載最多是多花一次重生，判成藏著卻其實
+            // 有人在看的話，那片白屏會一直留到使用者自己去點系統匣才好。
+            .unwrap_or(true);
+        match plan_reload_after_terminate(visible) {
+            ReloadPlan::Now => {
+                log::warn!(
+                    "webview content process terminated (label: {}), reloading to self-heal",
+                    webview.label()
+                );
+                if let Err(e) = webview.reload() {
+                    log::warn!(
+                        "could not reload the webview after content process termination: {e}"
+                    );
+                }
+            }
+            ReloadPlan::Defer => {
+                log::warn!(
+                    "webview content process terminated (label: {}) while the window was hidden, \
+                     deferring the reload until the window is shown again",
+                    webview.label()
+                );
+                WEBVIEW_NEEDS_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     });
 
@@ -591,6 +742,16 @@ pub fn run() {
             // 圖示、只在系統匣的既有行為）。要趁還沒建視窗、建系統匣之前定調，
             // 免得使用者先看到一閃而過的 Dock 圖示。Windows 是 no-op（見
             // `platform::initial_policy_for_tray_start` 的門面說明）。
+            //
+            // 這一行看起來「太晚」而且確實太晚：setup 跑在事件迴圈的
+            // `RuntimeRunEvent::Ready` 上，比 tao 的
+            // `applicationDidFinishLaunching:` 還後面，所以 `--tray` 啟動時
+            // Dock 圖示會先閃一格（約 50–100ms）才消失。本輪 review（M1）把
+            // 這件事當成回歸查過，三個時機全部實測——搬到唯一真正更早的位置
+            // （`build()` 與 `run()` 之間）確實能把那一格消掉，代價卻是讓 tao
+            // 無條件執行的 `activateIgnoringOtherApps` 生效並**永久搶走鍵盤
+            // 焦點**，比原本更糟。**維持原狀**，數據與結論全記在
+            // `platform::macos::policy` 模組開頭。
             platform::initial_policy_for_tray_start(app.handle());
 
             let handle = app.handle().clone();
@@ -747,7 +908,7 @@ pub fn run() {
                 // 這條路徑自己已經彈過一顆通知，順帶把「關到系統匣」那顆一次性
                 // 提示領掉，避免使用者第一次按 X 時再被通知一次
                 let _ = shared.take_tray_hint();
-                balloon(&handle, &format!("Started in the system tray. {OPEN_HINT}"));
+                balloon(&handle, &format!("Started in the system tray. {}", open_hint()));
             } else {
                 show_main(&handle);
             }
@@ -864,29 +1025,22 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
     let model = traymenu::menu_model(&shared.source_views(), &shared.wg_views(), ready.as_deref());
     let menu = traymenu::build(app, &model)?;
 
-    // 圖示來源分平台：Windows 從內嵌 ICO 挑層（一字不動）；macOS 要一份純黑＋透明
-    // 的 template PNG，彩色 ICO 硬套 icon_as_template 只會走樣。兩邊都挑不到層時
-    // 一路退回 codegen 內建的圖示；連那個都沒有時寧可先把系統匣建起來也不要讓整支
-    // 程式 panic，圖示之後照樣可以補
-    #[cfg(windows)]
-    let icon = appicon::tray_icon().or_else(|| app.default_window_icon().cloned());
-    #[cfg(target_os = "macos")]
-    let icon = appicon::tray_icon_template()
-        .or_else(appicon::tray_icon)
-        .or_else(|| app.default_window_icon().cloned());
+    // 圖示與「它是不是 template image」一起由平台門面決定（`platform::tray_icon`）。
+    // 兩件事必須同源：舊做法在這裡分兩段 cfg——一段挑圖（macOS 先試 template PNG，
+    // 解不開退回彩色 ICO），另一段無條件 `icon_as_template(true)`——退路一旦踩到就
+    // 會拿彩色圖去套 template，AppKit 只讀 alpha 重畫剪影，系統匣上是一團走樣的
+    // 黑影。門面回 `(Image, bool)` 之後這個分岔在型別上就不成立了，這三段 cfg
+    // 也跟著消失。挑不到任何圖時寧可先把系統匣建起來，也不要讓整支程式 panic。
+    let icon = platform::tray_icon(app);
     if icon.is_none() {
         log::warn!("no tray icon available, building the tray without one");
     }
     let st = shared.clone();
     let mut builder = TrayIconBuilder::with_id(TRAY_ID);
-    if let Some(icon) = icon {
-        builder = builder.icon(icon);
-    }
-    // macOS 依明暗模式（與選取狀態）自動套色只認 template image；Windows 沒有這個
-    // 概念，這個呼叫在 Windows 上是 no-op，但仍限定在 macOS 分支讓意圖清楚
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder.icon_as_template(true);
+    if let Some((icon, template)) = icon {
+        // 依明暗模式（與選取狀態）自動套色只認 template image，這是 macOS 專屬的
+        // 概念；Windows 恆 false，這個呼叫在那邊本來就是 no-op
+        builder = builder.icon(icon).icon_as_template(template);
     }
     builder = builder
         .tooltip("Traytunnel")
@@ -895,7 +1049,11 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
 
     // 點擊行為（D4）：Windows 維持現行「左鍵開主視窗、右鍵開選單」一字不動；
     // macOS 採平台慣例——左右鍵一律開選單，開主視窗只留在選單的「Open window」項
-    // （traymenu::menu_model 一律附上這一項，見 traymenu.rs），不額外接雙擊處理常式
+    // （traymenu::menu_model 一律附上這一項，見 traymenu.rs），不額外接雙擊處理常式。
+    //
+    // **這兩段 cfg 與 `platform::TRAY_OPEN_GESTURE_HINT` 綁定**：通知裡教使用者
+    // 做的手勢就是這裡設定的政策。改了這裡就要去改那個常數（各平台的
+    // `trayicon` 子模組），否則通知會教一個做不到的手勢。
     #[cfg(windows)]
     {
         builder = builder.show_menu_on_left_click(false).on_tray_icon_event(|tray, event| {
@@ -913,4 +1071,94 @@ fn build_tray(app: &AppHandle, shared: &Shared) -> tauri::Result<()> {
 
     builder.build(app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// 白屏複查的判斷（M13）：**唯一**讓說明頁蓋上去的組合是「前端沒回報就緒」
+    /// 且「webview 指著 build.devUrl」。
+    ///
+    /// 舊版守衛看的是 `on_page_load` 的 Started／Finished，而 WebView2 對連線
+    /// 失敗的錯誤頁也照發那兩顆事件——說明頁在 Windows 上因此永遠不會出現。
+    /// 換成前端自己 invoke 的就緒信標之後，兩個平台走的才是同一套語意；這條
+    /// 測試釘住的就是那張真值表。
+    #[cfg(dev)]
+    #[test]
+    fn dev_notice_only_when_the_frontend_is_silent_on_a_dev_url() {
+        // 前端回報就緒 → 不管是不是 dev URL 都不必做任何事
+        assert_eq!(verdict(true, true), LoadVerdict::Ready);
+        assert_eq!(verdict(true, false), LoadVerdict::Ready);
+        // 沒回報就緒又指著 dev server → 這才是要蓋說明頁的那一格
+        assert_eq!(verdict(false, true), LoadVerdict::ShowDevNotice);
+        // 沒回報就緒但不是 dev URL（例如正式協定真的取不到資源）→ 只記一行
+        // warn，畫面上是什麼我們不知道，不擅自覆蓋
+        assert_eq!(verdict(false, false), LoadVerdict::WarnOnly);
+    }
+
+    /// content process 被回收時的處置（M14）：可見才立刻重載。
+    ///
+    /// 藏著的時候立刻 reload 會馬上重生一個 WebContent 行程去畫沒有人在看的
+    /// 頁面——而觸發這顆掛鉤的前提正是系統缺記憶體，於是它再被回收、再 reload，
+    /// 一路轉圈。這條測試釘住「藏著就只立旗標」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hidden_window_defers_the_reload() {
+        assert_eq!(plan_reload_after_terminate(true), ReloadPlan::Now);
+        assert_eq!(plan_reload_after_terminate(false), ReloadPlan::Defer);
+    }
+
+    /// 欠下的那次 reload 只還一次：`show_main` 每次開窗都會問這顆旗標，
+    /// 沒有「拿走即清掉」的話，回收過一次之後每次開窗都會白重載一遍。
+    #[test]
+    fn the_pending_reload_flag_is_taken_exactly_once() {
+        let flag = AtomicBool::new(false);
+        assert!(!take_pending_reload(&flag), "沒欠就不該回 true");
+
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(take_pending_reload(&flag), "欠了一次要領得到");
+        assert!(!take_pending_reload(&flag), "領過就該清掉，不可以每次開窗都重載");
+    }
+
+    /// 前端旗標的預設是「還沒就緒」，而且 `mark_frontend_ready` 之後就是就緒。
+    /// 這顆旗標是行程全域的，所以只在這一條測試裡碰它（`verdict` 那條走的是
+    /// 純函式，不依賴全域狀態）。
+    #[test]
+    fn the_frontend_ready_beacon_flips_the_flag() {
+        assert!(!FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed));
+        mark_frontend_ready();
+        assert!(FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// 前端平台旗標就是編譯目標本身，不再手抄一組 cfg 常數（M18）。
+    /// styles.css 的 `[data-platform="macos"]` 選擇器吃的是這個值。
+    #[test]
+    fn the_platform_flag_matches_the_build_target() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(PLATFORM_FLAG, "macos");
+        #[cfg(windows)]
+        assert_eq!(PLATFORM_FLAG, "windows");
+    }
+
+    /// 通知裡那句手勢提示由平台門面常數接出來，兩種語境共用同一份描述（M18）。
+    /// 文案與改動前逐字相同——這條測試釘的就是「沒有因為改結構而動到使用者
+    /// 看得到的字」。
+    #[test]
+    fn the_reopen_hints_read_exactly_as_before() {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                reopen_hint(),
+                "Choose \"Open window\" from the tray icon's menu to reopen."
+            );
+            assert_eq!(open_hint(), "Choose \"Open window\" from the tray icon's menu to open.");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(reopen_hint(), "Double-click the tray icon to reopen.");
+            assert_eq!(open_hint(), "Double-click the tray icon to open.");
+        }
+    }
 }

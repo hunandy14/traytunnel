@@ -9,6 +9,7 @@ mod notify;
 mod paths;
 mod policy;
 mod spawn;
+mod trayicon;
 pub mod update;
 mod winsys;
 
@@ -16,6 +17,7 @@ pub use notify::{prepare_notifications, show_notification};
 pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 pub use policy::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
 pub use spawn::ProcessSupervisor;
+pub use trayicon::{tray_icon, TRAY_OPEN_GESTURE_HINT};
 pub use winsys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
     local_time_hms, read_run_value as read_autostart_command,
