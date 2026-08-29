@@ -1,5 +1,7 @@
 //! W3-A：程序管理門面的跨平台契約測試——`platform::is_listening` 與
-//! `platform::ProcessSupervisor` 的不變量。
+//! `platform::ProcessSupervisor` 的不變量（§1／§2）；F3 車道起，順帶收留其餘
+//! 「兩平台原本各自測試模組逐字重複」的門面契約（§3：`local_time_hms`、
+//! `small_icon_size`／`large_icon_size`），不必為了兩三支測試另開一個檔案。
 //!
 //! 這一份刻意掛在 `platform/mod.rs`（門面）底下，而不是塞進任何一邊的實作：
 //! 契約是「兩個平台都得成立的那些話」，寫在門面這一層才擋得住「某一邊悄悄
@@ -30,11 +32,16 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
-use super::{is_listening, ProcessSupervisor};
+use super::{is_listening, large_icon_size, local_time_hms, small_icon_size, ProcessSupervisor};
 
 /// 等一件「應該會發生」的事的上限。給得很寬：CI runner 上程序建立與埠狀態
 /// 更新都可能慢上一個數量級，這個數字只負責讓測試不要無限掛住。
-const DEADLINE: Duration = Duration::from_secs(20);
+///
+/// `pub(super)`：macOS 的 `sys::tests::a_wildcard_listener_is_visible` 也借用
+/// 這個期限與下面的 [`poll_until`]，不必自己另外手刻一份輪詢迴圈——那支測試查
+/// 的是 wildcard 位址這個 macOS 專屬的額外語意，不屬於兩平台都要成立的契約，
+/// 所以留在它自己的模組，只是輪詢機制跟這裡共用。
+pub(super) const DEADLINE: Duration = Duration::from_secs(20);
 
 /// 輪詢間隔。夠密才不會把「已經生效」誤記成「花了很久」，夠疏才不會空轉燒 CPU。
 const TICK: Duration = Duration::from_millis(50);
@@ -48,7 +55,9 @@ const QUIET_WINDOW: Duration = Duration::from_secs(3);
 const SLEEP_SECONDS: &str = "120";
 
 /// 輪詢到條件成立，或到期限為止。回 false 就是逾時。
-fn poll_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+///
+/// `pub(super)`：理由同 [`DEADLINE`]。
+pub(super) fn poll_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + deadline;
     loop {
         if cond() {
@@ -283,4 +292,42 @@ async fn a_running_child_is_left_alone_while_the_supervisor_lives() {
     // 收尾：測完不留東西在機器上跑
     drop(supervisor);
     let _ = tokio::time::timeout(DEADLINE, child.wait()).await;
+}
+
+// ------------------------------------------------------------------
+// 規格 §3：與程序管理無關，但兩平台原本逐字重複的其餘契約測試
+// ------------------------------------------------------------------
+//
+// 這兩支跟 §1／§2 一樣不帶任何平台閘，但測的不是程序或埠，而是
+// `platform::local_time_hms` 與 `platform::{small_icon_size,large_icon_size}`
+// 這兩組門面函式：兩邊分別在 `macos::sys` 與 `windows::winsys` 的測試模組裡
+// 各自抄了一份、逐字相同（連斷言帶訊息都一樣，`metrics_are_sane_on_this_machine`
+// 只有一句失敗訊息的措辭不同，已收斂成不偏袒任一平台的版本），這裡沿用本檔
+// 「兩平台都必須成立的話收在門面這一層」的同一個理由，一併搬進來，兩邊各自
+// 的副本已刪除。
+
+/// §3(i)：時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss。
+#[test]
+fn local_time_is_a_fixed_width_hms() {
+    let ts = local_time_hms();
+    assert_eq!(ts.len(), 8, "{ts}");
+    let parts: Vec<&str> = ts.split(':').collect();
+    assert_eq!(parts.len(), 3, "{ts}");
+    let bounds = [24, 60, 60];
+    for (p, max) in parts.iter().zip(bounds) {
+        assert_eq!(p.len(), 2, "每段都要補到兩位：{ts}");
+        assert!(p.parse::<u32>().unwrap() < max, "{ts}");
+    }
+}
+
+/// §3(ii)：這台機器兩種圖示尺寸的合理性——大圖示不會比小圖示小，也不會是 0，
+/// 兩者都該是正方形。
+#[test]
+fn metrics_are_sane_on_this_machine() {
+    let (sw, sh) = small_icon_size();
+    let (lw, lh) = large_icon_size();
+    assert_eq!(sw, sh, "小圖示應為正方");
+    assert_eq!(lw, lh, "大圖示應為正方");
+    assert!(sw >= 16 && lw >= 32, "small={sw} large={lw}");
+    assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
 }

@@ -46,14 +46,15 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-/// 登記簿放 `~/Library/Application Support/<identifier>/supervised-pgids.json`。
-///
-/// identifier 直接寫死而不是走 `app.path().app_local_data_dir()`，理由與
-/// Windows 那邊的 `update::staging_dir` 一樣：這一層完全沒有 `AppHandle`
-/// （`ProcessSupervisor::spawn` 拿到的只有一個 `Command`），而這個字串本來就
-/// 是 `tauri.conf.json` 的 `identifier`，兩邊不一致的話 CI 也抓不到——所以
-/// [`the_identifier_matches_tauri_conf`] 直接把 tauri.conf.json 讀進來比對。
-const IDENTIFIER: &str = "com.traytunnel.desktop";
+use crate::platform::update_common::IDENTIFIER;
+
+// 登記簿放 `~/Library/Application Support/<identifier>/supervised-pgids.json`。
+// identifier 不在這裡另外寫死一份，而是共用 `update_common::IDENTIFIER`
+// （上面的 import）：理由與 Windows 那邊的 `update::staging_dir` 一樣，這一層
+// 完全沒有 `AppHandle`（`ProcessSupervisor::spawn` 拿到的只有一個 `Command`）。
+// 原本這裡另外寫死一份字面常數、用一條測試釘住不能與 tauri.conf.json 的
+// `identifier` 欄位漂掉；現在直接共用同一個來源，沒有第二份可以漂，那條
+// 釘住測試也就一併沒有存在的必要（見 F3 車道 C17）。
 
 /// 登記簿檔名。
 const FILE_NAME: &str = "supervised-pgids.json";
@@ -234,7 +235,7 @@ fn registry_path() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    Some(super::paths::home_dir()?.join("Library").join("Application Support").join(IDENTIFIER))
+    Some(super::paths::home_dir()?.join("Library").join("Application Support").join(&*IDENTIFIER))
         .map(|dir| dir.join(FILE_NAME))
 }
 
@@ -734,15 +735,9 @@ mod tests {
         assert_eq!(command_line(&std::process::Command::new("ssh")), "ssh");
     }
 
-    /// 登記簿的資料夾名就是 tauri.conf.json 的 identifier。寫死一份字串是為了
-    /// 讓這一層不必有 `AppHandle`，但寫死就有漂掉的風險，所以直接讀那份設定比對。
-    #[test]
-    fn the_identifier_matches_tauri_conf() {
-        let conf =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"))
-                .expect("讀得到 tauri.conf.json");
-        let json: serde_json::Value =
-            serde_json::from_str(&conf).expect("tauri.conf.json 要是合法 JSON");
-        assert_eq!(json["identifier"].as_str(), Some(IDENTIFIER));
-    }
+    // `the_identifier_matches_tauri_conf`：登記簿的資料夾名以前是另外寫死一份
+    // 字面常數，這條測試把 tauri.conf.json 讀進來比對兩者沒有漂掉。F3 車道 C17
+    // 把 `IDENTIFIER` 改成直接共用 `update_common` 那份（本來就是從
+    // tauri.conf.json 讀出來的），沒有第二份可以漂了，這條測試也就跟著刪除
+    // （見本檔開頭 `IDENTIFIER` 的說明）。
 }

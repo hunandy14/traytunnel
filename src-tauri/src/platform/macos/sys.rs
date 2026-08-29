@@ -395,7 +395,8 @@ pub fn open_url(url: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+
+    use crate::platform::process_tests::{poll_until, DEADLINE};
 
     /// wildcard（`0.0.0.0`）監聽者必須被看得到——這是舊版 bind 探測看不到、
     /// 這次改成被動查詢要修的語意缺口（既有的三條埠偵測契約測試在
@@ -403,21 +404,14 @@ mod tests {
     /// 補的是 macOS 這邊 wildcard 這個額外語意，因此另外掛在這支實作自己的
     /// 測試模組底下）。用 OS 配發的 ephemeral 埠（bind 0 再讀實際埠號），
     /// 不寫死任何埠號；查表跟核心更新之間可能隔一拍，所以是輪詢＋期限，不是
-    /// 綁完就當場問一次——紀律同 `process_tests.rs`。
+    /// 綁完就當場問一次——輪詢機制借用 `process_tests` 那份（`poll_until`／
+    /// `DEADLINE` 升成 `pub(super)`），不必自己另外手刻一份一模一樣的迴圈。
     #[test]
     fn a_wildcard_listener_is_visible() {
         let listener = TcpListener::bind(("0.0.0.0", 0)).expect("要綁得起來");
         let port = listener.local_addr().expect("listener 一定有本地位址").port();
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut seen = false;
-        while Instant::now() < deadline {
-            if is_listening(port) {
-                seen = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let seen = poll_until(DEADLINE, || is_listening(port));
         drop(listener);
 
         assert!(
@@ -428,20 +422,8 @@ mod tests {
         );
     }
 
-    /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss。
-    /// 對照 Windows `winsys::local_time_is_a_fixed_width_hms`。
-    #[test]
-    fn local_time_is_a_fixed_width_hms() {
-        let ts = local_time_hms();
-        assert_eq!(ts.len(), 8, "{ts}");
-        let parts: Vec<&str> = ts.split(':').collect();
-        assert_eq!(parts.len(), 3, "{ts}");
-        let bounds = [24, 60, 60];
-        for (p, max) in parts.iter().zip(bounds) {
-            assert_eq!(p.len(), 2, "每段都要補到兩位：{ts}");
-            assert!(p.parse::<u32>().unwrap() < max, "{ts}");
-        }
-    }
+    // `local_time_is_a_fixed_width_hms` 與 Windows 逐字相同，已搬到
+    // `platform::process_tests`（跨平台契約容器），不在這裡重複一份。
 
     /// label 一定要是安全的檔名：非英數字元收斂成 `-`，大小寫正規化。
     #[test]
@@ -584,15 +566,7 @@ mod tests {
     // 最大層與空清單）已隨函式本體搬到 `crate::appicon`，與 Windows 版合併保留
     // 兩邊的斷言資料，不在這裡重複一份。
 
-    /// 這台機器兩種圖示尺寸的合理性：與 Windows 版
-    /// `metrics_are_sane_on_this_machine` 同樣的斷言，只是這裡的值是固定常數
-    #[test]
-    fn metrics_are_sane_on_this_machine() {
-        let (sw, sh) = small_icon_size();
-        let (lw, lh) = large_icon_size();
-        assert_eq!(sw, sh, "小圖示應為正方");
-        assert_eq!(lw, lh, "大圖示應為正方");
-        assert!(sw >= 16 && lw >= 32, "small={sw} large={lw}");
-        assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
-    }
+    // `metrics_are_sane_on_this_machine` 與 Windows 逐字相同（只差一句失敗訊息
+    // 的措辭），已搬到 `platform::process_tests`（跨平台契約容器），不在這裡
+    // 重複一份。
 }

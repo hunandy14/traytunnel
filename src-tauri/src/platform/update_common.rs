@@ -18,13 +18,36 @@
 //! 注入把「該用哪個 `open_url`」這個決定留在各平台的 `update.rs` 手上，這裡
 //! 只管「查完之後開哪個網址、失敗了記哪一行日誌」。
 //!
-//! 本檔這幾支的六支測試，兩邊原本逐字相同（連斷言帶註解都一樣），這裡只留一份。
+//! 本檔前六支測試，兩邊原本逐字相同（連斷言帶註解都一樣），這裡只留一份；
+//! 另外兩支不是這種逐字重複：`the_shipped_updater_endpoint_matches_latest_json`
+//! 是兩平台各自 endpoint 釘住測試的合併版（見下方「出貨設定的單一來源」），
+//! `the_shipped_identifier_and_product_name_are_the_ones_users_already_have`
+//! 是新補的一條——identifier／產品名是與既有安裝之間的相容契約，這裡把出貨
+//! 設定裡的絕對值直接釘住，見那條測試自己的說明。
+//!
+//! ## 出貨設定的單一來源（[`TAURI_CONF`]／[`conf_str`]／[`IDENTIFIER`]／[`PRODUCT_NAME`]）
+//!
+//! 這一段嚴格說不是「更新」邏輯——`IDENTIFIER` 同時是 macOS `pgids` 登記簿的
+//! 資料夾名，跟更新一點關係都沒有。比較乾淨的做法本來是另開一個平台中立的
+//! `shipped_conf` 模組，專門收「編譯期讀出貨的 tauri.conf.json」這件事；
+//! 但本車道的紀律是不動 `lib.rs`，而新模組得在那裡加一行 `mod` 宣告才掛得上
+//! 這棵樹。`update_common` 已經掛在 `platform/mod.rs` 底下不必再加線，且它本來
+//! 就是「平台中立的共用邏輯」這個角色，所以退而求其次收在這裡——比起兩平台
+//! 各自維護一份「怎麼讀 tauri.conf.json」，多掛一個不完全貼題的名字划算得多。
+//! 兩者原本都各自 `include_str!` 一次同一份檔案：Windows 的
+//! `update::conf_str`／`PRODUCT_NAME`／`IDENTIFIER`（只有它需要在
+//! `apply_pending_at_startup` 那個沒有 `AppHandle` 的時間點問設定），macOS 的
+//! `pgids::IDENTIFIER` 則是寫死一份字面常數、另外用一條測試釘住不能漂掉。
+//! 現在兩邊都改成從這裡讀同一份，字面常數與那條釘住測試也就一起沒有存在的
+//! 必要——不是漂不漂的問題，是它現在就是同一個值的兩個名字。
 
 use std::io;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use semver::Version;
 
+use crate::state::UpdateInfo;
 use crate::Shared;
 
 /// 啟動後隔這麼久才做第一次檢查：開機當下要先把系統匣、隧道那些真正要緊的事做完，
@@ -53,6 +76,26 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
 /// 所以只能在拿到 `Update` 物件之後對它的 pub 欄位直接賦值。兩平台同一個值。
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// 更新資訊清單。安裝版由 updater 外掛（tauri.conf.json 的 endpoints）去拿，
+/// Windows 可攜／單檔車道的 `fetch_latest_version` 與 macOS 的 live 測試各自
+/// 另外拉一次，三邊指的是同一份檔案。兩平台原本各自宣告一份（Windows 是
+/// production 常數，macOS 只有測試模組裡那份），字面值完全相同，這裡只留一份。
+//
+// 這兩個 cfg_attr 要長期留著（同 `config::automatic_updates_enabled` 那份的
+// 理由）：macOS 唯一的消費者是 `#[ignore]` 的 live 測試，不是 production 路徑
+// ——它沒有像 Windows 可攜車道那樣自己拉 latest.json 比版本，查詢整段外包給
+// updater 外掛（見 `macos::update` 模組說明）。拿掉的話 macOS 那一腿的
+// `cargo clippy --all-targets`（不含 `--tests` 的 `lib` 目標看不到測試模組）
+// 會 dead_code 撞上 `-D warnings` 紅燈。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const LATEST_JSON: &str =
+    "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
+
+/// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶。兩平台同一個值，
+/// 同樣只有 Windows 的 production 路徑會用到，理由同 [`LATEST_JSON`]。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
 /// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
 /// 使用者可以自己挑要哪一版（含更早的版本）
@@ -92,6 +135,29 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// 外掛（或自己拿 latest.json 比對出來）回報的那一版，要不要真的當成新版。
+///
+/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
+/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉任何
+/// 東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依（或遠端那份
+/// latest.json）手上：換版本、有人塞了 version_comparator、或內容長出沒預期的
+/// 形狀，都可能讓那個 Option 變成 Some 而我們這層毫無反抗餘地。
+///
+/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
+/// 重裝一個他已經在用的版本。因此版本比對這件事自己再做一次，任何比不出
+/// 「嚴格大於」的情形（含空字串、解析不出來的怪版本號）一律當成沒有新版。
+///
+/// `installed` 純粹是把呼叫端已經知道的「這一份能不能就地更新」原樣包進
+/// [`UpdateInfo`]，這支函式自己不判斷——三處呼叫端（macOS 唯一車道、Windows
+/// 安裝版車道、Windows 可攜／單檔車道）給的是不同的常數或探測結果，原本各自
+/// 抄一份幾乎一模一樣的「比版本、包結構」，現在收成這一份。
+pub fn accept(remote: &str, current: &str, installed: bool) -> Option<UpdateInfo> {
+    if !is_newer(remote, current) {
+        return None;
+    }
+    Some(UpdateInfo { version: normalize_version(remote).to_string(), installed })
+}
+
 /// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
 /// 使用者按下「View release notes」時至少看得到最新那一版的說明。
 ///
@@ -126,6 +192,109 @@ fn open_page(st: &Shared, url: &str, open_url: fn(&str) -> io::Result<()>) {
         st.log(format!("could not open {url}: {e}"));
     }
 }
+
+// ---------------------------------------------------------------- 查完之後的簿記
+//
+// 手動按下的檢查（設定頁「Check for updates」、下拉「Check now」）與背景排程
+// 的檢查，兩邊「查完之後」那一段原本兩平台各抄一份、逐字相同：跑一次
+// `check_lane`（各平台自己的判斷邏輯，回傳型別不同，留在呼叫端）→ 失敗記一行
+// 「update check failed」→ 成功就 `set_update`→ 依「有新版／已是最新」分別記
+// 一行。這裡收成兩支：手動路要把結果整個回傳給呼叫端（按鈕靠它顯示 Up to
+// date／Check failed 這兩個瞬態），背景路對這兩種結果都是靜默的，只在
+// `set_update` 回報「真的變了」時記一行「update available」，避免每 24 小時
+// 都在活動日誌裡重複同一句話。
+//
+// 兩支都吃已經正規化成 `Result<Option<UpdateInfo>, String>` 的結果，不是
+// `check_lane` 本身——Windows 的 `check_lane` 回的是帶著 `Update` 物件的
+// `Found`（下載要用），這裡收窄成 `Option<UpdateInfo>` 的話那個物件就丟了，
+// 所以呼叫端自己先用 `Found::info()` 轉一次，原始的 `Found` 留在自己手上
+// 接著判斷要不要順手下載。
+
+/// 使用者主動按下的檢查：查一次的結果记進 state、記一行日誌，原封不動回傳給
+/// 呼叫端。
+///
+/// 與背景路不同，這裡**兩種結果都記日誌**（有新版／已是最新），因為按鈕上
+/// 那兩個瞬態就是靠這兩行日誌背後的 `set_update` 呈現的。
+pub fn record_manual_check(
+    st: &Shared,
+    found: Result<Option<UpdateInfo>, String>,
+) -> Result<Option<UpdateInfo>, String> {
+    let found = match found {
+        Ok(found) => found,
+        Err(e) => {
+            st.log(format!("update check failed: {e}"));
+            return Err(e);
+        }
+    };
+    st.set_update(found.clone());
+    match &found {
+        Some(u) => st.log(format!("update check: v{} is available", u.version)),
+        None => st.log("update check: already up to date"),
+    }
+    Ok(found)
+}
+
+/// 背景排程的檢查：查失敗只記一行就算了——更新查不到不影響程式本身能不能用，
+/// 沒有理由為它彈通知或改變任何狀態。
+///
+/// 查成功一律 `set_update`，但「偵測到新版」這一行只在真的變化時記一次
+/// （去重靠 `set_update` 的回傳值）；「已經是最新版」在背景路完全靜默——
+/// 每 24 小時都重複同一句話只會讓活動日誌看起來像又發生了什麼事。
+///
+/// 不回傳查到的東西：兩個呼叫端後續要不要順手觸發下載，看的都是自己手上還
+/// 留著的那份原始查詢結果（Windows 是 `check_lane` 回的 `Found`，帶著下載要用
+/// 的 `Update` 物件），不是這裡記帳完才拿得到的 `Option<UpdateInfo>`——那份物件
+/// 收窄成 `Option<UpdateInfo>` 就沒了，見本節開頭的說明。
+pub fn record_background_check(st: &Shared, found: Result<Option<UpdateInfo>, String>) {
+    let found = match found {
+        Ok(found) => found,
+        Err(e) => {
+            st.log(format!("update check failed: {e}"));
+            return;
+        }
+    };
+    if st.set_update(found.clone()) {
+        if let Some(u) = &found {
+            st.log(format!("update available: v{}", u.version));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 出貨設定
+
+/// 會出貨的那份 tauri.conf.json，編譯期就嵌進來。
+///
+/// Windows 的 `apply_pending_at_startup` 跑在 `tauri::Builder` 之前，那時還沒有
+/// `AppHandle` 可以問設定；macOS 的 `pgids` 登記簿那一層完全沒有 `AppHandle`
+/// 可拿（`ProcessSupervisor::spawn` 手上只有一個 `Command`）。兩邊都只能自己讀
+/// 這份檔案，直接讀而不是各自抄一份常數：抄的話會漂，漂掉的症狀是 Windows
+/// 安裝版被誤判成可攜版（更新整條路靜默失效），或 macOS 的登記簿寫進一個沒人
+/// 會讀的資料夾。
+pub const TAURI_CONF: &str = include_str!("../../tauri.conf.json");
+
+/// tauri.conf.json 裡的一個頂層字串欄位。解析不出來就 panic——那代表出貨的設定
+/// 檔壞了或改了形狀，是編譯期就該被發現的事，絕不能默默退回一個猜的值。
+pub fn conf_str(key: &str) -> String {
+    let conf: serde_json::Value =
+        serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
+    conf.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("tauri.conf.json 少了頂層的 {key}"))
+        .to_string()
+}
+
+/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
+/// productName）。只有 Windows 用得到（NSIS 的解除安裝機碼），macOS 沒有對應
+/// 概念。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
+
+/// 應用識別碼（tauri.conf.json 的 identifier）。兩平台都用得到：Windows 那邊是
+/// `%LOCALAPPDATA%` 底下的資料夾名（Tauri 的 `app_local_data_dir()` 在 Windows
+/// 上就是 `%LOCALAPPDATA%\{identifier}`）、single-instance 外掛的具名互斥鎖、
+/// 通知的 AUMID；macOS 那邊是 `pgids` 登記簿所在的
+/// `~/Library/Application Support/{identifier}`。
+pub static IDENTIFIER: LazyLock<String> = LazyLock::new(|| conf_str("identifier"));
 
 #[cfg(test)]
 mod tests {
@@ -188,5 +357,53 @@ mod tests {
     #[test]
     fn the_downloads_menu_item_opens_the_release_list() {
         assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
+    }
+
+    /// 出貨的 tauri.conf.json 裡，updater 的 endpoint 必須就是 [`LATEST_JSON`]。
+    ///
+    /// 兩平台原本各自 `include_str!` 一次 tauri.conf.json 釘住這件事，巧的是
+    /// 釘法不完全一樣：macOS 那份直接用 JSON pointer 比對字串是不是
+    /// `LATEST_JSON`；Windows 那份多經過 `tauri_plugin_updater::Config` 解析出
+    /// 型別，順便驗了簽章公鑰不是空的。兩邊查的其實是同一件事的兩個切面，合成
+    /// 這一份：**兩邊原本各自檢查過的東西這裡一件都沒少**——公鑰非空
+    /// （Windows）、只有一個 endpoint（兩邊）、那個 endpoint 恰好等於
+    /// `LATEST_JSON`（macOS 的精確比對，蘊含了 Windows 原本另外分開驗的
+    /// https scheme 與 `/latest.json` 結尾）。
+    ///
+    /// Windows 自己的 `the_shipped_updater_config_parses` 留著，但只保留這裡
+    /// 沒有涵蓋到的部分（安裝畫面模式、`createUpdaterArtifacts` 開關）。
+    #[test]
+    fn the_shipped_updater_endpoint_matches_latest_json() {
+        let conf: serde_json::Value =
+            serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
+        let updater = conf.pointer("/plugins/updater").expect("plugins.updater 不可以消失");
+        let parsed: tauri_plugin_updater::Config =
+            serde_json::from_value(updater.clone()).expect("updater 設定要解析得出來");
+
+        assert!(!parsed.pubkey.is_empty(), "沒有公鑰就驗不了簽章");
+        assert_eq!(parsed.endpoints.len(), 1);
+        assert_eq!(parsed.endpoints[0].as_str(), LATEST_JSON);
+    }
+
+    /// identifier 與產品名是與既有安裝之間的相容契約，不是隨便什麼字串都行。
+    ///
+    /// C17 把兩者從各平台各自的來源（Windows 讀 tauri.conf.json、macOS 原本是
+    /// 一份寫死的字面常數）收成這裡共用的一份之後，`the_shipped_updater_endpoint_matches_latest_json`
+    /// 只驗 `/plugins/updater` 那一段，而 macOS 的 `registry_path` 在
+    /// `cfg(test)` 下一律早早回 `None`（碰不到 `IDENTIFIER`），Windows 那兩條
+    /// 既有測試（`the_staging_dir_matches_tauris_own`／
+    /// `the_instance_probe_uses_the_plugins_own_mutex_name`）比對的又只是
+    /// `IDENTIFIER` 跟自己（同義反覆，改了照樣過），於是整個 repo 沒有任何一條
+    /// 測試釘住「tauri.conf.json 的 identifier／productName 到底等不等於使用者
+    /// 電腦上已經有的那份」——這裡補上。
+    ///
+    /// 改掉這兩個值不是「重新命名」那麼單純：macOS 的 `pgids` 登記簿資料夾、
+    /// Windows 的暫存區資料夾、single-instance 具名互斥鎖、通知 AUMID、NSIS
+    /// 解除安裝機碼全部以它們定位，換掉的話既有使用者的這些東西全部靜默失聯
+    /// ——不是這次更新失敗，是連「有更新」這件事都不會再發生。
+    #[test]
+    fn the_shipped_identifier_and_product_name_are_the_ones_users_already_have() {
+        assert_eq!(*IDENTIFIER, "com.traytunnel.desktop");
+        assert_eq!(*PRODUCT_NAME, "traytunnel");
     }
 }

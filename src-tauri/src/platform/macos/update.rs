@@ -102,8 +102,8 @@ use tauri::AppHandle;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::platform::update_common::{
-    self, current_version, is_newer, normalize_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT,
-    FIRST_DELAY, INTERVAL,
+    self, accept, current_version, normalize_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY,
+    INTERVAL,
 };
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -173,22 +173,9 @@ fn target_key() -> String {
 
 // ---------------------------------------------------------------- 檢查
 
-/// 外掛回報的那一版要不要真的當成新版，由自家的 [`is_newer`] 再判一次。
-///
-/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
-/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉任何
-/// 東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依手上：換版本、
-/// 有人塞了 version_comparator、或 latest.json 長出沒預期的形狀，都可能讓那個
-/// Option 變成 Some 而我們這層毫無反抗餘地。
-///
-/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
-/// 重裝一個他已經在用的版本。
-fn accept(remote: &str, current: &str, installed: bool) -> Option<UpdateInfo> {
-    if !is_newer(remote, current) {
-        return None;
-    }
-    Some(UpdateInfo { version: normalize_version(remote).to_string(), installed })
-}
+// `accept`（外掛回報的版本要不要真的算新版，再過一次 `is_newer`）兩平台原本
+// 各抄一份（Windows 那邊叫 `accept_installed`，可攜車道還內聯了第三份），
+// 已上提到 [`update_common`]，這裡改成從那邊 `use` 進來（見本檔開頭 import）。
 
 /// 這個錯誤是不是「latest.json 裡沒有這個平台的條目」。
 ///
@@ -278,25 +265,16 @@ pub fn check_now(state: &Shared) {
 
 /// 背景查一次。任何失敗都只記一行就算了——更新查不到不影響程式本身能不能用，
 /// 沒有理由為它彈通知或改變任何狀態。
+///
+/// 「查完之後怎麼記帳」兩平台逐字相同，已上提到 [`update_common::record_background_check`]
+/// （見本檔開頭 import）；macOS 的 `check_lane` 本來就回 `Option<UpdateInfo>`，
+/// 不必像 Windows 那樣先轉一次。
 async fn check_once(st: &Shared) {
     // 關掉就是完全不連外：這道閘在任何請求送出之前
     if !st.checks_for_updates() {
         return;
     }
-    let found = match check_lane(&st.app).await {
-        Ok(found) => found,
-        Err(e) => {
-            st.log(format!("update check failed: {e}"));
-            return;
-        }
-    };
-    // 每 24 小時會再查一次，同一版重複記一行只會讓活動日誌看起來像真的又發生了
-    // 什麼事，所以「偵測到新版」這一行跟著 set_update 的去重走
-    if st.set_update(found.clone()) {
-        if let Some(u) = found {
-            st.log(format!("update available: v{}", u.version));
-        }
-    }
+    update_common::record_background_check(st, check_lane(&st.app).await);
 }
 
 /// 使用者主動按下的檢查（設定頁的「Check for updates」與下拉的「Check now」）。
@@ -311,20 +289,11 @@ async fn check_once(st: &Shared) {
 ///
 /// Windows 版在這裡還會多做一件事——查到新版且自動更新開著時順手把它下載進暫存區。
 /// macOS 沒有那一步（本檔開頭第 1 節），查到就是查到，要不要裝由使用者按下一顆鈕決定。
+///
+/// 「查完之後怎麼記帳」兩平台逐字相同，已上提到 [`update_common::record_manual_check`]
+/// （見本檔開頭 import）。
 pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
-    let found = match check_lane(&st.app).await {
-        Ok(found) => found,
-        Err(e) => {
-            st.log(format!("update check failed: {e}"));
-            return Err(e);
-        }
-    };
-    st.set_update(found.clone());
-    match &found {
-        Some(u) => st.log(format!("update check: v{} is available", u.version)),
-        None => st.log("update check: already up to date"),
-    }
-    Ok(found)
+    update_common::record_manual_check(st, check_lane(&st.app).await)
 }
 
 // ---------------------------------------------------------------- 暫存（macOS 沒有）
@@ -472,17 +441,9 @@ mod tests {
 
     use super::*;
     use crate::platform::update_common::{
-        release_url, LATEST_RELEASE_PAGE, RELEASES_PAGE, RELEASE_TAG_PREFIX,
+        release_url, LATEST_JSON, LATEST_RELEASE_PAGE, RELEASES_PAGE, RELEASE_TAG_PREFIX,
+        USER_AGENT,
     };
-
-    /// 更新資訊清單。這裡只有 live 測試會去拉它，實機那條路是 updater 外掛
-    /// 自己照 tauri.conf.json 的 endpoints 去拿——兩邊指的是同一份檔案，
-    /// `the_live_endpoint_is_the_one_the_app_ships_with` 釘住這件事。
-    const LATEST_JSON: &str =
-        "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
-
-    /// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
-    const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
     fn exe_in(bundle: &str) -> PathBuf {
         PathBuf::from(format!("{bundle}/Contents/MacOS/traytunnel"))
@@ -626,20 +587,10 @@ mod tests {
         assert!(RELEASE_TAG_PREFIX.starts_with("https://"));
     }
 
-    /// live 測試拉的那份 latest.json，必須就是出貨設定裡 updater 外掛會去拿的
-    /// 那一份——不然 live 測到的東西跟實機走的是兩條路
-    #[test]
-    fn the_live_endpoint_is_the_one_the_app_ships_with() {
-        let raw = include_str!("../../../tauri.conf.json");
-        let conf: serde_json::Value =
-            serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
-        let endpoints = conf
-            .pointer("/plugins/updater/endpoints")
-            .and_then(|v| v.as_array())
-            .expect("plugins.updater.endpoints 不可以消失");
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].as_str(), Some(LATEST_JSON));
-    }
+    // live 測試拉的那份 latest.json，必須就是出貨設定裡 updater 外掛會去拿的
+    // 那一份——這件事與 Windows 逐字相同，已上提到
+    // `update_common::tests::the_shipped_updater_endpoint_matches_latest_json`，
+    // 不在這裡重複一份。
 
     /// 實機測試：對真的 endpoint 拉一次 latest.json，確認 macOS 這一端的降級行為。
     ///
