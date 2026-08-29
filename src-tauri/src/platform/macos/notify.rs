@@ -21,13 +21,23 @@ use std::path::Path;
 
 /// 彈一顆系統通知。失敗只記一行警告——通知從來不是關鍵路徑，
 /// 與 Windows `show_notification` 的失敗處理原則一致。
-pub fn show_notification(aumid: &str, title: &str, body: &str) {
-    if let Err(e) = notify_rust::set_application(aumid) {
-        log::warn!("could not set the notification application id: {e}");
-    }
-    if let Err(e) = notify_rust::Notification::new().summary(title).body(body).show() {
-        log::warn!("failed to show notification: {e}");
-    }
+///
+/// 應用身分掛名（`set_application`）只在 `prepare_notifications` 做一次：
+/// `mac-notification-sys` 底層用 `Once` 實作，第二次起呼叫必回
+/// `AlreadySet` 錯誤——這裡若還跟著呼叫，每顆通知都會白噴一行假警告。
+///
+/// `show()` 丟去 `tauri::async_runtime::spawn` 送出，不在呼叫端等待：
+/// 這顆 handle 若在主執行緒被 drop，會轉一個巢狀 `NSRunLoop` 等投遞完成
+/// （最多可達 2 秒），等於讓通知擋住主執行緒；比照
+/// `tauri-plugin-notification` 桌面後端（`desktop.rs`）的做法，把 `show()`
+/// 丟到 runtime 執行緒上執行，呼叫端立即返回。
+pub fn show_notification(_aumid: &str, title: &str, body: &str) {
+    let notification = notify_rust::Notification::new().summary(title).body(body).finalize();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = notification.show() {
+            log::warn!("failed to show notification: {e}");
+        }
+    });
 }
 
 /// 通知掛名的自註冊：把行程掛到 `aumid`（即 `tauri.conf.json` 的 identifier）名下，

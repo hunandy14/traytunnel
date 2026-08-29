@@ -165,8 +165,10 @@ body {
 }
 
 /* ------------------------------------------------------------ macOS 原生視窗風格
-   data-platform 由 vite.config.ts 在建置期寫進 <html>（見 index.html 開頭註解），
-   兩邊唯一的視覺分歧收在這裡：
+   data-platform 由 Rust 端在頁面載入前用 webview initialization script 寫進
+   <html>（src-tauri/src/lib.rs 的 PLATFORM_FLAG／platform-flag 外掛，值來自
+   cfg(target_os = "macos")，執行期判斷；見 index.html 開頭註解），兩邊唯一的
+   視覺分歧收在這裡：
    - 藏掉 Windows 風格的自繪 −/×，原生紅綠燈接手同樣的語意（見 lib.rs 的
      window_close／window_minimize，兩邊呼叫的是同一批指令）。
    - 標題列讓出左上角，紅綠燈（trafficLightPosition 用 tauri.macos.conf.json

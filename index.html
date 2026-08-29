@@ -1,9 +1,13 @@
 <!doctype html>
-<!-- data-platform 由 vite.config.ts 的 htmlPlatformPlugin 在建置期依 process.platform 換成
-     "macos" 或 "windows"（build matrix 本來就是 windows-latest／macos-latest 各自原生編譯，
-     建置機的 OS 就是執行機的 OS，不必在執行期偵測）。styles.css 靠這個屬性做兩邊唯一的
-     視覺分歧：mac 藏自繪的 −/× 換原生紅綠燈、幫紅綠燈留左上角空間。 -->
-<html lang="en" data-platform="__PLATFORM_PLACEHOLDER__">
+<!-- data-platform 由 Rust 端在頁面載入前用 webview initialization script 寫進來
+     （src-tauri/src/lib.rs 的 PLATFORM_FLAG／platform-flag 外掛，值來自
+     cfg(target_os = "macos")，執行期判斷，不是建置期蓋章）。styles.css 靠這個
+     屬性做兩邊唯一的視覺分歧：mac 藏自繪的 −/× 換原生紅綠燈、幫紅綠燈留左上角
+     空間。這裡沒有預設值——script 在任何頁面內容解析之前就跑完，正常情況下
+     不會有沒套到屬性的一幀；若真的透過瀏覽器直接開這個檔案（不經 tauri），
+     屬性單純不存在，等同套用 Windows 那組樣式（styles.css 沒有另外的
+     [data-platform] 選擇器管這個狀態）。 -->
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
