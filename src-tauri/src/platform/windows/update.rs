@@ -32,21 +32,18 @@ use tauri_plugin_window_state::AppHandleExt as _;
 pub use staged::Pending;
 
 use crate::platform::update_common::{
-    self, current_version, is_newer, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, INTERVAL,
+    self, accept, current_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, INTERVAL,
+    LATEST_JSON, USER_AGENT,
 };
 use crate::state::{UpdateInfo, MAIN_WINDOW};
 use crate::Shared;
 
-/// 更新資訊清單。安裝版由 updater 外掛（tauri.conf.json 的 endpoints）去拿，
-/// 非安裝版由下面的 `fetch_latest_version` 自己拿，兩邊指向同一份檔案。
-const LATEST_JSON: &str =
-    "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
+// `LATEST_JSON`（安裝版由 updater 外掛去拿，非安裝版由下面的 `fetch_latest_version`
+// 自己拿，兩邊指向同一份檔案）與 `USER_AGENT` 兩平台逐字相同——macOS 的 live
+// 測試也要用同一份，已上提到 [`update_common`]（見本檔開頭 import）。
 
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
-const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
 /// 會出貨的那份 tauri.conf.json，編譯期就嵌進來。
 ///
@@ -209,23 +206,22 @@ pub fn check_now(state: &Shared) {
 /// 「開著自動更新時，檢查到的更新重啟就會裝上去」這個承諾在手動檢查之後
 /// 就不成立了。丟到背景去跑是因為下載是十幾 MB、幾十秒的事，而這支函式的
 /// 回傳值是那顆按鈕在等的東西，不可以被它拖住。
+///
+/// 「查完之後怎麼記帳」（跑 check_lane → 失敗記一行 → set_update → 記
+/// available／up to date）兩平台逐字相同，已上提到
+/// [`update_common::record_manual_check`]（見本檔開頭 import）。這裡先把
+/// `Found` 收窄成 `Option<UpdateInfo>` 交給它記帳，`found` 本身留著——
+/// 下面順手觸發下載那一段要用到它帶著的 `Update` 物件，收窄之後那個物件就
+/// 沒了，所以不能像 macOS 那樣直接把 `check_lane` 的結果整個交出去。
 pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
-    let found = match check_lane(&st.app).await {
-        Ok(found) => found,
-        Err(e) => {
-            st.log(format!("update check failed: {e}"));
-            return Err(e);
-        }
-    };
-    let info = found.info();
-    st.set_update(info.clone());
-    match &info {
-        Some(u) => st.log(format!("update check: v{} is available", u.version)),
-        None => st.log("update check: already up to date"),
-    }
+    let found = check_lane(&st.app).await;
+    let info = update_common::record_manual_check(
+        st,
+        found.as_ref().map(Found::info).map_err(String::clone),
+    )?;
     // 開關關著就不下載：`download_and_stage` 那道 A1 閘本來也會擋掉落地，
     // 但沒有理由先白抓十幾 MB 再把它丟掉
-    if let Found::Installed { update, .. } = found {
+    if let Ok(Found::Installed { update, .. }) = found {
         if st.checks_for_updates() {
             let bg = st.clone();
             tauri::async_runtime::spawn(async move {
@@ -240,27 +236,22 @@ pub async fn check_manually(st: &Shared) -> Result<Option<UpdateInfo>, String> {
 ///
 /// 任何失敗都只記一行就算了——更新不成功不影響程式本身能不能用，
 /// 沒有理由為它彈通知或改變任何狀態。
+///
+/// 「查完之後怎麼記帳」與 [`check_manually`] 同一份共用邏輯，差別只在背景路
+/// 對「已經是最新版」是靜默的——見 [`update_common::record_background_check`]
+/// 的說明。
 async fn check_once(st: &Shared) -> Outcome {
     // 關掉就是完全不連外：這道閘在任何請求送出之前
     if !st.checks_for_updates() {
         return Outcome::Settled;
     }
-    let found = match check_lane(&st.app).await {
-        Ok(found) => found,
-        Err(e) => {
-            st.log(format!("update check failed: {e}"));
-            return Outcome::Settled;
-        }
-    };
-    // 每 24 小時會再查一次，同一版重複記一行只會讓活動日誌看起來像真的又發生了
-    // 什麼事，所以「偵測到新版」這一行跟著 set_update 的去重走
-    if st.set_update(found.info()) {
-        if let Some(u) = found.info() {
-            st.log(format!("update available: v{}", u.version));
-        }
-    }
+    let found = check_lane(&st.app).await;
+    update_common::record_background_check(
+        st,
+        found.as_ref().map(Found::info).map_err(String::clone),
+    );
     match found {
-        Found::Installed { update, .. } => stage_if_needed(st, *update).await,
+        Ok(Found::Installed { update, .. }) => stage_if_needed(st, *update).await,
         _ => Outcome::Settled,
     }
 }
@@ -307,7 +298,8 @@ async fn check_lane(app: &AppHandle) -> Result<Found, String> {
 
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
 ///
-/// 外掛給的 Some 不直接照收，再過一次 [`accept_installed`]——理由見那支函式。
+/// 外掛給的 Some 不直接照收，再過一次 [`accept`]（固定 `installed: true`）——
+/// 理由見那支函式。
 /// 這裡不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
 /// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道 CHECK_TIMEOUT。
 /// 拿到的 `Update` 物件**連同結果一起交出去**，下載那一步才不必再查一次
@@ -318,29 +310,16 @@ async fn check_installed(app: &AppHandle) -> Result<Found, String> {
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
         return Ok(Found::None);
     };
-    match accept_installed(&update.version, current_version()) {
+    match accept(&update.version, current_version(), true) {
         Some(info) => Ok(Found::Installed { update: Box::new(update), info }),
         None => Ok(Found::None),
     }
 }
 
-/// 外掛回報的那一版要不要真的當成新版，由自家的 [`is_newer`] 再判一次。
-///
-/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
-/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉
-/// 任何東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依手上：
-/// 換版本、有人塞了 version_comparator、或 latest.json 長出沒預期的形狀，
-/// 都可能讓那個 Option 變成 Some 而我們這層毫無反抗餘地。
-///
-/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
-/// 重裝一個他已經在用的版本。因此版本比對這件事自己做一次，任何比不出「嚴格
-/// 大於」的情形（含空字串、解析不出來的怪版本號）一律當成沒有新版。
-fn accept_installed(remote: &str, current: &str) -> Option<UpdateInfo> {
-    if !is_newer(remote, current) {
-        return None;
-    }
-    Some(UpdateInfo { version: normalize_version(remote).to_string(), installed: true })
-}
+// `accept`（外掛回報的版本要不要真的算新版，再過一次 `is_newer`；這裡固定
+// `installed: true`，對應原本的 `accept_installed`）兩平台原本各抄一份，
+// 可攜車道下面那支 `check_unmanaged` 還內聯了第三份，已上提到 [`update_common`]，
+// 這裡改成從那邊 `use` 進來（見本檔開頭 import）。
 
 // ------------------------------------------------- 可攜／單檔車道（不就地更新）
 
@@ -355,13 +334,10 @@ async fn check_unmanaged() -> Result<Found, String> {
     let latest = tauri::async_runtime::spawn_blocking(fetch_latest_version)
         .await
         .map_err(|e| e.to_string())??;
-    if !is_newer(&latest, current_version()) {
-        return Ok(Found::None);
-    }
-    Ok(Found::Unmanaged(UpdateInfo {
-        version: normalize_version(&latest).to_string(),
-        installed: false,
-    }))
+    Ok(match accept(&latest, current_version(), false) {
+        Some(info) => Found::Unmanaged(info),
+        None => Found::None,
+    })
 }
 
 /// 拿 latest.json 的 version 欄位。阻塞式，呼叫端負責丟到 blocking 執行緒。
@@ -851,22 +827,24 @@ mod tests {
     /// 安裝版車道的最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
     ///
     /// 「有沒有新版」這個判斷不可以整個外包給外部相依，這裡釘住自己一定會再判一次。
+    /// `accept` 本身（兩平台共用，已搬到 [`crate::platform::update_common`]）不在
+    /// 這裡重複測，這裡釘的是安裝版車道固定傳 `installed: true` 這件事。
     #[test]
     fn the_installed_lane_refuses_a_version_that_is_not_newer() {
-        assert_eq!(accept_installed("0.5.0", "0.5.0"), None);
-        assert_eq!(accept_installed("0.4.9", "0.5.0"), None);
+        assert_eq!(accept("0.5.0", "0.5.0", true), None);
+        assert_eq!(accept("0.4.9", "0.5.0", true), None);
         // 版本號怪到解析不出來時同樣不報，寧可漏報也不要叫人去重裝已經在用的版本
-        assert_eq!(accept_installed("", "0.5.0"), None);
-        assert_eq!(accept_installed("latest", "0.5.0"), None);
+        assert_eq!(accept("", "0.5.0", true), None);
+        assert_eq!(accept("latest", "0.5.0", true), None);
     }
 
     /// 真的有新版時照樣要放行，而且版本號存進去是不帶 v 的（UpdateInfo 的契約，
     /// 前端會自己補上 v 顯示成 `Update to v0.6.0`）
     #[test]
     fn the_installed_lane_still_passes_a_real_update_through() {
-        let found = accept_installed("0.6.0", "0.5.0").expect("0.6.0 比 0.5.0 新");
+        let found = accept("0.6.0", "0.5.0", true).expect("0.6.0 比 0.5.0 新");
         assert_eq!(found, UpdateInfo { version: "0.6.0".into(), installed: true });
-        let prefixed = accept_installed("v0.6.0", "0.5.0").expect("帶 v 的一樣認得");
+        let prefixed = accept("v0.6.0", "0.5.0", true).expect("帶 v 的一樣認得");
         assert_eq!(prefixed.version, "0.6.0");
     }
 
@@ -1224,6 +1202,11 @@ mod tests {
     /// 合法網址），外掛會在 setup 階段回 Err，`run()` 當場 panic——使用者連視窗
     /// 都看不到。那是執行期才會發生的失敗，這裡拿真的會發佈的那份設定解析一次，
     /// 把它擋在 CI。
+    ///
+    /// 公鑰非空與 endpoint 釘住那兩段與 macOS 逐字相同，已搬到
+    /// [`crate::platform::update_common`] 的
+    /// `the_shipped_updater_endpoint_matches_latest_json`，不在這裡重複——這裡
+    /// 只留 Windows 專屬的那兩件事：安裝畫面模式、`createUpdaterArtifacts` 開關。
     #[test]
     fn the_shipped_updater_config_parses() {
         let raw = include_str!("../../../tauri.conf.json");
@@ -1233,12 +1216,6 @@ mod tests {
         let updater = conf.pointer("/plugins/updater").expect("plugins.updater 不可以消失");
         let parsed: tauri_plugin_updater::Config =
             serde_json::from_value(updater.clone()).expect("updater 設定要解析得出來");
-
-        assert!(!parsed.pubkey.is_empty(), "沒有公鑰就驗不了簽章");
-        assert_eq!(parsed.endpoints.len(), 1);
-        let endpoint = &parsed.endpoints[0];
-        assert_eq!(endpoint.scheme(), "https", "非 https 的 endpoint 在 release 建置會被拒絕");
-        assert!(endpoint.as_str().ends_with("/latest.json"), "{endpoint}");
 
         // 安裝走 quiet（NSIS 的 /S /R）：全靜默，連進度條都不出現，裝完自動重啟。
         // 自動更新是在使用者不在場的時候發生的（下次啟動的最早期），

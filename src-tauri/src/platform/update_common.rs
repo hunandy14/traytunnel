@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use semver::Version;
 
+use crate::state::UpdateInfo;
 use crate::Shared;
 
 /// 啟動後隔這麼久才做第一次檢查：開機當下要先把系統匣、隧道那些真正要緊的事做完，
@@ -53,6 +54,26 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
 /// 所以只能在拿到 `Update` 物件之後對它的 pub 欄位直接賦值。兩平台同一個值。
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// 更新資訊清單。安裝版由 updater 外掛（tauri.conf.json 的 endpoints）去拿，
+/// Windows 可攜／單檔車道的 `fetch_latest_version` 與 macOS 的 live 測試各自
+/// 另外拉一次，三邊指的是同一份檔案。兩平台原本各自宣告一份（Windows 是
+/// production 常數，macOS 只有測試模組裡那份），字面值完全相同，這裡只留一份。
+//
+// 這兩個 cfg_attr 要長期留著（同 `config::automatic_updates_enabled` 那份的
+// 理由）：macOS 唯一的消費者是 `#[ignore]` 的 live 測試，不是 production 路徑
+// ——它沒有像 Windows 可攜車道那樣自己拉 latest.json 比版本，查詢整段外包給
+// updater 外掛（見 `macos::update` 模組說明）。拿掉的話 macOS 那一腿的
+// `cargo clippy --all-targets`（不含 `--tests` 的 `lib` 目標看不到測試模組）
+// 會 dead_code 撞上 `-D warnings` 紅燈。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const LATEST_JSON: &str =
+    "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
+
+/// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶。兩平台同一個值，
+/// 同樣只有 Windows 的 production 路徑會用到，理由同 [`LATEST_JSON`]。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
 
 /// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
 /// 使用者可以自己挑要哪一版（含更早的版本）
@@ -92,6 +113,29 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// 外掛（或自己拿 latest.json 比對出來）回報的那一版，要不要真的當成新版。
+///
+/// 外掛預設的比較器確實是嚴格大於（2.10.1 的 updater.rs：
+/// `release.version > self.current_version`），所以正常情況下這一關不會擋掉任何
+/// 東西。留著它是因為這條路上「說有新版」的權力整個握在外部相依（或遠端那份
+/// latest.json）手上：換版本、有人塞了 version_comparator、或內容長出沒預期的
+/// 形狀，都可能讓那個 Option 變成 Some 而我們這層毫無反抗餘地。
+///
+/// 更新提示的失敗方向是不對稱的：漏報只是使用者晚幾天更新，誤報卻是叫他去
+/// 重裝一個他已經在用的版本。因此版本比對這件事自己再做一次，任何比不出
+/// 「嚴格大於」的情形（含空字串、解析不出來的怪版本號）一律當成沒有新版。
+///
+/// `installed` 純粹是把呼叫端已經知道的「這一份能不能就地更新」原樣包進
+/// [`UpdateInfo`]，這支函式自己不判斷——三處呼叫端（macOS 唯一車道、Windows
+/// 安裝版車道、Windows 可攜／單檔車道）給的是不同的常數或探測結果，原本各自
+/// 抄一份幾乎一模一樣的「比版本、包結構」，現在收成這一份。
+pub fn accept(remote: &str, current: &str, installed: bool) -> Option<UpdateInfo> {
+    if !is_newer(remote, current) {
+        return None;
+    }
+    Some(UpdateInfo { version: normalize_version(remote).to_string(), installed })
+}
+
 /// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
 /// 使用者按下「View release notes」時至少看得到最新那一版的說明。
 ///
@@ -125,6 +169,75 @@ fn open_page(st: &Shared, url: &str, open_url: fn(&str) -> io::Result<()>) {
     if let Err(e) = open_url(url) {
         st.log(format!("could not open {url}: {e}"));
     }
+}
+
+// ---------------------------------------------------------------- 查完之後的簿記
+//
+// 手動按下的檢查（設定頁「Check for updates」、下拉「Check now」）與背景排程
+// 的檢查，兩邊「查完之後」那一段原本兩平台各抄一份、逐字相同：跑一次
+// `check_lane`（各平台自己的判斷邏輯，回傳型別不同，留在呼叫端）→ 失敗記一行
+// 「update check failed」→ 成功就 `set_update`→ 依「有新版／已是最新」分別記
+// 一行。這裡收成兩支：手動路要把結果整個回傳給呼叫端（按鈕靠它顯示 Up to
+// date／Check failed 這兩個瞬態），背景路對這兩種結果都是靜默的，只在
+// `set_update` 回報「真的變了」時記一行「update available」，避免每 24 小時
+// 都在活動日誌裡重複同一句話。
+//
+// 兩支都吃已經正規化成 `Result<Option<UpdateInfo>, String>` 的結果，不是
+// `check_lane` 本身——Windows 的 `check_lane` 回的是帶著 `Update` 物件的
+// `Found`（下載要用），這裡收窄成 `Option<UpdateInfo>` 的話那個物件就丟了，
+// 所以呼叫端自己先用 `Found::info()` 轉一次，原始的 `Found` 留在自己手上
+// 接著判斷要不要順手下載。
+
+/// 使用者主動按下的檢查：查一次的結果记進 state、記一行日誌，原封不動回傳給
+/// 呼叫端。
+///
+/// 與背景路不同，這裡**兩種結果都記日誌**（有新版／已是最新），因為按鈕上
+/// 那兩個瞬態就是靠這兩行日誌背後的 `set_update` 呈現的。
+pub fn record_manual_check(
+    st: &Shared,
+    found: Result<Option<UpdateInfo>, String>,
+) -> Result<Option<UpdateInfo>, String> {
+    let found = match found {
+        Ok(found) => found,
+        Err(e) => {
+            st.log(format!("update check failed: {e}"));
+            return Err(e);
+        }
+    };
+    st.set_update(found.clone());
+    match &found {
+        Some(u) => st.log(format!("update check: v{} is available", u.version)),
+        None => st.log("update check: already up to date"),
+    }
+    Ok(found)
+}
+
+/// 背景排程的檢查：查失敗只記一行就算了——更新查不到不影響程式本身能不能用，
+/// 沒有理由為它彈通知或改變任何狀態。
+///
+/// 查成功一律 `set_update`，但「偵測到新版」這一行只在真的變化時記一次
+/// （去重靠 `set_update` 的回傳值）；「已經是最新版」在背景路完全靜默——
+/// 每 24 小時都重複同一句話只會讓活動日誌看起來像又發生了什麼事。
+///
+/// 回傳這一輪查到的東西，讓呼叫端自己接著判斷（Windows 的安裝版車道要看是不是
+/// 手上那個 `Found::Installed` 才順手觸發下載，那個判斷留在呼叫端）。
+pub fn record_background_check(
+    st: &Shared,
+    found: Result<Option<UpdateInfo>, String>,
+) -> Option<UpdateInfo> {
+    let found = match found {
+        Ok(found) => found,
+        Err(e) => {
+            st.log(format!("update check failed: {e}"));
+            return None;
+        }
+    };
+    if st.set_update(found.clone()) {
+        if let Some(u) = &found {
+            st.log(format!("update available: v{}", u.version));
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -188,5 +301,32 @@ mod tests {
     #[test]
     fn the_downloads_menu_item_opens_the_release_list() {
         assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
+    }
+
+    /// 出貨的 tauri.conf.json 裡，updater 的 endpoint 必須就是 [`LATEST_JSON`]。
+    ///
+    /// 兩平台原本各自 `include_str!` 一次 tauri.conf.json 釘住這件事，巧的是
+    /// 釘法不完全一樣：macOS 那份直接用 JSON pointer 比對字串是不是
+    /// `LATEST_JSON`；Windows 那份多經過 `tauri_plugin_updater::Config` 解析出
+    /// 型別，順便驗了簽章公鑰不是空的。兩邊查的其實是同一件事的兩個切面，合成
+    /// 這一份：**兩邊原本各自檢查過的東西這裡一件都沒少**——公鑰非空
+    /// （Windows）、只有一個 endpoint（兩邊）、那個 endpoint 恰好等於
+    /// `LATEST_JSON`（macOS 的精確比對，蘊含了 Windows 原本另外分開驗的
+    /// https scheme 與 `/latest.json` 結尾）。
+    ///
+    /// Windows 自己的 `the_shipped_updater_config_parses` 留著，但只保留這裡
+    /// 沒有涵蓋到的部分（安裝畫面模式、`createUpdaterArtifacts` 開關）。
+    #[test]
+    fn the_shipped_updater_endpoint_matches_latest_json() {
+        let raw = include_str!("../../tauri.conf.json");
+        let conf: serde_json::Value =
+            serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
+        let updater = conf.pointer("/plugins/updater").expect("plugins.updater 不可以消失");
+        let parsed: tauri_plugin_updater::Config =
+            serde_json::from_value(updater.clone()).expect("updater 設定要解析得出來");
+
+        assert!(!parsed.pubkey.is_empty(), "沒有公鑰就驗不了簽章");
+        assert_eq!(parsed.endpoints.len(), 1);
+        assert_eq!(parsed.endpoints[0].as_str(), LATEST_JSON);
     }
 }
