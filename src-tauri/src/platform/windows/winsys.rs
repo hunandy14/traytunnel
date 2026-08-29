@@ -530,25 +530,16 @@ mod tests {
     // 最大層與空清單）已隨函式本體搬到 `crate::appicon`，與 macOS 版合併保留
     // 兩邊的斷言資料，不在這裡重複一份。
 
-    /// 這台機器兩種圖示尺寸的合理性：大圖示不會比小圖示小，也不會是 0
-    #[test]
-    fn metrics_are_sane_on_this_machine() {
-        let (sw, sh) = small_icon_size();
-        let (lw, lh) = large_icon_size();
-        assert_eq!(sw, sh, "小圖示應為正方");
-        assert_eq!(lw, lh, "大圖示應為正方");
-        assert!(sw >= 16 && lw >= 32, "SM_CXSMICON={sw} SM_CXICON={lw}");
-        assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
-    }
+    // `metrics_are_sane_on_this_machine` 與 macOS 逐字相同（只差一句失敗訊息
+    // 的措辭），已搬到 `platform::process_tests`（跨平台契約容器），不在這裡
+    // 重複一份。
 
-    /// 取表那段是手寫 FFI，用一個真的 listener 釘住行為：
-    /// 綁得起來的埠一定要被看見，否則 spawn 前的埠檢查就失去意義
-    #[test]
-    fn detects_a_real_listener() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("綁得起來");
-        let port = l.local_addr().unwrap().port();
-        assert!(is_listening(port), "剛綁上的 {port} 應該查得到");
-    }
+    // `detects_a_real_listener`：綁一個真的 listener、確認 `is_listening` 查得到，
+    // 已經被 `platform::process_tests` 的
+    // `a_bound_loopback_port_is_reported_as_listening`（§1(i)）涵蓋——那一支測的
+    // 是同一支門面函式 `platform::is_listening`（在 Windows 上就是這裡的
+    // `is_listening`），斷言同一件事，只是多了輪詢＋期限而不是綁完當場問一次，
+    // 覆蓋範圍只多不少，所以這裡整支刪掉不留副本。
 
     /// 自啟登錄值的內容格式是與 tauri-plugin-autostart 相容的關鍵：
     /// 一定要有 --tray，路徑一定要有引號（安裝路徑含空白時沒引號會被截斷）
@@ -634,19 +625,8 @@ mod tests {
         assert!(approved_enabled(&name), "沒有紀錄就當成啟用");
     }
 
-    /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss
-    #[test]
-    fn local_time_is_a_fixed_width_hms() {
-        let ts = local_time_hms();
-        assert_eq!(ts.len(), 8, "{ts}");
-        let parts: Vec<&str> = ts.split(':').collect();
-        assert_eq!(parts.len(), 3, "{ts}");
-        let bounds = [24, 60, 60];
-        for (p, max) in parts.iter().zip(bounds) {
-            assert_eq!(p.len(), 2, "每段都要補到兩位：{ts}");
-            assert!(p.parse::<u32>().unwrap() < max, "{ts}");
-        }
-    }
+    // `local_time_is_a_fixed_width_hms` 與 macOS 逐字相同，已搬到
+    // `platform::process_tests`（跨平台契約容器），不在這裡重複一份。
 
     #[test]
     fn wide_is_nul_terminated() {
