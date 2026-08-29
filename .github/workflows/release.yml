@@ -69,7 +69,22 @@ jobs:
       platform_keys: ${{ steps.set.outputs.platform_keys }}
       dry_run: ${{ steps.set.outputs.dry_run }}
       allow_stale_platforms: ${{ steps.set.outputs.allow_stale_platforms }}
+      # 版本／tag 只在這裡解析一次（見下面 Resolve release version and tag
+      # 步驟），build 與 compose 都直接吃這兩個 job output，不再各自重跑一次
+      # resolve-release.mjs／PowerShell 版本——三份各自解析、日後改壞一處卻
+      # 沒同步改到另外兩處的風險，靠「只有一個地方會算這件事」直接消除。
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+
       - name: Compute build matrix and dry_run flag
         id: set
         shell: bash
@@ -111,6 +126,23 @@ jobs:
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
           echo "allow_stale_platforms=$allow_stale" >> "$GITHUB_OUTPUT"
 
+      # 版本／tag 解析（含 tag push 時的 Cargo.toml 一致性檢查，以及
+      # workflow_dispatch 正式發佈時向遠端確認 tag 已存在）只在這裡跑一次；
+      # 過去分別在 build job 的 Windows（pwsh）、macOS（這支 mjs）腿，以及
+      # compose job 各跑一次，三份同一套邏輯、稍有語意差異（pwsh 版本是純
+      # 手刻的字面翻版），改一處很容易漏改另外兩處。npm ci 前置：跟 build／
+      # compose 用同一套「先 npm ci 再跑 script」慣例，即使這支腳本目前無
+      # 外部相依，也不必為它單獨開特例。
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Resolve release version and tag
+        id: resolve
+        shell: bash
+        env:
+          DRY_RUN: ${{ steps.set.outputs.dry_run }}
+        run: node scripts/resolve-release.mjs
+
   build:
     name: build (${{ matrix.os }})
     needs: plan
@@ -130,84 +162,6 @@ jobs:
         with:
           node-version: "24"
           cache: "npm"
-
-      # 版本防呆：tag 觸發時比對 tag（去 v）與 Cargo.toml version，
-      # workflow_dispatch 則以 Cargo.toml 為準，並用 git ls-remote 向遠端
-      # 確認對應 tag 已存在（不吃本地 checkout 深度，對齊 autotag.yml 的作法）。
-      # windows-latest 預設 shell 是 pwsh，這裡明定 shell 並用 PowerShell 語法。
-      #
-      # dry_run=true 時（僅限 workflow_dispatch 演練）略過遠端 tag 存在性
-      # 檢查——這是本檔案唯一新增的分支，其餘邏輯與訊息原封不動。
-      - name: Resolve release version and tag (windows)
-        if: matrix.os == 'windows-latest'
-        id: resolve_windows
-        shell: pwsh
-        run: |
-          $cargoTomlPath = "src-tauri/Cargo.toml"
-          $lines = Get-Content $cargoTomlPath
-          $inPackage = $false
-          $version = $null
-          foreach ($line in $lines) {
-            if ($line -match '^\[package\]\s*$') { $inPackage = $true; continue }
-            if ($line -match '^\[.*\]\s*$') { $inPackage = $false; continue }
-            if ($inPackage -and $line -match '^version\s*=\s*"([^"]+)"') {
-              $version = $Matches[1]
-              break
-            }
-          }
-          if (-not $version) {
-            Write-Error "$cargoTomlPath 的 [package] 區塊找不到 version"
-            exit 1
-          }
-          Write-Host "Cargo.toml 版本：$version"
-
-          if ("${{ github.event_name }}" -eq "push") {
-            $tagName = "${{ github.ref_name }}"
-            $tagVersion = $tagName -replace '^v', ''
-            if ($tagVersion -ne $version) {
-              Write-Error "Tag $tagName 與 src-tauri/Cargo.toml 的版本 $version 不一致，請確認後重新打 tag"
-              exit 1
-            }
-            $releaseTag = $tagName
-          } else {
-            $releaseTag = "v$version"
-            if ("${{ needs.plan.outputs.dry_run }}" -eq "true") {
-              Write-Host "dry_run=true：workflow_dispatch 手動觸發，略過遠端 tag 存在性檢查（僅供演練，不建立/發佈任何東西）"
-            } else {
-              $exists = git ls-remote --tags origin "refs/tags/$releaseTag"
-              if ([string]::IsNullOrWhiteSpace($exists)) {
-                Write-Error "workflow_dispatch 手動觸發，但 tag $releaseTag 不存在——請先 npm run bump、commit、git tag $releaseTag 並 git push --tags，再重新執行本 workflow"
-                exit 1
-              }
-              Write-Host "workflow_dispatch：沿用既有 tag $releaseTag"
-            }
-          }
-
-          Write-Host "Release tag：$releaseTag"
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
-
-      # macOS 腿與下面 compose job 共用 scripts/resolve-release.mjs（同一套
-      # 版本/tag 解析邏輯，語意對齊上面 windows 腿的 PowerShell 版本）。
-      - name: Resolve release version and tag (macos)
-        if: matrix.os != 'windows-latest'
-        id: resolve_macos
-        shell: bash
-        env:
-          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
-        run: node scripts/resolve-release.mjs
-
-      # 兩條 resolve 分支裡永遠只有一條真的跑，另一條的 outputs 是空字串，
-      # 直接串接即可拿到有值的那一份——避免下游步驟還要各自寫平台判斷。
-      - name: Normalize resolved version/tag
-        id: resolve
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.resolve_windows.outputs.version }}${{ steps.resolve_macos.outputs.version }}"
-          release_tag="${{ steps.resolve_windows.outputs.release_tag }}${{ steps.resolve_macos.outputs.release_tag }}"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust (stable, ${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -253,7 +207,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $version = "${{ steps.resolve.outputs.version }}"
+          $version = "${{ needs.plan.outputs.version }}"
           $bundleSetup = "src-tauri/target/release/bundle/nsis/traytunnel_${version}_x64-setup.exe"
           $releaseSetup = "out/traytunnel-$version-setup.exe"
 
@@ -273,7 +227,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.resolve.outputs.version }}"
+          version="${{ needs.plan.outputs.version }}"
           # 檔名跟的是 tauri.macos.conf.json 的 productName "Traytunnel"（首字大寫）；
           # out/ 那顆是 scripts/package.mjs 刻意改名回小寫的發佈檔名，兩者不同一份，
           # 這正是這關要比對的東西
@@ -318,13 +272,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-
-      - name: Resolve release version and tag
-        id: resolve
-        shell: bash
-        env:
-          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
-        run: node scripts/resolve-release.mjs
 
       # merge-multiple: true 直接把每一腿的內容攤平進 out/，不建以 artifact
       # 命名的子目錄。這不是省事而已：download-artifact 在「只比對到一個
@@ -420,7 +367,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ steps.resolve.outputs.release_tag }}"
+          tag="${{ needs.plan.outputs.release_tag }}"
           url="https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS.txt"
           attempts=5
           status="failed"
@@ -478,8 +425,8 @@ jobs:
           ALLOW_STALE: ${{ needs.plan.outputs.allow_stale_platforms }}
         run: |
           set -euo pipefail
-          version="${{ steps.resolve.outputs.version }}"
-          tag="${{ steps.resolve.outputs.release_tag }}"
+          version="${{ needs.plan.outputs.version }}"
+          tag="${{ needs.plan.outputs.release_tag }}"
           repo="${{ github.repository }}"
           pub_date="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
@@ -564,8 +511,8 @@ jobs:
         if: needs.plan.outputs.dry_run != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          tag_name: ${{ steps.resolve.outputs.release_tag }}
-          name: v${{ steps.resolve.outputs.version }}
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          name: v${{ needs.plan.outputs.version }}
           body: |
             ## macOS 安裝說明
 
