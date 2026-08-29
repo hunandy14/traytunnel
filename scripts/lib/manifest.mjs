@@ -25,8 +25,10 @@ export function readManifest(dir, platformKey) {
   const path = join(dir, manifestFileName(platformKey));
   if (!existsSync(path)) {
     throw new Error(
-      `找不到 ${path}——package.mjs 應該已經在該平台的建置步驟（npm run build:dist）裡產生它，` +
-        `檢查該平台的建置有沒有成功、或簽署產物是否真的被複製進 out/。`,
+      `找不到 ${path}——package.mjs 應該已經在該平台的建置步驟（CI 是 tauri build --target ` +
+        `<matrix.rust_target> + package.mjs --target <matrix.rust_target>，本機等價流程是 ` +
+        `npm run build:dist，不帶 --target）裡產生它，檢查該平台的建置有沒有成功、或簽署產物` +
+        `是否真的被複製進 out/。`,
     );
   }
   const manifest = JSON.parse(readFileSync(path, "utf8"));

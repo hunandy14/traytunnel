@@ -262,6 +262,20 @@ function verifyMacBinaryArch() {
   // （見 src-tauri/Cargo.toml），跟 out/traytunnel.exe 用的是同一個名字。
   const appBinary = join(release, "bundle", "macos", "Traytunnel.app", "Contents", "MacOS", "traytunnel");
   if (!existsSync(appBinary)) {
+    if (strict) {
+      // strict（帶 --target，正式發佈建置）不能靜默跳過：dmg／app.tar.gz／.sig
+      // 三個「預期必有」的產物可能都齊備（M10 的檢查因此放行、manifest 照樣
+      // 寫出），但主執行檔本身找不到——例如 bundle 內部結構變了、
+      // mainBinaryName 被改掉。這種情況下架構驗證這道關卡等於沒跑，
+      // platform_key 又回到沒人驗證過的狀態，跟 M9 要修的問題（架構標錯卻
+      // 全綠）本質相同，必須硬失敗，不能只印一行然後放行。
+      console.error(
+        `::error::找不到 ${appBinary}，架構驗證無法執行。這是帶 --target 的正式建置` +
+          `（release.yml），少了這道檢查等於 platform_key 又回到沒人驗證過、可能標錯` +
+          `架構的狀態，不能放行——確認 .app bundle 的內部結構／執行檔名稱有沒有變。`,
+      );
+      process.exit(1);
+    }
     console.log(`  跳過架構驗證（找不到 ${appBinary}）`);
     return;
   }

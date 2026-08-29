@@ -194,7 +194,7 @@ URL（見 `lib.rs` 的 `DEV_BUILD_NOTICE_HTML`），所以裸執行檔不會一�
 
 ```
 build
-├── dist          build:dist        當前平台完整發佈建置＋打包，CI 雙腿共用
+├── dist          build:dist        當前平台完整發佈建置＋打包，本機等價於 CI 走法
 ├── mac           build:mac         單一變體，停在兩層
 └── win
     ├── exe       build:win:exe     只編免安裝執行檔，跳過打包
@@ -225,3 +225,11 @@ web:preview       純前端（vite preview）
   `missing script` 錯誤，逼你在 `web:build`、`build:dist`、`build:win:exe`、
   `build:win:setup`、`build:mac` 之間選一個實際存在的鍵，不會誤觸一個「看似
   合理但做錯事」的指令。
+- **`build:dist` 是 CI 建置的本機等價流程，不是 CI 實際呼叫的指令**：
+  `.github/workflows/release.yml` 的 build job 不跑 `npm run build:dist`，
+  而是直接呼叫 `tauri build --target <matrix.rust_target>` + `node
+  scripts/package.mjs --target <matrix.rust_target>`——多帶了明確的
+  `--target`，這樣 `platform_key` 才能從 target triple 推導，不必用
+  runner 架構猜。本機沒有多平台 matrix 好帶，`build:dist` 因此省略
+  `--target`，`package.mjs` 退回用 `process.platform`／`process.arch` 猜，
+  兩者邏輯一致、只差這個旗標。
