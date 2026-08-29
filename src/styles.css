@@ -870,12 +870,22 @@ html[data-platform="macos"] .titlebar .app-icon {
   min-width: 0;
 }
 
+/* 標題與逐欄錯誤同一行：標題固定在左，錯誤訊息靠右——省下獨立一行的
+   垂直空間。長訊息允許換到第二行（可讀性優先，不截斷），但仍維持右對齊。 */
+.field-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .edit-label {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.6px;
   text-transform: uppercase;
   color: var(--muted);
+  flex-shrink: 0;
 }
 
 .input {
@@ -923,10 +933,19 @@ html[data-platform="macos"] .titlebar .app-icon {
   font-size: 10.5px;
   line-height: 14px;
   color: var(--red);
+  overflow-wrap: anywhere;
 }
 
 .field-error.show {
   display: block;
+}
+
+/* 掛在 .field-head 裡的逐欄錯誤：靠右對齊，長訊息換行也維持右對齊；
+   不設固定寬度，讓 flex 依可用空間收縮換行（min-width:0 在 .field-head 上）。 */
+.field-head .field-error {
+  margin-left: auto;
+  text-align: right;
+  min-width: 0;
 }
 
 .field-error.general {

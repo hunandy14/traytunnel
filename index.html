@@ -228,24 +228,32 @@
           <!-- SSH 欄位 -->
           <div class="type-fields" id="src-fields-ssh">
             <label class="sheet-field field-name">
-              <span class="edit-label">Name</span>
+              <span class="field-head">
+                <span class="edit-label">Name</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-name" spellcheck="false" placeholder="tokyo" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-host">
-              <span class="edit-label">Host</span>
+              <span class="field-head">
+                <span class="edit-label">Host</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-host" spellcheck="false" placeholder="gateway.example.com" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-user">
-              <span class="edit-label">User</span>
+              <span class="field-head">
+                <span class="edit-label">User</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-user" spellcheck="false" placeholder="ubuntu" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-proxyCommand">
-              <span class="edit-label">ProxyCommand</span>
+              <span class="field-head">
+                <span class="edit-label">ProxyCommand</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
-              <span class="field-error"></span>
             </label>
           </div>
 
@@ -254,26 +262,32 @@
                在 DOM 裡撞到（兩組欄位同時存在，只是靠 hidden 切換）。 -->
           <div class="type-fields" id="src-fields-wg" hidden>
             <label class="sheet-field field-wgName">
-              <span class="edit-label">Name</span>
+              <span class="field-head">
+                <span class="edit-label">Name</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="wg-name" spellcheck="false" placeholder="home-relay" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-conf">
-              <span class="edit-label">.conf path</span>
+              <span class="field-head">
+                <span class="edit-label">.conf path</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input with-icon">
                 <!-- 路徑可以手打／貼上，不是唯讀的選檔結果；送出期間由 setBusy 暫時鎖成唯讀 -->
                 <input id="wg-conf" class="mono" spellcheck="false" placeholder="C:\Users\you\wg\home-relay.conf" />
                 <button class="input-icon-btn" id="wg-pick" type="button" title="Browse…" data-icon="folder-open" data-icon-size="14"></button>
               </span>
-              <span class="field-error"></span>
             </label>
             <!-- 選填的 MTU 覆寫，緊貼 .conf 路徑欄下方：它修飾的就是上面那份檔案。
                  空白＝照 .conf（.conf 也沒寫就用 1280），永遠不回寫那份檔案。 -->
             <label class="sheet-field field-mtu">
-              <span class="edit-label">MTU</span>
+              <span class="field-head">
+                <span class="edit-label">MTU</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="wg-mtu" class="mono" spellcheck="false" placeholder="Auto (1280 or config value)" /></span>
               <span class="setting-hint">Overrides the config file. Raise it (e.g. 1400) for throughput if your line allows; lower it if pages stall.</span>
-              <span class="field-error"></span>
             </label>
           </div>
 
@@ -311,21 +325,27 @@
 
         <div class="sheet-body">
           <label class="sheet-field field-name">
-            <span class="edit-label">Name</span>
+            <span class="field-head">
+              <span class="edit-label">Name</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="fwd-name" spellcheck="false" placeholder="forward" /></span>
-            <span class="field-error"></span>
           </label>
           <label class="sheet-field field-local">
-            <span class="edit-label">Local port</span>
+            <span class="field-head">
+              <span class="edit-label">Local port</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="fwd-local" class="mono" spellcheck="false" placeholder="1080" /></span>
-            <span class="field-error"></span>
           </label>
 
           <div class="proxy-flag-group">
             <label class="sheet-field field-remote">
-              <span class="edit-label">Remote</span>
+              <span class="field-head">
+                <span class="edit-label">Remote</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="fwd-remote" class="mono" spellcheck="false" placeholder="1080 (server-side port) or host:port" /></span>
-              <span class="field-error"></span>
             </label>
             <div class="sheet-toggle-row proxy-flag-row">
               <span class="toggle-row-label">Destination is a proxy</span>
@@ -357,14 +377,18 @@
 
         <div class="sheet-body">
           <label class="sheet-field field-name">
-            <span class="edit-label">Name</span>
+            <span class="field-head">
+              <span class="edit-label">Name</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="socks-name" spellcheck="false" placeholder="proxy" /></span>
-            <span class="field-error"></span>
           </label>
           <label class="sheet-field field-local">
-            <span class="edit-label">Local port</span>
+            <span class="field-head">
+              <span class="edit-label">Local port</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="socks-local" class="mono" spellcheck="false" placeholder="1080" /></span>
-            <span class="field-error"></span>
           </label>
           <span class="setting-hint">Starts a local SOCKS5 proxy server on this connection</span>
 
