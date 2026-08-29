@@ -552,7 +552,18 @@ pub fn run() {
 }
 
 /// 系統匣選單的事件路由：id 前綴決定要做什麼，一律呼叫內部函式，不繞 invoke
+///
+/// tauri 把 `TrayIconBuilder::on_menu_event` 與 `App::on_menu_event` 註冊進同一份
+/// 全域監聽清單（`TrayIcon::on_menu_event` 官方文件原話：「called for any menu
+/// event, whether it is coming from this window, another window or from the tray
+/// icon menu」），所以 macOS 選單列的 Cmd+Q（`platform::MENU_QUIT_ID`）也會呼叫
+/// 到這裡——早退避免落進下面的 catch-all，誤記一行「unhandled tray menu id」；
+/// quit 本身已經由 `setup()` 裡的 `app.on_menu_event` 處理過（呼叫 `do_exit`）。
 fn on_tray_menu(app: &AppHandle, st: &Shared, id: &str) {
+    #[cfg(target_os = "macos")]
+    if id == platform::MENU_QUIT_ID {
+        return;
+    }
     match id {
         traymenu::ID_OPEN => show_main(app),
         // 系統匣的 Exit 一律真的退出
