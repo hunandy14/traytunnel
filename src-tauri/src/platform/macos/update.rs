@@ -101,7 +101,7 @@ use std::time::Duration;
 
 use semver::Version;
 use tauri::AppHandle;
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -270,6 +270,32 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
     matches!(e, Error::TargetNotFound(_) | Error::TargetsNotFound(_))
 }
 
+/// 查一次遠端，拿回外掛的 `Update` 物件（還沒經過 [`accept`] 判斷是不是真的算
+/// 新版）。
+///
+/// [`check_lane`] 與 [`install`] 都要走這三步：建 updater、發 `check()`、把
+/// 「這個平台在 latest.json 裡還沒有條目」降級成「沒有東西可拿」——原本兩處各自
+/// 抄一份，抄出了一個分歧：`check_lane` 那份會記一行 info，`install` 那份悄悄
+/// 吞掉，同一件事在活動日誌裡看起來厚此薄彼。統一在這裡記那一行日誌，兩個呼叫端
+/// 都看得到同一句話，也不會有人漏記。
+///
+/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
+/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
+/// [`CHECK_TIMEOUT`]。
+async fn fetch_update(app: &AppHandle) -> Result<Option<Update>, String> {
+    let updater =
+        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(found) => Ok(found),
+        // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
+        Err(e) if is_target_missing(&e) => {
+            log::info!("update check: {} has no entry in latest.json yet", target_key());
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// 查一次遠端，回「有沒有比現在新的版本」。
 ///
 /// 兩條車道共用這一支：真正的差別只在 `UpdateInfo.installed`（也就是查到之後
@@ -277,23 +303,8 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
 /// 這與 Windows 不同——那邊可攜車道刻意繞開外掛自己拿 latest.json，是因為
 /// 外掛的 check 一路連著 download＋install；macOS 這條路上 check 只是 check，
 /// 下載與安裝都在 [`install`] 裡另外發動，沒有繞開的必要。
-///
-/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
-/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
-/// [`CHECK_TIMEOUT`]。
 async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater =
-        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let found = match updater.check().await {
-        Ok(found) => found,
-        // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
-        Err(e) if is_target_missing(&e) => {
-            log::info!("update check: {} has no entry in latest.json yet", target_key());
-            return Ok(None);
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    let Some(update) = found else {
+    let Some(update) = fetch_update(app).await? else {
         return Ok(None);
     };
     Ok(accept(&update.version, current_version(), is_installed()))
@@ -442,14 +453,8 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if !is_installed() {
         return Err("This build cannot update itself".into());
     }
-    let updater =
-        st.app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let found = match updater.check().await {
-        Ok(found) => found,
-        Err(e) if is_target_missing(&e) => None,
-        Err(e) => return Err(e.to_string()),
-    };
-    let mut update = found.ok_or_else(|| "No update available".to_string())?;
+    let mut update =
+        fetch_update(&st.app).await?.ok_or_else(|| "No update available".to_string())?;
     // 「有沒有新版」不外包給外部相依，這一關與檢查那條路走同一支判定
     if accept(&update.version, current_version(), true).is_none() {
         return Err("No update available".into());
