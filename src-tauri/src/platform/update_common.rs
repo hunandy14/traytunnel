@@ -19,8 +19,25 @@
 //! 只管「查完之後開哪個網址、失敗了記哪一行日誌」。
 //!
 //! 本檔這幾支的六支測試，兩邊原本逐字相同（連斷言帶註解都一樣），這裡只留一份。
+//!
+//! ## 出貨設定的單一來源（[`TAURI_CONF`]／[`conf_str`]／[`IDENTIFIER`]／[`PRODUCT_NAME`]）
+//!
+//! 這一段嚴格說不是「更新」邏輯——`IDENTIFIER` 同時是 macOS `pgids` 登記簿的
+//! 資料夾名，跟更新一點關係都沒有。比較乾淨的做法本來是另開一個平台中立的
+//! `shipped_conf` 模組，專門收「編譯期讀出貨的 tauri.conf.json」這件事；
+//! 但本車道的紀律是不動 `lib.rs`，而新模組得在那裡加一行 `mod` 宣告才掛得上
+//! 這棵樹。`update_common` 已經掛在 `platform/mod.rs` 底下不必再加線，且它本來
+//! 就是「平台中立的共用邏輯」這個角色，所以退而求其次收在這裡——比起兩平台
+//! 各自維護一份「怎麼讀 tauri.conf.json」，多掛一個不完全貼題的名字划算得多。
+//! 兩者原本都各自 `include_str!` 一次同一份檔案：Windows 的
+//! `update::conf_str`／`PRODUCT_NAME`／`IDENTIFIER`（只有它需要在
+//! `apply_pending_at_startup` 那個沒有 `AppHandle` 的時間點問設定），macOS 的
+//! `pgids::IDENTIFIER` 則是寫死一份字面常數、另外用一條測試釘住不能漂掉。
+//! 現在兩邊都改成從這裡讀同一份，字面常數與那條釘住測試也就一起沒有存在的
+//! 必要——不是漂不漂的問題，是它現在就是同一個值的兩個名字。
 
 use std::io;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use semver::Version;
@@ -240,6 +257,42 @@ pub fn record_background_check(
     found
 }
 
+// ---------------------------------------------------------------- 出貨設定
+
+/// 會出貨的那份 tauri.conf.json，編譯期就嵌進來。
+///
+/// Windows 的 `apply_pending_at_startup` 跑在 `tauri::Builder` 之前，那時還沒有
+/// `AppHandle` 可以問設定；macOS 的 `pgids` 登記簿那一層完全沒有 `AppHandle`
+/// 可拿（`ProcessSupervisor::spawn` 手上只有一個 `Command`）。兩邊都只能自己讀
+/// 這份檔案，直接讀而不是各自抄一份常數：抄的話會漂，漂掉的症狀是 Windows
+/// 安裝版被誤判成可攜版（更新整條路靜默失效），或 macOS 的登記簿寫進一個沒人
+/// 會讀的資料夾。
+pub const TAURI_CONF: &str = include_str!("../../tauri.conf.json");
+
+/// tauri.conf.json 裡的一個頂層字串欄位。解析不出來就 panic——那代表出貨的設定
+/// 檔壞了或改了形狀，是編譯期就該被發現的事，絕不能默默退回一個猜的值。
+pub fn conf_str(key: &str) -> String {
+    let conf: serde_json::Value =
+        serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
+    conf.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("tauri.conf.json 少了頂層的 {key}"))
+        .to_string()
+}
+
+/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
+/// productName）。只有 Windows 用得到（NSIS 的解除安裝機碼），macOS 沒有對應
+/// 概念。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
+
+/// 應用識別碼（tauri.conf.json 的 identifier）。兩平台都用得到：Windows 那邊是
+/// `%LOCALAPPDATA%` 底下的資料夾名（Tauri 的 `app_local_data_dir()` 在 Windows
+/// 上就是 `%LOCALAPPDATA%\{identifier}`）、single-instance 外掛的具名互斥鎖、
+/// 通知的 AUMID；macOS 那邊是 `pgids` 登記簿所在的
+/// `~/Library/Application Support/{identifier}`。
+pub static IDENTIFIER: LazyLock<String> = LazyLock::new(|| conf_str("identifier"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,9 +371,8 @@ mod tests {
     /// 沒有涵蓋到的部分（安裝畫面模式、`createUpdaterArtifacts` 開關）。
     #[test]
     fn the_shipped_updater_endpoint_matches_latest_json() {
-        let raw = include_str!("../../tauri.conf.json");
         let conf: serde_json::Value =
-            serde_json::from_str(raw).expect("tauri.conf.json 必須是合法 JSON");
+            serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
         let updater = conf.pointer("/plugins/updater").expect("plugins.updater 不可以消失");
         let parsed: tauri_plugin_updater::Config =
             serde_json::from_value(updater.clone()).expect("updater 設定要解析得出來");

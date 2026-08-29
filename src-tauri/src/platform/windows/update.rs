@@ -22,7 +22,6 @@
 mod staged;
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
@@ -32,8 +31,8 @@ use tauri_plugin_window_state::AppHandleExt as _;
 pub use staged::Pending;
 
 use crate::platform::update_common::{
-    self, accept, current_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, INTERVAL,
-    LATEST_JSON, USER_AGENT,
+    self, accept, current_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, IDENTIFIER,
+    INTERVAL, LATEST_JSON, PRODUCT_NAME, USER_AGENT,
 };
 use crate::state::{UpdateInfo, MAIN_WINDOW};
 use crate::Shared;
@@ -41,38 +40,16 @@ use crate::Shared;
 // `LATEST_JSON`（安裝版由 updater 外掛去拿，非安裝版由下面的 `fetch_latest_version`
 // 自己拿，兩邊指向同一份檔案）與 `USER_AGENT` 兩平台逐字相同——macOS 的 live
 // 測試也要用同一份，已上提到 [`update_common`]（見本檔開頭 import）。
+//
+// `TAURI_CONF`／`conf_str`／`PRODUCT_NAME`／`IDENTIFIER` 原本也在這裡：開機那條
+// 路（[`apply_pending_at_startup`]）跑在 `tauri::Builder` 之前，那時還沒有
+// `AppHandle` 可以問設定，所以產品名與識別碼只能自己讀 tauri.conf.json。
+// `IDENTIFIER` 這份 macOS 的 `pgids` 登記簿也要用（同一個理由：那一層同樣沒有
+// `AppHandle`），原本 macOS 端是另外寫死一份字面常數、用測試釘住不能漂掉，
+// 已改成兩邊共用同一個來源，已上提到 [`update_common`]（見本檔開頭 import）。
 
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 會出貨的那份 tauri.conf.json，編譯期就嵌進來。
-///
-/// 開機那條路（[`apply_pending_at_startup`]）跑在 `tauri::Builder` 之前，
-/// 那時還沒有 `AppHandle` 可以問設定，所以產品名與識別碼只能自己拿。
-/// 直接讀這份檔案而不是各抄一份常數：抄的話兩邊會漂，而漂掉的症狀是
-/// 安裝版被誤判成可攜版（更新整條路靜默失效）或暫存區寫進一個沒人會讀的資料夾。
-const TAURI_CONF: &str = include_str!("../../../tauri.conf.json");
-
-/// tauri.conf.json 裡的一個頂層字串欄位。解析不出來就 panic——那代表出貨的設定
-/// 檔壞了或改了形狀，是編譯期就該被發現的事，絕不能默默退回一個猜的值。
-fn conf_str(key: &str) -> String {
-    let conf: serde_json::Value =
-        serde_json::from_str(TAURI_CONF).expect("tauri.conf.json 必須是合法 JSON");
-    conf.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("tauri.conf.json 少了頂層的 {key}"))
-        .to_string()
-}
-
-/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
-/// productName）
-static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
-
-/// 應用識別碼（tauri.conf.json 的 identifier）。三個地方用到它：
-/// `%LOCALAPPDATA%` 底下那個資料夾的名字（Tauri 的 `app_local_data_dir()`
-/// 在 Windows 上就是 `%LOCALAPPDATA%\{identifier}`）、single-instance 外掛的
-/// 具名互斥鎖、以及通知的 AUMID。
-static IDENTIFIER: LazyLock<String> = LazyLock::new(|| conf_str("identifier"));
 
 /// 暫存區在 `%LOCALAPPDATA%\{identifier}` 底下的資料夾名
 const STAGING_DIR: &str = "pending-update";
