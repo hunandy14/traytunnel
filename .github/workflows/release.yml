@@ -219,7 +219,7 @@ jobs:
       # 空字串，否則 tauri 會停下來問。
       #
       # macOS 這條腿走同一顆 npm script：tauri.conf.json 的
-      # beforeBuildCommand 本來就會先跑 npm run build（前端），"tauri build"
+      # beforeBuildCommand 本來就會先跑 npm run web:build（前端），"tauri build"
       # 依平台自動合併 src-tauri/tauri.macos.conf.json（bundle targets
       # app+dmg、minimumSystemVersion、ad-hoc 簽章 signingIdentity "-"——
       # 沒有 Apple 開發者憑證，才能在 CI 上出包），接著 minisign 用同一把
@@ -227,7 +227,7 @@ jobs:
       # process.platform 分流改名進 out/。跟 Windows 腿完全對稱，不必拆成
       # 多個步驟。
       - name: Build app and bundles
-        run: npm run build:all
+        run: npm run build:dist
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""

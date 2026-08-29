@@ -4,7 +4,7 @@
  * 用官方的 @tauri-apps/api/mocks：mockIPC 攔下所有 invoke，shouldMockEvents
  * 讓 listen/emit 也走記憶體，前端程式碼完全不用為了 mock 改寫。
  *
- * 這支檔案只會在 `npm run dev` 且偵測不到 Tauri runtime 時被動態載入，
+ * 這支檔案只會在 `npm run web:dev` 且偵測不到 Tauri runtime 時被動態載入，
  * 正式打包時整段會被 import.meta.env.DEV 判斷掉，不會進 bundle。
  */
 

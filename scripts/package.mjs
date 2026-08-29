@@ -13,7 +13,7 @@
  * 簽章沒被複製進 out/ 就等於在 compose 端不存在，Windows 條目會靜默沿用底稿舊值。
  *
  * Windows（process.platform === "win32"）產出四個檔案（來源不存在的那項會
- * 跳過並印一行提示，所以只編 exe 不打包 NSIS 的 build:exe 也能照跑）：
+ * 跳過並印一行提示，所以只編 exe 不打包 NSIS 的 build:win:exe 也能照跑）：
  *
  *   traytunnel-<v>.exe            一般單檔，設定檔走 %USERPROFILE%\.traytunnel.toml
  *   traytunnel-<v>p.exe           可攜版，與上面同一顆二進位，差別只在檔名結尾的 p

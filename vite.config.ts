@@ -35,7 +35,8 @@ function htmlVersionPlugin(version: string): Plugin {
  * 規則），不需要引入 @tauri-apps/plugin-os 這類執行期偵測——CI 的 build
  * matrix 本來就是 windows-latest／macos-latest 各自原生編譯（見
  * docs/platform-guide.md），建置機的 process.platform 跟執行機的 OS
- * 保證一致，`npm run dev` 也是同一台機器，建置期判斷完全夠用。
+ * 保證一致，`npm run web:dev`（或 `npm run dev` 底下的 beforeDevCommand）
+ * 也是同一台機器，建置期判斷完全夠用。
  */
 function htmlPlatformPlugin(nodePlatform: string): Plugin {
   const platform = nodePlatform === "darwin" ? "macos" : "windows";

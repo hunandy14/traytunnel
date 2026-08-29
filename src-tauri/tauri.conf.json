@@ -3,9 +3,9 @@
   "productName": "traytunnel",
   "identifier": "com.traytunnel.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run web:dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run web:build",
     "frontendDist": "../dist"
   },
   "app": {

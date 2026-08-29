@@ -124,7 +124,7 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 
 ```
 npm install
-npm run tauri dev
+npm run dev
 ```
 
 要在 `src-tauri/src/platform/` 底下加平台相依功能，或想知道跨平台程式碼的規則，先看
@@ -136,7 +136,7 @@ npm run tauri dev
 只想調畫面、不想每次都等 Rust 編譯時，可以只開前端：
 
 ```
-npm run dev
+npm run web:dev
 ```
 
 然後用瀏覽器打開 http://localhost:1420/ 。整個 UI 只有這一頁，主區靠左側欄切換。
@@ -156,19 +156,22 @@ npm run dev
   - `__mock.updateFails()` 讓按下 `Restart to update` 演成失敗，看鈕從 `Restarting…` 彈回來、原因寫進設定頁的錯誤列
   - 真後端的背景車道對「已是最新」與「檢查失敗」都是靜默的（失敗只在活動日誌留一行），畫面上沒有對應的狀態，所以那兩種結果沒有東西好演
 
-假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
+假後端只在 `npm run web:dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
 
 ## 建置
 
-三個指令，差別只在要不要順便打包安裝檔：
+四個指令，差別只在目標平台、要不要順便打包安裝檔：
 
 | 指令 | 做什麼 |
 | --- | --- |
-| `npm run build:exe` | 只編免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
-| `npm run build:setup` | 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
-| `npm run build:all` | 走設定檔裡列的全部 bundle 目標（`tauri build`），要發佈時用 |
+| `npm run build:win:exe` | 只編 Windows 免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
+| `npm run build:win:setup` | Windows 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
+| `npm run build:mac` | macOS `.app`（`tauri build --bundles app`），建完複製一份到 `bin/` 方便本機直接雙擊試跑 |
+| `npm run build:dist` | 走設定檔裡列的全部 bundle 目標（`tauri build`），當前平台的完整發佈建置＋打包，要發佈時用，CI 的 `release.yml` 雙腿共用這顆指令 |
 
-三個指令都會在建置後跑 `node scripts/package.mjs`，把產物複製成發佈用的檔名放進根目錄的 `out/`（每次重跑會先清空）：
+沒有裸的 `npm run build`：光看這個名字猜不出是要建前端還是建整個 app，改名後打錯字會直接得到明確的 `missing script` 錯誤（腳本命名規則見 [`docs/platform-guide.md`](docs/platform-guide.md#scripts-命名規則)）。
+
+`build:win:exe`／`build:win:setup`／`build:dist` 會在建置後跑 `node scripts/package.mjs`，把產物複製成發佈用的檔名放進根目錄的 `out/`（每次重跑會先清空）：
 
 | 發佈檔 | 說明 |
 | --- | --- |
@@ -176,9 +179,11 @@ npm run dev
 | `out/traytunnel-<版本>p.exe` | 可攜版。**與上面同一顆二進位**，差別只在檔名結尾的 `p`——那個 p 就是可攜模式的記號，設定檔改放 exe 旁邊 |
 | `out/traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
-版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
+`build:mac` 跑的是另一支腳本 `node scripts/copy-app-bundle.mjs`，把 `.app` 複製到根目錄的 `bin/`（同樣每次重跑先清空），不寫 `out/`——macOS 的正式發佈檔（`.dmg`／`.app.tar.gz`）是 `build:dist` 的產物。
 
-更新簽章：`tauri.conf.json` 開了 `bundle.createUpdaterArtifacts`，打包時會替 NSIS 安裝檔簽出一份 `.sig`（就落在安裝檔旁邊）。因此 `build:setup`／`build:all` 在**沒有簽章私鑰**的環境會在最後一步失敗——安裝檔本身已經產出，但簽不出 `.sig`，`tauri` 以非零狀態結束，後面的 `scripts/package.mjs` 也就不會跑到。平常只是要驗程式請用 `build:exe`（`--no-bundle` 根本不會走到簽章那一步）；真的要在本地打包安裝檔時，先設好 `TAURI_SIGNING_PRIVATE_KEY`（私鑰檔的**內容**）與 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（沒設密碼也要給空字串，否則 tauri 會停下來問）。私鑰放在 repo 的 `secrets\`，已列入 `.gitignore`；CI 的 `release.yml` 則從 GitHub Secrets 取同一把鑰匙。私鑰與 `tauri.conf.json` 裡的 `plugins.updater.pubkey` 對不起來時 tauri 會印一行警告，那種簽章在使用者端會驗不過。
+版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:win:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/`／`bin/` 只是複製出來的方便命名版本，都已列入 `.gitignore`。
+
+更新簽章：`tauri.conf.json` 開了 `bundle.createUpdaterArtifacts`，打包時會替 updater 產物（Windows 的 NSIS 安裝檔、macOS 的 `.app.tar.gz`）簽出一份 `.sig`。**本機沒有簽章私鑰時**：`build:win:setup`／`build:dist` 會在最後一步失敗——安裝檔本身已經產出，但簽不出 `.sig`，`tauri` 以非零狀態結束，後面的 `scripts/package.mjs` 也就不會跑到；`build:win:exe`（`--no-bundle`）完全不受影響，本來就不會走到打包與簽章那一步。`build:mac` 則是刻意在指令裡多帶一個 `--config '{"bundle":{"createUpdaterArtifacts":false}}'`，只為本機快速試跑 `.app` 這個用途覆寫掉 updater 產物開關——沒有這個覆寫的話，`--bundles app` 一樣會嘗試產出 `.app.tar.gz` 並簽章，本機沒有私鑰時會在最後一步炸掉，`.app` 明明已經建好卻因為 `&&` 短路，`scripts/copy-app-bundle.mjs` 完全不會被跑到，`bin/` 什麼都拿不到（這正是 `build:mac` 曾經回報過的「npm run 跑失敗、直接下 `tauri build --bundles app` 卻像是成功」的根因：兩者其實同樣會失敗，只是後者的失敗訊號很容易在只看終端機最後幾行、或指令有接 `| tee`／`| tail` 之類管線吃掉 exit code 時被忽略掉）。平常只是要驗程式請用 `build:win:exe`（Windows）或 `build:mac`（macOS），兩者都不需要簽章私鑰也能穩定出 `.exe`／`.app`；真的要在本地打包安裝檔或 updater 產物時，先設好 `TAURI_SIGNING_PRIVATE_KEY`（私鑰檔的**內容**）與 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（沒設密碼也要給空字串，否則 tauri 會停下來問）。私鑰放在 repo 的 `secrets\`，已列入 `.gitignore`；CI 的 `release.yml` 則從 GitHub Secrets 取同一把鑰匙。私鑰與 `tauri.conf.json` 裡的 `plugins.updater.pubkey` 對不起來時 tauri 會印一行警告，那種簽章在使用者端會驗不過。
 
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
@@ -196,7 +201,7 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別跑 `npm run build:all`，兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別跑 `npm run build:dist`，兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
 
 ```
 npm run release <x.y.z>

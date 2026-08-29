@@ -133,13 +133,13 @@ cargo test --lib -- --ignored --nocapture live_autostart
 
 `cargo build` 產出的執行檔**不會內嵌前端**，它載的是 `tauri.conf.json` 的
 `build.devUrl`（`http://localhost:1420`）。單獨把它跑起來、旁邊沒有
-`npm run dev`，視窗會照常開出來、macOS 的紅綠燈也照常畫，但 webview 內容
+`npm run web:dev`，視窗會照常開出來、macOS 的紅綠燈也照常畫，但 webview 內容
 是完全空白的一片白——**這是 dev 產物的正常行為，不是 app 的 bug**。
 README 的「建置」章節本來就寫了這件事，這裡再記一次是因為它在 macOS 上
 特別容易被誤判成視窗風格或 activation policy 的問題（實際量測：`cargo build`
 的執行檔單獨啟動 17/17 全白；`tauri build` 的 `.app` 70/70 全部正常）。
 
-驗 macOS UI 只有兩條路：`npm run tauri dev`（Vite 在跑），或
+驗 macOS UI 只有兩條路：`npm run dev`（完整 app，Vite 在跑），或
 `npx tauri build [--debug] --bundles app` 之後跑 `.app` 裡的執行檔。
 
 分辨方法不必再靠截圖猜，日誌第一段就有（見 `lib.rs` 的 `watch_first_page_load`）：
@@ -168,3 +168,41 @@ URL（見 `lib.rs` 的 `DEV_BUILD_NOTICE_HTML`），所以裸執行檔不會一�
 `didCommitNavigation`，佇列裡的 script 永遠卡在排隊狀態，`eval` 形同沒打中。
 `navigate` 是全新的一次導航請求，不吃這個佇列，`data:` URL 也不需要任何網路
 連線就能被直接當成一份完整文件載入。
+
+## scripts 命名規則
+
+`package.json` 的 script 鍵名是一棵樹，`:` 是階層分隔，不是扁平字串：
+
+```
+build
+├── dist          build:dist        當前平台完整發佈建置＋打包，CI 雙腿共用
+├── mac           build:mac         單一變體，停在兩層
+└── win
+    ├── exe       build:win:exe     只編免安裝執行檔，跳過打包
+    └── setup     build:win:setup   執行檔＋NSIS 安裝檔
+
+dev               完整 app（tauri dev，含 Rust 編譯與 webview）
+web:dev           純前端（vite）
+web:build         純前端（tsc && vite build）
+web:preview       純前端（vite preview）
+```
+
+規則：
+
+- **冒號＝層級**，不是命名裝飾。讀 `build:win:exe` 要當「`build` → `win` →
+  `exe`」三層路徑讀，不是一個扁平的識別碼。
+- **單一變體的平台停在兩層**：macOS 目前只有一種建置產物，鍵名就是
+  `build:mac`，不必為了「將來可能有第二個變體」預先開第三層占位。等它真的
+  長出第二個變體（例如公證版）才升到 `build:mac:app`／`build:mac:notarized`
+  三層——沒有第二個變體之前硬升一層，只是多一層沒人用的空殼。Windows
+  從一開始就有 `exe`／`setup` 兩個變體，所以它直接是三層
+  `build:win:exe`／`build:win:setup`。
+- **`dev` 與 `web:*` 是兩個不同的心智模型，不是同一件事的兩種寫法**：
+  `dev`（`tauri dev`）啟動完整 app，含 Rust 編譯與 Tauri IPC，驗證含後端邏輯
+  的完整行為要用它；`web:dev`／`web:build`／`web:preview` 只碰前端，不啟動
+  Rust 那一側，只想調 UI、不想每次都等 Rust 編譯時用它們。
+- **刻意不設裸 `build`**：光看 `npm run build` 猜不出是要建前端還是建整個
+  app。拿掉之後，打錯字或沿用舊記憶敲 `npm run build` 會直接得到明確的
+  `missing script` 錯誤，逼你在 `web:build`、`build:dist`、`build:win:exe`、
+  `build:win:setup`、`build:mac` 之間選一個實際存在的鍵，不會誤觸一個「看似
+  合理但做錯事」的指令。
