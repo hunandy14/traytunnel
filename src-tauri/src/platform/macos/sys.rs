@@ -373,7 +373,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 ///
 /// 只放行 `https://`：`open` 的第一個位置參數什麼都收——`file:///`、
 /// 自訂 scheme、甚至一個本地路徑都會照開，而網址在這條路上是拼出來的
-/// （版本號來自遠端的 latest.json）。呼叫端已經有 [`super::update::release_url`]
+/// （版本號來自遠端的 latest.json）。呼叫端已經有 [`crate::platform::update_common::release_url`]
 /// 那一層過濾，這裡是第二道，兩道都在才擋得住「有人日後多開一個呼叫端」。
 pub fn open_url(url: &str) -> io::Result<()> {
     if !url.starts_with("https://") {
