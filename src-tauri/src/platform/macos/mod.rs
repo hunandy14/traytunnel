@@ -30,9 +30,10 @@
 //! （`show_main`／`hide_to_tray`／`setup`）各自散一段幾乎一樣的 cfg 區塊，
 //! 值得比照 `menu` 進一層門面收攏，見 `policy` 子模組的
 //! `enter_foreground`／`retire_to_tray`／`initial_policy_for_tray_start`。
-//! 這三支門面項目**不是**不對稱設計——Windows 側直接在 `platform::mod` 補
-//! 三支 no-op（而不是進 `platform/windows` 湊一份假實作），讓 `lib.rs`
-//! 呼叫端完全不必知道平台差異，三個 cfg 區塊因此消失。
+//! 這三支門面項目**不是**不對稱設計——Windows 側在 `platform::windows::policy`
+//! 補了同名同簽章的三支 no-op，`platform::mod` 跟其他跨平台項目一樣只是
+//! 一行 `pub use imp::{...}` 轉出去，讓 `lib.rs` 呼叫端完全不必知道平台
+//! 差異，三個 cfg 區塊因此消失。
 
 mod menu;
 mod notify;

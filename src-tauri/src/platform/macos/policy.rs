@@ -2,9 +2,8 @@
 //! `#[cfg(target_os = "macos")] app.set_activation_policy(...)` 收進這裡，
 //! 讓呼叫端（`show_main`／`hide_to_tray`／`setup`）改叫平台門面，不必自己包
 //! cfg。Windows 沒有「activation policy」這個概念（工作列圖示是系統內建，
-//! 不需要動態前景／背景切換），對應的三支 no-op 直接寫在
-//! `platform::mod`（見該檔「Activation policy」那一節），不必湊一份假的
-//! Windows 實作進 `platform/windows`。
+//! 不需要動態前景／背景切換），對應的三支 no-op 在
+//! `platform::windows::policy`，同名同簽章。
 //!
 //! 三支函式都吃 `&AppHandle`，統一走 `AppHandle::set_activation_policy`
 //! （回 `Result`）；`initial_policy_for_tray_start` 在 `setup()` 內用的是
