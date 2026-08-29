@@ -785,6 +785,16 @@ function handle(cmd: string, args: Args): unknown {
       log(null, `(browser mock) ${cmd}`);
       return null;
 
+    // 白屏診斷的就緒信標。瀏覽器裡沒有 Rust 端可以通知，靜靜吃掉就好。
+    //
+    // 實際上這一格現在打不到：main.ts 是在 render() 之後、bootstrap() 之前
+    // 就發出信標的，那時這份假後端還沒被裝上（bootstrap 是動態 import），
+    // invoke 直接 reject 而呼叫端 catch 掉，根本走不到 mockIPC 這裡。留著是
+    // 防禦——哪天信標挪到 bootstrap 之後，落到 default 就會在活動區留一行
+    // 「unhandled command」的假雜訊。
+    case "frontend_ready":
+      return null;
+
     case "get_state":
       return structuredClone(state);
 

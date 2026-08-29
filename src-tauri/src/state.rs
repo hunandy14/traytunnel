@@ -1196,6 +1196,22 @@ impl AppState {
         self.exiting.store(true, Ordering::SeqCst);
     }
 
+    /// 收尾：立退出旗標 → 收掉所有程序樹。
+    ///
+    /// 這兩支從來只成對出現，而且**順序就是規格**：先 `mark_exiting()` 讓所有
+    /// 「還活著就重連」的路徑（watchdog、隧道的重試迴圈、`RunEvent::Exit` 的
+    /// 補救掛鉤）看得到「要走了」，再 `kill_all_jobs()` 動手殺；反過來的話，
+    /// 殺完到立旗標之間有一個窗口，重連迴圈會醒過來把剛收掉的隧道再拉一條起來。
+    ///
+    /// 收成一支方法就是為了讓這個順序沒有第二種寫法。**不是**「exit 專用」：
+    /// 更新交棒那條路（`platform::*::update`）也走同一組收尾，那裡程式不一定會
+    /// 結束（安裝失敗就留在原地），所以 `kill_all_jobs` 只收 worker、不刪項目，
+    /// 狀態會被壓成 stopped——語意見該函式的說明。
+    pub fn shutdown(&self) {
+        self.mark_exiting();
+        self.kill_all_jobs();
+    }
+
     pub fn autostart(&self) -> bool {
         crate::platform::autostart_enabled(&autostart_name(&self.app))
     }

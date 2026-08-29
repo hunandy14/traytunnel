@@ -230,6 +230,19 @@ export const openReleasesPage = () => invoke<void>("open_releases_page");
 export const windowMinimize = () => invoke<void>("window_minimize");
 export const windowClose = () => invoke<void>("window_close");
 
+/**
+ * 就緒信標：整條啟動鏈跑完之後叫一次，讓 Rust 端知道前端真的活著。
+ *
+ * 這是白屏診斷唯一的守衛（Rust 那側見 lib.rs 的「白屏診斷」段落）。不帶參數、
+ * 不回值，發生過這件事本身就是它的全部意義——WebView2 對連線失敗自己畫的
+ * 錯誤頁、WKWebView 的空白頁都發不出這個 invoke，Rust 端因此能分辨
+ * 「前端根本沒載進來」與「載進來但沒畫出來」。
+ *
+ * 失敗不必處理（呼叫端 catch 掉即可）：它只是診斷訊號，叫不到最壞的結果就是
+ * 五秒後多一行 warn。
+ */
+export const frontendReady = () => invoke<void>("frontend_ready");
+
 // ------------------------------------------------------------ 事件
 
 export const onExitStatus = (fn: (e: ExitStatusEvent) => void) =>

@@ -1034,3 +1034,15 @@ pub fn window_minimize(app: AppHandle) {
 pub fn exit_app(state: State<'_, Shared>) {
     do_exit(state.inner());
 }
+
+/// 前端就緒信標：`main.ts` 的啟動鏈跑完就 invoke 一次。
+///
+/// 白屏診斷唯一的守衛（見 `lib.rs` 那段「白屏診斷」的說明）。這支指令不帶
+/// 參數、不回值、也不碰 `AppState`——它的全部意義就是「這個 invoke 發生過」：
+/// 只有我們自己的前端真的跑起來才發得出來，WebView2 對連線失敗自己畫的錯誤頁
+/// 與 WKWebView 的空白頁都不可能。舊守衛看的 page-load 事件在前者身上會照發，
+/// 那正是說明頁在 Windows 上永遠不出現的原因。
+#[tauri::command]
+pub fn frontend_ready() {
+    crate::mark_frontend_ready();
+}

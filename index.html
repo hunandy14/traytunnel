@@ -142,7 +142,10 @@
           <div class="setting-row">
             <span class="setting-icon" data-icon="power" data-icon-size="17"></span>
             <div class="setting-text">
-              <div class="setting-name">Start with Windows</div>
+              <!-- 平台中立：這一列在 macOS 上走的是 LaunchAgent、Windows 上是
+                   HKCU 的 Run 機碼，同一個 toggle 兩邊都成立，標題不該只寫其中
+                   一邊。副標本來就是中立的「at sign-in」，標題跟上。 -->
+              <div class="setting-name">Start at login</div>
               <div class="setting-hint">Launch Traytunnel at sign-in</div>
             </div>
             <button class="toggle" id="tg-autostart" role="switch" aria-checked="false"></button>

@@ -26,14 +26,20 @@ use std::path::Path;
 /// `mac-notification-sys` 底層用 `Once` 實作，第二次起呼叫必回
 /// `AlreadySet` 錯誤——這裡若還跟著呼叫，每顆通知都會白噴一行假警告。
 ///
-/// `show()` 丟去 `tauri::async_runtime::spawn` 送出，不在呼叫端等待：
-/// 這顆 handle 若在主執行緒被 drop，會轉一個巢狀 `NSRunLoop` 等投遞完成
-/// （最多可達 2 秒），等於讓通知擋住主執行緒；比照
-/// `tauri-plugin-notification` 桌面後端（`desktop.rs`）的做法，把 `show()`
-/// 丟到 runtime 執行緒上執行，呼叫端立即返回。
+/// `show()` 不在呼叫端等待：這顆 handle 被 drop 時會轉一個巢狀 `NSRunLoop`
+/// 等投遞完成（最多可達 2 秒），在呼叫端同步做等於讓通知擋住主執行緒。
+///
+/// 丟的是 **`spawn_blocking` 而不是 `spawn`**。`show()` 整支是同步阻塞的
+/// （那 2 秒的巢狀 run loop 就是它），包進 `async` 區塊並不會讓它變得可以
+/// 讓出——只會把一條 tokio worker 執行緒整整佔住兩秒。async runtime 上還有
+/// 隧道監看、連線探測那些真的在等 I/O 的任務，不該被一顆通知卡住。
+/// `spawn_blocking` 有自己的執行緒池，那才是阻塞呼叫該去的地方。
+///
+/// （`tauri-plugin-notification` 桌面後端用的是 `spawn`。這裡刻意不照抄：
+/// 它是外掛，不知道宿主的 runtime 上還跑著什麼；我們知道。）
 pub fn show_notification(_aumid: &str, title: &str, body: &str) {
     let notification = notify_rust::Notification::new().summary(title).body(body).finalize();
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::spawn_blocking(move || {
         if let Err(e) = notification.show() {
             log::warn!("failed to show notification: {e}");
         }
@@ -48,8 +54,20 @@ pub fn show_notification(_aumid: &str, title: &str, body: &str) {
 /// 應用身分與圖示都直接來自 `.app` bundle 的 `CFBundleIdentifier`／`CFBundleIconFile`，
 /// `set_application` 是唯一需要在建立任何 UI 之前做的事。`product`／`exe` 目前用不到
 /// （Windows 那邊要組捷徑與登錄機碼才需要），簽章維持跟 Windows 一致方便呼叫端共用。
+///
+/// dev 執行檔改掛 `com.apple.Terminal`，**與官方外掛同一條規則**
+/// （`tauri-plugin-notification` 2.3.3 `desktop.rs`：
+/// `set_application(if tauri::is_dev() { "com.apple.Terminal" } else { identifier })`）。
+/// 理由是 `mac-notification-sys` 的 `set_application` 會去 LaunchServices 查那個
+/// bundle id 註冊在哪——`cargo build` 出來的裸執行檔沒有 `.app` bundle、也沒有
+/// 註冊過，查不到就回 `CouldNotSet`，於是每次 dev 啟動的活動日誌第一行都是一句
+/// 假警告（實測：`could not set the notification application id: Could not set
+/// application '…', using default "com.apple.Terminal"`）。掛 Terminal 是那條
+/// 訊息自己講的退路，通知照樣彈得出來，只是掛在終端機名下——dev 本來就是從終端機
+/// 跑起來的，這個掛名反而是誠實的。正式 `.app` bundle 走 `else` 分支，一字不動。
 pub fn prepare_notifications(aumid: &str, _product: &str, _exe: &Path) -> Vec<String> {
-    match notify_rust::set_application(aumid) {
+    let id = if tauri::is_dev() { "com.apple.Terminal" } else { aumid };
+    match notify_rust::set_application(id) {
         Ok(()) => Vec::new(),
         Err(e) => vec![format!("could not set the notification application id: {e}")],
     }
