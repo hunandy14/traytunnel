@@ -123,3 +123,86 @@ Tauri 的 updater manifest 只有一個全域 `version` 欄位，沒有 per-plat
 
 `mergeLatestJson` 的 `options.tag` 是必填參數（缺省即 throw）：漏傳就等於整條
 斷言靜默停用，而那正是這條防線存在的理由，所以刻意不給「忘記傳」留活路。
+
+## 發佈管線：`SHA256SUMS.txt` 也要底稿合併，不能只用這次建置的檔案生成
+
+跟上面 `latest.json` 同一類問題，出在另一個檔案上：`compose` job 過去只用
+「這次建置、下載進 `out/` 的檔案」重新生成整份 `SHA256SUMS.txt`。
+`softprops/action-gh-release` 上傳資產預設 overwrite——單平台補腿（例如
+`v0.6.6` 已經發過 Windows，這次只補 macOS）時，這樣生出來的 `SHA256SUMS.txt`
+只有 macOS 兩行，一旦蓋掉舊檔，Windows 那三個 `.exe` 的 checksum 就從 release
+資產裡永久消失，而且整條流程全綠——這是一個**致命 bug**：`.exe` 本身還在，
+卻再也沒有官方管道可以核對它們的完整性。
+
+修法跟 `latest.json` 一樣是底稿合併（`scripts/lib/sha256sums.mjs` 的
+`mergeSha256Sums`）：`compose` 先抓現行（這個 release tag 底下的）
+`SHA256SUMS.txt` 當底稿，只用這次建置出來的檔案覆寫同名行，其餘行原樣保留。
+
+**跟 `latest.json` 底稿抓取不同的一點**：`SHA256SUMS.txt` 的底稿網址用的是
+「這次要發佈的 tag」本身（`releases/download/<tag>/SHA256SUMS.txt`），不是
+`releases/latest` 那個浮動指標。`SHA256SUMS.txt` 沒有 `latest.json` 那種
+「manifest 只有一個全域 `version`」的先天限制，不需要靠 `releases/latest`
+對齊 updater endpoint；用浮動指標反而會在「要補腿的不是目前最新一個
+release」時抓錯底稿。
+
+**這兩份底稿刻意不保證來自同一個 release，這是正確設計，不要為了「看起來
+要一致」而改掉**：`SHA256SUMS.txt` 是每個 release 各一份、跟這次的 tag
+一對一對應的產物，底稿理所當然要用這次的 tag 去抓「這個 release 自己」的
+內容；`latest.json` 是整個 repo 唯一一份、`releases/latest/download/
+latest.json` 這個固定 endpoint，updater 只認這一份，底稿因此固定抓
+`releases/latest`，跟這次是哪個 tag 無關。補腿到**目前最新的那個 tag**時
+兩份底稿剛好同源（這次的 tag 本來就是 `releases/latest`指向的 release）；
+補腿到**比較舊、不是目前最新**的 tag 時兩份底稿會刻意分岔：`SHA256SUMS.txt`
+底稿仍抓那個較舊 tag 自己的內容（正確——不該被別的 release 污染），
+`latest.json` 底稿仍抓 `releases/latest`（正確——它永遠只反映目前真正最新
+的 release）。若把 `SHA256SUMS.txt` 的底稿網址也改成 `releases/latest`
+以求「兩者同源」，會在補較舊 tag 的腿時抓到別的（更新的）release 的
+`SHA256SUMS.txt` 當底稿，等於重新引入前面說的致命 bug。三種情境的邊界：
+
+- **首發**：tag 對應的 release 還不存在，兩份底稿都是 404 → 空底稿，
+  `SHA256SUMS.txt`／`latest.json` 都只有這次建置的內容。
+- **補腿到最新 tag**（往已經發過、且目前就是 `releases/latest` 的 tag
+  補另一個平台，最常見的補腿情境）：兩份底稿同源，都抓到同一個 tag 底下
+  的既有內容，另一平台的 checksum／platforms 條目原樣保留。
+- **補腿到較舊 tag**（往一個不是目前最新的舊 tag 補平台，較少見但合法）：
+  兩份底稿刻意分岔（見上段），`SHA256SUMS.txt` 仍正確保留該舊 tag 自己的
+  另一平台 checksum；`latest.json` 的底稿則是目前最新 release 的內容，跟
+  這次要補的舊 tag 通常對不上，陳舊條目斷言（見上面的斷言 2）會視情況擋下
+  或需要顯式 `allow_stale_platforms=true`。
+- **全平台重發**（同一個 tag 重跑兩個平台）：底稿裡兩個平台的舊行都會被
+  這次的新值覆寫，等於整份重新生成，但語意上仍然是「合併」而非「清空重建」。
+
+`404` 與「暫時性失敗（網路抖動、5xx、rate limit）」的分野，以及重試邏輯，
+跟 `latest.json` 底稿抓取完全一樣（見 `release.yml` 的兩個 `Fetch current
+... as merge baseline` 步驟）：只有確定 404 才視為空底稿，其餘一律重試、
+重試用盡就硬失敗——把暫時性失敗靜默當成空底稿，後果跟前面 `latest.json`
+的陳舊條目斷言要擋的事故一樣：另一個平台的資產完整性驗證資訊被無聲抹掉。
+
+### 殘餘風險：底稿合併不核對 release 實際的資產清單
+
+`mergeSha256Sums` 只按「檔名」合併兩份清單，不會反過來核對底稿裡保留下來
+的那些檔名，在這個 release 上是不是真的還有對應的資產存在。正常路徑下
+（`softprops/action-gh-release` 用同一組檔名 overwrite）這不是問題——保留
+的行本來就對應仍然存在的資產。但如果同一個 tag 被重新發過、而且檔名方案
+本身也跟著改了（例如把 `traytunnel-<v>-setup.exe` 改名成別的規則、或整批
+換掉某個平台的產物命名），底稿裡指向舊檔名的那一行會變成殭屍：`SHA256SUMS.
+txt` 上留著一行雜湊，卻沒有對應資產可以下載核對。
+
+失效方向是安全的：使用者拿這樣的 `SHA256SUMS.txt` 跑 `sha256sum -c` 時，
+殭屍行的結果是「找不到那個檔案」（`No such file or directory`），不會是
+「雜湊核對通過」的誤報——不會有人被騙去信任一個內容其實不對的檔案。目前
+評估這個殘餘風險可以接受：換檔名方案本身就是低頻、需要人工同步改
+`package.mjs`／`compose-latest-json.mjs` 的變更，屆時人工順手核對一次
+`SHA256SUMS.txt` 內容即可；沒有為它加自動化的「跟 release 資產列表比對」
+檢查。
+
+### 附帶修好的既有缺陷：SHA256SUMS.txt 的換行字元
+
+線上既有（`v0.6.5` 以前手刻 `sha256sum` 產出的）`SHA256SUMS.txt` 其實是
+CRLF 換行——`scripts/lib/sha256sums.mjs` 的 `formatSha256Sums` 一律輸出
+LF，這是本次順手修掉的一個既有小缺陷：CRLF 版本的 `SHA256SUMS.txt` 在
+Linux／macOS 上直接 `sha256sum -c SHA256SUMS.txt` 會因為每一行多出的 `\r`
+被當成檔名的一部分而報 `No such file or directory`，實際上並不能拿來驗證
+（Windows 上用 `certutil` 之類工具通常不受影響，這是為什麼過去沒被發現）。
+新管線輸出的 `SHA256SUMS.txt` 是純 LF，`sha256sum -c` 在三個平台上都能
+正常核對。
