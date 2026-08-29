@@ -206,3 +206,57 @@ Linux／macOS 上直接 `sha256sum -c SHA256SUMS.txt` 會因為每一行多出�
 （Windows 上用 `certutil` 之類工具通常不受影響，這是為什麼過去沒被發現）。
 新管線輸出的 `SHA256SUMS.txt` 是純 LF，`sha256sum -c` 在三個平台上都能
 正常核對。
+
+## 發佈管線：建置架構標籤不能靠「runner 剛好是什麼」猜
+
+`release.yml` 過去 `tauri build` 沒帶 `--target`，`scripts/package.mjs` 的
+`platform_key` 也單純用 `process.platform` 猜——兩邊都隱性假設「這個
+runner 的架構，剛好就是這次要發佈的架構」。這件事對目前唯一的 macOS
+runner（`macos-14`，Apple Silicon）為真，但沒有任何機制保證它永遠為真：
+未來只要 matrix 換一顆 Intel runner、或改用交叉編譯，建出來的二進位架構
+就會跟 `platform_key`（進而跟 `latest.json` 的 `url`）對不上，使用者抓到
+一顆在自己機器上跑不動的檔案，而且整條 CI 照樣全綠——猜測法本身不會
+產生任何錯誤訊號。
+
+現在的作法是把「要建哪個架構」變成宣告式的事實，而不是從環境反推：
+
+- `release.yml` 的 build 步驟明確傳 `--target ${{ matrix.rust_target }}`
+  給 `tauri build`，`scripts/package.mjs` 也吃同一個 `--target`（或
+  `TAURI_BUILD_TARGET` 環境變數），`platform_key` 從 target triple 用查表
+  推導，不吃 `process.platform`。
+- mac 建置額外加一道終端檢查：`package.mjs` 用 `lipo -archs`（找不到就退回
+  `file -b`）讀出實際建出來的 `.app` 執行檔架構，跟 `--target` 期望的架構
+  （`aarch64-apple-darwin` → `arm64`）比對，不符就 `exit 1`。這是最後一道
+  防線——即使 `--target` 跟 runner 實際架構本身不一致（例如 CI 設定手滑、
+  要求交叉編譯到不支援的目標），也能在發佈前擋下來，而不是等使用者回報
+  「裝了但打不開」才發現。
+- 本機沒帶 `--target` 手動執行（例如 `npm run build:dist`）時，
+  `package.mjs` 退回用 `process.platform`／`process.arch` 猜，並印一行
+  警告——這只是本機開發便利，CI 一律明確傳 `--target`，不依賴這個猜測。
+
+## 發佈管線：`softprops/action-gh-release` 對既有 release 的 `body` 覆寫
+
+`softprops/action-gh-release` 對已存在的 release 執行更新時，只要
+`with.body` 有值（不論內容是不是固定字串）就會整份覆寫掉目前的
+description。`release.yml` 過去固定帶一段 macOS 安裝說明當 `body`，若
+release 已經存在且 description 曾經被人工編輯過（例如補一段已知問題、
+額外的升級注意事項），下一次針對同一個 tag 重跑（最典型：單平台補腿，
+先發 Windows，人工潤飾過 release notes，之後再補 macOS）就會把那些編輯
+悄悄清空，換回這段固定文字。
+
+修法是先用唯讀的 `gh api repos/<repo>/releases/tags/<tag>` 判斷這個 tag
+底下現在有沒有 release，據此分成兩條路徑（見 `release.yml` compose job
+的 `Check whether a GitHub Release already exists for this tag` 步驟與
+之後兩個 `Create GitHub Release` 步驟）：
+
+- **尚不存在**：照舊帶固定 body（macOS 安裝說明）＋
+  `generate_release_notes: true`，第一次建立沒有「人工編輯」可覆寫。
+- **已存在**：完全不傳 `body`、也不傳 `generate_release_notes`——後者不能
+  留：GitHub release API 在沒有明確 `body` 時，`generate_release_notes:
+  true` 仍然會用自動產生的 changelog 當 body 寫回去，一樣會蓋掉人工編輯的
+  內容。只有兩者都不傳，`softprops/action-gh-release` 才不會在更新時觸碰
+  這個欄位，既有 description 原樣保留。
+
+這個判斷步驟刻意不受 `dry_run` 限制（純讀公開資料，不建立/修改任何東西）：
+`dry_run=true` 時雖然不會真的建立/更新 release，但分流判斷本身照樣執行、
+把結果印進 log，可以在不動任何真實 release 的情況下驗證這條邏輯是對的。

@@ -63,12 +63,18 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
-      # 這次「應該建置成功」的平台 key 清單（空白分隔），與 matrix 同源。
-      # compose job 拿它做 fail-closed 檢查：任何一個應建平台缺 .sig 就中止，
-      # 不會靜默沿用底稿舊值（舊管線本來就有這道防呆，重構時掉了，補回來）。
-      platform_keys: ${{ steps.set.outputs.platform_keys }}
-      dry_run: ${{ steps.set.outputs.dry_run }}
-      allow_stale_platforms: ${{ steps.set.outputs.allow_stale_platforms }}
+      # dry_run／allow_stale_platforms／platform_keys 刻意不是這個 job 的
+      # output：workflow_dispatch 的 inputs.* context 本來就是整個 workflow
+      # 都看得到（不限定義它的那個 job），這裡再原封不動 echo 一份出去只是
+      # 純轉傳，多一層間接、也多一處「要記得同步改」的地方。下游一律直接讀
+      # inputs.dry_run／inputs.allow_stale_platforms；tag push 事件沒有
+      # workflow_dispatch 的 inputs，inputs.* 一律是 null，跟布林 true 比較
+      # 時自然是 false，等價於這兩個開關的預設值（false），不需要在這裡
+      # 額外處理這個情境。platform_keys（compose job 拿來做 fail-closed
+      # 檢查的平台清單）也一樣：直接從這個 job 輸出的 matrix 用
+      # fromJson(...).include.*.platform_key 推導，不必另外存一份同源的
+      # 字串當 output。
+      #
       # 版本／tag 只在這裡解析一次（見下面 Resolve release version and tag
       # 步驟），build 與 compose 都直接吃這兩個 job output，不再各自重跑一次
       # resolve-release.mjs／PowerShell 版本——三份各自解析、日後改壞一處卻
@@ -83,20 +89,15 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-          cache: "npm"
 
-      - name: Compute build matrix and dry_run flag
+      - name: Compute build matrix
         id: set
         shell: bash
         run: |
           set -euo pipefail
           platform="all"
-          dry_run="false"
-          allow_stale="false"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             platform="${{ inputs.platform }}"
-            dry_run="${{ inputs.dry_run }}"
-            allow_stale="${{ inputs.allow_stale_platforms }}"
           fi
 
           # 每個平台的 matrix 物件只在這裡定義一次；windows／macos／all 三個
@@ -122,32 +123,25 @@ jobs:
               ;;
           esac
 
-          # platform_keys 與 matrix 同源：從 matrix 本身推導，而不是各分支
-          # 各寫一份字面值——避免「新增平台進 matrix 卻忘了同步 platform_keys」
-          # 這種無聲遺漏。
-          platform_keys="$(printf '%s' "$matrix" | jq -r '[.include[].platform_key] | join(" ")')"
-
-          echo "platform=${platform}  dry_run=${dry_run}  allow_stale_platforms=${allow_stale}"
+          echo "platform=${platform}  dry_run=${{ inputs.dry_run }}  allow_stale_platforms=${{ inputs.allow_stale_platforms }}"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "platform_keys=$platform_keys" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "allow_stale_platforms=$allow_stale" >> "$GITHUB_OUTPUT"
 
       # 版本／tag 解析（含 tag push 時的 Cargo.toml 一致性檢查，以及
       # workflow_dispatch 正式發佈時向遠端確認 tag 已存在）只在這裡跑一次；
       # 過去分別在 build job 的 Windows（pwsh）、macOS（這支 mjs）腿，以及
       # compose job 各跑一次，三份同一套邏輯、稍有語意差異（pwsh 版本是純
-      # 手刻的字面翻版），改一處很容易漏改另外兩處。npm ci 前置：跟 build／
-      # compose 用同一套「先 npm ci 再跑 script」慣例，即使這支腳本目前無
-      # 外部相依，也不必為它單獨開特例。
-      - name: Install npm dependencies
-        run: npm ci
-
+      # 手刻的字面翻版），改一處很容易漏改另外兩處。resolve-release.mjs 無
+      # 外部套件相依（見該檔開頭註解），這裡刻意不跑 npm ci、Setup Node 也
+      # 不設 npm cache：跟 build／compose 用同一套「先 npm ci 再跑 script」
+      # 慣例是為了「有相依時保持一致」，不是不管有沒有相依都無腦照抄；平白
+      # 多一次 npm ci 只會拖慢這個 job，沒有任何東西真的要裝（compose job
+      # 呼叫 compose-latest-json.mjs／compose-sha256sums.mjs 時本來就是這樣
+      # 處理的，這裡只是補齊同一個慣例）。
       - name: Resolve release version and tag
         id: resolve
         shell: bash
         env:
-          DRY_RUN: ${{ steps.set.outputs.dry_run }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: node scripts/resolve-release.mjs
 
   build:
@@ -189,16 +183,33 @@ jobs:
       # 缺了它 bundler 會直接失敗。產私鑰時沒有設密碼，但環境變數仍要給
       # 空字串，否則 tauri 會停下來問。
       #
-      # macOS 這條腿走同一顆 npm script：tauri.conf.json 的
-      # beforeBuildCommand 本來就會先跑 npm run web:build（前端），"tauri build"
-      # 依平台自動合併 src-tauri/tauri.macos.conf.json（bundle targets
-      # app+dmg、minimumSystemVersion、ad-hoc 簽章 signingIdentity "-"——
-      # 沒有 Apple 開發者憑證，才能在 CI 上出包），接著 minisign 用同一把
+      # 這裡直接呼叫 `npx tauri build --target <matrix.rust_target>`，不再走
+      # `npm run build:dist`（package.json 那顆腳本沒帶 --target）：Tauri 的
+      # `tauri build` 不帶 --target 時用「目前 runner 的架構」當預設，
+      # package.mjs 過去也是照 process.platform 猜 platform_key——兩邊都在
+      # 猜，猜的前提是「runner 架構剛好等於要發布的架構」，這件事對
+      # macos-14（Apple Silicon）目前為真，但沒有任何東西保證未來永遠為真：
+      # 只要哪天 matrix 加一個 Intel runner（或改用 macos-13）、或者只是 CI
+      # 設定手滑，建出來的二進位架構就會跟 platform_key／latest.json 對不上，
+      # 使用者拿到跑不動的檔案，而且整條流程照樣全綠。明確傳 --target 把
+      # 「要建哪個架構」變成宣告式的事實，不再依賴 runner 剛好長什麼樣；
+      # package.mjs 也同步吃 --target（見該檔），platform_key 從 target 推導，
+      # 並在 mac 上額外用 lipo/file 驗證實際建出來的二進位架構真的跟
+      # target 一致，兩層防線都不再依賴猜測。
+      #
+      # macOS 這條腿：tauri.conf.json 的 beforeBuildCommand 本來就會先跑
+      # npm run web:build（前端），"tauri build" 依平台自動合併
+      # src-tauri/tauri.macos.conf.json（bundle targets app+dmg、
+      # minimumSystemVersion、ad-hoc 簽章 signingIdentity "-"——沒有 Apple
+      # 開發者憑證，才能在 CI 上出包），接著 minisign 用同一把
       # TAURI_SIGNING_PRIVATE_KEY 簽 updater 產物，最後 package.mjs 依
-      # process.platform 分流改名進 out/。跟 Windows 腿完全對稱，不必拆成
-      # 多個步驟。
+      # --target 分流改名進 out/。跟 Windows 腿完全對稱，不必拆成多個步驟。
       - name: Build app and bundles
-        run: npm run build:dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tauri build --target "${{ matrix.rust_target }}"
+          node scripts/package.mjs --target "${{ matrix.rust_target }}"
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
@@ -215,17 +226,24 @@ jobs:
       # shasum），程式邏輯完全對稱，只是語言不同——兩份要同步改的風險，
       # 加上 bundle/release 檔名各自手寫一份 traytunnel-<version>-...。
       # windows-latest 的 `shell: bash` 走 Git Bash，一樣有 sha256sum／
-      # shasum 可用，兩腿因此能共用同一支腳本；bundle_source／asset 改讀
+      # shasum 可用，兩腿因此能共用同一支腳本；bundle_source／asset 直接讀
       # scripts/package.mjs 產出的 out/manifest.<platform_key>.json（見
-      # scripts/lib/manifest.mjs），不再手寫檔名——跟 compose job 讀同一份
-      # manifest，是同一組檔名的單一來源。
+      # scripts/lib/manifest.mjs）——manifest 本身就是 JSON，這裡用 jq 讀
+      # 一次就拿到兩個欄位，不必再為每個欄位各起一次 node 行程去跑
+      # print-manifest-field.mjs（已刪除，這是它唯二兩個呼叫點之一，另一個
+      # 在 compose job，那邊改成 compose-latest-json.mjs 直接讀 manifest）。
       - name: Verify updater signature matches release asset
         shell: bash
         run: |
           set -euo pipefail
           platform_key="${{ matrix.platform_key }}"
-          bundle_source="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${platform_key}" --field bundle_source)"
-          asset="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${platform_key}" --field asset)"
+          manifest_file="out/manifest.${platform_key}.json"
+          if [ ! -f "${manifest_file}" ]; then
+            echo "::error::找不到 ${manifest_file}——package.mjs 應該已經在上一步產生它，檢查這個平台的建置有沒有成功、或簽署產物是否真的被複製進 out/。"
+            exit 1
+          fi
+          bundle_source="$(jq -r '.bundle_source' "${manifest_file}")"
+          asset="$(jq -r '.asset' "${manifest_file}")"
           release_asset="out/${asset}"
 
           # 優先用 sha256sum（確認存在於 windows-latest 的 Git Bash）；macOS
@@ -249,6 +267,15 @@ jobs:
 
       # out/ 整包（含 package.mjs 順手複製進去的 .sig）交給 compose job：
       # latest.json 要合併雙平台，勢必得先把兩腿的產物集中到同一個 job。
+      #
+      # overwrite: true（M8：失敗重跑的冪等性）——這個 workflow 用固定
+      # concurrency group 序列化（見檔案最上面的 concurrency 區塊），同一個
+      # 分支/tag 失敗後重跑時，GitHub Actions 會沿用同一個 run（re-run failed
+      # jobs），這個 artifact 名稱在該 run 裡因此會被重新上傳一次。舊版
+      # upload-artifact 沒設 overwrite，同名 artifact 已存在時直接以 409
+      # 回絕整個上傳步驟，一次失敗重跑永遠死在這一步，逼人必須手動觸發全新
+      # 一次 run 才能重試——overwrite: true 讓重跑直接覆寫掉上一次失敗前
+      # （若有）殘留的同名 artifact，不需要任何人工介入。
       - name: Upload build artifact (${{ matrix.platform_key }})
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -256,6 +283,7 @@ jobs:
           path: out/
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
   # 彙總 job：下載兩腿（或單平台逃生門時的那一腿）產物，組出「單平台可控
   # 發佈」語意下的 latest.json（底稿合併——見 scripts/lib/latest-json.mjs），
@@ -283,6 +311,15 @@ jobs:
       # artifact」時本來就不會建子目錄，單平台模式下自己組裝子目錄的迴圈會
       # 撈不到東西、out/ 全空，compose 隨即死在找不到簽章。交給 action 自己
       # 攤平，單平台與雙平台走同一條路徑。兩腿的檔名各自帶平台後綴，不會相撞。
+      #
+      # pattern: release-* 只挑兩腿的建置產物（release-windows-x86_64／
+      # release-darwin-aarch64），不會連這個 compose job 自己產出的
+      # compose-output 一起抓進來（見下面「Upload compose output」步驟：
+      # 那個 artifact 刻意不用 release- 前綴，就是為了不撞這個 pattern——
+      # M8：失敗重跑時如果 compose-output 也叫 release-compose-output，
+      # 重跑會把上一輪自己合併過的 latest.json／SHA256SUMS.txt 也下載進
+      # out/，跟這一輪重新產出的內容混在一起，合併邏輯讀到的「這次建置」
+      # 就不再只是這次建置的東西）。
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -301,7 +338,14 @@ jobs:
       # 純讀公開資料，dry_run 與否都做——這樣 dry-run 才能真實驗證合併邏輯，
       # 而不是每次都只測「空底稿」這一種情境。
       #
-      # 關鍵：必須區分「確定沒有底稿」與「這次沒抓到」。
+      # scripts/fetch-baseline.mjs（C2）：這一步跟下面「Fetch current
+      # SHA256SUMS.txt as merge baseline」過去是兩段幾乎逐字重複的 bash
+      # curl 重試迴圈（重試次數、退避秒數、200/404/其他狀態碼的分流邏輯都
+      # 一樣，只有 URL 跟「200 之後怎麼驗證內容合法」不同），抽成同一支
+      # 腳本，這裡跟下一步各呼叫一次、帶不同的 --url／--validator／--on-404。
+      #
+      # 關鍵：必須區分「確定沒有底稿」與「這次沒抓到」，這條分野是
+      # fetch-baseline.mjs 存在的核心理由：
       #   HTTP 404      → 真的沒有（首發，或最新 release 上沒有 latest.json
       #                   這個資產）。視為空底稿，不擋流程。
       #   其他任何失敗  → 暫時性（網路抖動、5xx、rate limit、被攔截的錯誤頁）。
@@ -313,47 +357,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          url="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
-          attempts=5
-          status="failed"
-          code="000"
-
-          for i in $(seq 1 "${attempts}"); do
-            code="$(curl -sSL --connect-timeout 10 --max-time 60 \
-              -o baseline-latest.json.tmp -w '%{http_code}' "${url}")" || code="000"
-
-            if [ "${code}" = "200" ]; then
-              # 200 也可能拿到半截／被中間層換掉的內容，解得開才算數，
-              # 否則一樣當暫時性失敗重試（總比拿壞底稿去合併好）。
-              if node --input-type=module \
-                -e 'import{readFileSync}from"node:fs";JSON.parse(readFileSync("baseline-latest.json.tmp","utf8"))'; then
-                mv baseline-latest.json.tmp baseline-latest.json
-                status="ok"
-                break
-              fi
-              echo "第 ${i} 次：HTTP 200 但內容不是合法 JSON，視為暫時性失敗"
-            elif [ "${code}" = "404" ]; then
-              status="absent"
-              break
-            else
-              echo "第 ${i} 次：HTTP ${code}，視為暫時性失敗"
-            fi
-
-            if [ "${i}" -lt "${attempts}" ]; then
-              sleep $(( i * 5 ))
-            fi
-          done
-
-          if [ "${status}" = "ok" ]; then
-            echo "抓到現行 latest.json 當底稿："
-            cat baseline-latest.json
-          elif [ "${status}" = "absent" ]; then
-            echo "HTTP 404：線上沒有 latest.json（首發，或目前還沒有任何 release）——視為空底稿"
-            echo '{}' > baseline-latest.json
-          else
-            echo "::error::連續 ${attempts} 次都拿不到現行 latest.json（最後一次 HTTP ${code}），且不是 404。無法確認線上底稿內容，繼續下去可能把其他平台的條目從 latest.json 抹掉，因此中止。請稍後重跑。"
-            exit 1
-          fi
+          node scripts/fetch-baseline.mjs \
+            --url "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" \
+            --out baseline-latest.json \
+            --validator json \
+            --on-404 empty-json \
+            --label "releases/latest 的 latest.json"
 
       # SHA256SUMS.txt 的底稿，取得方式刻意跟上面 latest.json 不同源，而且
       # 兩者「應該」不同源——這不是疏漏，改成同源反而會把這次修的 bug 重新
@@ -377,106 +386,68 @@ jobs:
       # 「補腿的不是目前最新一個 release」時，把另一個（更新的）release 的
       # SHA256SUMS.txt 錯當底稿，等於重新引入這次要修的致命 bug。
       #
-      # 404／暫時性失敗的分野與 latest.json 那步完全一樣：真的沒有（首發，
-      # 或這次是全新版本、這個 tag 底下還沒發過任何一腿）才視為空底稿；其餘
-      # 失敗一律重試，重試用盡就硬失敗——静默當成空底稿會把另一個平台的
-      # checksum 從 SHA256SUMS.txt 永久抹掉，且沒有任何訊號（這正是這次要
-      # 修的致命 bug）。
+      # 404／暫時性失敗的分野與上一步完全一樣（見 scripts/fetch-baseline.mjs
+      # 開頭註解）：真的沒有（首發，或這次是全新版本、這個 tag 底下還沒發過
+      # 任何一腿）才視為空底稿；其餘失敗一律重試，重試用盡就硬失敗——靜默
+      # 當成空底稿會把另一個平台的 checksum 從 SHA256SUMS.txt 永久抹掉，且
+      # 沒有任何訊號（這正是這次要修的致命 bug）。
       - name: Fetch current SHA256SUMS.txt as merge baseline
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ needs.plan.outputs.release_tag }}"
-          url="https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS.txt"
-          attempts=5
-          status="failed"
-          code="000"
+          node scripts/fetch-baseline.mjs \
+            --url "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS.txt" \
+            --out baseline-SHA256SUMS.txt \
+            --validator sha256sums \
+            --on-404 empty \
+            --label "${tag} 的 SHA256SUMS.txt"
 
-          for i in $(seq 1 "${attempts}"); do
-            code="$(curl -sSL --connect-timeout 10 --max-time 60 \
-              -o baseline-SHA256SUMS.txt.tmp -w '%{http_code}' "${url}")" || code="000"
-
-            if [ "${code}" = "200" ]; then
-              if node --input-type=module \
-                -e 'import{readFileSync}from"node:fs";import{parseSha256Sums}from"./scripts/lib/sha256sums.mjs";parseSha256Sums(readFileSync("baseline-SHA256SUMS.txt.tmp","utf8"))'; then
-                mv baseline-SHA256SUMS.txt.tmp baseline-SHA256SUMS.txt
-                status="ok"
-                break
-              fi
-              echo "第 ${i} 次：HTTP 200 但內容不是合法的 SHA256SUMS 格式，視為暫時性失敗"
-            elif [ "${code}" = "404" ]; then
-              status="absent"
-              break
-            else
-              echo "第 ${i} 次：HTTP ${code}，視為暫時性失敗"
-            fi
-
-            if [ "${i}" -lt "${attempts}" ]; then
-              sleep $(( i * 5 ))
-            fi
-          done
-
-          if [ "${status}" = "ok" ]; then
-            echo "抓到 ${tag} 現行 SHA256SUMS.txt 當底稿："
-            cat baseline-SHA256SUMS.txt
-          elif [ "${status}" = "absent" ]; then
-            echo "HTTP 404：${tag} 這個 release 目前沒有 SHA256SUMS.txt（首發，或這個 tag 還沒發過任何一腿）——視為空底稿"
-            : > baseline-SHA256SUMS.txt
-          else
-            echo "::error::連續 ${attempts} 次都拿不到 ${tag} 現行 SHA256SUMS.txt（最後一次 HTTP ${code}），且不是 404。無法確認線上底稿內容，繼續下去可能把其他平台的 checksum 從 SHA256SUMS.txt 抹掉，因此中止。請稍後重跑。"
-            exit 1
-          fi
-
-      # 要餵給 compose-latest-json.mjs 的平台清單，直接來自 plan job 算出來的
-      # build matrix（needs.plan.outputs.platform_keys），不是「out/ 底下剛好
-      # 有哪些 manifest／.sig」。
+      # 這次應建置的平台清單直接從 plan job 輸出的 matrix 用
+      # fromJson(...).include.*.platform_key 推導（C8：不再另外存一份
+      # plan job 的 platform_keys output——那份純粹是同一個 matrix 的
+      # 字串重複版，兩處要同步改的風險，直接刪掉這層間接）。
       #
-      # 差別很要命：用「檔案在不在」推導的話，簽章因為任何原因沒被產出／沒被
-      # 複製進 out/ 時，該平台會被靜默跳過，latest.json 於是沿用底稿的舊條目，
-      # 整條流程全綠——使用者拿到的是上一版的簽章配新版的 url，更新直接壞掉，
-      # 而且沒有任何訊號。所以這裡反過來：這次矩陣說要建的平台，manifest 與
-      # 它指到的簽章檔就必須在，缺一個就中止（fail-closed）。底稿沿用只保留
-      # 給「這次根本沒排進矩陣」的平台，那才是單平台可控發佈的本意。
+      # 不是「out/ 底下剛好有哪些 manifest／.sig」的理由沒有變：簽章因為任何
+      # 原因沒被產出／沒被複製進 out/ 時，用「檔案在不在」推導會讓該平台被
+      # 靜默跳過，latest.json 於是沿用底稿的舊條目，整條流程全綠——使用者
+      # 拿到的是上一版的簽章配新版的 url，更新直接壞掉，而且沒有任何訊號。
+      # 所以反過來：這次矩陣說要建的平台，manifest 與它指到的簽章檔就必須
+      # 在，缺一個就中止（fail-closed，見 scripts/compose-latest-json.mjs
+      # 的 resolvePlatformsFromManifests）。底稿沿用只保留給「這次根本沒
+      # 排進矩陣」的平台，那才是單平台可控發佈的本意。
       #
-      # 資產／簽章檔名不在這裡手寫：改讀 scripts/package.mjs 產出的
-      # out/manifest.<platform_key>.json（scripts/lib/manifest.mjs），單一
-      # 來源——package.mjs 才是真的知道「這次到底複製出了什麼檔案」的地方。
+      # ALLOW_STALE 直接讀 inputs.allow_stale_platforms（C8）：這裡是純字串
+      # 內插進 env，不是布林比較，workflow_dispatch 時渲染成 "true"/"false"
+      # 字面字串、tag push（inputs 為 null）時渲染成空字串，下面 bash 的
+      # `[ "${ALLOW_STALE}" = "true" ]` 三種情況都得到正確結果，等價於過去
+      # plan job 幫 tag push 預設出的 "false"。
+      #
+      # 資產／簽章檔名不在這裡手寫：compose-latest-json.mjs 直接讀
+      # scripts/package.mjs 產出的 out/manifest.<platform_key>.json
+      # （scripts/lib/manifest.mjs），單一來源——package.mjs 才是真的知道
+      # 「這次到底複製出了什麼檔案」的地方（C5：過去這裡要先呼叫兩次
+      # print-manifest-field.mjs 組出 --platform key=sig=url 字串，現在
+      # 直接傳 --dir／--platforms／--repo，manifest 只有一個讀取點）。
       - name: Compose merged latest.json
         shell: bash
         env:
-          EXPECTED_PLATFORMS: ${{ needs.plan.outputs.platform_keys }}
-          ALLOW_STALE: ${{ needs.plan.outputs.allow_stale_platforms }}
+          EXPECTED_PLATFORMS: ${{ join(fromJson(needs.plan.outputs.matrix).include.*.platform_key, ' ') }}
+          ALLOW_STALE: ${{ inputs.allow_stale_platforms }}
         run: |
           set -euo pipefail
           tag="${{ needs.plan.outputs.release_tag }}"
-          repo="${{ github.repository }}"
           pub_date="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
+          echo "這次應建置的平台：${EXPECTED_PLATFORMS}"
+
           args=(--version "${{ needs.plan.outputs.version }}" --tag "${tag}" --pub-date "${pub_date}"
+                --dir out --platforms "${EXPECTED_PLATFORMS}" --repo "${{ github.repository }}"
                 --baseline baseline-latest.json --out out/latest.json)
           if [ "${ALLOW_STALE}" = "true" ]; then
             echo "::warning::allow_stale_platforms=true：latest.json 允許保留不屬於 ${tag} 的舊平台條目"
             args+=(--allow-stale-platforms)
           fi
-
-          echo "這次應建置的平台：${EXPECTED_PLATFORMS}"
-          for key in ${EXPECTED_PLATFORMS}; do
-            if [ ! -f "out/manifest.${key}.json" ]; then
-              echo "::error::這次 build matrix 排了 ${key}，但 out/manifest.${key}.json 不存在。latest.json 的 ${key} 條目無法產生，若放行會靜默沿用底稿舊簽章，因此中止。檢查該平台的建置有沒有成功、scripts/package.mjs 有沒有把已簽署產物與 .sig 複製進 out/，以及該腿的 upload/download artifact。"
-              exit 1
-            fi
-
-            asset="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${key}" --field asset)"
-            sig_name="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${key}" --field sig)"
-            sig="out/${sig_name}"
-
-            if [ ! -f "${sig}" ]; then
-              echo "::error::out/manifest.${key}.json 指到的簽章檔 ${sig} 不存在。latest.json 的 ${key} 條目無法產生，因此中止。"
-              exit 1
-            fi
-
-            args+=(--platform "${key}=${sig}=https://github.com/${repo}/releases/download/${tag}/${asset}")
-          done
 
           node scripts/compose-latest-json.mjs "${args[@]}"
 
@@ -488,55 +459,121 @@ jobs:
         shell: bash
         run: node scripts/compose-sha256sums.mjs --dir out --baseline baseline-SHA256SUMS.txt --out out/SHA256SUMS.txt
 
-      # dry_run 與否都上傳這個 artifact：這是驗證「合併邏輯 + 建置」整條路徑
-      # 有沒有真的兜起來的證據，不必開真 release 也能下載回來檢查
-      # latest.json／SHA256SUMS.txt 的結構。
+      # dry_run 與否都上傳這個 artifact：latest.json／SHA256SUMS.txt 是驗證
+      # 「合併邏輯＋建置」有沒有真的兜起來的最終產物，不必開真 release 也能
+      # 下載回來核對結構。
       #
-      # 內容量依 dry_run 分兩種：
-      #   dry_run=true   沒有真 release 可以核對，二進位檔本身也是要驗證的
-      #                   對象之一（例如確認建置出來的檔案真的存在、大小
-      #                   合理），連二進位檔一起上傳。
-      #   dry_run=false  二進位檔已經上傳到 GitHub Release 的資產（下面
-      #                   Create GitHub Release 那步），build job 也還留著
-      #                   per-platform 的 release-<platform_key> workflow
-      #                   artifact（7 天）——這裡沒有理由再存一份重複的
-      #                   二進位檔，只需要 latest.json／SHA256SUMS.txt 這兩
-      #                   個「合併結果」本身，減少 workflow artifact 儲存量。
-      - name: Upload compose output as workflow artifact (dry-run：含二進位檔，供驗證)
-        if: needs.plan.outputs.dry_run == 'true'
+      # 二進位檔本身不重複上傳（C19）：build job 每一腿已經各自上傳了
+      # release-<platform_key> workflow artifact（見上面，7 天保留），要核對
+      # 二進位檔存不存在／大小合不合理（包含 dry-run 演練時），直接下載那兩個
+      # per-platform artifact 即可，沒必要在這個 compose-output 裡再存一份
+      # 重複的二進位內容——不管是 dry-run 還是正式發佈，這裡都只放
+      # latest.json／SHA256SUMS.txt 這兩個「合併結果」本身。
+      #
+      # overwrite: true（M8，重跑語意同上面 build job 的 upload 步驟）；
+      # 名稱刻意叫 compose-output、不叫 release-compose-output：上面
+      # Download build artifacts 步驟的 pattern: release-* 只挑兩腿的建置
+      # 產物，如果這個 artifact 也用 release- 前綴，失敗重跑時會把上一輪
+      # 自己合併出來的 latest.json／SHA256SUMS.txt 也下載進 out/，混進這一輪
+      # 重新產生的內容裡。
+      - name: Upload compose output as workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-compose-output
-          path: |
-            out/*.exe
-            out/*.dmg
-            out/*.tar.gz
-            out/SHA256SUMS.txt
-            out/latest.json
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload compose output as workflow artifact (正式發佈：二進位檔已在 release 資產上，不重複存)
-        if: needs.plan.outputs.dry_run != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-compose-output
+          name: compose-output
           path: |
             out/SHA256SUMS.txt
             out/latest.json
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
       # dry_run=true 時到此為止：不 attest、不建立/覆寫真實 GitHub Release，
       # 不動 releases/latest 這個 updater endpoint 指標。
+      #
+      # inputs.dry_run != true（C8）：拿掉字串比較 `== 'true'`，直接跟布林
+      # 常值 true 比。workflow_dispatch 的 inputs.dry_run 型別是真的布林
+      # （不是字串），跟字串常值 'true' 比較時 GitHub Actions 表達式引擎會走
+      # 數值強制轉換，字串 'true' 轉數字是 NaN，布林轉數字是 1/0，兩者永遠
+      # 不相等——直接跟布林常值 true/false 比較才是型別安全的寫法。tag push
+      # 時 inputs.dry_run 是 null，`null != true` 為 true（視為「不是
+      # dry-run，要做正式的事」），語意等價於過去 needs.plan.outputs.dry_run
+      # 預設的 "false"。
       - name: Attest build provenance
-        if: needs.plan.outputs.dry_run != 'true'
+        if: inputs.dry_run != true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             out/*.exe
             out/*.dmg
             out/*.tar.gz
+
+      # M11：softprops/action-gh-release 對「已存在的 release」執行 update
+      # 時，只要 with.body 有值就會整份覆寫掉現有的 description——即使那份
+      # description 是人事後手動編輯過的 release notes，也會被這次 workflow
+      # 帶的固定字串蓋掉。單平台補腿（例如 v0.6.6 先發了 Windows，人工潤飾過
+      # release notes，之後再補 macOS 那條腿）會直接把潤飾過的內容清空重寫。
+      #
+      # 修法：先用唯讀的 `gh api repos/.../releases/tags/<tag>` 確認這個 tag
+      # 底下「現在」有沒有 release，並把結果分流成兩個 Create GitHub Release
+      # 步驟（見下面）：
+      #   尚不存在  → 照舊帶固定的 body（macOS 安裝說明）＋
+      #               generate_release_notes: true，第一次建立時的說明文字
+      #               沒有「人工編輯」這件事可覆寫。
+      #   已經存在  → 完全不傳 body、也不傳 generate_release_notes——後者
+      #               同樣要拿掉：GitHub 的 release API 在沒有明確 body 時，
+      #               generate_release_notes: true 仍然會用自動產生的
+      #               changelog 當 body 寫回去，一樣會蓋掉人工編輯的內容；
+      #               只有 body／generate_release_notes 都不傳，softprops
+      #               才不會在 PATCH 這個欄位，既有 description 原樣保留。
+      #
+      # 這一步刻意不受 dry_run 限制（跟上面兩個 Fetch baseline 步驟一樣的
+      # 理由）：純讀公開資料，不建立/修改任何東西，dry-run 也要能跑到、把
+      # 分流結果印進 log，才能在不建真 release 的情況下驗證這條判斷邏輯本身
+      # 是對的。404 與「其他任何失敗」的分野照抄本檔案一貫的作法：只有確定
+      # 404 才視為「不存在」；其餘一律重試，重試用盡就硬失敗，不能把暫時性
+      # 錯誤誤判成「不存在」進而覆寫掉真正存在、人工編輯過的 release notes。
+      - name: Check whether a GitHub Release already exists for this tag
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.plan.outputs.release_tag }}"
+          attempts=5
+          status="unknown"
+          detail=""
+
+          for i in $(seq 1 "${attempts}"); do
+            if err="$(gh api "repos/${{ github.repository }}/releases/tags/${tag}" 2>&1 >/dev/null)"; then
+              status="exists"
+              break
+            fi
+            detail="${err}"
+            if printf '%s' "${err}" | grep -q "HTTP 404"; then
+              status="absent"
+              break
+            fi
+            echo "第 ${i} 次查詢 release 是否存在失敗（非 404）：${err}"
+            if [ "${i}" -lt "${attempts}" ]; then
+              sleep $(( i * 5 ))
+            fi
+          done
+
+          case "${status}" in
+            exists)
+              echo "release ${tag} 已存在：這次 Create GitHub Release 不會傳 body／generate_release_notes，保留人工編輯過的說明"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            absent)
+              echo "release ${tag} 尚不存在：這次會用固定的 macOS 安裝說明當 body 建立新 release"
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::連續 ${attempts} 次都無法確認 release ${tag} 是否存在（最後一次：${detail}），且不是確定的 404。無法判斷這次該不該覆寫 body，因此中止，避免誤判成『不存在』而覆寫掉人工編輯過的 release notes。請稍後重跑。"
+              exit 1
+              ;;
+          esac
 
       # body 與 generate_release_notes 並用時，GitHub API 會把 body 放在前面、
       # 自動生成的變更記錄接在後面（不是互斥，兩者都會出現在最終 release
@@ -546,8 +583,11 @@ jobs:
       # 寫不了檔案會直接失敗。單平台（僅 Windows）發佈時這段說明依然會
       # 出現在說明文字裡，但無害——它描述的是「若你要用 macOS 版」的固定
       # 步驟，不代表這次 release 一定有新的 macOS 資產。
-      - name: Create GitHub Release
-        if: needs.plan.outputs.dry_run != 'true'
+      #
+      # 只在 steps.check_release 判定「這個 tag 尚不存在 release」時跑：見上面
+      # check_release 步驟與 M11 說明。
+      - name: Create GitHub Release (new)
+        if: inputs.dry_run != true && steps.check_release.outputs.exists != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.plan.outputs.release_tag }}
@@ -563,5 +603,24 @@ jobs:
             out/SHA256SUMS.txt
             out/latest.json
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # M11：更新既有 release 時不傳 body、也不傳 generate_release_notes——
+      # 兩者只要有一個帶了值，softprops 都會把 description 整份覆寫掉，人工
+      # 編輯過的 release notes 就這樣消失。這裡只更新 tag_name／name／files，
+      # 現有 description 原樣保留。
+      - name: Create GitHub Release (existing — preserve manually edited notes)
+        if: inputs.dry_run != true && steps.check_release.outputs.exists == 'true'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          name: v${{ needs.plan.outputs.version }}
+          files: |
+            out/*.exe
+            out/*.dmg
+            out/*.tar.gz
+            out/SHA256SUMS.txt
+            out/latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
