@@ -27,6 +27,11 @@ compile_error!("traytunnel 目前只支援 Windows 與 macOS，其餘平台請�
 // 更新整條路（車道判定、背景檢查、暫存交棒、開 Releases 頁）與封裝格式綁得很死
 // （Windows 是 NSIS setup.exe + HKCU 解除安裝機碼），因此整個子模組由平台提供。
 // 對外的名字仍是 `platform::update::*`，呼叫端與搬移前一字不差。
+//
+// 這條路上不看平台的那一小段（逾時常數、release 網址組法、版本號比較）不受這條
+// 規則管：那是純邏輯，兩邊硬要各自維護一份只會漂，收在平台中立的 [`update_common`]
+// 一份，兩邊的 `update.rs` 各自 `use` 進來——見該檔開頭的說明。
+mod update_common;
 pub use imp::update;
 
 // ---------------------------------------------------------------- 受監督 spawn

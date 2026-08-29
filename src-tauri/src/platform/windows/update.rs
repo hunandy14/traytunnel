@@ -25,64 +25,25 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use semver::Version;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tauri_plugin_window_state::AppHandleExt as _;
 
 pub use staged::Pending;
 
+use crate::platform::update_common::{
+    self, current_version, is_newer, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, INTERVAL,
+};
 use crate::state::{UpdateInfo, MAIN_WINDOW};
 use crate::Shared;
-
-/// 啟動後隔這麼久才做第一次檢查：開機當下要先把系統匣、隧道那些真正要緊的事做完，
-/// 更新檢查是最不急的一件。
-const FIRST_DELAY: Duration = Duration::from_secs(8);
-
-/// 常駐期間的檢查間隔
-const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 更新資訊清單。安裝版由 updater 外掛（tauri.conf.json 的 endpoints）去拿，
 /// 非安裝版由下面的 `fetch_latest_version` 自己拿，兩邊指向同一份檔案。
 const LATEST_JSON: &str =
     "https://github.com/hunandy14/traytunnel/releases/latest/download/latest.json";
 
-/// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
-/// 使用者可以自己挑要哪一版（含更早的版本）
-const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases";
-
-/// 單一版本的 release 頁前綴。發佈說明與該版的下載資產都在同一頁上，
-/// 所以「View release notes」與可攜版的「Get vX.Y.Z」開的是同一個網址。
-const RELEASE_TAG_PREFIX: &str = "https://github.com/hunandy14/traytunnel/releases/tag/v";
-
-/// 還不知道是哪一版（沒查過或查不到）時，release 頁退回這裡
-const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
-
 /// 非安裝版查版本的逾時。查不到就是查不到，沒有理由讓一條卡住的連線一直掛著
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 安裝版查 latest.json 的逾時。
-///
-/// updater 外掛的 builder 預設是 `None`，也就是**完全沒有上限**：GitHub 那邊
-/// 一旦是半開的連線（封包進得去、回應永遠不來），這個 async 任務就再也不會回來。
-/// 背景檢查每 24 小時起一次，卡住的任務會一直累積；手動按下的那顆「Check now」
-/// 更糟，前端的 await 沒有逾時，按鈕會永遠停在轉圈。
-///
-/// 給得比可攜車道的 10 秒寬一些：這條路要拉的是完整的 latest.json 並驗簽章。
-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 下載安裝檔的逾時。
-///
-/// 與 CHECK_TIMEOUT 分開設是因為兩段的性質完全不同：查版本只拉一份幾百位元組的
-/// JSON，超過半分鐘一定是卡住了；下載拉的是十幾 MB 的安裝檔，而 reqwest 的
-/// `timeout` 管的是**整個請求含讀完 body** 的總時間，設窄了會把慢速但正常的
-/// 下載一起砍掉（使用者看到的是「更新老是失敗」，而不是「網路慢」）。
-/// 因此這裡放寬到 10 分鐘：它要擋的是永遠不會結束的連線，不是慢的連線。
-///
-/// 這一段的值傳不進 builder——外掛建 `Update` 物件時把 timeout 寫死成 `None`
-/// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
-/// 所以只能在拿到 Update 物件之後對它的 pub 欄位直接賦值。
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// GitHub 對沒有 User-Agent 的請求會直接回 403，一定要帶
 const USER_AGENT: &str = concat!("traytunnel/", env!("CARGO_PKG_VERSION"));
@@ -142,14 +103,10 @@ fn staging_dir() -> Option<PathBuf> {
     Some(PathBuf::from(local).join(&*IDENTIFIER).join(STAGING_DIR))
 }
 
-/// 版本號的比較用形式：去空白、去前導的 v。
-///
-/// 全程式只有這一份：`is_newer`、標記寫入、同版去重、開機決策都吃它，
-/// 各自寫一次 `trim_start_matches` 的話遲早會有一處漏掉而讓 `v0.7.0`
-/// 與 `0.7.0` 被當成兩個版本。
-pub(crate) fn normalize_version(version: &str) -> &str {
-    version.trim().trim_start_matches(['v', 'V'])
-}
+// `normalize_version`（標記寫入、同版去重、開機決策都吃它）兩平台逐字相同，已
+// 上提到 [`update_common`]。這裡用 `pub(crate) use` 重新匯出，讓 `staged.rs`
+// 那句 `use super::normalize_version;` 不必改。
+pub(crate) use update_common::normalize_version;
 
 /// 清掉暫存區並把狀態同步歸零。
 ///
@@ -344,13 +301,9 @@ async fn check_lane(app: &AppHandle) -> Result<Found, String> {
     }
 }
 
-/// 這一份執行檔是哪一版。
-///
-/// 用編譯期常數而不是 `app.package_info().version`（那一份的來源同樣是
-/// Cargo.toml 的 version），開機那條路才問得到。
-fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+// `current_version`：用編譯期常數而不是 `app.package_info().version`（那一份的
+// 來源同樣是 Cargo.toml 的 version），開機那條路才問得到——與 macOS 同一份實作，
+// 已上提到 [`update_common`]（見本檔開頭 import）。
 
 /// 安裝版車道的檢查：走 updater 外掛，簽章驗證與版本比對都由它做。
 ///
@@ -427,47 +380,26 @@ fn fetch_latest_version() -> Result<String, String> {
         .ok_or_else(|| "latest.json has no version field".to_string())
 }
 
-/// 遠端版本是不是嚴格大於目前這一版。
-///
-/// 用 semver 的比較規則（它已經在相依樹裡，是 updater 外掛自己在用的那一顆），
-/// 因此 0.10.0 > 0.9.0，而 pre-release 一律小於同號的正式版。兩邊任一個解析
-/// 不出來就當成「沒有新版」：更新提示寧可漏報，也不要因為一個怪字串誤報。
-pub fn is_newer(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| Version::parse(normalize_version(s)).ok();
-    match (parse(remote), parse(current)) {
-        (Some(r), Some(c)) => r > c,
-        _ => false,
-    }
-}
+// `is_newer`（semver 比較、"0.10.0" > "0.9.0"、v 前綴、pre-release、解析失敗一律
+// 當沒有新版）與 `release_url` 的網址組法兩平台逐字相同，已上提到 [`update_common`]
+// （見本檔開頭 import）。
 
-/// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
-/// 使用者按下「View release notes」時至少看得到最新那一版的說明。
-///
-/// 純函式，網址組法有問題要在測試裡就看得出來，不必等到實機按下去開錯頁。
-pub fn release_url(version: Option<&str>) -> String {
-    let tag = version.map(normalize_version).filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
-    match tag {
-        Some(v) => format!("{RELEASE_TAG_PREFIX}{v}"),
-        None => LATEST_RELEASE_PAGE.to_string(),
-    }
-}
+// ---------------------------------------------------------------- 開瀏覽器
+//
+// 這兩支邏輯與 macOS 版逐字相同，已上提到 [`update_common`]；這裡只負責把
+// Windows 自己的 `winsys::open_url` 注入進去——見 `update_common` 開頭「為什麼
+// 不直接伸手進 `platform::windows::winsys`」那段。
 
 /// 單一版本的 release 頁：發佈說明與該版的下載資產都在上面。
 /// 可攜／單檔版的「Get vX.Y.Z」與下拉的「View release notes」都走這裡。
 pub fn open_release_page(st: &Shared, version: Option<&str>) {
-    open_page(st, &release_url(version));
+    update_common::open_release_page(st, version, super::winsys::open_url);
 }
 
 /// Releases 列表頁：下拉的「Download from Releases」走這裡，
 /// 讓使用者自己挑版本換檔案。這條路不下載、不碰自己這顆 exe。
 pub fn open_releases_page(st: &Shared) {
-    open_page(st, RELEASES_PAGE);
-}
-
-fn open_page(st: &Shared, url: &str) {
-    if let Err(e) = super::winsys::open_url(url) {
-        st.log(format!("could not open {url}: {e}"));
-    }
+    update_common::open_releases_page(st, super::winsys::open_url);
 }
 
 // ------------------------------------------------------------ 背景下載與暫存
@@ -912,39 +844,9 @@ mod tests {
         assert!(!location_matches("   ", &exe_in("C:\\app")));
     }
 
-    /// 只有嚴格大於才算新版：同版與舊版都不可以跳出更新提示
-    #[test]
-    fn only_a_strictly_greater_version_counts() {
-        assert!(is_newer("0.5.0", "0.4.3"));
-        assert!(is_newer("1.0.0", "0.9.9"));
-        assert!(!is_newer("0.4.3", "0.4.3"));
-        assert!(!is_newer("0.4.2", "0.4.3"));
-    }
-
-    /// 字串比大小的經典陷阱：字面上 "0.10.0" < "0.9.0"，semver 規則下才是大的
-    #[test]
-    fn ten_is_newer_than_nine() {
-        assert!(is_newer("0.10.0", "0.9.0"));
-        assert!(!is_newer("0.9.0", "0.10.0"));
-    }
-
-    /// latest.json 的 version 寫成 v0.5.0 也照樣認得；pre-release 小於同號正式版
-    #[test]
-    fn leading_v_is_tolerated_and_prerelease_is_older() {
-        assert!(is_newer("v0.5.0", "0.4.3"));
-        assert!(is_newer("0.5.0", "v0.4.3"));
-        assert!(!is_newer("0.5.0-rc.1", "0.5.0"));
-        assert!(is_newer("0.5.0", "0.5.0-rc.1"));
-    }
-
-    /// 解析不出來一律當成沒有新版：更新提示寧可漏報也不要誤報
-    #[test]
-    fn garbage_never_reports_an_update() {
-        assert!(!is_newer("", "0.4.3"));
-        assert!(!is_newer("latest", "0.4.3"));
-        assert!(!is_newer("0.5", "0.4.3"));
-        assert!(!is_newer("0.5.0", "not-a-version"));
-    }
+    // `is_newer` 本身的測試（嚴格大於、"0.10.0" vs "0.9.0"、v 前綴、pre-release、
+    // 解析失敗的退讓方向……）兩平台逐字相同，已搬到 [`crate::platform::update_common`]
+    // 的測試裡，不在這裡重複一份。
 
     /// 安裝版車道的最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
     ///
@@ -968,30 +870,8 @@ mod tests {
         assert_eq!(prefixed.version, "0.6.0");
     }
 
-    /// release 頁的網址組法：帶不帶 v 都要組出同一個 tag 頁，
-    /// 不知道版本時退回 releases/latest 而不是組出一個 tag 是空的壞網址
-    #[test]
-    fn a_release_url_points_at_that_version_or_falls_back_to_latest() {
-        assert_eq!(
-            release_url(Some("0.6.0")),
-            "https://github.com/hunandy14/traytunnel/releases/tag/v0.6.0"
-        );
-        assert_eq!(release_url(Some("v0.6.0")), release_url(Some("0.6.0")));
-        assert_eq!(release_url(Some("  0.6.0  ")), release_url(Some("0.6.0")));
-        let latest = "https://github.com/hunandy14/traytunnel/releases/latest";
-        assert_eq!(release_url(None), latest);
-        assert_eq!(release_url(Some("")), latest);
-        assert_eq!(release_url(Some("   ")), latest);
-        // 版本號裡混進路徑分隔符就不是版本號了，不可以讓它把網址帶去別的地方
-        assert_eq!(release_url(Some("0.6.0/../../evil")), latest);
-    }
-
-    /// 「Download from Releases」開的是列表頁，不是 releases/latest 那一頁——
-    /// 整份列表才挑得到更早的版本
-    #[test]
-    fn the_downloads_menu_item_opens_the_release_list() {
-        assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
-    }
+    // `release_url` 的網址組法、`RELEASES_PAGE` 的值同樣兩平台逐字相同，測試也
+    // 已搬到 [`crate::platform::update_common`]，這裡不重複。
 
     /// `hidden` 屬性的 `display: none` 只來自瀏覽器預設樣式表，層疊順序上輸給
     /// 任何一條作者樣式，所以 `.setting-row { display: flex }` 之類的規則會讓
