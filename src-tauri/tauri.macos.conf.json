@@ -1,5 +1,24 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Traytunnel",
+        "width": 540,
+        "height": 446,
+        "minWidth": 480,
+        "minHeight": 420,
+        "resizable": true,
+        "maximizable": false,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "center": true,
+        "visible": false
+      }
+    ]
+  },
   "bundle": {
     "targets": ["app", "dmg"],
     "macOS": {

@@ -82,6 +82,19 @@ pub use imp::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 /// 就是平台各自提供的，跨平台門面上再開一個沒有共用核心會用的洞只是多一個死角。
 pub use imp::reveal_in_file_manager;
 
+// ---------------------------------------------------------------- App 選單（僅 macOS）
+//
+// 「activation policy」「選單列上的 App／Edit／Window」是 macOS 獨有的概念，
+// Windows 沒有對應語意（工作列圖示與視窗系統選單本來就是系統內建，不必自己組）。
+// 這裡刻意不做「兩邊都要湊一份」的門面項目——整段 `#[cfg(target_os = "macos")]`，
+// Windows 編譯時這兩個名字根本不存在，呼叫端（`lib.rs`）也用同一個 cfg 包住
+// 呼叫的地方，不會有「呼叫了但 Windows 沒實作」這種事。`build_menu` 是三個
+// 子選單（App／Edit／Window）的組裝；`MENU_QUIT_ID` 是自訂 Quit 項目的 id，
+// 事件路由靠它辨認要不要呼叫 `do_exit`（原因見 `platform::macos::menu` 模組
+// 開頭：`PredefinedMenuItem::quit` 直接 `exit(0)`，繞過我們的收尾）。
+#[cfg(target_os = "macos")]
+pub use imp::{build_menu, MENU_QUIT_ID};
+
 // ---------------------------------------------------------------- 介面契約測試
 //
 // W3-A：`is_listening` 與 `ProcessSupervisor` 的跨平台不變量。掛在門面這一層而
