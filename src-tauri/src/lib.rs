@@ -79,6 +79,24 @@ fn show_main(app: &AppHandle) {
 //
 // 與底下 `on_web_content_process_terminate` 的 warn 是同一套思路：使用者再回報
 // 白屏時，traytunnel.log 要能一行定位是哪一種成因。
+//
+// 只記日誌對「拿到裸執行檔卻不知道要另外跑 Vite」的人幫助有限——他們十之八九
+// 不會去翻 traytunnel.log，只會看到一片白就回報成 bug。寬限時間到、確認是
+// dev URL（`build.devUrl`）又真的沒有任何 page load 時，額外把空白的 webview
+// `navigate` 到一個內嵌好說明文字的 `data:` URL，把「這是預期行為」直接畫在
+// 畫面上。
+//
+// 選 `navigate` 而不是 `eval`：實測過 `eval`／`eval_with_callback`，兩者在這個
+// 情境下完全沒有作用（不報錯、callback 也不會觸發）——原因是 wry 的 WKWebView
+// 後端把 `evaluateJavaScript` 呼叫閘在 `pending_scripts` 佇列後面，只有
+// `didCommitNavigation`（wry-0.55.1 `src/wkwebview/navigation.rs` 的
+// `did_commit_navigation`）才會把佇列真的送進 webview 執行；`http://localhost:1420`
+// 連線被拒絕是在 provisional navigation 階段就失敗，從來不會走到
+// `didCommitNavigation`，所以佇列裡的 script 永遠停在排隊狀態，`eval` 形同
+// 沒打中。`navigate` 是全新的一次導航請求，不吃這個佇列，`data:` URL 也不需要
+// 任何網路連線就能被 WKWebView 直接當成一份完整文件載入，兩邊實測都能穩定畫出來。
+// 也因此完全不影響 `tauri build` 產物：正式版走 `tauri://localhost` 自訂協定，
+// 這裡的 URL 判斷直接跳過。
 #[cfg(target_os = "macos")]
 static PAGE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -87,11 +105,56 @@ static PAGE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 #[cfg(target_os = "macos")]
 const PAGE_LOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 記下主 webview 的來源，並在寬限時間後複查一次有沒有真的載完。
+/// 空白 webview 要 `navigate` 過去的說明頁。深色底、繁體中文，讓拿到裸執行檔的
+/// 人一看畫面就知道這是預期行為，不必先去翻日誌。只在下面
+/// `watch_first_page_load` 判斷「dev URL 且寬限時間內沒有任何 page load」時
+/// 才會被組成 `data:` URL 用掉。
+#[cfg(target_os = "macos")]
+const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    margin: 0;
+    min-height: 100vh;
+    background: #1e1e1e;
+    color: #e6e6e6;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", "Helvetica Neue", sans-serif;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  .card { max-width: 520px; padding: 32px; line-height: 1.8; text-align: left; }
+  h1 { font-size: 20px; margin: 0 0 12px; color: #ffb454; }
+  p { margin: 0 0 12px; }
+  ul { margin: 0 0 12px; padding-left: 20px; }
+  .hint { margin: 0; opacity: 0.7; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>這是開發用建置</h1>
+    <p>
+      這支執行檔由「cargo build」直接產生，沒有內嵌前端，等了 5 秒仍未偵測到
+      任何畫面載入，代表 Vite 開發伺服器沒有在跑。
+    </p>
+    <p style="color:#9cdcfe;">正確的驗證方式：</p>
+    <ul>
+      <li>執行「npm run tauri dev」（會一併啟動 Vite）</li>
+      <li>或改用「tauri build」產出的正式版 App（不需要 Vite）</li>
+    </ul>
+    <p class="hint">（這則說明只在裸執行檔又沒有開發伺服器時出現，正式產物不受影響）</p>
+  </div>
+</body>
+</html>
+"##;
+
+/// 記下主 webview 的來源，並在寬限時間後複查一次有沒有真的載完；載不完又是
+/// dev URL 的話，順手把說明頁 `navigate` 進空白的 webview。
 #[cfg(target_os = "macos")]
 fn watch_first_page_load<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
     let url = win.url().map(|u| u.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     log::info!("main webview url: {url}");
+    let win = win.clone();
     std::thread::spawn(move || {
         std::thread::sleep(PAGE_LOAD_GRACE);
         if PAGE_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -103,6 +166,24 @@ fn watch_first_page_load<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
              running alongside it, build with `tauri build` for one that stands alone",
             PAGE_LOAD_GRACE.as_secs()
         );
+        // 只在確認是 build.devUrl（`http://localhost:1420`）又真的沒有任何
+        // page load 時才 navigate；正式版的 `tauri://localhost` 不會走進這裡，
+        // 對 `tauri build` 產物零影響。
+        if url.starts_with("http://localhost:1420") {
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
+            let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
+            match tauri::Url::parse(&data_url) {
+                Ok(notice_url) => {
+                    if let Err(e) = win.navigate(notice_url) {
+                        log::warn!(
+                            "could not navigate the blank webview to the dev-build notice: {e}"
+                        );
+                    }
+                }
+                Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
+            }
+        }
     });
 }
 
