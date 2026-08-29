@@ -115,29 +115,9 @@ pub fn large_icon_size() -> (u32, u32) {
     (64, 64)
 }
 
-/// 從一組尺寸裡挑最接近 `want` 的一層，回傳索引。
-///
-/// 純數字邏輯，不靠任何系統 API，故意與 Windows 版
-/// （`platform::windows::winsys::pick_icon_layer`）用同一套演算法：完全相符優先；
-/// 沒有就取「大於它的最小一層」（縮小而不是放大，縮小遠比放大乾淨）；再沒有就
-/// 退而取最大的一層。macOS 沒有 per-monitor DPI 挑層的問題，這裡的 `want` 只來自
-/// `small_icon_size`／`large_icon_size` 這兩個固定值，不會隨螢幕或執行時狀態變動，
-/// 因此不必像 Windows 版那樣另外查詢系統度量。
-pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
-    if sizes.is_empty() {
-        return None;
-    }
-    if let Some(exact) = sizes.iter().position(|s| *s == want) {
-        return Some(exact);
-    }
-    let bigger = sizes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s > want)
-        .min_by_key(|(_, s)| **s)
-        .map(|(i, _)| i);
-    bigger.or_else(|| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i))
-}
+// 「從一組尺寸裡挑最接近 want 的一層」（pick_icon_layer）不靠任何系統 API，是純
+// 數字邏輯，原本這裡與 Windows 版（`platform::windows::winsys`）各自維護一份逐字
+// 相同的演算法，已上提到唯一的呼叫端 `crate::appicon`，不再由這個模組提供。
 
 // ---------------------------------------------------------------- 開機自啟
 //
@@ -381,7 +361,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 ///
 /// 只放行 `https://`：`open` 的第一個位置參數什麼都收——`file:///`、
 /// 自訂 scheme、甚至一個本地路徑都會照開，而網址在這條路上是拼出來的
-/// （版本號來自遠端的 latest.json）。呼叫端已經有 [`super::update::release_url`]
+/// （版本號來自遠端的 latest.json）。呼叫端已經有 [`crate::platform::update_common::release_url`]
 /// 那一層過濾，這裡是第二道，兩道都在才擋得住「有人日後多開一個呼叫端」。
 pub fn open_url(url: &str) -> io::Result<()> {
     if !url.starts_with("https://") {
@@ -572,29 +552,9 @@ mod tests {
         disable_autostart(&name).expect("重複停用仍要成功");
     }
 
-    /// 圖示工廠產出的層序，測試照著它走（與 `appicon.rs` 內嵌的那顆 ICO 同一份）
-    const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
-
-    /// 完全相符的層優先
-    #[test]
-    fn exact_layer_wins() {
-        assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
-        assert_eq!(pick_icon_layer(&LAYERS, 64), Some(6));
-    }
-
-    /// 沒有專用層時寧可讓系統縮小，也不要放大
-    #[test]
-    fn falls_back_to_the_next_size_up() {
-        assert_eq!(pick_icon_layer(&LAYERS, 44), Some(5)); // 44 -> 48
-        assert_eq!(pick_icon_layer(&LAYERS, 20), Some(1));
-    }
-
-    /// 要的比所有層都大時只能拿最大的那層；空清單回 None
-    #[test]
-    fn falls_back_to_the_largest_layer() {
-        assert_eq!(pick_icon_layer(&LAYERS, 1024), Some(8));
-        assert_eq!(pick_icon_layer(&[], 16), None);
-    }
+    // `pick_icon_layer` 本身的測試（完全相符優先、沒有專用層時的退讓方向、超過
+    // 最大層與空清單）已隨函式本體搬到 `crate::appicon`，與 Windows 版合併保留
+    // 兩邊的斷言資料，不在這裡重複一份。
 
     /// 這台機器兩種圖示尺寸的合理性：與 Windows 版
     /// `metrics_are_sane_on_this_machine` 同樣的斷言，只是這裡的值是固定常數

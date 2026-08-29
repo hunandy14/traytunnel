@@ -34,8 +34,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import struct
-import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -87,26 +85,6 @@ def composite_on_gray(rgba: bytes, n: int, bg=(0x80, 0x80, 0x80)) -> bytes:
     return bytes(out)
 
 
-def rgb_png_bytes(n: int, rgb: bytes) -> bytes:
-    """跟 `factory.png_bytes` 一樣的容器，只是色彩型別是不帶 alpha 的 RGB（color type 2）。"""
-    raw = b"".join(b"\x00" + bytes(rgb[y * n * 3 : (y + 1) * n * 3]) for y in range(n))
-
-    def chunk(tag, data):
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(raw, 9))
-        + chunk(b"IEND", b"")
-    )
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="macOS 系統匣 template 圖示產生器")
     ap.add_argument("--preview-out", type=Path, help="另存一份灰底合成版，方便肉眼檢查（目檢用）")
@@ -125,7 +103,7 @@ def main() -> None:
         args.preview_out.mkdir(parents=True, exist_ok=True)
         preview = composite_on_gray(rgba, args.size)
         preview_path = args.preview_out / "tray-template-preview.png"
-        preview_path.write_bytes(rgb_png_bytes(args.size, preview))
+        preview_path.write_bytes(factory.png_bytes(args.size, preview, color_type=2))
         print(f"  灰底預覽：{preview_path}")
 
 

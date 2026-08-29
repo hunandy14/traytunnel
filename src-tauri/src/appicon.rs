@@ -16,6 +16,31 @@ use crate::platform;
 /// 系統匣與視窗圖示都從這一顆挑層，assets/gen-tray-icons.py 產生。
 const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 
+/// 從一組尺寸裡挑最接近 `want` 的一層，回傳索引。
+///
+/// 優先完全相符（完全不縮放）；沒有就取「大於它的最小一層」，讓系統縮小而不是
+/// 放大（縮小遠比放大乾淨）；再沒有就退而取最大的一層。
+///
+/// 純數字邏輯，不靠任何系統 API，因此兩個平台原本各自維護一份逐字相同的實作
+/// （`platform::windows::winsys`／`platform::macos::sys`），現在只在這裡留一份
+/// ——這裡是唯一的呼叫端（[`ico_layer`]），不必比照 `platform/mod.rs` 那份「兩邊
+/// 各自實作」的介面清單。
+fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
+    if sizes.is_empty() {
+        return None;
+    }
+    if let Some(exact) = sizes.iter().position(|s| *s == want) {
+        return Some(exact);
+    }
+    let bigger = sizes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s > want)
+        .min_by_key(|(_, s)| **s)
+        .map(|(i, _)| i);
+    bigger.or_else(|| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i))
+}
+
 /// 從內嵌的多層 ICO 裡挑最接近 `want` 的一層，解成 RGBA。
 ///
 /// Tauri codegen 的 `default_window_icon()` 只取 ICO 的第一層固定尺寸（我們的第一層
@@ -24,7 +49,7 @@ const APP_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 fn ico_layer(want: u32, purpose: &str) -> Option<Image<'static>> {
     let dir = ico::IconDir::read(Cursor::new(APP_ICO)).ok()?;
     let sizes: Vec<u32> = dir.entries().iter().map(|e| e.width()).collect();
-    let idx = platform::pick_icon_layer(&sizes, want)?;
+    let idx = pick_icon_layer(&sizes, want)?;
     let img = dir.entries()[idx].decode().ok()?;
     log::info!("{purpose} icon: system wants {want}px, using the {}px layer", img.width());
     Some(Image::new_owned(img.rgba_data().to_vec(), img.width(), img.height()))
@@ -68,6 +93,54 @@ pub fn tray_icon_template() -> Option<Image<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 圖示工廠產出的層序，測試照著它走（與內嵌的那顆 ICO 同一份）。
+    /// 兩平台原本各自維護一份同名常數，這裡合併成一份。
+    const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
+
+    /// 完全相符的層優先。這裡合併了 Windows 版（「GDI 完全不用縮放」）與 macOS
+    /// 版兩組原本各自的斷言，兩邊挑的尺寸不完全一樣，斷言本身一字未改。
+    #[test]
+    fn exact_layer_wins() {
+        assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
+        assert_eq!(pick_icon_layer(&LAYERS, 64), Some(6));
+        // 175% DPI 的 28px 有專用層
+        assert_eq!(pick_icon_layer(&LAYERS, 28), Some(3));
+        assert_eq!(pick_icon_layer(&LAYERS, 32), Some(4));
+    }
+
+    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層：
+    /// 放大會模糊，縮小不會（原 Windows 版 `large_icon_sizes_never_upscale`）
+    #[test]
+    fn large_icon_sizes_never_upscale() {
+        // 100%／125%／150%／175%／200%／250%／300% 的 SM_CXICON
+        let ladder = [(32, 32), (40, 48), (48, 48), (56, 64), (64, 64), (80, 128), (96, 128)];
+        for (want, expect) in ladder {
+            let idx = pick_icon_layer(&LAYERS, want).expect("一定挑得到一層");
+            assert_eq!(LAYERS[idx], expect, "{want}px 挑錯層");
+        }
+    }
+
+    /// 沒有專用層時寧可讓系統縮小，也不要放大。兩平台原本各自的斷言都保留：
+    /// macOS 版對著 `LAYERS` 挑，Windows 版另外用一組較小的清單挑。
+    #[test]
+    fn falls_back_to_the_next_size_up() {
+        assert_eq!(pick_icon_layer(&LAYERS, 44), Some(5)); // 44 -> 48
+        assert_eq!(pick_icon_layer(&LAYERS, 20), Some(1));
+
+        let sizes = [16, 24, 32];
+        assert_eq!(pick_icon_layer(&sizes, 20), Some(1)); // 24 縮到 20
+        assert_eq!(pick_icon_layer(&sizes, 28), Some(2)); // 32 縮到 28
+    }
+
+    /// 要的比所有層都大時只能拿最大的那層；空清單回 None。
+    /// 兩平台原本各自的斷言都保留（空清單那一條兩邊相同，只留一次）。
+    #[test]
+    fn falls_back_to_the_largest_layer() {
+        assert_eq!(pick_icon_layer(&LAYERS, 1024), Some(8));
+        assert_eq!(pick_icon_layer(&[16, 32, 24], 64), Some(1));
+        assert_eq!(pick_icon_layer(&[], 16), None);
+    }
 
     /// 內嵌的 ICO 必須含系統匣（SM_CXSMICON）與視窗（SM_CXICON）常用的整數縮放
     /// 尺寸，少了哪一層就會退回讓 GDI 拉伸而模糊。125%／150%／175% 的 40／48／56
