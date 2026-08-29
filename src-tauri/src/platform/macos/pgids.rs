@@ -210,6 +210,23 @@ pub(super) fn plan_sweep(
     plan
 }
 
+/// `ps` 報回來的那一行有沒有提到我們這支執行檔的檔名。
+///
+/// **兩邊都轉小寫再比**，不是原樣 `contains`。macOS 的預設檔案系統（APFS 與
+/// 舊的 HFS+）是**不分大小寫**的，同一支執行檔在不同的路徑寫法下都跑得起來，
+/// 而「打包出來的那一份」與「`cargo build` 出來的那一份」檔名大小寫本來就不必
+///一致（bundle 的執行檔名跟著 `productName` 走，開發產物跟著 crate 名走）。
+/// 原樣比對的話，正式版與 dev 版並存時兩邊會互相判定「對方那個 pid 不是我們的
+/// 程式、主人已死」，接著把對方**現役**的隧道全部 SIGKILL——正是這個機制最不該
+/// 做的事（同一段推演見 [`owner_still_running`] 裡「為什麼比檔名不比完整路徑」）。
+///
+/// 不分大小寫是往「主人還活著」偏的方向（多認、不少認），與這個模組
+/// 「寧可漏殺不誤殺」的總原則一致。同一份紀律在 `lib.rs::heal_autostart` 比對
+/// 自啟命令列時也是這樣寫的（兩邊 `to_lowercase` 再 `contains`）。
+fn ps_output_mentions(ps_output: &str, exe_name: &str) -> bool {
+    ps_output.to_lowercase().contains(&exe_name.to_lowercase())
+}
+
 /// 一行命令列：program 與每個 argv 用單一空白接起來，對齊 `ps -o command=`。
 pub(super) fn command_line(cmd: &std::process::Command) -> String {
     let mut line = cmd.get_program().to_string_lossy().into_owned();
@@ -374,6 +391,8 @@ fn owner_still_running(owner_pid: i32) -> bool {
     // `traytunnel` 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆
     // 不掃。代價只是那一輪少收一具屍體，下一次啟動再收；而且要湊齊
     // 「pid 剛好被回收」＋「新主人剛好也叫這個名字」兩件事，機率本來就極低。
+    //
+    // 比對本身不分大小寫，理由見 [`ps_output_mentions`]。
     let name = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -387,7 +406,7 @@ fn owner_still_running(owner_pid: i32) -> bool {
         .arg(owner_pid.to_string())
         .output();
     match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&name),
+        Ok(out) => ps_output_mentions(&String::from_utf8_lossy(&out.stdout), &name),
         // 連 ps 都跑不起來時同樣往「主人還活著」偏
         Err(_) => true,
     }
@@ -717,6 +736,28 @@ mod tests {
         let mut dead = |_: i32| false;
         let mut ps = |_: i32| panic!("下界保護要在問 ps 之前就擋掉");
         assert!(plan_sweep(&reg, &mut dead, &mut ps).doomed.is_empty());
+    }
+
+    /// 「主人還在不在」的 `ps` 比對必須**不分大小寫**。macOS 的預設檔案系統不分
+    /// 大小寫，而打包產物與 `cargo build` 產物的執行檔名大小寫本來就不必一致
+    /// （前者跟 `productName` 走、後者跟 crate 名走）。原樣比對的話，正式版與
+    /// dev 版並存時兩邊會互相判定「對方的主人已死」，接著把對方**現役**的隧道
+    /// 全部 SIGKILL。
+    #[test]
+    fn the_owner_check_ignores_executable_name_case() {
+        let prod_line = "/Applications/Traytunnel.app/Contents/MacOS/Traytunnel --tray";
+        assert!(
+            ps_output_mentions(prod_line, "traytunnel"),
+            "dev 版（檔名 traytunnel）必須認得出正式版（檔名 Traytunnel）還活著，\
+             否則會把正式版現役的隧道當成殘骸掃掉"
+        );
+        let dev_line = "/Users/bob/dev/tt/target/debug/traytunnel";
+        assert!(ps_output_mentions(dev_line, "Traytunnel"), "反方向同樣要成立");
+
+        // 不分大小寫不等於「什麼都算」：完全不相干的行仍然不可以匹配
+        assert!(!ps_output_mentions("/usr/libexec/some-daemon --serve", "traytunnel"));
+        // `ps` 問不到東西（行程已經不在）會回空字串，那時候不該認為主人還在
+        assert!(!ps_output_mentions("", "traytunnel"));
     }
 
     /// 登記下來的命令列格式必須就是 `ps -o command=` 的格式（program 與 argv
