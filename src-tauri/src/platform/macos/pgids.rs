@@ -457,17 +457,16 @@ pub(super) fn unregister(pgid: i32) {
 /// 「另一個實例現役的連線」不靠呼叫時機保護，而是靠逐筆的 `ownerPid`
 /// （見 [`Entry::owner_pid`]）——single-instance 外掛有一條會讓兩個實例並存的
 /// 錯誤分支，時機本身擋不住它。
+///
+/// 沒有「檔案不在就早退」「登記簿是空的就刪檔早退」這兩道分支，是刻意的：
+/// [`read_at`] 讀不到檔案本來就回一份空的登記簿，空登記簿的 [`plan_sweep`] 回
+/// 一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），最後 [`write_or_clear_at`]
+/// 對空的登記簿做的正是「把檔案刪掉，本來就沒有也算成功」。兩道早退跟這條主線
+/// 一字不差地等價，留著只是同一件事寫兩遍。
 pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !path.is_file() {
-        return;
-    }
     let reg = read_at(&path);
-    if reg.entries.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return;
-    }
     let plan = plan_sweep(&reg, &mut owner_still_running, &mut group_commands);
     for pgid in &plan.doomed {
         log::warn!(
@@ -564,6 +563,29 @@ mod tests {
 
         unregister_at(&path, 900, 222).expect("最後一筆退登記要成功");
         assert!(!path.exists(), "最後一筆走了就不該再留一份空殼：{}", path.display());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sweep_leftovers` 拿掉的那兩道早退（「檔案不在」「登記簿是空的」）之所以
+    /// 跟主線等價，靠的就是這裡的三件事：讀不到檔案回一份空的登記簿、空的登記簿
+    /// 規劃不出任何動作、清空的寫入就是「刪掉檔案，本來沒有也算成功」，而且不會
+    /// 順手建出任何東西。
+    #[test]
+    fn an_absent_registry_reads_as_empty_and_clears_to_nothing() {
+        let dir = tempdir("absent");
+        let path = dir.join(FILE_NAME);
+        assert!(!path.exists(), "前提：這個路徑一開始就沒有檔案");
+
+        assert_eq!(read_at(&path), Registry::default(), "讀不到檔案要回一份空的登記簿");
+
+        let mut never = |_: i32| panic!("空的登記簿不該問任何人");
+        let plan =
+            plan_sweep(&Registry::default(), &mut never, &mut |_| panic!("空的登記簿不該問 ps"));
+        assert_eq!(plan, SweepPlan::default(), "空的登記簿規劃不出任何動作");
+
+        write_or_clear_at(&path, &Registry::default()).expect("清空一份本來就不存在的檔案不算錯");
+        assert!(!path.exists(), "不可以憑空生出一份空殼：{}", path.display());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
