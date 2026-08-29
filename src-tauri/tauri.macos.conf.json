@@ -4,6 +4,7 @@
     "windows": [
       {
         "label": "main",
+        "url": "index.html",
         "title": "Traytunnel",
         "width": 540,
         "height": 446,
