@@ -412,8 +412,7 @@ pub async fn install(st: &Shared) -> Result<(), String> {
 /// `--tray` 給安裝程式，macOS 這條路沒有地方塞參數，視窗會跟著回來。
 fn restart_into(st: &Shared, version: &str) -> Result<(), String> {
     st.log(format!("restarting to finish updating to v{version}"));
-    st.mark_exiting();
-    st.kill_all_jobs();
+    st.shutdown();
     st.app.restart()
 }
 

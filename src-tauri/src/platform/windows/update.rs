@@ -682,8 +682,7 @@ pub fn apply_now(st: &Shared) -> Result<(), String> {
     launch_installer(&pending.installer, tray).map_err(|e| e.to_string())?;
 
     // 交棒確定開始了，現在才收尾——上面任何一步失敗時，程式都還是完好的
-    st.mark_exiting();
-    st.kill_all_jobs();
+    st.shutdown();
     if let Err(e) = st.app.save_window_state(crate::winstate::flags()) {
         log::warn!("could not save window state before the update installer takes over: {e}");
     }
