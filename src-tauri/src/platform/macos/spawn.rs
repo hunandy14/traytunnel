@@ -111,6 +111,15 @@ impl ProcessSupervisor {
         // 環境只准呼叫 async-signal-safe 的東西（不能配置記憶體、不能取鎖）。
         // 這裡只呼叫 `setsid()` 一支系統呼叫，沒有配置、沒有鎖、沒有 Rust 端的
         // 狀態，符合要求。
+        //
+        // **前提：同一個 `cmd` 只會被交給這支函式一次。** `pre_exec` 是**追加**
+        // 的（每呼叫一次就多掛一個閉包，spawn 時依序全跑），所以同一個 `Command`
+        // 走第二趟就會執行第二次 `setsid()`——那一次一定拿 `EPERM`（第一次成功
+        // 之後子程序已經是 session 領袖了），閉包回 `Err`，`spawn()` 直接失敗。
+        // 目前兩個呼叫端（`tunnel::supervise` 的監看迴圈、`tunnel::test_connection`）
+        // 都是「一個 `Command` 配一次 spawn」，重連是重新組一個新的 `Command`，
+        // 前提成立。日後若有人想重複使用同一個 `Command`，要改的是這裡（把
+        // `pre_exec` 換成只掛一次），不是把這段註解刪掉。
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {

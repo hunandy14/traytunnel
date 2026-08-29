@@ -37,7 +37,10 @@ use std::time::{Duration, Instant};
 //   3. 它把**整份環境**（`env` 的每一行）都灌回行程裡，我們只需要 `PATH` 一個鍵。
 //
 // 於是這裡只保留那套手法真正有價值的部分（登入 shell ＋ 標記夾出結果），另外補上
-// 它缺的兩件事：逾時（連同殺掉整個行程群組）與「只動 `PATH`」。
+// 它缺的三件事：逾時（連同殺掉整個行程群組）、「只動 `PATH`」，以及**輸出不走管線**
+// ——那顆 crate 的 `Command::output()` 會在使用者 rc 檔有 `some-daemon &` 時一路等到
+// 那支背景程序死掉（管線的 EOF 要所有寫端關閉），逾時預算完全被繞過，詳見
+// [`ask_shell_for_path`]。
 
 /// launchd 沒有另外設定時，給 GUI 行程的預設 `PATH`（`man launchd.plist` 的
 /// `EnvironmentVariables`／`launchctl config user path` 都是在改它）。
@@ -52,9 +55,18 @@ const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// 輪詢登入 shell 有沒有結束的間隔。
 const LOGIN_SHELL_TICK: Duration = Duration::from_millis(20);
 
+/// 問不到 `SHELL`（或它不是絕對路徑）時要跑哪一支。macOS 10.15 起的預設登入 shell。
+const DEFAULT_LOGIN_SHELL: &str = "/bin/zsh";
+
 /// 把 `PATH` 從互動式 shell 的雜訊（rc 檔自己的 echo、提示字元、顏色碼）裡夾出來的標記。
-const PATH_BEGIN: &str = "__traytunnel_path_begin__";
-const PATH_END: &str = "__traytunnel_path_end__";
+///
+/// 首字元刻意是 `>`／`<` 這種**不可能出現在識別字裡**的字元：標記若以底線或字母
+/// 開頭，任何把它接在變數後面的寫法（`$PATH__traytunnel_path_end__`）都會被 shell
+/// 當成一個更長的變數名。現在的取法根本不讓 shell 展開變數（見
+/// [`ask_shell_for_path`] 用的是 `printenv`），這一層是第二道保險，擋的是「日後
+/// 有人把腳本改回 `$PATH` 拼接」。
+const PATH_BEGIN: &str = ">>>traytunnel-path>>>";
+const PATH_END: &str = "<<<traytunnel-path<<<";
 
 /// 目前這個 `PATH` 是不是「GUI 啟動才會拿到的那份最小集」——每一段都落在
 /// [`LAUNCHD_DEFAULT_PATH`] 裡面就算。
@@ -101,25 +113,87 @@ fn with_system_dirs(login_path: &str) -> String {
     out.join(":")
 }
 
+/// 要問哪一支 shell：`SHELL` 有值**而且是絕對路徑**才用它，否則退回
+/// [`DEFAULT_LOGIN_SHELL`]。純函式。
+///
+/// 絕對路徑這一關不是形式主義：`Command::new` 拿到一個相對名字時會照 `PATH` 去找，
+/// 而這支函式的整個存在理由就是「現在的 `PATH` 是壞的」——用一份壞掉的 `PATH` 去
+/// 解析要跑哪支 shell，最好的情況是找不到，最壞的情況是找到當前工作目錄底下同名的
+/// 別的東西。問不出一個可信的絕對路徑時，跑系統預設的那一支才是對的。
+fn resolve_login_shell(from_env: Option<&str>) -> String {
+    match from_env {
+        Some(s) if Path::new(s).is_absolute() => s.to_string(),
+        _ => DEFAULT_LOGIN_SHELL.to_string(),
+    }
+}
+
 /// 跑一次使用者的登入 shell，把它的 `PATH` 問回來。逾時或任何一步失敗都回 `None`。
+fn login_shell_path() -> Option<String> {
+    ask_shell_for_path(&resolve_login_shell(std::env::var("SHELL").ok().as_deref()))
+}
+
+/// [`login_shell_path`] 的本體，shell 由呼叫端指定（測試才餵得進一支假的）。
 ///
 /// `-ilc`（互動＋登入＋執行一行）是 `fix-path-env` 用的同一組旗標，也是這件事的
 /// 社群慣例：`.zprofile`（登入）與 `.zshrc`（互動）兩份都得跑過，使用者的 `PATH`
 /// 才會完整——大多數人是在 `.zshrc` 裡加 Homebrew 的。
 ///
-/// `${PATH}` 一定要帶大括號：標記是底線開頭的，寫成 `$PATH__traytunnel_path_end__`
-/// 會被 shell 當成一個叫 `PATH__traytunnel_path_end__` 的變數（展開成空字串）。
-fn login_shell_path() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let script = format!("printf '%s' \"{PATH_BEGIN}${{PATH}}{PATH_END}\"");
+/// ## stdout 一定要導到檔案，不可以是管線
+///
+/// 這是覆審擋下來的一個真缺陷。管線的讀端要等**所有**寫端關閉才收得到 EOF，而
+/// 子程序 spawn 出來的孫程序會繼承同一支寫端：使用者的 rc 檔只要有一句
+/// `some-daemon &`（或 `nohup … &`），登入 shell 自己秒退，`wait_with_output()`
+/// 卻會一路等到那支背景程序死掉為止——覆審者實測 25.3 秒，而預算是 5 秒。
+/// 這條路跑在**任何 UI 之前**，症狀就是「雙擊圖示，什麼都沒發生」。
+///
+/// （這裡原本的註解寫「輸出遠小於管線緩衝區，不會死鎖」——那句話診斷錯了病因：
+/// 卡住的不是緩衝區滿，是**寫端沒關**。輸出再小也一樣卡。）
+///
+/// 導到一個暫存檔就沒有這回事：檔案沒有 EOF 語意，`read_to_string` 讀的是「此刻
+/// 檔案裡有什麼」，於是**逾時迴圈就是唯一的上界**。rc 檔生出來的背景程序照樣繼承
+/// 那支 fd，但它之後往一個已經被我們刪掉的 inode 寫，誰都不影響。
+///
+/// ## 為什麼是 `printenv` 而不是 `"$PATH"`
+///
+/// 讓 shell 展開變數會被 shell 的語法綁死：`${PATH}` 在 fish 直接是語法錯誤，
+/// 而 `"$PATH"` 在 fish 是**用空白**接起來的（`PATH` 在 fish 是 list 變數），
+/// 拿回來的字串根本不是冒號分隔的 `PATH`——這種失敗還是靜默的。改成讓 shell 去
+/// 跑 `/usr/bin/printenv PATH`，印的是它**匯出給子程序**的那一份，sh／bash／zsh／
+/// ksh／dash／fish 一律是冒號分隔的同一個答案，我們這邊一個字都不必展開。
+///
+/// （已知例外：`tcsh` 不收合併寫的 `-ilc`，它要求 `-l` 單獨當第一個參數。那是
+/// `-ilc` 這個社群慣例本身的限制，`fix-path-env` 也一樣；`SHELL` 是 tcsh 的人
+/// 會走到「問不到」那一支——照原樣啟動、日誌留一行，不會卡住也不會更糟。）
+///
+/// 成敗只看「標記在不在」，不看退出碼：互動式 shell 的退出碼是它 rc 檔最後一個
+/// 命令的結果，跟「我們有沒有問到答案」沒有關係。
+fn ask_shell_for_path(shell: &str) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "traytunnel-login-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let found = ask_shell_for_path_into(shell, &tmp);
+    // 成功、逾時、失敗都要清掉，暫存檔不留在 /tmp
+    let _ = std::fs::remove_file(&tmp);
+    found
+}
 
-    let mut cmd = std::process::Command::new(&shell);
+/// [`ask_shell_for_path`] 扣掉暫存檔清理的那一段，拆開只為了讓清理有唯一一個出口。
+fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
+    let script =
+        format!("/bin/echo '{PATH_BEGIN}'; /usr/bin/printenv PATH; /bin/echo '{PATH_END}'");
+
+    let mut cmd = std::process::Command::new(shell);
     cmd.args(["-ilc", &script])
         // oh-my-zsh 的自動更新會在互動式啟動時停下來問人（`fix-path-env` 也特地
         // 設這個變數擋它）。逾時保護接得住，但能不觸發就不要觸發
         .env("DISABLE_AUTO_UPDATE", "true")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(std::fs::File::create(tmp).ok()?))
         .stderr(Stdio::null());
     // 自成一個行程群組，逾時時才收得掉「shell 自己＋它 rc 檔生出來的東西」整棵樹
     // ——只 kill shell 的話，卡住它的那支孫程序會留下來
@@ -130,12 +204,7 @@ fn login_shell_path() -> Option<String> {
     let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
+            Ok(Some(_)) => break,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     // 整組收掉再 wait，不留殭屍也不留孤兒
@@ -148,9 +217,7 @@ fn login_shell_path() -> Option<String> {
             Err(_) => return None,
         }
     }
-    // stdout 只有一行標記包起來的 PATH，遠小於管線緩衝區，先等結束再讀不會死鎖
-    let out = child.wait_with_output().ok()?;
-    extract_marked_path(&String::from_utf8_lossy(&out.stdout))
+    extract_marked_path(&std::fs::read_to_string(tmp).ok()?)
 }
 
 /// GUI（Finder／`open`／LaunchAgent）啟動時把 `PATH` 換成使用者登入 shell 的那一份。
@@ -714,6 +781,90 @@ mod tests {
         // 沒有標記（shell 根本沒跑到我們那一行）就老實回 None，不要拿雜訊當 PATH
         assert_eq!(extract_marked_path("zsh: command not found"), None);
         assert_eq!(extract_marked_path(&format!("{PATH_BEGIN}   {PATH_END}")), None, "空的不算");
+    }
+
+    /// 要跑哪一支 shell：`SHELL` 必須是**絕對路徑**才採信。相對名字會讓
+    /// `Command::new` 照 `PATH` 去找，而這條路存在的理由就是「現在的 `PATH`
+    /// 是壞的」——用壞掉的 `PATH` 去找 shell，最壞會找到工作目錄底下同名的
+    /// 別的東西。
+    #[test]
+    fn only_an_absolute_shell_path_is_trusted() {
+        assert_eq!(resolve_login_shell(Some("/bin/bash")), "/bin/bash");
+        assert_eq!(resolve_login_shell(Some("/opt/homebrew/bin/fish")), "/opt/homebrew/bin/fish");
+
+        for bogus in [Some("zsh"), Some("./zsh"), Some(""), None] {
+            assert_eq!(
+                resolve_login_shell(bogus),
+                DEFAULT_LOGIN_SHELL,
+                "{bogus:?} 不是絕對路徑，必須退回系統預設的 shell"
+            );
+        }
+    }
+
+    /// **逾時必須涵蓋整段**（覆審擋下的缺陷）。
+    ///
+    /// 假的登入 shell 模擬使用者 rc 檔裡一句 `some-daemon &`：先把一支 `sleep 25`
+    /// 丟到背景（它繼承同一支 stdout），再印出標記、正常退出。
+    ///
+    /// stdout 若是管線，`wait_with_output()` 要等**所有**寫端關閉才收得到 EOF，
+    /// 於是這裡會卡滿 25 秒——遠超過 5 秒預算，而且這條路跑在任何 UI 之前，
+    /// 症狀是「雙擊圖示什麼都沒發生」。導到暫存檔之後沒有 EOF 這回事，
+    /// 逾時迴圈就是唯一的上界，shell 一退出就讀得到答案。
+    ///
+    /// 兩個斷言缺一不可：**沒有卡住**（< 6 秒），而且**真的問到了 PATH**
+    /// （不是靠逾時放棄換來的快）。
+    #[test]
+    fn a_background_process_in_the_rc_file_cannot_blow_the_timeout() {
+        let dir = std::env::temp_dir().join(format!(
+            "traytunnel-test-fakeshell-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("要建得起 tempdir");
+        let shell = dir.join("fake-login-shell");
+        let bg_pid = dir.join("background.pid");
+
+        // 忽略 -ilc 與腳本，照自己的劇本跑：背景程序 → 印標記 → 退出
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n\
+                 sleep 25 &\n\
+                 echo $! > '{pid}'\n\
+                 echo '{PATH_BEGIN}'\n\
+                 echo '/opt/homebrew/bin:/usr/bin'\n\
+                 echo '{PATH_END}'\n\
+                 exit 0\n",
+                pid = bg_pid.display(),
+            ),
+        )
+        .expect("寫得出假 shell");
+        std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("要設得起執行權限");
+
+        let started = Instant::now();
+        let found = ask_shell_for_path(&shell.to_string_lossy());
+        let elapsed = started.elapsed();
+
+        // 先把背景那支收掉再斷言，測試失敗也不會在機器上留一支 sleep
+        if let Ok(pid) = std::fs::read_to_string(&bg_pid) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "rc 檔留下的背景程序把逾時預算撐爆了（花了 {elapsed:?}，上限是 \
+             {LOGIN_SHELL_TIMEOUT:?}）——stdout 又走回管線了嗎？"
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin"),
+            "不能只是『沒卡住』，還要真的問到 PATH；問不到代表是逾時放棄換來的快"
+        );
     }
 
     /// 修正過的 PATH 一定要含系統目錄：使用者把 PATH 整個覆寫掉時，不可以因為
