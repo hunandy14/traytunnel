@@ -393,6 +393,64 @@ jobs:
             exit 1
           fi
 
+      # SHA256SUMS.txt 的底稿，道理和上面 latest.json 一樣——但網址刻意不是
+      # releases/latest：SHA256SUMS.txt 沒有 latest.json 那種「manifest 只有
+      # 一個全域 version」的先天限制，不需要靠 releases/latest 對齊 updater
+      # endpoint。用浮動指標反而會在「要補腿的不是目前最新一個 release」時
+      # 抓錯底稿（例如補一個較舊 tag 的腿，releases/latest 這時指向的是更新
+      # 的另一個 tag）。這裡直接用這次已經解析好的 tag 去抓「同一個 release」
+      # 的 SHA256SUMS.txt，跟 latest.json 的底稿保證來自同一個 release。
+      #
+      # 404／暫時性失敗的分野與 latest.json 那步完全一樣：真的沒有（首發，
+      # 或這次是全新版本、這個 tag 底下還沒發過任何一腿）才視為空底稿；其餘
+      # 失敗一律重試，重試用盡就硬失敗——静默當成空底稿會把另一個平台的
+      # checksum 從 SHA256SUMS.txt 永久抹掉，且沒有任何訊號（這正是這次要
+      # 修的致命 bug）。
+      - name: Fetch current SHA256SUMS.txt as merge baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.release_tag }}"
+          url="https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS.txt"
+          attempts=5
+          status="failed"
+          code="000"
+
+          for i in $(seq 1 "${attempts}"); do
+            code="$(curl -sSL --connect-timeout 10 --max-time 60 \
+              -o baseline-SHA256SUMS.txt.tmp -w '%{http_code}' "${url}")" || code="000"
+
+            if [ "${code}" = "200" ]; then
+              if node --input-type=module \
+                -e 'import{readFileSync}from"node:fs";import{parseSha256Sums}from"./scripts/lib/sha256sums.mjs";parseSha256Sums(readFileSync("baseline-SHA256SUMS.txt.tmp","utf8"))'; then
+                mv baseline-SHA256SUMS.txt.tmp baseline-SHA256SUMS.txt
+                status="ok"
+                break
+              fi
+              echo "第 ${i} 次：HTTP 200 但內容不是合法的 SHA256SUMS 格式，視為暫時性失敗"
+            elif [ "${code}" = "404" ]; then
+              status="absent"
+              break
+            else
+              echo "第 ${i} 次：HTTP ${code}，視為暫時性失敗"
+            fi
+
+            if [ "${i}" -lt "${attempts}" ]; then
+              sleep $(( i * 5 ))
+            fi
+          done
+
+          if [ "${status}" = "ok" ]; then
+            echo "抓到 ${tag} 現行 SHA256SUMS.txt 當底稿："
+            cat baseline-SHA256SUMS.txt
+          elif [ "${status}" = "absent" ]; then
+            echo "HTTP 404：${tag} 這個 release 目前沒有 SHA256SUMS.txt（首發，或這個 tag 還沒發過任何一腿）——視為空底稿"
+            : > baseline-SHA256SUMS.txt
+          else
+            echo "::error::連續 ${attempts} 次都拿不到 ${tag} 現行 SHA256SUMS.txt（最後一次 HTTP ${code}），且不是 404。無法確認線上底稿內容，繼續下去可能把其他平台的 checksum 從 SHA256SUMS.txt 抹掉，因此中止。請稍後重跑。"
+            exit 1
+          fi
+
       # 要餵給 compose-latest-json.mjs 的平台清單，直接來自 plan job 算出來的
       # build matrix（needs.plan.outputs.platform_keys），不是「out/ 底下剛好
       # 有哪些 .sig」。
@@ -449,23 +507,13 @@ jobs:
 
           node scripts/compose-latest-json.mjs "${args[@]}"
 
-      - name: Generate SHA256SUMS
+      # 底稿合併（見 scripts/lib/sha256sums.mjs 開頭註解）：只用這次建置出來的
+      # 檔案覆寫 SHA256SUMS.txt 裡的同名行，這次沒建置、但底稿裡本來就有的
+      # 行（例如單平台補腿時的另一平台）原樣保留，不會被 softprops/action-gh-release
+      # 預設的 overwrite 行為連帶抹掉。
+      - name: Generate SHA256SUMS (merge with baseline)
         shell: bash
-        run: |
-          set -euo pipefail
-          cd out
-          files=()
-          for pattern in '*.exe' '*.dmg' '*.tar.gz'; do
-            for f in $pattern; do
-              [ -e "$f" ] && files+=("$f")
-            done
-          done
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::out/ 底下沒有任何要發佈的二進位檔（*.exe / *.dmg / *.tar.gz）"
-            exit 1
-          fi
-          sha256sum "${files[@]}" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+        run: node scripts/compose-sha256sums.mjs --dir out --baseline baseline-SHA256SUMS.txt --out out/SHA256SUMS.txt
 
       # dry_run 與否都上傳這個 artifact：這是驗證「合併邏輯 + 建置」整條路徑
       # 有沒有真的兜起來的證據，不必開真 release 也能下載回來檢查

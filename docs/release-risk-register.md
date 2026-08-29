@@ -123,3 +123,38 @@ Tauri 的 updater manifest 只有一個全域 `version` 欄位，沒有 per-plat
 
 `mergeLatestJson` 的 `options.tag` 是必填參數（缺省即 throw）：漏傳就等於整條
 斷言靜默停用，而那正是這條防線存在的理由，所以刻意不給「忘記傳」留活路。
+
+## 發佈管線：`SHA256SUMS.txt` 也要底稿合併，不能只用這次建置的檔案生成
+
+跟上面 `latest.json` 同一類問題，出在另一個檔案上：`compose` job 過去只用
+「這次建置、下載進 `out/` 的檔案」重新生成整份 `SHA256SUMS.txt`。
+`softprops/action-gh-release` 上傳資產預設 overwrite——單平台補腿（例如
+`v0.6.6` 已經發過 Windows，這次只補 macOS）時，這樣生出來的 `SHA256SUMS.txt`
+只有 macOS 兩行，一旦蓋掉舊檔，Windows 那三個 `.exe` 的 checksum 就從 release
+資產裡永久消失，而且整條流程全綠——這是一個**致命 bug**：`.exe` 本身還在，
+卻再也沒有官方管道可以核對它們的完整性。
+
+修法跟 `latest.json` 一樣是底稿合併（`scripts/lib/sha256sums.mjs` 的
+`mergeSha256Sums`）：`compose` 先抓現行（這個 release tag 底下的）
+`SHA256SUMS.txt` 當底稿，只用這次建置出來的檔案覆寫同名行，其餘行原樣保留。
+
+**跟 `latest.json` 底稿抓取不同的一點**：`SHA256SUMS.txt` 的底稿網址用的是
+「這次要發佈的 tag」本身（`releases/download/<tag>/SHA256SUMS.txt`），不是
+`releases/latest` 那個浮動指標。`SHA256SUMS.txt` 沒有 `latest.json` 那種
+「manifest 只有一個全域 `version`」的先天限制，不需要靠 `releases/latest`
+對齊 updater endpoint；用浮動指標反而會在「要補腿的不是目前最新一個
+release」時抓錯底稿。這樣一來 `SHA256SUMS.txt` 的底稿保證跟 `latest.json`
+的底稿是同一個 release，三種情境的邊界很清楚：
+
+- **首發**：tag 對應的 release 還不存在，兩份底稿都是 404 → 空底稿，
+  `SHA256SUMS.txt`／`latest.json` 都只有這次建置的內容。
+- **補腿**（往已經發過、tag 相同的 release 補另一個平台）：兩份底稿都抓到
+  同一個 tag 底下的既有內容，另一平台的 checksum／platforms 條目原樣保留。
+- **全平台重發**（同一個 tag 重跑兩個平台）：底稿裡兩個平台的舊行都會被
+  這次的新值覆寫，等於整份重新生成，但語意上仍然是「合併」而非「清空重建」。
+
+`404` 與「暫時性失敗（網路抖動、5xx、rate limit）」的分野，以及重試邏輯，
+跟 `latest.json` 底稿抓取完全一樣（見 `release.yml` 的兩個 `Fetch current
+... as merge baseline` 步驟）：只有確定 404 才視為空底稿，其餘一律重試、
+重試用盡就硬失敗——把暫時性失敗靜默當成空底稿，後果跟前面 `latest.json`
+的陳舊條目斷言要擋的事故一樣：另一個平台的資產完整性驗證資訊被無聲抹掉。
