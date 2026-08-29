@@ -185,6 +185,17 @@ html[data-platform="macos"] .titlebar .app-icon {
   margin-left: 0;
 }
 
+/* mac 上不重複顯示 app 名稱＋icon：自訂標題列＋側欄的介面裡，系統選單列
+   已經有 app 名稱，HIG 建議自訂標題列不要再標一次；緊貼紅綠燈的位置也
+   容易被原生視窗控制熱區蓋到。只藏視覺內容——DOM、pointer-events:none、
+   data-tauri-drag-region 都不動，佔位高度與寬度照舊（不塌陷），拖曳區
+   仍是整條 .titlebar 本身的 data-tauri-drag-region 在接手，不靠這兩個
+   子元素的可見度。Windows 維持原樣（保留標題是該平台慣例）。 */
+html[data-platform="macos"] .titlebar .app-icon,
+html[data-platform="macos"] .titlebar .app-title {
+  opacity: 0;
+}
+
 /* ------------------------------------------------------------ 骨架 */
 
 .shell {
