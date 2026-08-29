@@ -904,13 +904,33 @@ pub fn get_config_path(state: State<'_, Shared>) -> String {
     state.path.to_string_lossy().into_owned()
 }
 
+// ---------------------------------------------------------------- 開外部程式
+//
+// 底下三支都是「請系統開一個東西給使用者看」，共同的紀律是**不可以在指令函式
+// 裡同步等它**：Tauri 的同步指令跑在主執行緒上，而這幾條路底下是
+// `open`（macOS）／`ShellExecuteW`（Windows），冷啟一個 Finder 視窗或瀏覽器
+// 動輒一到三秒——那段時間整個 UI 會凍住。
+//
+// 作法是把阻塞那一段丟到 `spawn_blocking`（阻塞 I/O 專用的執行緒池，不佔
+// tokio 的工作執行緒），指令本身立刻返回，成敗照舊記進活動日誌。刻意**不**
+// 改成 `async fn` 去 await 它：這三支的回傳值前端一個都沒有用（`ipc.ts` 一律
+// `invoke<void>`），await 只會把「promise 什麼時候 resolve」跟「系統視窗什麼
+// 時候真的開出來」綁在一起，換不到任何東西；而帶 `State<'_, _>` 的 async 指令
+// 又被 Tauri 逼著回一個永遠是 `Ok` 的 `Result`（`Result<(), ()>` 還會撞上
+// `clippy::result_unit_err`）。
+//
+// 這一段是共用核心，沒有任何 `cfg`：「怎麼開」在 `platform` 那一層，
+// 兩個平台的實作都不必為此改動。
+
 /// 在檔案總管裡開啟設定檔所在資料夾，並選中設定檔本身
 #[tauri::command]
 pub fn open_config_dir(state: State<'_, Shared>) {
-    let st = state.inner();
-    if let Err(e) = platform::reveal_in_file_manager(&st.path) {
-        st.log(format!("could not open the config folder: {e}"));
-    }
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = platform::reveal_in_file_manager(&st.path) {
+            st.log(format!("could not open the config folder: {e}"));
+        }
+    });
 }
 
 /// 自動更新的總開關（設定頁的「Automatic updates」）。
@@ -984,14 +1004,18 @@ pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
 /// version 給 None 時退回 releases/latest。
 #[tauri::command]
 pub fn open_release_page(state: State<'_, Shared>, version: Option<String>) {
-    update::open_release_page(state.inner(), version.as_deref());
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        update::open_release_page(&st, version.as_deref());
+    });
 }
 
 /// 下拉的「Download from Releases」：開系統瀏覽器到 Releases 列表頁，
 /// 剩下的交給使用者。這條路不下載任何東西，也不會動到執行中的這顆 exe。
 #[tauri::command]
 pub fn open_releases_page(state: State<'_, Shared>) {
-    update::open_releases_page(state.inner());
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || update::open_releases_page(&st));
 }
 
 #[tauri::command]

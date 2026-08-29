@@ -421,9 +421,14 @@ pub async fn install(st: &Shared) -> Result<(), String> {
 
 /// 換完 bundle 之後把自己重啟到新版上。
 ///
-/// 收尾那一組（`mark_exiting`／`kill_all_jobs`）要在重啟之前自己做：`lib.rs::run`
-/// 沒有掛 `RunEvent` 回呼，隧道是靠 `do_exit` 手動收的，重啟這條路一樣得收，
-/// 否則新舊兩個行程會同時抓著同一批本地埠。
+/// 收尾那一組（`mark_exiting`／`kill_all_jobs`）要在重啟之前自己做，否則新舊
+/// 兩個行程會同時抓著同一批本地埠。
+///
+/// `lib.rs::run` 確實掛了 `RunEvent::Exit` 回呼（`kill_jobs_on_final_exit`，
+/// 那是給 Dock Quit 與登出準備的），但這條路**不靠它**：那個掛鉤是最後一道
+/// 保險，跑的時機是事件迴圈已經要收攤的當下，而這裡需要的是「在
+/// `AppHandle::restart()` 之前就確定埠已經放掉」。先在這裡 `mark_exiting()`
+/// 也順便讓那個掛鉤讓路（它看到 `is_exiting()` 就直接返回），不會重複殺一次。
 ///
 /// 視窗位置**不必**自己存（Windows 那邊要，因為它 `std::process::exit(0)` 繞過了
 /// `RunEvent::Exit`，tauri-plugin-window-state 落地存檔的 hook 不會跑）。

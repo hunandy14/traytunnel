@@ -102,6 +102,9 @@ tracing = { version = "0.1", default-features = false, features = ["log"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
+  # ShellExecuteW 之前要先初始化 COM（見 winsys::open_url 的說明）：
+  # 那條路現在跑在 spawn_blocking 的執行緒上，沒有人替它 CoInitializeEx
+  "Win32_System_Com",
   "Win32_System_JobObjects",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
@@ -175,3 +178,17 @@ notify-rust = "4.18"
 #     平均 1.7ms、debug 組態平均 3ms（110 顆左右的系統 listener），對每 2 秒
 #     才輪詢一次的 `tunnel::supervise` 熱路徑而言可以忽略不計。
 listeners = "0.6"
+# SIGTERM／SIGHUP／SIGINT：這幾條退出路徑的預設動作是「行程當場消失」，
+# `ProcessSupervisor` 的 Drop 與 tauri 的 `RunEvent::Exit` 一個都不會跑，ssh
+# 程序樹整棵變孤兒繼續佔著 -L 的本地埠（Windows 那邊由 Job Object 的
+# KILL_ON_JOB_CLOSE 在核心層擋掉，macOS 沒有等價物）。
+#
+# 不自己 `sigaction`：訊號處理常式受 async-signal-safety 限制，不能配置記憶體、
+# 不能取任何可能已被中斷的鎖，而我們的收尾要碰 tokio 執行期與好幾把 Mutex。
+# signal-hook 真正掛進核心的 handler 只做「往 pipe 寫一個位元組」，其餘全部在
+# 一條普通執行緒上處理，正是這件事的社群標準解。
+#
+# 相依樹不會因此多長一顆陌生的東西：它底下的 signal-hook-registry 本來就已經
+# 在鎖檔裡（tokio 的 unix signal 支援間接帶進來的）。features 只留 iterator
+# （`Signals::forever()`），不要 channel／extended-siginfo 那些用不到的。
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }

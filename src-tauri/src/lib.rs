@@ -252,6 +252,143 @@ fn do_exit(state: &Shared) {
     state.app.exit(0);
 }
 
+// ------------------------------------------------- 退出掛鉤（macOS）
+//
+// Windows 上這一整段沒有對應語意：`ProcessSupervisor` 在那邊是一個 Job Object，
+// `KILL_ON_JOB_CLOSE` 是**核心**的保證——行程無論怎麼消失（正常退出、當掉、
+// 被工作管理員結束、登出），核心都會把整個 job 收乾淨。
+//
+// macOS 的 `ProcessSupervisor` 收尾靠的是 `Drop`，那是使用者空間的程式碼，
+// 而 `ssh -N` 是最不容易自己死掉的東西（stdin 是 null、父行程死了被 launchd
+// 收養、SIGPIPE 被忽略）。只要有一條退出路徑跑不到 `do_exit`，那條隧道的 ssh
+// 就會留下來繼續握著 `-L` 的本地埠，下一次啟動每一列都 `PORT_BUSY`、而重連是
+// 無退避無上限的五秒一輪——症狀是「app 永遠連不上，重開機才好」。
+//
+// 底下兩支各補一條 `do_exit` 到不了的路徑，第三條（SIGKILL／當機）沒辦法在
+// 當下補救，由 `platform::sweep_supervised_leftovers` 在下一次啟動收屍。
+
+/// 事件迴圈真的要結束了（`RunEvent::Exit`）——最後一次收拾程序樹的機會。
+///
+/// 補的是 **Dock 圖示的 Quit 與登出／關機**：那兩個走的是 AppleEvent，
+/// AppKit 呼叫 `applicationWillTerminate:`，tao 在那裡發出 `LoopDestroyed`
+/// （tao-0.35.3 `platform_impl/macos/app_delegate.rs`），tauri 把它轉成
+/// `RunEvent::Exit`（tauri-runtime-wry-2.11.4 `lib.rs`）；接著 NSApplication
+/// 直接把行程結束掉，managed 的 `Arc<AppState>` 永遠不會被 drop，
+/// `ProcessSupervisor` 的 `Drop` 當然也不會跑。
+///
+/// 選單列自己的 Quit 不走這條——那一項的 id 是我們自訂的
+/// [`platform::MENU_QUIT_ID`]，事件路由到 `do_exit`（見 setup）。這裡用
+/// `is_exiting()` 擋掉已經收過尾的情形，`do_exit` 自己觸發的 `RunEvent::Exit`
+/// 因此不會再殺第二次。
+#[cfg(target_os = "macos")]
+fn kill_jobs_on_final_exit(app: &AppHandle, event: &tauri::RunEvent) {
+    if !matches!(event, tauri::RunEvent::Exit) {
+        return;
+    }
+    let Some(state) = app.try_state::<Shared>() else {
+        // setup 都還沒跑完（或已經拆掉），沒有東西需要收
+        return;
+    };
+    if state.is_exiting() {
+        return; // do_exit 已經收過尾了
+    }
+    log::warn!(
+        "the event loop is exiting without going through do_exit (Dock Quit or logout), \
+         killing every supervised process tree now"
+    );
+    state.mark_exiting();
+    state.kill_all_jobs();
+}
+
+/// 掛上 SIGTERM／SIGHUP／SIGINT 的收尾。
+///
+/// 補的是 `kill <pid>`（預設就是 SIGTERM）、launchd 在登出或 `launchctl bootout`
+/// 時對 job 送的 SIGTERM、以及終端機的 Ctrl+C 與掛斷。這幾條的預設動作都是
+/// 「行程當場消失」，連 `RunEvent::Exit` 都不會發出來。
+///
+/// 收尾內容就是 `do_exit`（收程序樹 → 請事件迴圈退出），這裡跑在 signal-hook
+/// 開的那條普通執行緒上，不是訊號處理常式裡，所以拿鎖、寫日誌、呼叫
+/// `AppHandle::exit` 都是安全的（見 `platform::install_termination_handler`）。
+///
+/// 三道保險，順序本身就是規格：
+///
+/// 1. **寬限計時器要在 `do_exit` 之前起跑**，而且是從「收到訊號」那一刻起算，
+///    不是從「收尾做完」起算。送訊號的人（使用者、launchd 的登出流程）等的是
+///    行程結束，`do_exit` 自己卡住（例如某把鎖被別的執行緒抓著不放）也一樣要
+///    有人把行程帶走；排在後面的話這個計時器根本不會被建立。
+/// 2. **`do_exit` 用 `catch_unwind` 包住**。`kill_all_jobs` 裡有好幾處
+///    `.lock().unwrap()`，鎖一旦中毒（別的執行緒持鎖時 panic）這裡就會跟著
+///    panic；沒有這層包裝的話 panic 會直接把訊號執行緒炸掉，`signals.forever()`
+///    的迴圈就沒了——之後每一顆 SIGTERM 都被 signal-hook 的 handler 吃掉、
+///    卻再也沒有人處理，行程從此殺不死（`kill` 沒反應，只剩 `kill -9`）。
+///    `AssertUnwindSafe` 在這裡是誠實的：唯一跨越邊界的是 `Arc<AppState>`，
+///    而它內部的狀態就算被 panic 留在半途，我們接下來也只是要退出而已。
+/// 3. **第二次訊號直接硬退出**（`130` 是 shell 對 `SIGINT` 終止的慣例碼）。
+///    保留「按不動就再按一次 Ctrl+C」這個所有人都有的肌肉記憶，不必等寬限跑完。
+///
+///    這一條的前提是**前一顆訊號已經被處理完**：`signals.forever()` 是一條
+///    迴圈，`on_signal` 沒回來就不會取下一顆訊號。所以第一顆卡在 `do_exit`
+///    裡面時，再按幾次 Ctrl+C 都不會走到這個分支——那種情況由 (1) 的寬限
+///    計時器收場，它是獨立的執行緒，不受這條迴圈影響。兩者各管一種卡法：
+///    這一條管「收尾做完了但事件迴圈不理人」，計時器管「連收尾本身都卡住」。
+///
+/// ## 硬退出這條路會少做什麼
+///
+/// `process::exit` 不會發 `RunEvent::Exit`，所以兩顆外掛的收尾都不會跑，
+/// 明列在這裡免得日後有人以為它是無損的：
+///
+/// * **single-instance 的 `/tmp/<id>_si.sock` 會留在磁碟上。** 無害：那顆
+///   socket 沒有人在 listen，下一次啟動 `connect` 會拿到 `ConnectionRefused`，
+///   外掛自己就把它清掉再重新 listen（見該外掛 `platform_impl/macos.rs`）。
+/// * **這一次的視窗位置／大小不會被存下來**，下次開窗回到上一次存過的幾何。
+///
+/// 刻意**不**在這裡補一句「存一下視窗狀態」：`tauri-plugin-window-state` 的
+/// `save_window_state` 要去問每一扇視窗的位置與大小，那些呼叫會被派回主執行緒
+/// ——而走到硬退出這條路的前提就是主執行緒已經不回應了，補這一句只會讓收尾
+/// 卡在同一個地方，把「至少會結束」也一起賠掉。
+#[cfg(target_os = "macos")]
+fn install_signal_exit(state: &Shared) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 從**收到訊號**起算，給收尾與事件迴圈的寬限。
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+    static SIGNALS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    let st = state.clone();
+    let installed = platform::install_termination_handler(move |name| {
+        if SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst) > 0 {
+            log::warn!("received {name} again, leaving immediately");
+            std::process::exit(130);
+        }
+        log::warn!("received {name}, killing every supervised process tree before exiting");
+
+        // (1) 先起跑再收尾——理由見上面那段
+        std::thread::spawn(|| {
+            std::thread::sleep(GRACE);
+            log::warn!("still here {}s after the signal; leaving the hard way", GRACE.as_secs());
+            std::process::exit(0);
+        });
+
+        // (2) 收尾 panic 不可以把這條訊號執行緒帶走
+        let st = st.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            st.log(format!("received {name}, exiting"));
+            do_exit(&st);
+        }))
+        .is_err()
+        {
+            log::error!(
+                "the shutdown path panicked while handling {name} (a poisoned lock?); \
+                 the grace timer will take the process down"
+            );
+        }
+    });
+    if let Err(e) = installed {
+        log::warn!("could not install the termination signal handler: {e}");
+    }
+}
+
 /// 關閉鈕行為由 closeToTray 決定
 fn close_main(state: &Shared) {
     if state.with_config(|c| c.close_to_tray) {
@@ -472,6 +609,23 @@ pub fn run() {
             }
             app.manage(shared.clone());
 
+            // macOS 的程序樹收尾（Windows 由 Job Object 的 KILL_ON_JOB_CLOSE 全包，
+            // 這裡整段不存在）。兩件事都要卡在這個位置：
+            //
+            // * 收屍必須在 single-instance 外掛確定「我們是唯一實例」之後——
+            //   第二個實例是在 `Builder::build()` 裡就 `process::exit(0)` 的，
+            //   走不到這個 setup 閉包，所以站在這裡就等於站在那道閘後面；
+            //   若在它前面掃，會把**還在服役**的那個實例的 ssh 全部砍掉。
+            // * 收屍也必須在任何一條隧道 spawn 之前（`tunnel::start_enabled`
+            //   在本函式最後），上一輪殘留的 ssh 才來得及把埠讓出來。
+            // * 訊號處理要趁早掛：掛好之前收到的 SIGTERM 走的是預設動作
+            //   （行程當場消失），那正是要補的那條路。
+            #[cfg(target_os = "macos")]
+            {
+                platform::sweep_supervised_leftovers();
+                install_signal_exit(&shared);
+            }
+
             // 暫存區裡那份就緒的更新要在**畫系統匣之前**認回來，
             // 「Restart to update」才會從第一次畫的時候就在選單上，
             // 而不是等到下一次狀態變動才冒出來。
@@ -612,8 +766,17 @@ pub fn run() {
             update::spawn_checker(&shared);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // `build` + `App::run(callback)` 而不是 `Builder::run(context)`：後者是
+        // 前者外加一個空的事件回呼（tauri-2.11.5 `app.rs` 的
+        // `Builder::run` 就是 `self.build(context)?.run(|_, _| {})`），而我們需要
+        // 那個回呼——macOS 的 Dock Quit 與登出只會發出 `RunEvent::Exit`，
+        // 不會經過任何一條我們自己的退出路徑。行為上兩者其餘完全相同。
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            kill_jobs_on_final_exit(_app, &_event);
+        });
 }
 
 /// 系統匣選單的事件路由：id 前綴決定要做什麼，一律呼叫內部函式，不繞 invoke

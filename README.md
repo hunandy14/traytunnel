@@ -89,7 +89,9 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 
 ### 已知限制
 
+- **開機自啟的開關是「下一次登入」生效**：打開就是寫一份 plist 進 `~/Library/LaunchAgents`，關掉就是把它刪掉，launchd 在下一次登入時讀那個資料夾。程式**不會**呼叫 `launchctl load`／`unload` 讓它立即生效——那樣做會有兩個很不舒服的副作用：`load` 會當場多開一個實例（因為那份 plist 的 `RunAtLoad` 是 true），而 `unload` 在「這一次就是開機自啟進來的」情況下等於請系統把 traytunnel 自己殺掉（連同它管的 ssh 一起變成孤兒）。Windows 版寫 HKCU 的 Run 值同樣是下次登入才生效，兩邊語意一致。
 - **開機自啟的偵測不含「使用者在系統設定裡手動停用」的狀態**：程式判斷開機自啟是否生效，看的是自己有沒有寫入 `~/Library/LaunchAgents` 底下的 plist；如果你在「系統設定 → 一般 → 登入項目」把它關掉，程式不會發現，畫面上的開關依然顯示為開啟。Windows 版有對齊「工作管理員」的停用紀錄，macOS 版目前還沒有對應的偵測。
+- **被強制結束（`kill -9`）或當掉時，那一瞬間的 ssh 會活下來，但下一次啟動會清掉**：Windows 版靠 Job Object 由核心保證「主程式沒了，整棵程序樹就沒了」，macOS 沒有等價機制。正常退出、Dock 的 Quit、登出、`kill`（SIGTERM）、Ctrl+C 都會走過完整的收尾；只有 `kill -9` 與真正的當機來不及。那種情況下 traytunnel 會在下一次啟動時，比對 `~/Library/Application Support/com.traytunnel.desktop/supervised-pgids.json` 裡記下的命令列，把上一輪留下、還握著本地埠的 ssh 清掉。
 
 ## 介面
 

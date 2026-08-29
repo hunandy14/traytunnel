@@ -98,7 +98,11 @@ src-tauri/src/platform/
 ## 新增一項 OS 相依功能的流程
 
 1. 決定這項功能要不要進共用門面。只有一個平台用得到、共用核心也不會呼叫，
-   就留在對應子模組內部，不必動 `mod.rs`。
+   就留在對應子模組內部，不必動 `mod.rs`。共用核心**確實**要呼叫、但另一個平台
+   沒有對應語意時，門面上開一個整段 `#[cfg(target_os = "...")]` 的項目，
+   不要為了對稱去湊一份假的實作；呼叫端用同一個 `cfg` 包住即可（現有例子：
+   `build_menu`／`MENU_QUIT_ID`、`install_termination_handler`／
+   `sweep_supervised_leftovers`，三者都只有 macOS 有）。
 2. 需要跨平台呼叫的話：先在 `mod.rs` 決定簽章（參數、回傳型別要兩邊通用），
    在清單裡加一行 `pub use imp::your_fn`。
 3. 兩個子模組（`windows/`、`macos/`）都要補齊同名同簽章的實作，順序不拘，
@@ -122,8 +126,8 @@ src-tauri/src/platform/
 
 ## live 測試慣例（`#[ignore]` + 環境變數）
 
-會碰真實系統資源的測試（寫真的 `~/Library/LaunchAgents`、`launchctl load`、
-真的 SSH／WireGuard 連線……）一律 `#[ignore]`，預設測試輪（`cargo test`、CI）
+會碰真實系統資源的測試（寫真的 `~/Library/LaunchAgents`、真的 SSH／WireGuard
+連線……）一律 `#[ignore]`，預設測試輪（`cargo test`、CI）
 不會跑到，只有手動指定測試名稱前綴時才會跑，例如：
 
 ```
@@ -136,7 +140,13 @@ cargo test --lib -- --ignored --nocapture live_autostart
 自己建立的狀態清乾淨（例如測試名稱帶 `std::process::id()` 避免撞到使用者真正
 的登記項），但 assert 失敗仍可能跳過收尾——這正是這類測試不准留在預設測試輪的
 理由，見 `src-tauri/src/wg_live_tests.rs`、`src-tauri/src/platform/macos/sys.rs`
-的 `live_autostart_round_trips_through_launchd`。
+的 `live_autostart_round_trips_through_the_launch_agents_folder`。
+
+會寫進使用者資料夾的**產品程式碼**也適用同一條規則的另一半：測試輪跑得到的路徑
+不准去動真實位置。`platform/macos/pgids.rs` 的 `registry_path()` 在 `cfg(test)`
+下直接回 `None`（登記簿整個變 no-op），因為 `platform::process_tests` 會真的建
+`ProcessSupervisor` 並 spawn 子程序；登記簿本身的行為改用 `*_at(path)` 系列打
+tempdir 測，涵蓋率不打折。新增任何「會寫檔的平台功能」時照這個形狀做。
 
 ## 驗 UI 一定要用 `tauri build` 的產物（白屏最常見的假警報）
 

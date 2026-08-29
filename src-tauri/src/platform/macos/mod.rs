@@ -34,10 +34,18 @@
 //! 補了同名同簽章的三支 no-op，`platform::mod` 跟其他跨平台項目一樣只是
 //! 一行 `pub use imp::{...}` 轉出去，讓 `lib.rs` 呼叫端完全不必知道平台
 //! 差異，三個 cfg 區塊因此消失。
+//!
+//! `pgids`（受監督行程群組的磁碟登記簿與啟動時的收屍）與
+//! `spawn::install_termination_handler`（SIGTERM／SIGHUP／SIGINT）則**是**
+//! 不對稱的門面項目，而且與 `policy` 那三支正好是對照組：Windows 的 Job Object
+//! 有核心層級的 `KILL_ON_JOB_CLOSE`，那一整套補救在 Windows 上沒有對應語意，
+//! 補一份 no-op 只會讓人以為那邊也需要做這件事。兩者的門面轉出
+//! （`platform/mod.rs`）因此都整段 `#[cfg(target_os = "macos")]`。
 
 mod menu;
 mod notify;
 mod paths;
+mod pgids;
 mod policy;
 mod spawn;
 mod sys;
@@ -46,8 +54,9 @@ pub mod update;
 pub use menu::{build as build_menu, QUIT_ID as MENU_QUIT_ID};
 pub use notify::{prepare_notifications, show_notification};
 pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
+pub use pgids::sweep_leftovers as sweep_supervised_leftovers;
 pub use policy::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
-pub use spawn::ProcessSupervisor;
+pub use spawn::{install_termination_handler, ProcessSupervisor};
 pub use sys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
     local_time_hms, read_autostart_command, reveal_in_file_manager, small_icon_size,
