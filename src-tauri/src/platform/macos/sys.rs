@@ -379,6 +379,27 @@ fn xml_unescape(s: &str) -> String {
 
 /// `--tray` 讓開機啟動直接縮在系統匣、不彈主視窗——與 Windows
 /// `winsys::autostart_command` 的 `--tray` 是同一個約定。
+///
+/// ## 為什麼一定要有 `AbandonProcessGroup`
+///
+/// `launchd.plist(5)` 對這個鍵的原文是：
+///
+/// > **AbandonProcessGroup** \<boolean\>
+/// > When a job dies, launchd kills any remaining processes with the same
+/// > process group ID as the job. Setting this key to true disables that
+/// > behavior.
+///
+/// 也就是說**預設**行為是「job 一死，launchd 順手把同 pgid 的殘餘程序也殺掉」。
+/// 這條規則會直接砸掉應用內更新：開機自啟進來的那個實例就是這個 job 的行程，
+/// 更新走到最後是 `app.restart()`——先 `spawn` 一個新實例、再讓自己 `exit`。
+/// 新實例是從舊實例 fork 出來的，**繼承同一個 pgid**，於是舊實例一 exit，
+/// launchd 就把剛生出來、還在初始化的新實例一起連坐殺掉：使用者按下
+/// 「Restart to update」之後，程式直接消失，而且只有「這一次是開機自啟進來的」
+/// 才會這樣，從 Finder 手動開的那次完全正常——症狀差異大到極難查。
+///
+/// 設成 true 只關掉 launchd 那一手連坐，不影響本程式自己的收尾：ssh 程序樹是由
+/// [`super::spawn::ProcessSupervisor`] 明確 `killpg` 收的（自成 pgid，本來就不
+/// 屬於這個 job 的 pgid），三道防線一個都沒少。
 fn plist_contents(label: &str, exe: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -393,6 +414,8 @@ fn plist_contents(label: &str, exe: &Path) -> String {
          \t\t<string>--tray</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>AbandonProcessGroup</key>\n\
          \t<true/>\n\
          </dict>\n\
          </plist>\n",
@@ -693,11 +716,32 @@ mod tests {
         let exe = Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel");
         let xml = plist_contents("com.traytunnel.autostart.traytunnel", exe);
         assert!(xml.contains("<key>Label</key>"));
-        assert!(xml.contains("<true/>"), "RunAtLoad 要是 true");
+        // 兩個布林鍵各自釘住，不再只斷言「檔案裡有一個 <true/>」——現在有兩個，
+        // 那種寫法會讓其中一個掉了也照樣綠
+        assert!(
+            xml.contains("<key>RunAtLoad</key>\n\t<true/>"),
+            "RunAtLoad 要是 true，否則登入時根本不會被啟動：{xml}"
+        );
 
         let cmd = read_program_arguments(&xml).expect("要讀得回 ProgramArguments");
         assert_eq!(cmd, format!("{} --tray", exe.display()));
         assert!(cmd.ends_with(" --tray"), "少了 --tray 就會開機彈主視窗：{cmd}");
+    }
+
+    /// `AbandonProcessGroup` 是規格，不是可有可無的調味：`launchd.plist(5)` 明定
+    /// 「job 一死，launchd 會把同 pgid 的殘餘程序也殺掉」，而應用內更新的
+    /// `app.restart()` 正是「spawn 一個同 pgid 的新實例、然後自己 exit」——沒有
+    /// 這個鍵，開機自啟進來的那個實例一更新，新舊兩個實例會一起被 launchd 收走。
+    #[test]
+    fn the_plist_tells_launchd_not_to_kill_the_process_group() {
+        let xml = plist_contents(
+            "com.traytunnel.autostart.traytunnel",
+            Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel"),
+        );
+        assert!(
+            xml.contains("<key>AbandonProcessGroup</key>\n\t<true/>"),
+            "少了 AbandonProcessGroup，自啟實例做應用內更新時會被 launchd 連坐殺掉：{xml}"
+        );
     }
 
     /// 路徑含 XML 特殊字元時要轉義，讀回來又要能正確還原——不然使用者裝在
