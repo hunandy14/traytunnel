@@ -48,7 +48,7 @@ do shell script "rm -rf '{舊 bundle 路徑}' && mv -f '{新 bundle 路徑}' '{�
   主動觸發、正看著畫面、還能重試或回報的當下，不會在他不在場、或以為程式只是
   照常待在系統匣時，被背景邏輯默默炸掉。
 - **README 把使用者導向不會觸發提權、也不會踩到單引號的路徑**：安裝指示明講
-  「把 `traytunnel.app` 拖進『應用程式』資料夾再開啟」——`/Applications` 是
+  「把 `Traytunnel.app` 拖進『應用程式』資料夾再開啟」——`/Applications` 是
   固定的系統路徑、不含特殊字元，且一般 admin 帳號對自己拖進去的 bundle 有寫入
   權限，走的是非提權的 `rename`＋備份路徑，兩筆缺陷都碰不到。真正會撞上提權
   路徑的情境（bundle 是 root 所有、或曾經 `sudo cp` 過）超出一般使用者的操作

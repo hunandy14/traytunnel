@@ -264,7 +264,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.resolve.outputs.version }}"
-          bundle_tar="src-tauri/target/release/bundle/macos/traytunnel.app.tar.gz"
+          # 檔名跟的是 tauri.macos.conf.json 的 productName "Traytunnel"（首字大寫）；
+          # out/ 那顆是 scripts/package.mjs 刻意改名回小寫的發佈檔名，兩者不同一份，
+          # 這正是這關要比對的東西
+          bundle_tar="src-tauri/target/release/bundle/macos/Traytunnel.app.tar.gz"
           release_tar="out/traytunnel-${version}-aarch64.app.tar.gz"
 
           bundle_hash=$(shasum -a 256 "$bundle_tar" | awk '{print $1}')
@@ -508,7 +511,7 @@ jobs:
           body: |
             ## macOS 安裝說明
 
-            下載 `.dmg` 打開後，請把 `traytunnel.app` 拖進「應用程式」資料夾再開啟——這不只是慣例，而是避開 App Translocation 的必要步驟：macOS 會讓還沒搬進「應用程式」的下載檔案在唯讀的隨機掛載點上執行，自動更新機制在那裡寫不了檔案會直接失敗。
+            下載 `.dmg` 打開後，請把 `Traytunnel.app` 拖進「應用程式」資料夾再開啟——這不只是慣例，而是避開 App Translocation 的必要步驟：macOS 會讓還沒搬進「應用程式」的下載檔案在唯讀的隨機掛載點上執行，自動更新機制在那裡寫不了檔案會直接失敗。
           files: |
             out/*.exe
             out/*.dmg
