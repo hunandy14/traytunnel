@@ -15,8 +15,11 @@
  * 沒有這把私鑰，簽不出來就會讓整個 `tauri build` 以非零狀態結束（.app 其實
  * 已經建好，只是簽不出 .sig），這支腳本就不會被 `&&` 接著跑到。這裡只是要
  * 本機快速試跑 .app，updater 產物與簽章跟這個用途無關，直接關掉最乾脆；
- * 真正需要簽出 updater 產物的路徑是 `npm run build:dist`（CI 的
- * release.yml 用的就是這顆，那邊有 TAURI_SIGNING_PRIVATE_KEY 可用）。
+ * 真正需要簽出 updater 產物的路徑是 `npm run build:dist`（本機等價流程，
+ * 不帶 --target）——CI 的 release.yml 走的是同一套邏輯，但直接呼叫
+ * `tauri build --target <matrix.rust_target>` + `node scripts/package.mjs
+ * --target <matrix.rust_target>`（見該檔 build job），那邊有
+ * TAURI_SIGNING_PRIVATE_KEY 可用。
  *
  * 無相依，直接 node scripts/copy-app-bundle.mjs。
  */
