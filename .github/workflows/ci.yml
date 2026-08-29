@@ -63,6 +63,18 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      # scripts/lib/*.mjs（latest.json／SHA256SUMS.txt 的底稿合併邏輯，見
+      # release.yml 的 compose job）純屬 Node 邏輯，跟平台無關，兩腿的執行
+      # 結果必然一致——比照下面「cargo fmt 只在 Windows 腿跑一次」的作法，
+      # 不必在 macOS 腿重複，也不必為了它另外開一個 ubuntu-only job 承擔
+      # 多一輪 checkout／setup-node／npm ci 的開銷。放在最前面（Build
+      # frontend 之前）是因為 test:release 不依賴前端或 Rust 產物，能給出
+      # 這個 workflow 裡最快的失敗訊號；這組測試以前完全沒有被任何 CI
+      # 跑過，latest.json／SHA256SUMS.txt 的合併邏輯改壞了也不會被擋下來。
+      - name: Run release pipeline unit tests
+        if: matrix.os == 'windows-latest'
+        run: npm run test:release
+
       - name: Build frontend (tsc + vite)
         run: npm run web:build
 

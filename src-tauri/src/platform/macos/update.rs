@@ -97,52 +97,16 @@
 //! 固定的——這條路上根本沒有會失敗的下載可以退避。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use semver::Version;
 use tauri::AppHandle;
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::platform::update_common::{
+    self, current_version, is_newer, normalize_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT,
+    FIRST_DELAY, INTERVAL,
+};
 use crate::state::UpdateInfo;
 use crate::Shared;
-
-/// 啟動後隔這麼久才做第一次檢查：開機當下要先把系統匣、隧道那些真正要緊的事做完，
-/// 更新檢查是最不急的一件。與 Windows 同一個值。
-const FIRST_DELAY: Duration = Duration::from_secs(8);
-
-/// 常駐期間的檢查間隔。與 Windows 同一個值。
-const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// 查 latest.json 的逾時。
-///
-/// updater 外掛 builder 的預設是 `None`，也就是**完全沒有上限**：GitHub 那邊一旦
-/// 是半開的連線（封包進得去、回應永遠不來），這個 async 任務就再也不會回來。
-/// 背景檢查每 24 小時起一次，卡住的任務會一直累積；手動按下的那顆「Check now」
-/// 更糟，前端的 await 沒有逾時，按鈕會永遠停在轉圈。與 Windows 同一個值。
-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 下載更新包的逾時。
-///
-/// 與 [`CHECK_TIMEOUT`] 分開設是因為兩段的性質完全不同：查版本只拉一份幾百位元組
-/// 的 JSON，超過半分鐘一定是卡住了；下載拉的是十幾 MB 的 `.app.tar.gz`，而
-/// reqwest 的 `timeout` 管的是**整個請求含讀完 body** 的總時間，設窄了會把慢速但
-/// 正常的下載一起砍掉。它要擋的是永遠不會結束的連線，不是慢的連線。
-///
-/// 這一段的值傳不進 builder——外掛建 `Update` 物件時把 timeout 寫死成 `None`
-/// （2.10.1 的 updater.rs），builder 上設的那個只作用在 check 那次請求。
-/// 所以只能在拿到 `Update` 物件之後對它的 pub 欄位直接賦值。與 Windows 同一個值。
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// Releases 列表頁：下拉選單的「Download from Releases」開這裡，
-/// 使用者可以自己挑要哪一版（含更早的版本）
-const RELEASES_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases";
-
-/// 單一版本的 release 頁前綴。發佈說明與該版的下載資產都在同一頁上，
-/// 所以「View release notes」與非 bundle 版的「Get vX.Y.Z」開的是同一個網址。
-const RELEASE_TAG_PREFIX: &str = "https://github.com/hunandy14/traytunnel/releases/tag/v";
-
-/// 還不知道是哪一版（沒查過或查不到）時，release 頁退回這裡
-const LATEST_RELEASE_PAGE: &str = "https://github.com/hunandy14/traytunnel/releases/latest";
 
 /// 已經下載完、等下一次啟動才安裝的那一版。
 ///
@@ -204,32 +168,8 @@ fn target_key() -> String {
     format!("darwin-{}", std::env::consts::ARCH)
 }
 
-/// 版本號的比較用形式：去空白、去前導的 v。
-///
-/// 全模組只有這一份：`is_newer`、`UpdateInfo` 的版本欄位、release 頁網址都吃它，
-/// 各自寫一次 `trim_start_matches` 的話遲早會有一處漏掉而讓 `v0.7.0`
-/// 與 `0.7.0` 被當成兩個版本。
-fn normalize_version(version: &str) -> &str {
-    version.trim().trim_start_matches(['v', 'V'])
-}
-
-/// 遠端版本是不是嚴格大於目前這一版。
-///
-/// 用 semver 的比較規則（它已經在相依樹裡，是 updater 外掛自己在用的那一顆），
-/// 因此 0.10.0 > 0.9.0，而 pre-release 一律小於同號的正式版。兩邊任一個解析
-/// 不出來就當成「沒有新版」：更新提示寧可漏報，也不要因為一個怪字串誤報。
-pub fn is_newer(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| Version::parse(normalize_version(s)).ok();
-    match (parse(remote), parse(current)) {
-        (Some(r), Some(c)) => r > c,
-        _ => false,
-    }
-}
-
-/// 這一份執行檔是哪一版。用編譯期常數，與 Windows 同一個來源。
-fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+// `normalize_version`／`is_newer`／`current_version` 兩平台逐字相同，已上提到
+// [`update_common`]，這裡改成從那邊 `use` 進來（見本檔開頭 import）。
 
 // ---------------------------------------------------------------- 檢查
 
@@ -270,6 +210,32 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
     matches!(e, Error::TargetNotFound(_) | Error::TargetsNotFound(_))
 }
 
+/// 查一次遠端，拿回外掛的 `Update` 物件（還沒經過 [`accept`] 判斷是不是真的算
+/// 新版）。
+///
+/// [`check_lane`] 與 [`install`] 都要走這三步：建 updater、發 `check()`、把
+/// 「這個平台在 latest.json 裡還沒有條目」降級成「沒有東西可拿」——原本兩處各自
+/// 抄一份，抄出了一個分歧：`check_lane` 那份會記一行 info，`install` 那份悄悄
+/// 吞掉，同一件事在活動日誌裡看起來厚此薄彼。統一在這裡記那一行日誌，兩個呼叫端
+/// 都看得到同一句話，也不會有人漏記。
+///
+/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
+/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
+/// [`CHECK_TIMEOUT`]。
+async fn fetch_update(app: &AppHandle) -> Result<Option<Update>, String> {
+    let updater =
+        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(found) => Ok(found),
+        // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
+        Err(e) if is_target_missing(&e) => {
+            log::info!("update check: {} has no entry in latest.json yet", target_key());
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// 查一次遠端，回「有沒有比現在新的版本」。
 ///
 /// 兩條車道共用這一支：真正的差別只在 `UpdateInfo.installed`（也就是查到之後
@@ -277,23 +243,8 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
 /// 這與 Windows 不同——那邊可攜車道刻意繞開外掛自己拿 latest.json，是因為
 /// 外掛的 check 一路連著 download＋install；macOS 這條路上 check 只是 check，
 /// 下載與安裝都在 [`install`] 裡另外發動，沒有繞開的必要。
-///
-/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
-/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
-/// [`CHECK_TIMEOUT`]。
 async fn check_lane(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater =
-        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let found = match updater.check().await {
-        Ok(found) => found,
-        // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
-        Err(e) if is_target_missing(&e) => {
-            log::info!("update check: {} has no entry in latest.json yet", target_key());
-            return Ok(None);
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    let Some(update) = found else {
+    let Some(update) = fetch_update(app).await? else {
         return Ok(None);
     };
     Ok(accept(&update.version, current_version(), is_installed()))
@@ -442,14 +393,8 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if !is_installed() {
         return Err("This build cannot update itself".into());
     }
-    let updater =
-        st.app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
-    let found = match updater.check().await {
-        Ok(found) => found,
-        Err(e) if is_target_missing(&e) => None,
-        Err(e) => return Err(e.to_string()),
-    };
-    let mut update = found.ok_or_else(|| "No update available".to_string())?;
+    let mut update =
+        fetch_update(&st.app).await?.ok_or_else(|| "No update available".to_string())?;
     // 「有沒有新版」不外包給外部相依，這一關與檢查那條路走同一支判定
     if accept(&update.version, current_version(), true).is_none() {
         return Err("No update available".into());
@@ -504,42 +449,31 @@ fn restart_into(st: &Shared, version: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------- 開瀏覽器
-
-/// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
-/// 使用者按下「View release notes」時至少看得到最新那一版的說明。
-///
-/// 純函式，網址組法有問題要在測試裡就看得出來，不必等到實機按下去開錯頁。
-/// 版本號裡混進路徑分隔符或空白就不是版本號了，一律退回 latest——那既是網址
-/// 正確性，也是不讓一個從遠端來的字串把網址帶去別的地方。
-pub fn release_url(version: Option<&str>) -> String {
-    let tag = version.map(normalize_version).filter(|v| !v.is_empty() && !v.contains(['/', ' ']));
-    match tag {
-        Some(v) => format!("{RELEASE_TAG_PREFIX}{v}"),
-        None => LATEST_RELEASE_PAGE.to_string(),
-    }
-}
+//
+// `release_url` 的組法、逾時常數與這兩支 `open_*` 的邏輯兩平台逐字相同，已上提到
+// [`update_common`]；這裡的兩支只負責把 macOS 自己的 `sys::open_url` 注入進去
+// ——見 `update_common` 開頭「為什麼不直接伸手進 `platform::macos::sys`」那段。
 
 /// 單一版本的 release 頁：發佈說明與該版的下載資產都在上面。
 /// 非 bundle 版的「Get vX.Y.Z」與下拉的「View release notes」都走這裡。
 pub fn open_release_page(st: &Shared, version: Option<&str>) {
-    open_page(st, &release_url(version));
+    update_common::open_release_page(st, version, super::sys::open_url);
 }
 
 /// Releases 列表頁：下拉的「Download from Releases」走這裡，
 /// 讓使用者自己挑版本換檔案。這條路不下載、不碰自己這顆 bundle。
 pub fn open_releases_page(st: &Shared) {
-    open_page(st, RELEASES_PAGE);
-}
-
-fn open_page(st: &Shared, url: &str) {
-    if let Err(e) = super::sys::open_url(url) {
-        st.log(format!("could not open {url}: {e}"));
-    }
+    update_common::open_releases_page(st, super::sys::open_url);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::platform::update_common::{
+        release_url, LATEST_RELEASE_PAGE, RELEASES_PAGE, RELEASE_TAG_PREFIX,
+    };
 
     /// 更新資訊清單。這裡只有 live 測試會去拉它，實機那條路是 updater 外掛
     /// 自己照 tauri.conf.json 的 endpoints 去拿——兩邊指的是同一份檔案，
@@ -632,39 +566,9 @@ mod tests {
         assert!(target_key().starts_with("darwin-"), "{}", target_key());
     }
 
-    /// 只有嚴格大於才算新版：同版與舊版都不可以跳出更新提示
-    #[test]
-    fn only_a_strictly_greater_version_counts() {
-        assert!(is_newer("0.5.0", "0.4.3"));
-        assert!(is_newer("1.0.0", "0.9.9"));
-        assert!(!is_newer("0.4.3", "0.4.3"));
-        assert!(!is_newer("0.4.2", "0.4.3"));
-    }
-
-    /// 字串比大小的經典陷阱：字面上 "0.10.0" < "0.9.0"，semver 規則下才是大的
-    #[test]
-    fn ten_is_newer_than_nine() {
-        assert!(is_newer("0.10.0", "0.9.0"));
-        assert!(!is_newer("0.9.0", "0.10.0"));
-    }
-
-    /// latest.json 的 version 寫成 v0.5.0 也照樣認得；pre-release 小於同號正式版
-    #[test]
-    fn leading_v_is_tolerated_and_prerelease_is_older() {
-        assert!(is_newer("v0.5.0", "0.4.3"));
-        assert!(is_newer("0.5.0", "v0.4.3"));
-        assert!(!is_newer("0.5.0-rc.1", "0.5.0"));
-        assert!(is_newer("0.5.0", "0.5.0-rc.1"));
-    }
-
-    /// 解析不出來一律當成沒有新版：更新提示寧可漏報也不要誤報
-    #[test]
-    fn garbage_never_reports_an_update() {
-        assert!(!is_newer("", "0.4.3"));
-        assert!(!is_newer("latest", "0.4.3"));
-        assert!(!is_newer("0.5", "0.4.3"));
-        assert!(!is_newer("0.5.0", "not-a-version"));
-    }
+    // `is_newer` 本身的測試（嚴格大於、"0.10.0" vs "0.9.0"、v 前綴、pre-release、
+    // 解析失敗的退讓方向……）兩平台逐字相同，已搬到 [`update_common`] 的測試裡，
+    // 不在這裡重複一份。
 
     /// 最後一道閘：外掛就算回了 Some，版本沒有嚴格大於就不算數。
     /// 「有沒有新版」這個判斷不可以整個外包給外部相依。
@@ -709,30 +613,8 @@ mod tests {
         assert!(!is_target_missing(&Error::Network("connection reset".into())));
     }
 
-    /// release 頁的網址組法：帶不帶 v 都要組出同一個 tag 頁，
-    /// 不知道版本時退回 releases/latest 而不是組出一個 tag 是空的壞網址
-    #[test]
-    fn a_release_url_points_at_that_version_or_falls_back_to_latest() {
-        assert_eq!(
-            release_url(Some("0.6.0")),
-            "https://github.com/hunandy14/traytunnel/releases/tag/v0.6.0"
-        );
-        assert_eq!(release_url(Some("v0.6.0")), release_url(Some("0.6.0")));
-        assert_eq!(release_url(Some("  0.6.0  ")), release_url(Some("0.6.0")));
-        let latest = "https://github.com/hunandy14/traytunnel/releases/latest";
-        assert_eq!(release_url(None), latest);
-        assert_eq!(release_url(Some("")), latest);
-        assert_eq!(release_url(Some("   ")), latest);
-        // 版本號裡混進路徑分隔符就不是版本號了，不可以讓它把網址帶去別的地方
-        assert_eq!(release_url(Some("0.6.0/../../evil")), latest);
-    }
-
-    /// 「Download from Releases」開的是列表頁，不是 releases/latest 那一頁——
-    /// 整份列表才挑得到更早的版本
-    #[test]
-    fn the_downloads_menu_item_opens_the_release_list() {
-        assert_eq!(RELEASES_PAGE, "https://github.com/hunandy14/traytunnel/releases");
-    }
+    // `release_url` 的網址組法、`RELEASES_PAGE` 的值同樣兩平台逐字相同，測試也
+    // 已搬到 [`update_common`]，這裡不重複。
 
     /// 這條路上的每一個網址都必須是 https：`sys::open_url` 只放行 https，
     /// 組出一個別的 scheme 的話按下去只會在活動日誌留一行「could not open」

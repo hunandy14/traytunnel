@@ -16,6 +16,6 @@ pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
 pub use spawn::ProcessSupervisor;
 pub use winsys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
-    local_time_hms, pick_icon_layer, read_run_value as read_autostart_command,
+    local_time_hms, read_run_value as read_autostart_command,
     reveal_in_explorer as reveal_in_file_manager, small_icon_size,
 };

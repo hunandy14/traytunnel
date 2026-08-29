@@ -147,6 +147,34 @@ libc = "0.2"
 # 的這顆 crate，等於是同一條 macOS 通知路徑，只是繞過外掛那層 Manager 綁定。
 # 版本對齊 tauri-plugin-notification 2.3.3 目前鎖的 4.18。
 notify-rust = "4.18"
+# 本地埠是否有人在 Listen（`sys::is_listening`），語意對齊 Windows 那邊唯讀掃
+# `GetExtendedTcpTable` 的做法：只讀核心已經記著的行程／socket 表，不主動
+# `bind` 去探測（獨立審查 2026-08-29 阻擋缺陷：主動 bind 探測會在 ssh 完成
+# 認證、準備 `bind -L` 的時間窗跟它搶同一個位址，見 `sys::is_listening` 的
+# 說明）。macOS 沒有 Windows 那種一次系統呼叫就能拿到全表的 API，只能繞經
+# libproc（`proc_pidinfo`／`proc_pidfdinfo`）逐行程展開 fd 表這條路；挑這顆
+# 而不是自己手刻 FFI 或改用 `netstat2`：
+#   * 跟 `netstat2` 比較過——它的 macOS 後端走的也是同一條 libproc 路線
+#     （其原始碼可見 `integrations/osx/netstat.rs`），沒有多拿到任何可見性；
+#     但它額外拉一顆 `bindgen` 當 build-dependency，在 build.rs 裡對著寫死的
+#     `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/` 路徑跑
+#     C++ 標頭產生 FFI 綁定——沒有走 `xcrun --show-sdk-path`，只裝 Xcode.app
+#     沒裝 Command Line Tools、或 CLT 版本換了路徑的機器上這步會直接編譯失敗；
+#     還連帶多拖 num-derive／num-traits／bitflags／thiserror。這顆的 macOS 後端
+#     反而是手寫 FFI 宣告（`src/platform/macos/c_libproc.rs`），沒有 bindgen、
+#     沒有硬編路徑，多的相依只有下面這顆 byteorder（解 fd 資訊裡的位元組序）。
+#   * 維護狀態：發布很頻繁（最近一版是這次審查同一週內），比 `netstat2`
+#     （近一年才一版）活躍。
+#   * 可見性實測（見 PR 說明）：同 uid 底下、甚至是完全獨立的另一支子行程
+#     （不是查詢者自己）綁的埠一律讀得到，wildcard（`0.0.0.0`／`[::]`）綁定
+#     也讀得到；libproc 對「不是自己也不是 root」的行程有存取限制，root 擁有
+#     的行程（例如 launchd 隨選啟動的 `sshd`）在沒有 root 權限時查不到——這是
+#     libproc 這條路徑本身的限制，`netstat2` 換皮不換底，一樣繞不過去，寫進
+#     `sys::is_listening` 的文件註解當已知限制。
+#   * 成本：每呼叫一次 `listeners::get_all()` 在這台機器上量到 release 組態
+#     平均 1.7ms、debug 組態平均 3ms（110 顆左右的系統 listener），對每 2 秒
+#     才輪詢一次的 `tunnel::supervise` 熱路徑而言可以忽略不計。
+listeners = "0.6"
 # SIGTERM／SIGHUP／SIGINT：這幾條退出路徑的預設動作是「行程當場消失」，
 # `ProcessSupervisor` 的 Drop 與 tauri 的 `RunEvent::Exit` 一個都不會跑，ssh
 # 程序樹整棵變孤兒繼續佔著 -L 的本地埠（Windows 那邊由 Job Object 的
