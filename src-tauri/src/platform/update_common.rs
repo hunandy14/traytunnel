@@ -18,7 +18,12 @@
 //! 注入把「該用哪個 `open_url`」這個決定留在各平台的 `update.rs` 手上，這裡
 //! 只管「查完之後開哪個網址、失敗了記哪一行日誌」。
 //!
-//! 本檔這幾支的六支測試，兩邊原本逐字相同（連斷言帶註解都一樣），這裡只留一份。
+//! 本檔前六支測試，兩邊原本逐字相同（連斷言帶註解都一樣），這裡只留一份；
+//! 另外兩支不是這種逐字重複：`the_shipped_updater_endpoint_matches_latest_json`
+//! 是兩平台各自 endpoint 釘住測試的合併版（見下方「出貨設定的單一來源」），
+//! `the_shipped_identifier_and_product_name_are_the_ones_users_already_have`
+//! 是新補的一條——identifier／產品名是與既有安裝之間的相容契約，這裡把出貨
+//! 設定裡的絕對值直接釘住，見那條測試自己的說明。
 //!
 //! ## 出貨設定的單一來源（[`TAURI_CONF`]／[`conf_str`]／[`IDENTIFIER`]／[`PRODUCT_NAME`]）
 //!
@@ -236,17 +241,16 @@ pub fn record_manual_check(
 /// （去重靠 `set_update` 的回傳值）；「已經是最新版」在背景路完全靜默——
 /// 每 24 小時都重複同一句話只會讓活動日誌看起來像又發生了什麼事。
 ///
-/// 回傳這一輪查到的東西，讓呼叫端自己接著判斷（Windows 的安裝版車道要看是不是
-/// 手上那個 `Found::Installed` 才順手觸發下載，那個判斷留在呼叫端）。
-pub fn record_background_check(
-    st: &Shared,
-    found: Result<Option<UpdateInfo>, String>,
-) -> Option<UpdateInfo> {
+/// 不回傳查到的東西：兩個呼叫端後續要不要順手觸發下載，看的都是自己手上還
+/// 留著的那份原始查詢結果（Windows 是 `check_lane` 回的 `Found`，帶著下載要用
+/// 的 `Update` 物件），不是這裡記帳完才拿得到的 `Option<UpdateInfo>`——那份物件
+/// 收窄成 `Option<UpdateInfo>` 就沒了，見本節開頭的說明。
+pub fn record_background_check(st: &Shared, found: Result<Option<UpdateInfo>, String>) {
     let found = match found {
         Ok(found) => found,
         Err(e) => {
             st.log(format!("update check failed: {e}"));
-            return None;
+            return;
         }
     };
     if st.set_update(found.clone()) {
@@ -254,7 +258,6 @@ pub fn record_background_check(
             st.log(format!("update available: v{}", u.version));
         }
     }
-    found
 }
 
 // ---------------------------------------------------------------- 出貨設定
@@ -380,5 +383,27 @@ mod tests {
         assert!(!parsed.pubkey.is_empty(), "沒有公鑰就驗不了簽章");
         assert_eq!(parsed.endpoints.len(), 1);
         assert_eq!(parsed.endpoints[0].as_str(), LATEST_JSON);
+    }
+
+    /// identifier 與產品名是與既有安裝之間的相容契約，不是隨便什麼字串都行。
+    ///
+    /// C17 把兩者從各平台各自的來源（Windows 讀 tauri.conf.json、macOS 原本是
+    /// 一份寫死的字面常數）收成這裡共用的一份之後，`the_shipped_updater_endpoint_matches_latest_json`
+    /// 只驗 `/plugins/updater` 那一段，而 macOS 的 `registry_path` 在
+    /// `cfg(test)` 下一律早早回 `None`（碰不到 `IDENTIFIER`），Windows 那兩條
+    /// 既有測試（`the_staging_dir_matches_tauris_own`／
+    /// `the_instance_probe_uses_the_plugins_own_mutex_name`）比對的又只是
+    /// `IDENTIFIER` 跟自己（同義反覆，改了照樣過），於是整個 repo 沒有任何一條
+    /// 測試釘住「tauri.conf.json 的 identifier／productName 到底等不等於使用者
+    /// 電腦上已經有的那份」——這裡補上。
+    ///
+    /// 改掉這兩個值不是「重新命名」那麼單純：macOS 的 `pgids` 登記簿資料夾、
+    /// Windows 的暫存區資料夾、single-instance 具名互斥鎖、通知 AUMID、NSIS
+    /// 解除安裝機碼全部以它們定位，換掉的話既有使用者的這些東西全部靜默失聯
+    /// ——不是這次更新失敗，是連「有更新」這件事都不會再發生。
+    #[test]
+    fn the_shipped_identifier_and_product_name_are_the_ones_users_already_have() {
+        assert_eq!(*IDENTIFIER, "com.traytunnel.desktop");
+        assert_eq!(*PRODUCT_NAME, "traytunnel");
     }
 }
