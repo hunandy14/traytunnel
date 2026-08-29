@@ -353,27 +353,67 @@ pub(super) fn kill_group(pgid: i32) {
     }
 }
 
-/// 問 `ps` 這個行程群組裡現在有哪些行程，回它們各自的命令列。
+/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成「pgid → 這一組裡每一支的
+/// 命令列」。純函式，`ps` 的實際執行在 [`commands_by_pgid`]。
 ///
-/// `-g` 收的是行程群組 id，`-ww` 關掉「照終端機寬度截斷」的預設行為（截斷會
-/// 讓命令列比對無謂地失手）。用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者
-/// 要解一份 Apple 沒有公開穩定文件的核心緩衝格式，還得整段 unsafe，而這條路
-/// 一輩子只在啟動時跑一次、每個殘留 pgid 一次，完全不在乎那一次 fork/exec。
-fn group_commands(pgid: i32) -> Vec<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-g"])
-        .arg(pgid.to_string())
-        .output();
-    match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
+/// 每一行的形狀固定是「pid、pgid、命令列」，前兩欄是**靠右對齊、寬度不定**的
+/// 數字（欄與欄之間可能有好幾個空白），第三欄開始整個都是命令，而命令本身含
+/// 空白。所以是「切掉前兩個欄位、剩下的整段就是命令」，不可以
+/// `split_whitespace` 全切開再用單一空白拼回去——那樣會把命令列裡連續的空白
+/// 壓掉，`ps -o command=` 印的是什麼就不再是什麼，而 [`commands_match`] 是逐字
+/// 前綴比對，壓掉就對不上了。解不開的行（`ps` 哪天多印了什麼）整行跳過，
+/// 不要瞎猜。
+fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<String>> {
+    /// 切掉開頭的空白與第一個欄位，回 (那個欄位, 剩下的整段)。
+    fn split_first_field(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        let end = s.find(char::is_whitespace)?;
+        Some((&s[..end], &s[end..]))
+    }
+
+    let mut table: std::collections::HashMap<i32, Vec<String>> = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        // 第一欄是 pid，這裡用不到（比對只看命令列），但一定要切掉才輪得到 pgid
+        let Some((_pid, rest)) = split_first_field(line) else {
+            continue;
+        };
+        let Some((pgid, command)) = split_first_field(rest) else {
+            continue;
+        };
+        let Ok(pgid) = pgid.parse::<i32>() else {
+            continue;
+        };
+        // 只去頭尾：命令列**內部**的空白原樣留著
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        table.entry(pgid).or_default().push(command.to_string());
+    }
+    table
+}
+
+/// 問 `ps` 一次，把系統上每一個行程按 pgid 分好組。
+///
+/// **一次就好**。這條路的呼叫端只有 [`sweep_leftovers`]，而它要問的是登記簿裡
+/// 每一筆 pgid「這一組現在有誰」——原本是逐筆 `ps -g <pgid>`，登記簿有 N 筆就
+/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建
+/// 成 `HashMap` 完全等價，而且是啟動路徑上唯一一次外部程序。
+///
+/// `-ww` 一定要在：它關掉「照終端機寬度截斷」的預設行為，截斷會讓命令列比對
+/// 無謂地失手——[`commands_match`] 只認一個方向（`ps` 至少要印出我們登記的
+/// 那一整行）正是建立在「不會截斷」這個前提上。
+///
+/// 用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者要解一份 Apple 沒有公開穩定
+/// 文件的核心緩衝格式，還得整段 unsafe，而這條路一輩子只在啟動時跑這一次。
+fn commands_by_pgid() -> std::collections::HashMap<i32, Vec<String>> {
+    match std::process::Command::new("ps").args(["-axww", "-o", "pid=,pgid=,command="]).output() {
+        Ok(out) => parse_ps_pgid_table(&String::from_utf8_lossy(&out.stdout)),
         Err(e) => {
-            log::warn!("could not ask ps about process group {pgid}: {e}");
-            Vec::new()
+            log::warn!("could not ask ps about the running process groups: {e}");
+            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺。
+            // 方向是漏殺不是誤殺，與整個模組的原則一致
+            std::collections::HashMap::new()
         }
     }
 }
@@ -467,7 +507,11 @@ pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let reg = read_at(&path);
-    let plan = plan_sweep(&reg, &mut owner_still_running, &mut group_commands);
+    // 一次把全表拿回來，登記簿有幾筆都只問 `ps` 這一次（見 `commands_by_pgid`）
+    let by_pgid = commands_by_pgid();
+    let plan = plan_sweep(&reg, &mut owner_still_running, &mut |pgid| {
+        by_pgid.get(&pgid).cloned().unwrap_or_default()
+    });
     for pgid in &plan.doomed {
         log::warn!(
             "killing a process group left behind by a previous run (pgid {pgid}); the last run \
@@ -841,6 +885,49 @@ mod tests {
 
         // 沒有參數的情況也要是乾淨的一個 token，不要留下尾隨空白
         assert_eq!(command_line(&std::process::Command::new("ssh")), "ssh");
+    }
+
+    /// `ps -axww -o pid=,pgid=,command=` 的輸出要按 pgid 分好組，而且命令列
+    /// 必須**原樣**保留（含裡面的連續空白）——`commands_match` 是逐字前綴比對，
+    /// 把空白壓掉就再也對不上我們登記的那一行。
+    #[test]
+    fn the_ps_table_groups_commands_by_pgid() {
+        // 前兩欄靠右對齊、寬度不定，這是 `ps -o pid=,pgid=` 真的會印出來的樣子
+        let out = "    1     1 /sbin/launchd\n\
+                   \x20 900   900 ssh -N  -L 1080:127.0.0.1:1080 bob@a\n\
+                   \x209001   900 cloudflared access ssh --hostname a\n\
+                   \x209100  9100 /usr/libexec/some-daemon --serve\n";
+        let table = parse_ps_pgid_table(out);
+
+        assert_eq!(
+            table.get(&900).map(Vec::as_slice),
+            Some(
+                &[
+                    "ssh -N  -L 1080:127.0.0.1:1080 bob@a".to_string(),
+                    "cloudflared access ssh --hostname a".to_string(),
+                ][..]
+            ),
+            "同一個 pgid 的兩支（ssh 與它 ProxyCommand 生的孫程序）要收在一起，\
+             而且 `ssh -N  -L` 中間那兩個空白不可以被壓成一個"
+        );
+        assert_eq!(table.get(&9100).map(Vec::len), Some(1));
+        assert_eq!(table.get(&12345), None, "沒出現過的 pgid 就是沒有");
+
+        // 解不開的行整行跳過，不要瞎猜也不要炸掉
+        assert!(parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n").is_empty());
+    }
+
+    /// 這台機器上真的跑一次 `ps`，確認上面那支解析器吃的格式沒有猜錯：
+    /// **本行程自己**一定要出現在自己的 pgid 底下。純唯讀查詢，不動任何東西。
+    #[test]
+    fn the_ps_table_can_find_this_very_process() {
+        let table = commands_by_pgid();
+        let me = std::process::id() as i32;
+        let my_pgid = unsafe { libc::getpgid(me) };
+        assert!(
+            table.contains_key(&my_pgid),
+            "ps 的全表裡找不到本行程自己的 pgid {my_pgid}——解析器跟真實輸出對不上了"
+        );
     }
 
     /// 登記簿的資料夾名就是 tauri.conf.json 的 identifier。寫死一份字串是為了
