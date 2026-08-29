@@ -49,10 +49,7 @@ fn is_tray_start() -> bool {
 /// 閃一下」，讓 AppKit 先吃到 policy 變更、視窗操作晚一步跟上，比兩者
 /// 同一瞬間做完更穩。
 fn show_main(app: &AppHandle) {
-    #[cfg(target_os = "macos")]
-    if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
-        log::warn!("could not switch to the Regular activation policy: {e}");
-    }
+    platform::enter_foreground(app);
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
         let _ = w.show();
         let _ = w.unminimize();
@@ -199,10 +196,7 @@ fn hide_to_tray(state: &Shared) {
     }
     // 視窗收起來就回 Accessory：Dock 圖示與選單列跟著消失，回到純系統匣常駐
     // 的樣子，跟 show_main 的 Regular 對稱。
-    #[cfg(target_os = "macos")]
-    if let Err(e) = state.app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
-        log::warn!("could not switch to the Accessory activation policy: {e}");
-    }
+    platform::retire_to_tray(&state.app);
     if state.take_tray_hint() {
         balloon(&state.app, "Closed to tray, still running. Double-click the tray icon to reopen.");
     }
@@ -378,9 +372,9 @@ pub fn run() {
             // 純 tray 常駐：不要 Dock 圖示、不要出現在 Cmd+Tab 切換器。traytunnel
             // 是系統匣工具，沒有「一般 App」該有的存在感（對應 Windows 沒有工作列
             // 圖示、只在系統匣的既有行為）。要趁還沒建視窗、建系統匣之前定調，
-            // 免得使用者先看到一閃而過的 Dock 圖示。
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // 免得使用者先看到一閃而過的 Dock 圖示。Windows 是 no-op（見
+            // `platform::initial_policy_for_tray_start` 的門面說明）。
+            platform::initial_policy_for_tray_start(app.handle());
 
             let handle = app.handle().clone();
             // 通知掛名要在任何 UI／toast 之前處理掉

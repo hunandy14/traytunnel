@@ -95,6 +95,28 @@ pub use imp::reveal_in_file_manager;
 #[cfg(target_os = "macos")]
 pub use imp::{build_menu, MENU_QUIT_ID};
 
+// ---------------------------------------------------------------- Activation policy
+//
+// 「前景／背景」語意（Dock 圖示、選單列、Cmd+Tab 切換器要不要跟著視窗一起
+// 出現／消失）只有 macOS 有——但跟上面 `build_menu` 那組不對稱門面不同，這裡
+// 兩邊都湊了同名同簽章的項目：Windows 側直接是三支 no-op（工作列圖示本來就是
+// 系統內建，沒有東西可切），讓 `lib.rs` 的呼叫端（`show_main`／`hide_to_tray`／
+// `setup`）不必為了平台差異各自包一段 `#[cfg(target_os = "macos")]`。macOS
+// 側的實作在 `platform::macos::policy`（該模組說明有解釋為什麼這裡跟
+// `build_menu` 走不同的門面風格）。
+#[cfg(target_os = "macos")]
+pub use imp::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
+
+/// Windows 沒有 activation policy 這回事，no-op。
+#[cfg(windows)]
+pub fn enter_foreground(_app: &tauri::AppHandle) {}
+/// Windows 沒有 activation policy 這回事，no-op。
+#[cfg(windows)]
+pub fn retire_to_tray(_app: &tauri::AppHandle) {}
+/// Windows 沒有 activation policy 這回事，no-op。
+#[cfg(windows)]
+pub fn initial_policy_for_tray_start(_app: &tauri::AppHandle) {}
+
 // ---------------------------------------------------------------- 介面契約測試
 //
 // W3-A：`is_listening` 與 `ProcessSupervisor` 的跨平台不變量。掛在門面這一層而

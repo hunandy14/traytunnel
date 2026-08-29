@@ -21,16 +21,23 @@
 //!
 //! 視窗風格車道也已落地：`menu`（App／Edit／Window 標準選單，`build_menu`／
 //! `MENU_QUIT_ID` 進了門面）。這是刻意**不對稱**的門面項目——Windows 沒有
-//! 「activation policy」「app 選單列」這兩個概念，門面上這兩行整段
-//! `#[cfg(target_os = "macos")]`，Windows 編譯時連符號都不存在，不必湊一份
-//! 假的 Windows 實作。動態 activation policy（Accessory／Regular 切換）
-//! 直接呼叫 tauri 的 `AppHandle::set_activation_policy`，屬於一行等級的
-//! 外部 API 呼叫，跟既有的初始 policy 設定同一種寫法，留在 `lib.rs` 裡
-//! `#[cfg(target_os = "macos")]` 內聯，沒有另外進這裡。
+//! 「app 選單列」這個概念，門面上這兩行整段 `#[cfg(target_os = "macos")]`，
+//! Windows 編譯時連符號都不存在，不必湊一份假的 Windows 實作。
+//!
+//! 動態 activation policy（Accessory／Regular 切換）原本也是同一種寫法——
+//! 直接在 `lib.rs` 裡 `#[cfg(target_os = "macos")]` 內聯呼叫
+//! `AppHandle::set_activation_policy`——R3 車道改觀點：`lib.rs` 有三處
+//! （`show_main`／`hide_to_tray`／`setup`）各自散一段幾乎一樣的 cfg 區塊，
+//! 值得比照 `menu` 進一層門面收攏，見 `policy` 子模組的
+//! `enter_foreground`／`retire_to_tray`／`initial_policy_for_tray_start`。
+//! 這三支門面項目**不是**不對稱設計——Windows 側直接在 `platform::mod` 補
+//! 三支 no-op（而不是進 `platform/windows` 湊一份假實作），讓 `lib.rs`
+//! 呼叫端完全不必知道平台差異，三個 cfg 區塊因此消失。
 
 mod menu;
 mod notify;
 mod paths;
+mod policy;
 mod spawn;
 mod sys;
 pub mod update;
@@ -38,6 +45,7 @@ pub mod update;
 pub use menu::{build as build_menu, QUIT_ID as MENU_QUIT_ID};
 pub use notify::{prepare_notifications, show_notification};
 pub use paths::{exe_toml_marks_portable, home_dir, stem_marks_portable};
+pub use policy::{enter_foreground, initial_policy_for_tray_start, retire_to_tray};
 pub use spawn::ProcessSupervisor;
 pub use sys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
