@@ -355,13 +355,27 @@ jobs:
             exit 1
           fi
 
-      # SHA256SUMS.txt 的底稿，道理和上面 latest.json 一樣——但網址刻意不是
-      # releases/latest：SHA256SUMS.txt 沒有 latest.json 那種「manifest 只有
-      # 一個全域 version」的先天限制，不需要靠 releases/latest 對齊 updater
-      # endpoint。用浮動指標反而會在「要補腿的不是目前最新一個 release」時
-      # 抓錯底稿（例如補一個較舊 tag 的腿，releases/latest 這時指向的是更新
-      # 的另一個 tag）。這裡直接用這次已經解析好的 tag 去抓「同一個 release」
-      # 的 SHA256SUMS.txt，跟 latest.json 的底稿保證來自同一個 release。
+      # SHA256SUMS.txt 的底稿，取得方式刻意跟上面 latest.json 不同源，而且
+      # 兩者「應該」不同源——這不是疏漏，改成同源反而會把這次修的 bug 重新
+      # 引入，理由如下：
+      #
+      # SHA256SUMS.txt 是「每個 release 各一份」的產物，跟這次要發佈的 tag
+      # 是一對一的關係，所以底稿網址直接用這次已解析好的 tag（見下面
+      # `tag=`），對應到「這個 release 自己過去的內容」。latest.json 則相反：
+      # 它是整個 repo 唯一一份、releases/latest/download/latest.json 這個
+      # 固定 endpoint，updater 只認這一份，跟「這次是哪個 tag」無關，底稿
+      # 因此固定抓 releases/latest（見上一步）。
+      #
+      # 兩者補腿到「目前最新的那個 tag」時剛好同源（這次的 tag 就是
+      # releases/latest 指向的 release），但補腿到「不是目前最新」的較舊
+      # tag 時會刻意分岔：SHA256SUMS.txt 底稿仍然抓那個較舊 tag 自己的內容
+      # （正確——這個 release 自己的 checksum 清單不該被別的 release 污染），
+      # latest.json 底稿仍然抓 releases/latest（正確——它只有一份，永遠反映
+      # 目前真正最新的那個 release，不會因為我們在補一個舊 tag 的腿就跟著
+      # 指去那個舊 tag）。這個分岔是正確設計，不要為了「兩份底稿看起來要
+      # 一致」而把 SHA256SUMS.txt 的網址也改成 releases/latest——那樣做會在
+      # 「補腿的不是目前最新一個 release」時，把另一個（更新的）release 的
+      # SHA256SUMS.txt 錯當底稿，等於重新引入這次要修的致命 bug。
       #
       # 404／暫時性失敗的分野與 latest.json 那步完全一樣：真的沒有（首發，
       # 或這次是全新版本、這個 tag 底下還沒發過任何一腿）才視為空底稿；其餘

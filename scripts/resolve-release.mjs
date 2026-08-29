@@ -1,12 +1,12 @@
 /**
  * 解析這次 release 要用的版本號與 tag，寫進 GITHUB_OUTPUT。
  *
- * 給 release.yml 的 macOS 建置腿與 compose job 用（兩者都是 bash shell，
- * 用同一支腳本避免各自手刻一份 bash 版本、日後改壞其中一處卻沒改到另一處）。
- *
- * Windows 建置腿刻意*不*改用這支腳本——那段 PowerShell 是既有、已跑過
- * 正式發佈驗證過的程式碼，這次只在裡面插入 dry_run 略過檢查的分支，
- * 語意不變、改動範圍壓到最低，沒有理由連它一起重寫。
+ * 唯一呼叫端是 release.yml 的 plan job（見該 job 的 Resolve release version
+ * and tag 步驟）：版本／tag 只在 plan 解析一次，build（Windows／macOS 兩腿）
+ * 與 compose 都直接吃 plan 的 job outputs（needs.plan.outputs.version /
+ * release_tag），不再各自重跑一次解析——過去 build job 的 Windows 腿（pwsh
+ * 手刻翻版）、macOS 腿、compose job 三處各自呼叫一次同一套邏輯的作法已經
+ * 拿掉，避免三份同步改壞其中一處卻沒改到另外兩處的風險。
  *
  * 環境變數（GITHUB_EVENT_NAME / GITHUB_REF_NAME / GITHUB_OUTPUT 由 Actions 自動提供）：
  *   GITHUB_EVENT_NAME  tag push 事件是 "push"，其餘（workflow_dispatch）視為手動觸發
