@@ -210,44 +210,42 @@ jobs:
       # 的動作，這兩顆檔案就會分岔，簽章也就簽不到真正要發布的那顆，而且
       # 沒有這關卡的話 CI 完全抓不到。這裡用 SHA256 比對兩者，不一致就讓
       # CI 紅。
-      - name: Verify updater signature matches release asset (windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $version = "${{ needs.plan.outputs.version }}"
-          $bundleSetup = "src-tauri/target/release/bundle/nsis/traytunnel_${version}_x64-setup.exe"
-          $releaseSetup = "out/traytunnel-$version-setup.exe"
-
-          $bundleHash = (Get-FileHash -Path $bundleSetup -Algorithm SHA256).Hash
-          $releaseHash = (Get-FileHash -Path $releaseSetup -Algorithm SHA256).Hash
-          if ($bundleHash -ne $releaseHash) {
-            Write-Error "簽章不一致：$releaseSetup（SHA256 $releaseHash）與簽章實際簽的 $bundleSetup（SHA256 $bundleHash）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
-            exit 1
-          }
-          Write-Host "簽章一致性確認：$releaseSetup 與 $bundleSetup 的 SHA256 相同（$releaseHash）"
-
-      # 同一個防呆，macOS 版本：比對 out/ 的 .app.tar.gz 與 bundle/macos 底下
-      # minisign 實際簽的那顆是否位元組相同。dmg 不是 updater 產物、latest.json
-      # 不會提到它，不必比對。
-      - name: Verify updater signature matches release asset (macos)
-        if: matrix.os != 'windows-latest'
+      #
+      # 過去 Windows／macOS 各寫一份（pwsh 用 Get-FileHash、bash 用
+      # shasum），程式邏輯完全對稱，只是語言不同——兩份要同步改的風險，
+      # 加上 bundle/release 檔名各自手寫一份 traytunnel-<version>-...。
+      # windows-latest 的 `shell: bash` 走 Git Bash，一樣有 sha256sum／
+      # shasum 可用，兩腿因此能共用同一支腳本；bundle_source／asset 改讀
+      # scripts/package.mjs 產出的 out/manifest.<platform_key>.json（見
+      # scripts/lib/manifest.mjs），不再手寫檔名——跟 compose job 讀同一份
+      # manifest，是同一組檔名的單一來源。
+      - name: Verify updater signature matches release asset
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.plan.outputs.version }}"
-          # 檔名跟的是 tauri.macos.conf.json 的 productName "Traytunnel"（首字大寫）；
-          # out/ 那顆是 scripts/package.mjs 刻意改名回小寫的發佈檔名，兩者不同一份，
-          # 這正是這關要比對的東西
-          bundle_tar="src-tauri/target/release/bundle/macos/Traytunnel.app.tar.gz"
-          release_tar="out/traytunnel-${version}-aarch64.app.tar.gz"
+          platform_key="${{ matrix.platform_key }}"
+          bundle_source="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${platform_key}" --field bundle_source)"
+          asset="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${platform_key}" --field asset)"
+          release_asset="out/${asset}"
 
-          bundle_hash=$(shasum -a 256 "$bundle_tar" | awk '{print $1}')
-          release_hash=$(shasum -a 256 "$release_tar" | awk '{print $1}')
-          if [ "$bundle_hash" != "$release_hash" ]; then
-            echo "::error::簽章不一致：${release_tar}（SHA256 ${release_hash}）與簽章實際簽的 ${bundle_tar}（SHA256 ${bundle_hash}）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
+          # 優先用 sha256sum（確認存在於 windows-latest 的 Git Bash）；macOS
+          # runner 不保證有 sha256sum，退回內建的 shasum -a 256。兩者輸出格式
+          # 一致（雜湊 空白 檔名），都用 awk 取第一欄。
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+
+          bundle_hash="$(hash_file "${bundle_source}")"
+          release_hash="$(hash_file "${release_asset}")"
+          if [ "${bundle_hash}" != "${release_hash}" ]; then
+            echo "::error::簽章不一致：${release_asset}（SHA256 ${release_hash}）與簽章實際簽的 ${bundle_source}（SHA256 ${bundle_hash}）內容不同，latest.json 的 signature 會對不上要發布的檔案，中止發布"
             exit 1
           fi
-          echo "簽章一致性確認：${release_tar} 與 ${bundle_tar} 的 SHA256 相同（${release_hash}）"
+          echo "簽章一致性確認：${release_asset} 與 ${bundle_source} 的 SHA256 相同（${release_hash}）"
 
       # out/ 整包（含 package.mjs 順手複製進去的 .sig）交給 compose job：
       # latest.json 要合併雙平台，勢必得先把兩腿的產物集中到同一個 job。
