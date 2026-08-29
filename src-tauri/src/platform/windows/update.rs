@@ -869,7 +869,7 @@ mod tests {
     fn the_release_workflow_manifest_still_deserializes() {
         let raw = r#"{
             "version": "0.5.0",
-            "pub_date": "2026-08-22T09:41:07.1234567Z",
+            "pub_date": "2026-08-22T09:41:07.000Z",
             "platforms": {
                 "windows-x86_64": {
                     "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZQo=",
