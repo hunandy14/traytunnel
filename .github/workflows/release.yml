@@ -417,14 +417,18 @@ jobs:
 
       # 要餵給 compose-latest-json.mjs 的平台清單，直接來自 plan job 算出來的
       # build matrix（needs.plan.outputs.platform_keys），不是「out/ 底下剛好
-      # 有哪些 .sig」。
+      # 有哪些 manifest／.sig」。
       #
       # 差別很要命：用「檔案在不在」推導的話，簽章因為任何原因沒被產出／沒被
       # 複製進 out/ 時，該平台會被靜默跳過，latest.json 於是沿用底稿的舊條目，
       # 整條流程全綠——使用者拿到的是上一版的簽章配新版的 url，更新直接壞掉，
-      # 而且沒有任何訊號。所以這裡反過來：這次矩陣說要建的平台，簽章就必須在，
-      # 缺一個就中止（fail-closed）。底稿沿用只保留給「這次根本沒排進矩陣」的
-      # 平台，那才是單平台可控發佈的本意。
+      # 而且沒有任何訊號。所以這裡反過來：這次矩陣說要建的平台，manifest 與
+      # 它指到的簽章檔就必須在，缺一個就中止（fail-closed）。底稿沿用只保留
+      # 給「這次根本沒排進矩陣」的平台，那才是單平台可控發佈的本意。
+      #
+      # 資產／簽章檔名不在這裡手寫：改讀 scripts/package.mjs 產出的
+      # out/manifest.<platform_key>.json（scripts/lib/manifest.mjs），單一
+      # 來源——package.mjs 才是真的知道「這次到底複製出了什麼檔案」的地方。
       - name: Compose merged latest.json
         shell: bash
         env:
@@ -432,12 +436,11 @@ jobs:
           ALLOW_STALE: ${{ needs.plan.outputs.allow_stale_platforms }}
         run: |
           set -euo pipefail
-          version="${{ needs.plan.outputs.version }}"
           tag="${{ needs.plan.outputs.release_tag }}"
           repo="${{ github.repository }}"
           pub_date="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
-          args=(--version "${version}" --tag "${tag}" --pub-date "${pub_date}"
+          args=(--version "${{ needs.plan.outputs.version }}" --tag "${tag}" --pub-date "${pub_date}"
                 --baseline baseline-latest.json --out out/latest.json)
           if [ "${ALLOW_STALE}" = "true" ]; then
             echo "::warning::allow_stale_platforms=true：latest.json 允許保留不屬於 ${tag} 的舊平台條目"
@@ -446,23 +449,17 @@ jobs:
 
           echo "這次應建置的平台：${EXPECTED_PLATFORMS}"
           for key in ${EXPECTED_PLATFORMS}; do
-            case "${key}" in
-              windows-x86_64)
-                sig="out/traytunnel-${version}-setup.exe.sig"
-                asset="traytunnel-${version}-setup.exe"
-                ;;
-              darwin-aarch64)
-                sig="out/traytunnel-${version}-aarch64.app.tar.gz.sig"
-                asset="traytunnel-${version}-aarch64.app.tar.gz"
-                ;;
-              *)
-                echo "::error::未知的平台 key ${key}，plan job 與 compose job 對不起來"
-                exit 1
-                ;;
-            esac
+            if [ ! -f "out/manifest.${key}.json" ]; then
+              echo "::error::這次 build matrix 排了 ${key}，但 out/manifest.${key}.json 不存在。latest.json 的 ${key} 條目無法產生，若放行會靜默沿用底稿舊簽章，因此中止。檢查該平台的建置有沒有成功、scripts/package.mjs 有沒有把已簽署產物與 .sig 複製進 out/，以及該腿的 upload/download artifact。"
+              exit 1
+            fi
+
+            asset="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${key}" --field asset)"
+            sig_name="$(node scripts/print-manifest-field.mjs --dir out --platform-key "${key}" --field sig)"
+            sig="out/${sig_name}"
 
             if [ ! -f "${sig}" ]; then
-              echo "::error::這次 build matrix 排了 ${key}，但簽章檔 ${sig} 不存在。latest.json 的 ${key} 條目無法產生，若放行會靜默沿用底稿舊簽章，因此中止。檢查 scripts/package.mjs 有沒有把 .sig 複製進 out/，以及該腿的 upload/download artifact。"
+              echo "::error::out/manifest.${key}.json 指到的簽章檔 ${sig} 不存在。latest.json 的 ${key} 條目無法產生，因此中止。"
               exit 1
             fi
 
