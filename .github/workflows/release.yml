@@ -99,15 +99,22 @@ jobs:
             allow_stale="${{ inputs.allow_stale_platforms }}"
           fi
 
+          # 每個平台的 matrix 物件只在這裡定義一次；windows／macos／all 三個
+          # case 用 jq 組合出對應的 include 陣列，不再各自手抄一份幾乎一樣的
+          # JSON 字面值（新增平台、改 rust_target 之類的欄位只要改一個地方，
+          # 不必記得三個 case 都要同步改到）。
+          windows_entry='{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"}'
+          macos_entry='{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}'
+
           case "$platform" in
             windows)
-              matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"}]}'
+              matrix="$(jq -nc --argjson w "$windows_entry" '{include:[$w]}')"
               ;;
             macos)
-              matrix='{"include":[{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              matrix="$(jq -nc --argjson m "$macos_entry" '{include:[$m]}')"
               ;;
             all)
-              matrix='{"include":[{"os":"windows-latest","platform_key":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc"},{"os":"macos-14","platform_key":"darwin-aarch64","rust_target":"aarch64-apple-darwin"}]}'
+              matrix="$(jq -nc --argjson w "$windows_entry" --argjson m "$macos_entry" '{include:[$w,$m]}')"
               ;;
             *)
               echo "::error::未知的 platform 輸入：${platform}（要 all / windows / macos 其中之一）"
