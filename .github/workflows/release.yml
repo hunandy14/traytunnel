@@ -40,8 +40,18 @@ on:
 permissions:
   contents: read
 
+# 固定常數群組（不含 github.ref）：tag push（refs/tags/vX.Y.Z）跟
+# workflow_dispatch（refs/heads/main 或任何分支）的 github.ref 本來就不同，
+# 用 github.ref 當群組鍵會讓兩者被視為不同群組、能夠平行跑。compose job 的
+# latest.json／SHA256SUMS.txt 都是「先讀現行 release 底稿、再整個覆寫」的
+# read-modify-write：兩個 run 平行跑，會各自讀到同一份底稿、各自覆寫，後
+# 完成的那個直接蓋掉先完成的合併結果，另一個 run 剛加進去的平台條目／
+# checksum 就這樣不見了——而且兩條 run 都可能全綠，沒有任何錯誤訊號。用
+# 固定字串把所有 release run（不論 tag push 或任何 workflow_dispatch）序
+# 列化到同一個群組即可徹底避免；cancel-in-progress 維持 false，讓排隊的
+# run 等前一個做完，而不是取消掉一個正在真的建置/發佈東西的 run。
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
