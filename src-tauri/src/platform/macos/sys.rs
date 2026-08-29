@@ -499,12 +499,65 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
     read_autostart_command_at(&launch_agents_dir()?, name)
 }
 
+/// App Translocation 的掛載點記號。
+///
+/// macOS（10.12 起）對「帶著隔離標記、又還沒被搬進正式位置」的 app 會做
+/// Gatekeeper 路徑隨機化：從 dmg 視窗或 `~/Downloads` 直接雙擊時，系統不是原地
+/// 執行那顆 app，而是把它掛成一份**唯讀的隨機路徑影本**再跑，`current_exe()`
+/// 於是長成
+///
+/// ```text
+/// /private/var/folders/<x>/<y>/T/AppTranslocation/<uuid>/d/Traytunnel.app/Contents/MacOS/traytunnel
+/// ```
+///
+/// 這個路徑是**這一次執行才存在的**：app 結束、掛載點消失，下次登入時它不存在。
+/// 比對整段 `/AppTranslocation/` 而不是只比 `AppTranslocation`，是為了確保比到的
+/// 是一整層路徑元件，不會被某個剛好叫 `MyAppTranslocationTool` 的資料夾騙過去。
+fn is_app_translocated(exe: &Path) -> bool {
+    exe.to_string_lossy().contains("/AppTranslocation/")
+}
+
+/// 從 App Translocation 的唯讀影本跑起來時，寫開機自啟一律拒絕，錯誤訊息直接
+/// 是給使用者看的處理方式（`commands::set_autostart` 原樣往前端送）。
+fn translocation_refusal() -> io::Error {
+    io::Error::other(
+        "Traytunnel is running from a temporary read-only copy made by macOS App Translocation, \
+         so the path it would record here no longer exists at the next login. Move Traytunnel.app \
+         into the Applications folder, open it from there, and turn this on again.",
+    )
+}
+
 /// 寫出（或覆寫）LaunchAgent plist，**下次登入生效**。
 ///
 /// 不呼叫 `launchctl load`：`RunAtLoad = true` 的 job 一被 load 就會當場再跑一次
 /// `<exe> --tray`，多開一個實例（理由整段寫在本節開頭）。覆寫檔案本身就足以更新
 /// 登記內容——launchd 是在下次登入時才讀這個資料夾的。
+///
+/// **App Translocation 底下一律拒絕寫入**（見 [`is_app_translocated`]）。呼叫端
+/// 傳進來的 `exe` 一律是 `current_exe()`，而在那個模式下它是一條這次執行才存在的
+/// 隨機掛載點路徑：寫進 plist 等於登記一個下次登入必定不存在的執行檔，開關顯示
+/// ON、實際永遠啟動不到任何東西。更糟的是自癒那條路（`lib.rs::heal_autostart`）
+/// ——使用者本來有一份指向 `/Applications` 的**好** plist，只要哪天從 dmg 直接
+/// 開一次，自癒就會「發現登記的命令跟現在的執行檔對不上」而主動把它覆寫成那條
+/// 暫時路徑，把原本好好的自啟弄壞。所以拒絕要放在這一層：`heal_autostart` 走的
+/// 也是這支函式，這一擋同時關掉手動開關與自癒兩條路，共用核心那邊不必加 cfg，
+/// 只要照原樣把錯誤往上送。
+///
+/// 為什麼不「自己還原成真正的原始路徑」：把 translocated 路徑換算回原始位置只有
+/// Security.framework 的 `SecTranslocateCreatePathForURL`／
+/// `SecTranslocateCreateOriginalPathForURL` 那一組 SPI 做得到，它們不在公開 API
+/// 裡；而且就算換算得回來，那個位置（`~/Downloads`、dmg 掛載點）本來就不是 app
+/// 該長住的地方。老實回一句「請先搬進應用程式資料夾」才是對的答案，README 的
+/// 安裝說明講的也是同一件事。
 pub fn enable_autostart(name: &str, exe: &Path) -> io::Result<()> {
+    if is_app_translocated(exe) {
+        log::warn!(
+            "refusing to write the login item: this run is an App Translocation copy ({}), \
+             the path would not exist at the next login",
+            exe.display()
+        );
+        return Err(translocation_refusal());
+    }
     let dir = launch_agents_dir()
         .ok_or_else(|| io::Error::other("could not resolve $HOME for ~/Library/LaunchAgents"))?;
     write_autostart_plist_at(&dir, name, exe).map(|_| ())
@@ -763,6 +816,48 @@ mod tests {
     fn read_program_arguments_is_none_for_unrelated_content() {
         assert_eq!(read_program_arguments("<plist></plist>"), None);
         assert_eq!(read_program_arguments(""), None);
+    }
+
+    /// App Translocation 的偵測：路徑裡有整整一層 `AppTranslocation` 才算，
+    /// 名字裡剛好含這個字串的一般資料夾不算。
+    #[test]
+    fn app_translocation_paths_are_recognised() {
+        assert!(is_app_translocated(Path::new(
+            "/private/var/folders/9x/abc/T/AppTranslocation/8B1F-4/d/Traytunnel.app/Contents/MacOS/traytunnel"
+        )));
+
+        assert!(!is_app_translocated(Path::new(
+            "/Applications/Traytunnel.app/Contents/MacOS/traytunnel"
+        )));
+        assert!(
+            !is_app_translocated(Path::new("/Users/bob/AppTranslocationNotes/traytunnel")),
+            "只是名字裡含這個字串的資料夾不是掛載點"
+        );
+        assert!(!is_app_translocated(Path::new(
+            "/Users/bob/dev/traytunnel/target/debug/traytunnel"
+        )));
+    }
+
+    /// 從 App Translocation 的唯讀影本跑起來時，`enable_autostart` 一定要拒絕：
+    /// 那條路徑下次登入不存在，寫進去等於「開關顯示 ON、其實永遠啟動不到」。
+    /// 自癒（`lib.rs::heal_autostart`）走的也是這支函式，因此同一擋也讓它不會把
+    /// 使用者原本指向 /Applications 的好 plist 覆寫掉。
+    ///
+    /// 這一條不碰檔案系統：拒絕發生在解析 `~/Library/LaunchAgents` 之前，
+    /// 所以就算 `$HOME` 是真的家目錄也不會寫出任何東西。
+    #[test]
+    fn autostart_is_refused_under_app_translocation() {
+        let translocated = Path::new(
+            "/private/var/folders/9x/abc/T/AppTranslocation/8B1F-4/d/Traytunnel.app/Contents/MacOS/traytunnel",
+        );
+        let err = enable_autostart("traytunnel-test-translocation", translocated)
+            .expect_err("App Translocation 底下必須拒絕寫入");
+        let msg = err.to_string();
+        assert!(msg.contains("App Translocation"), "訊息要說得出原因：{msg}");
+        assert!(
+            msg.contains("Applications folder"),
+            "訊息要直接告訴使用者怎麼處理（搬進應用程式資料夾）：{msg}"
+        );
     }
 
     /// 檔案存在就選中它本身；不存在就退而開啟上層資料夾；

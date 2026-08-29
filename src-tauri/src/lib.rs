@@ -401,6 +401,12 @@ fn close_main(state: &Shared) {
 /// 開機自啟自癒：登記的那一行命令未指向目前執行檔時，於啟動時重寫一次。
 /// 涵蓋路徑失效與非本程式寫入的殘留格式——這兩種情況下 toggle 都會顯示 ON，
 /// 實際卻啟動不到這支程式。
+///
+/// 「目前執行檔的路徑本身就不該被登記」這一格由 `platform::enable_autostart`
+/// 自己擋（macOS 的 App Translocation：從 dmg／`~/Downloads` 直接開啟時
+/// `current_exe()` 是一條這次執行才存在的隨機掛載點路徑，覆寫進去等於把使用者
+/// 原本好好的自啟弄壞）。這裡刻意不重複那道判斷、也不加任何平台 cfg：拒絕會以
+/// `Err` 回來，走下面既有的「refresh failed」那一支，訊息原樣進活動日誌。
 fn heal_autostart(app: &AppHandle, state: &Shared) {
     let name = state::autostart_name(app);
     if !platform::autostart_enabled(&name) {
