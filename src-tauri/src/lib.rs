@@ -190,6 +190,20 @@ fn balloon(app: &AppHandle, body: &str) {
     platform::show_notification(&app.config().identifier, "Traytunnel", body);
 }
 
+/// 通知裡「怎麼重新打開視窗」那句尾巴，平台各自的滑鼠慣例不同：Windows 維持
+/// 雙擊圖示的既有語意不動；macOS 沒有雙擊（D4 決議：左右鍵一律開選單，見
+/// `build_tray` 的 cfg 分支），改指向選單裡的「Open window」項
+/// （`traymenu::ID_OPEN` 的標籤）。
+#[cfg(windows)]
+const REOPEN_HINT: &str = "Double-click the tray icon to reopen.";
+#[cfg(target_os = "macos")]
+const REOPEN_HINT: &str = "Choose \"Open window\" from the tray icon's menu to reopen.";
+
+#[cfg(windows)]
+const OPEN_HINT: &str = "Double-click the tray icon to open.";
+#[cfg(target_os = "macos")]
+const OPEN_HINT: &str = "Choose \"Open window\" from the tray icon's menu to open.";
+
 fn hide_to_tray(state: &Shared) {
     if let Some(w) = state.app.get_webview_window(MAIN_WINDOW) {
         let _ = w.hide();
@@ -198,7 +212,7 @@ fn hide_to_tray(state: &Shared) {
     // 的樣子，跟 show_main 的 Regular 對稱。
     platform::retire_to_tray(&state.app);
     if state.take_tray_hint() {
-        balloon(&state.app, "Closed to tray, still running. Double-click the tray icon to reopen.");
+        balloon(&state.app, &format!("Closed to tray, still running. {REOPEN_HINT}"));
     }
 }
 
@@ -514,7 +528,7 @@ pub fn run() {
                 // 這條路徑自己已經彈過一顆通知，順帶把「關到系統匣」那顆一次性
                 // 提示領掉，避免使用者第一次按 X 時再被通知一次
                 let _ = shared.take_tray_hint();
-                balloon(&handle, "Started in the system tray. Double-click the tray icon to open.");
+                balloon(&handle, &format!("Started in the system tray. {OPEN_HINT}"));
             } else {
                 show_main(&handle);
             }
