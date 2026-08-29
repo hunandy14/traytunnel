@@ -79,3 +79,28 @@ cargo test --lib -- --ignored --nocapture live_autostart
 的登記項），但 assert 失敗仍可能跳過收尾——這正是這類測試不准留在預設測試輪的
 理由，見 `src-tauri/src/wg_live_tests.rs`、`src-tauri/src/platform/macos/sys.rs`
 的 `live_autostart_round_trips_through_launchd`。
+
+## 驗 UI 一定要用 `tauri build` 的產物（白屏最常見的假警報）
+
+`cargo build` 產出的執行檔**不會內嵌前端**，它載的是 `tauri.conf.json` 的
+`build.devUrl`（`http://localhost:1420`）。單獨把它跑起來、旁邊沒有
+`npm run dev`，視窗會照常開出來、macOS 的紅綠燈也照常畫，但 webview 內容
+是完全空白的一片白——**這是 dev 產物的正常行為，不是 app 的 bug**。
+README 的「建置」章節本來就寫了這件事，這裡再記一次是因為它在 macOS 上
+特別容易被誤判成視窗風格或 activation policy 的問題（實際量測：`cargo build`
+的執行檔單獨啟動 17/17 全白；`tauri build` 的 `.app` 70/70 全部正常）。
+
+驗 macOS UI 只有兩條路：`npm run tauri dev`（Vite 在跑），或
+`npx tauri build [--debug] --bundles app` 之後跑 `.app` 裡的執行檔。
+
+分辨方法不必再靠截圖猜，日誌第一段就有（見 `lib.rs` 的 `watch_first_page_load`）：
+
+```
+main webview url: tauri://localhost        <- tauri build 的產物，內嵌前端
+main webview url: http://localhost:1420/   <- cargo build 的產物，要 Vite 才有畫面
+```
+
+真的載不到時五秒後還會多一行 `the main webview has not finished loading ...`
+的 warn。使用者回報白屏時，`traytunnel.log` 要先看這兩行，再看
+`webview content process terminated`（那是另一條成因，見 `lib.rs` 的
+`on_web_content_process_terminate`）。

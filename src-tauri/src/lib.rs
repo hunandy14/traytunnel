@@ -60,6 +60,52 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+// ------------------------------------------------- 白屏診斷（macOS）
+//
+// 白屏這個症狀在日誌裡本來完全沒有痕跡：視窗開出來、紅綠燈畫得好好的，只有
+// webview 內容是一片白，Rust 這一側從頭到尾不會有任何一行不對勁。追這個症狀
+// 已經耗掉三輪（#62 的 vite base、#63 的 content process 自癒），每一輪都卡在
+// 同一件事上——**沒有辦法從日誌分辨「前端根本沒載進來」與「載進來但沒畫出來」**。
+//
+// 下面兩樣東西只寫日誌，不改任何行為，目的就是把這條分界線畫進 traytunnel.log：
+//
+// 1. 啟動時記一行 webview 實際的 URL。`tauri build` 產出的正式版一定是
+//    `tauri://localhost`（內嵌前端）；直接 `cargo build` 產出的執行檔則是
+//    `http://localhost:1420`（`build.devUrl`），單獨執行時 Vite 沒在跑，畫面
+//    **必然**一片白。README「建置」章節寫了這件事，但日誌看不出來，於是每次
+//    有人拿 `cargo build` 的執行檔驗 UI 就會重新踩一次。
+// 2. 寬限時間內沒有任何一次 page load 完成就記一行 warn，並把 URL 一起帶上。
+//    涵蓋上面那條 dev 路徑，也涵蓋正式版自訂協定真的取不到資源的情形。
+//
+// 與底下 `on_web_content_process_terminate` 的 warn 是同一套思路：使用者再回報
+// 白屏時，traytunnel.log 要能一行定位是哪一種成因。
+#[cfg(target_os = "macos")]
+static PAGE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 前端載入的寬限時間。正式版走的是本機自訂協定、dev 走的是本機 http，兩邊
+/// 都遠遠用不到這麼久；訂得寬是為了讓那行 warn 只在真的載不到時才出現。
+#[cfg(target_os = "macos")]
+const PAGE_LOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 記下主 webview 的來源，並在寬限時間後複查一次有沒有真的載完。
+#[cfg(target_os = "macos")]
+fn watch_first_page_load<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
+    let url = win.url().map(|u| u.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+    log::info!("main webview url: {url}");
+    std::thread::spawn(move || {
+        std::thread::sleep(PAGE_LOAD_GRACE);
+        if PAGE_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        log::warn!(
+            "the main webview has not finished loading {url} after {}s, the window will be blank; \
+             a binary from a plain `cargo build` points at build.devUrl and needs `npm run dev` \
+             running alongside it, build with `tauri build` for one that stands alone",
+            PAGE_LOAD_GRACE.as_secs()
+        );
+    });
+}
+
 /// 系統匣氣泡通知。掛名（Windows 的 AUMID）與實際怎麼彈都在平台層，
 /// 這裡只決定「掛在誰名下、標題寫什麼」。
 fn balloon(app: &AppHandle, body: &str) {
@@ -226,6 +272,15 @@ pub fn run() {
     // 不會自動重載，要自己呼叫 `Webview::reload`；先記一筆 warn 才有辦法從日誌
     // 回頭確認這件事真的發生過——使用者若再遇到白屏，第一步就是查
     // traytunnel.log 有沒有這行，有就是這個機制，沒有就要往別的方向查。
+    // 有任何一次 page load 走完就把旗標立起來，`watch_first_page_load` 的複查
+    // 靠它決定要不要記那行 warn（見上面那段說明）
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_page_load(|_webview, payload| {
+        if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            PAGE_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(|webview| {
         log::warn!(
@@ -292,6 +347,10 @@ pub fn run() {
             }
 
             if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+                // 白屏診斷：webview 到底載到哪一份前端、有沒有載成功（見模組上方那段）
+                #[cfg(target_os = "macos")]
+                watch_first_page_load(&win);
+
                 // 工作列的視窗按鈕吃的是 SM_CXICON（175% 下 56px），codegen 給的是
                 // ICO 第一層 16px，得自己挑層再設一次才不會被 GDI 放大而模糊
                 match appicon::window_icon() {
