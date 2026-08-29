@@ -4,76 +4,64 @@
 //! 落地（分別見 `feat/macos-process-mgmt`／`feat/macos-tray-window` 合併）。
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- 本地埠偵測
 
 /// 本地是否有程序在該埠 Listen（相當於 Windows 那邊查 `GetExtendedTcpTable`）。
 ///
-/// 手段：對 `127.0.0.1:port` 與 `::1:port` 各自嘗試 `bind`。
-/// 這是被動的——全程只跟本機核心的 socket 表打交道，從未對任何位址送出過一個
-/// TCP 封包，因此不會對「port 上真的有服務在跑」這件事產生任何 connect 探測
-/// 才有的副作用（不會被算進對方的連線數、不會觸發對方的日誌或速率限制）。
+/// 手段：唯讀查詢 libproc 記著的行程／socket 表（`listeners` crate 底下
+/// 實際呼叫的是 `proc_pidinfo`／`proc_pidfdinfo`，見 Cargo.toml 裡這顆依賴
+/// 的說明），列出系統上每一個行程、展開它的 fd、挑出型別是 socket 的那些，
+/// 逐一問 fd 的 socket 資訊，從中找有沒有一項 TCP／LISTEN 落在這個埠上。
+/// 全程只讀核心已經記著的表，從未對任何位址 `bind` 或 `connect`，因此完全
+/// 被動：不會佔用埠、不會跟任何人的 `bind` 搶，也不會對「port 上真的有服務
+/// 在跑」這件事產生 connect 探測才有的副作用。
 ///
-/// 判定依據：`SO_REUSEADDR`（Rust 的 `TcpListener::bind` 在 Unix 上預設會開）
-/// 只放寬「舊連線還卡在 TIME_WAIT」這件事，並不允許兩個 socket 同時
-/// `bind`＋`listen` 在同一個位址＋埠上——因此「bind 失敗且錯誤是
-/// `AddrInUse`」精準對應「這個位址＋埠上已經有一個 LISTEN 在佔著」；
-/// bind 成功則代表沒人佔，順手把這個探測用的 listener 立刻收掉，不留著佔用。
+/// **這支函式在 2026-08-29 之前是主動 bind 探測**（對 `127.0.0.1`／`::1`
+/// 各嘗試 `bind` 一次，bind 不上代表有人在聽）；獨立審查在本機實測踩到那個
+/// 做法的真實競態：`tunnel::supervise` 每 2 秒輪詢一次，若正好落在 ssh 完成
+/// 認證、準備自己 `bind -L` 的時間窗探測，兩邊都開 `SO_REUSEADDR` 也擋不住
+/// 「第二個 bind 撞上 `AddrInUse`」——探測會把 ssh 正要用的位址擠掉一個
+/// （雙位址 bind 時可能變成只綁到一族，連線卻照樣回報 `CONNECTED`；
+/// `AddressFamily inet` 只綁一族時，`ExitOnForwardFailure` 更會讓 ssh 直接
+/// 判定失敗、觸發重連迴圈）。改成唯讀查詢後這個時窗不存在了——這裡從來不去
+/// `bind` 任何位址，自然不會跟 ssh 搶；同一個理由也讓下面兩個舊語意缺口
+/// 一併修掉：
+///   * 綁在 `0.0.0.0`／`[::]`（wildcard，涵蓋所有介面）的監聽者現在看得到了
+///     ——舊版只精確比對 `127.0.0.1`／`::1` 這兩個字面位址；libproc 查的是
+///     核心記著的 socket 表，不管綁的是字面 loopback 還是 wildcard 都一樣讀
+///     得到（見下方測試 `a_wildcard_listener_is_visible`）。
+///   * 特權埠（<1024）不再誤判成「沒人聽」——舊版靠自己 `bind` 探測，沒有
+///     root 權限時去 `bind` 一個 <1024 的埠一定拿到 `PermissionDenied`，
+///     跟「這個埠真的有人在聽」是同一種錯誤外觀、分辨不出來；新版完全不
+///     `bind`，只是讀已經存在的 fd 表，同一個 uid 底下的行程無論綁在哪個埠
+///     都讀得到，不再受 bind 權限限制。
 ///
-/// 兩個位址都查是因為 ssh 的 `-L`（沒指定 bind 位址時）在雙棧主機上一般會同時
-/// 綁 `127.0.0.1` 與 `::1`；本專案自己的 SOCKS5 監聽器只綁 `127.0.0.1`
-/// （見 `wg::socks5::BIND_ADDR`），但 `is_listening` 是共用門面，兩邊的呼叫端
-/// 都吃同一份答案，查全了才不會漏掉 ssh 只綁到 `::1` 的情況。
-///
-/// 沒有另外選 `lsof` 子程序解析或手刻 `sysctl` 的 pcblist 解析：前者每次呼叫
-/// 都是一次 fork/exec 加上核心逐一列舉行程的開銷，這支函式是隧道監看迴圈
-/// 每輪都會呼叫的輪詢熱路徑，不值得為了問一個埠的狀態付出那個代價；後者要手刻
-/// unsafe 的 `xinpgen`／`xtcpcb` 結構體解析，對應的是 Apple 沒有公開穩定文件的
-/// 核心內部格式，維護風險遠高於一組標準函式庫就能做到的 `bind` 探測。
-///
-/// **與 Windows 版語意上的落差**：`GetExtendedTcpTable` 列的是系統上所有
-/// LISTEN 項目，含綁在 `0.0.0.0`／`[::]`（wildcard，涵蓋所有介面）的那些；
-/// 這裡的 bind 探測只精確比對 `127.0.0.1`／`::1` 這兩個字面位址，**看不到**
-/// 綁在 wildcard 位址上、但同樣會接受 loopback 連線的佔用者——本專案自己的
-/// 監聽器（SOCKS5、ssh `-L`）一律只綁字面 loopback，不受影響，但如果哪天
-/// 有別的程式改成綁 `0.0.0.0` 佔住同一個埠，這支函式會誤判成「沒人聽」。
-///
-/// 這個誤判不是沒有安全網：`ssh::tunnel::build_exit_args` 固定帶
-/// `ExitOnForwardFailure=yes`（見 `tunnel.rs`），埠真的被佔住時 ssh 自己
-/// `bind` 會失敗、直接退出，監看迴圈照樣會在下一輪判定成 disconnected 並重試
-/// ——不會是「顯示 connected 但其實沒轉發」這種更難查的錯。這條結論**依賴**
-/// 那個 ssh 參數；拿掉它，這裡漏掉的 wildcard 佔用就會變成真正的靜默失敗。
+/// **已知限制（不同 uid 的行程）**：libproc 對「不是自己也不是 root」的行程
+/// 之 fd 資訊有存取限制——實測（見 PR 說明）在這台機器上，同一個 uid 底下、
+/// 甚至是完全獨立的另一支子行程（不是查詢者自己）綁的埠一律讀得到；但 root
+/// 擁有的行程（例如 launchd 隨選啟動、uid 0 的 `sshd`，監聽在 `*.22`）在
+/// 沒有 root 權限時完全查不到，即使 `netstat`（讀 sysctl 的 pcblist，不受
+/// 這層限制）看得到。這是 libproc 這條路徑本身的限制，不是這支函式沒做完；
+/// 而且只在「別的使用者或 root 擁有的程序剛好佔住我們要用的那個埠」這種少見
+/// 情境才會現形——本專案自己會綁的監聽者（SOCKS5、我們 spawn 出來的 ssh）
+/// 一律跟查詢者同一個 uid，不受影響。
 pub fn is_listening(port: u16) -> bool {
-    bound_by_someone_else(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-        || bound_by_someone_else(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
-}
-
-/// 對單一位址做一次 bind 探測。`Ok` 代表沒人佔，探測用的 listener 隨函式結束
-/// 一起 drop 掉；`AddrInUse` 代表已經有人在 LISTEN；其餘錯誤一律當「沒有偵測到
-/// LISTEN」，不要把不相干的錯誤誤判成佔用，害 spawn 前的埠檢查卡住一條原本可以
-/// 走的隧道。
-///
-/// 這個「其餘錯誤一律當沒偵測到」本身是一個已知的限制，不是隨手忽略：
-/// `AddrNotAvailable`（例如這台機器根本沒有可用的 IPv6 堆疊）是預期中會出現
-/// 的訊號，不必聲張；但如果呼叫端把本地埠設在 1024 以下的特權範圍
-/// （例如 443／80），這個沒有 root 權限的行程去 `bind` 會拿到
-/// `PermissionDenied`，而不是 `AddrInUse`——那個埠即使真的有人在 LISTEN，
-/// 這裡也一樣會回 false，讓 `CONNECTED` 判定永遠不觸發。這種錯誤仍然值得
-/// 留一筆 `debug` 級的紀錄，讓排查的人查得到「這裡其實沒判斷出結果」，
-/// 而不是無聲無息地當成「沒人聽」。
-fn bound_by_someone_else(addr: SocketAddr) -> bool {
-    match TcpListener::bind(addr) {
-        Ok(_listener) => false,
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => true,
+    match listeners::get_all() {
+        Ok(all) => all.iter().any(|l| {
+            l.protocol == listeners::Protocol::TCP
+                && l.state == listeners::SocketState::Listen
+                && l.socket.port() == port
+        }),
         Err(e) => {
-            if e.kind() != io::ErrorKind::AddrNotAvailable {
-                log::debug!(
-                    "is_listening: probing {addr} failed with {e} ({:?}), treating as not listening",
-                    e.kind()
-                );
-            }
+            // 查表本身失敗（理論上只有系統呼叫層級的異常才會到這裡），比照舊版
+            // 「查不到答案就當沒偵測到」的保守方向：不要把「問不到」誤判成
+            // 「有人佔著」，害 spawn 前的埠檢查卡住一條原本可以走的隧道；
+            // 留一筆 debug 紀錄讓排查的人查得到「這裡其實沒判斷出結果」。
+            log::debug!(
+                "is_listening: querying the local listener table failed: {e}, treating as not listening"
+            );
             false
         }
     }
@@ -405,6 +393,39 @@ pub fn open_url(url: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// wildcard（`0.0.0.0`）監聽者必須被看得到——這是舊版 bind 探測看不到、
+    /// 這次改成被動查詢要修的語意缺口（既有的三條埠偵測契約測試在
+    /// `platform/process_tests.rs`，只查字面 `127.0.0.1`／`::1`，不動；這裡
+    /// 補的是 macOS 這邊 wildcard 這個額外語意，因此另外掛在這支實作自己的
+    /// 測試模組底下）。用 OS 配發的 ephemeral 埠（bind 0 再讀實際埠號），
+    /// 不寫死任何埠號；查表跟核心更新之間可能隔一拍，所以是輪詢＋期限，不是
+    /// 綁完就當場問一次——紀律同 `process_tests.rs`。
+    #[test]
+    fn a_wildcard_listener_is_visible() {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).expect("要綁得起來");
+        let port = listener.local_addr().expect("listener 一定有本地位址").port();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if is_listening(port) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(listener);
+
+        assert!(
+            seen,
+            "0.0.0.0:{port} 上有 TcpListener 在 LISTEN，is_listening 卻遲遲沒回 true\
+             ——舊版的 bind 探測只精確比對字面 loopback 位址，看不到 wildcard 監聽者，\
+             這正是這次要修的語意缺口"
+        );
+    }
 
     /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss。
     /// 對照 Windows `winsys::local_time_is_a_fixed_width_hms`。
