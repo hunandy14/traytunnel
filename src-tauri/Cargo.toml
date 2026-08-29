@@ -102,6 +102,9 @@ tracing = { version = "0.1", default-features = false, features = ["log"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
+  # ShellExecuteW 之前要先初始化 COM（見 winsys::open_url 的說明）：
+  # 那條路現在跑在 spawn_blocking 的執行緒上，沒有人替它 CoInitializeEx
+  "Win32_System_Com",
   "Win32_System_JobObjects",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",

@@ -348,8 +348,9 @@ fn group_commands(pgid: i32) -> Vec<String> {
 
 /// 某一筆登記的主人（spawn 它的那個 app 行程）是不是還在跑。
 ///
-/// 兩道都要成立才算：pid 還活著（`kill(pid, 0)`），而且那個 pid 的命令列開頭
-/// 真的是我們自己這支執行檔——只看 pid 活不活著會被 pid 回收騙過去。
+/// 兩道都要成立才算：pid 還活著（`kill(pid, 0)`），而且那個 pid 的命令列裡
+/// 出現得了我們這支執行檔的**檔名**——只看 pid 活不活著會被 pid 回收騙過去。
+/// 為什麼比檔名而不是完整路徑（以及這個取捨往哪邊偏）見函式內的說明。
 ///
 /// 「主人就是我自己」回 `false`：收屍只在啟動時、任何 `register` 之前跑，
 /// 這時候檔案裡不可能有本輪自己的條目，會對到只可能是 pid 回收的巧合。
@@ -360,19 +361,34 @@ fn owner_still_running(owner_pid: i32) -> bool {
     if unsafe { libc::kill(owner_pid, 0) } != 0 {
         return false;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        // 問不到自己是誰的話，寧可保守：pid 還活著就當主人還在，不要掃
+    // 比對用的是**執行檔檔名**，不是完整路徑。
+    //
+    // 這裡的每一個判斷失誤都要往「主人還活著」偏（＝那一筆不掃＝漏殺），
+    // 因為反方向是誤殺。用完整路徑當前綴比對就正好偏錯邊：同一個使用者同時
+    // 跑「裝在 /Applications 的正式版」與「開發中的 cargo build 產物」，而
+    // single-instance 又失手讓兩邊並存時，兩邊的 `current_exe()` 完全不同，
+    // 於是互相判定「對方那個 pid 不是我們的程式、主人已死」，接著把對方
+    // 現役的隧道全部 SIGKILL——正是這個機制最不該做的事。
+    //
+    // 換成檔名包含之後，誤判方向翻過來了：系統上剛好有另一支同名的
+    // `traytunnel` 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆
+    // 不掃。代價只是那一輪少收一具屍體，下一次啟動再收；而且要湊齊
+    // 「pid 剛好被回收」＋「新主人剛好也叫這個名字」兩件事，機率本來就極低。
+    let name = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    if name.is_empty() {
+        // 問不到自己叫什麼的話，寧可保守：pid 還活著就當主人還在，不要掃
         return true;
-    };
+    }
     let out = std::process::Command::new("ps")
         .args(["-ww", "-o", "command=", "-p"])
         .arg(owner_pid.to_string())
         .output();
     match out {
-        Ok(out) => {
-            let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            line.starts_with(&exe.to_string_lossy().into_owned())
-        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&name),
+        // 連 ps 都跑不起來時同樣往「主人還活著」偏
         Err(_) => true,
     }
 }
@@ -549,26 +565,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 寫完不可以留下 `.tmp`——留著的話下一次 `write_at` 會直接覆寫它，
-    /// 而使用者的資料夾裡永遠躺著一顆看不懂的半成品。
+    /// 寫完不可以留下 `.tmp`——留著的話使用者的資料夾裡永遠躺著一顆看不懂的
+    /// 半成品，而且下一次 `write_at` 才會把它覆寫掉。
+    ///
+    /// 兩段：成功那一條，以及 **`rename` 失敗**那一條。
+    ///
+    /// 只宣稱 `rename` 這一支是刻意的：`write_at` 的另一個失敗點是
+    /// `fs::write` 寫到一半失敗（典型是磁碟寫滿），那個沒有辦法在單元測試裡
+    /// 穩定重現——製造得出來的「寫不出去」（例如父路徑是一個檔案）會更早在
+    /// `create_dir_all` 就以 `AlreadyExists` 失敗，**根本走不到暫存檔那一行**，
+    /// 斷言會恆真。這一版之前正是那個形狀，等於什麼都沒測到。
+    ///
+    /// 這裡改成讓**目的地**是一個資料夾：`create_dir_all(parent)` 看到父資料夾
+    /// 已經在就直接成功、`fs::write` 也真的把暫存檔寫出來了，失敗的是最後那一步
+    /// 「把一個檔案 rename 蓋到一個資料夾上」（`ENOTDIR`）。兩處 `remove_file`
+    /// 是同一個形狀，釘住走得到的這一處就擋得住「順手刪掉一行」。
     #[test]
     fn writing_leaves_no_tmp_file_behind() {
         let dir = tempdir("notmp");
+        let tmp = dir.join(TMP_FILE_NAME);
+
         let path = dir.join(FILE_NAME);
         register_at(&path, 900, 111, "ssh -N bob@a").unwrap();
         assert!(path.is_file());
-        assert!(
-            !dir.join(TMP_FILE_NAME).exists(),
-            "寫完不該留下暫存檔：{}",
-            dir.join(TMP_FILE_NAME).display()
-        );
+        assert!(!tmp.exists(), "寫完不該留下暫存檔：{}", tmp.display());
 
-        // 寫不出去的情況（父路徑是一個檔案而不是資料夾）也不可以留下暫存檔
-        let blocked = dir.join("a-file");
-        std::fs::write(&blocked, "not a directory").unwrap();
-        let doomed = blocked.join(FILE_NAME);
-        assert!(write_at(&doomed, &Registry::default()).is_err(), "這條路本來就該失敗");
-        assert!(!blocked.join(TMP_FILE_NAME).exists());
+        // rename 失敗那一支：目的地是一個資料夾，前面兩步都會成功
+        let dest_is_a_dir = dir.join("dest-is-a-directory");
+        std::fs::create_dir_all(&dest_is_a_dir).unwrap();
+        assert!(
+            write_at(&dest_is_a_dir, &Registry::default()).is_err(),
+            "把檔案 rename 蓋到一個資料夾上本來就該失敗——失敗不了的話這一條測不到東西"
+        );
+        assert!(!tmp.exists(), "rename 失敗也不可以留下暫存檔：{}", tmp.display());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

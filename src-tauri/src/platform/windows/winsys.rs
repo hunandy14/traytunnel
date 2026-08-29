@@ -307,9 +307,52 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
 /// 另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。ShellExecuteW 是
 /// Windows 開啟關聯程式的正規做法（tauri-plugin-updater 自己叫安裝程式用的
 /// 也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+/// ## 為什麼這裡要自己初始化 COM
+///
+/// 這支函式以前只被 Tauri 的同步指令從**主執行緒**呼叫，那條執行緒上的 COM
+/// 早就被 Tauri／wry 初始化成 STA 了，所以什麼都不必做。macOS 車道為了不讓
+/// `open` 冷啟一個瀏覽器的一到三秒凍住 UI，把 `commands.rs` 的
+/// `open_release_page`／`open_releases_page` 挪進 `spawn_blocking`——那是
+/// tokio 的阻塞執行緒池，每一條都是全新的執行緒，**沒有人替它初始化過 COM**。
+///
+/// `ShellExecuteW` 的文件對此寫得很明白（Shell/nf-shellapi-shellexecutew 的
+/// Remarks）：「Because ShellExecute can delegate execution to Shell extensions
+/// … that use the COM threading model, COM should be initialized before
+/// ShellExecute is called」，並建議用
+/// `CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)`。
+/// 沒有初始化時症狀是「有些機器上開得起來、有些開不起來」——取決於使用者的
+/// 預設瀏覽器關聯有沒有走到需要 STA 的 Shell 擴充，是最難查的那一種。
+///
+/// 回傳值的兩種特殊情況都要照顧到：
+///
+/// * `S_FALSE`：這條執行緒**先前已經**初始化過（同一種模式），這仍然算成功，
+///   而且依規定一樣要配對一次 `CoUninitialize`。
+/// * `RPC_E_CHANGED_MODE`：這條執行緒已經以**另一種**模式（MTA）初始化過。
+///   這一次的 `CoInitializeEx` 沒有生效，因此**不可以**配對 `CoUninitialize`
+///   （那會把別人的初始化計數扣掉）；COM 本身是可用的，直接往下做。
 pub fn open_url(url: &str) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let hr = unsafe {
+        CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
+    };
+    // 規則是「每一次**成功**的 CoInitializeEx（含回 S_FALSE 的那些）配一次
+    // CoUninitialize」，失敗的那些一律不配。`HRESULT` 是 i32，非負就是 SUCCEEDED
+    // ——這一個判斷同時涵蓋 S_OK、S_FALSE（要配）與 RPC_E_CHANGED_MODE、
+    // 其餘錯誤（不配），見上面那段說明
+    let must_uninitialize = hr >= 0;
+    if hr == S_FALSE {
+        log::debug!("COM was already initialized on this thread");
+    } else if hr == RPC_E_CHANGED_MODE {
+        log::debug!("COM is already initialized as MTA on this thread, leaving it as it is");
+    } else if hr < 0 {
+        log::warn!("CoInitializeEx failed with {hr:#010x}, calling ShellExecuteW anyway");
+    }
 
     let verb = wide("open");
     let file = wide(url);
@@ -323,6 +366,9 @@ pub fn open_url(url: &str) -> io::Result<()> {
             SW_SHOWNORMAL,
         )
     };
+    if must_uninitialize {
+        unsafe { CoUninitialize() };
+    }
     // 舊式 API：回傳值大於 32 才算成功，小於等於 32 的那個數字本身就是錯誤碼
     let code = rc as isize;
     if code <= 32 {
