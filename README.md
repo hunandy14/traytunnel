@@ -80,12 +80,12 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 
 | 檔名 | 說明 |
 | --- | --- |
-| `traytunnel-<版本>-aarch64.dmg` | 安裝映像，掛載後把 `traytunnel.app` 拖進「應用程式」資料夾 |
+| `traytunnel-<版本>-aarch64.dmg` | 安裝映像，掛載後把 `Traytunnel.app` 拖進「應用程式」資料夾 |
 | `traytunnel-<版本>-aarch64.app.tar.gz` | 免安裝的 `.app` 壓縮包，解壓後一樣要拖進「應用程式」資料夾 |
 
-**不論哪一種，都務必先把 `traytunnel.app` 拖進「應用程式」資料夾再開啟**，不要直接從掛載的 dmg 視窗或 `~/Downloads` 裡雙擊執行。這不只是慣例：macOS 對「帶隔離標記、卻沒被搬進正式位置」的 app 會做 App Translocation（Gatekeeper 的路徑隨機化），直接執行的話系統會把它塞進一個唯讀的隨機路徑跑，應用內更新在那個路徑下必定失敗（寫入被拒絕）；搬進「應用程式」資料夾之後 macOS 才不會再套用這個機制。
+**不論哪一種，都務必先把 `Traytunnel.app` 拖進「應用程式」資料夾再開啟**，不要直接從掛載的 dmg 視窗或 `~/Downloads` 裡雙擊執行。這不只是慣例：macOS 對「帶隔離標記、卻沒被搬進正式位置」的 app 會做 App Translocation（Gatekeeper 的路徑隨機化），直接執行的話系統會把它塞進一個唯讀的隨機路徑跑，應用內更新在那個路徑下必定失敗（寫入被拒絕）；搬進「應用程式」資料夾之後 macOS 才不會再套用這個機制。
 
-我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。
+我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `Traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。
 
 ### 已知限制
 

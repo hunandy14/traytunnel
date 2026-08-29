@@ -60,17 +60,22 @@ const jobs =
   process.platform === "darwin"
     ? [
         {
-          from: join(release, "bundle", "dmg", `traytunnel_${version}_aarch64.dmg`),
+          // bundle 檔名跟的是 tauri.macos.conf.json 的 productName："Traytunnel"
+          // （首字大寫，對齊 mac 選單列慣例——見該檔與 platform/macos/menu.rs
+          // 的說明）。Windows 那邊 productName 維持 "traytunnel" 沒有動，這條
+          // 大小寫差異只在這裡的 from 路徑出現；out/ 的目標檔名兩邊都刻意保持
+          // 小寫 traytunnel-<version>-...，不隨 productName 變。
+          from: join(release, "bundle", "dmg", `Traytunnel_${version}_aarch64.dmg`),
           to: `traytunnel-${version}-aarch64.dmg`,
           note: "DMG 安裝映像",
         },
         {
-          from: join(release, "bundle", "macos", "traytunnel.app.tar.gz"),
+          from: join(release, "bundle", "macos", "Traytunnel.app.tar.gz"),
           to: `traytunnel-${version}-aarch64.app.tar.gz`,
           note: "updater 用的壓縮包",
         },
         {
-          from: join(release, "bundle", "macos", "traytunnel.app.tar.gz.sig"),
+          from: join(release, "bundle", "macos", "Traytunnel.app.tar.gz.sig"),
           to: `traytunnel-${version}-aarch64.app.tar.gz.sig`,
           note: "updater 壓縮包的 minisign 簽章",
         },

@@ -1,9 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Traytunnel",
   "app": {
     "windows": [
       {
         "label": "main",
+        "url": "index.html",
         "title": "Traytunnel",
         "width": 540,
         "height": 446,
