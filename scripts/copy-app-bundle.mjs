@@ -5,8 +5,18 @@
  * bin/ 整個在 .gitignore 裡（不進版本控制，純本機產物），所以每次都可以放心
  * 整個砍掉重建，不怕誤刪任何要保留的東西。
  *
- * 用法：npm run build:mac（先跑 `tauri build --bundles app`，這支腳本只管複製；
- * 已經 build 過的話也可以單獨重跑 node scripts/copy-app-bundle.mjs）。
+ * 用法：npm run build:mac（先跑 `tauri build --bundles app --config
+ * '{"bundle":{"createUpdaterArtifacts":false}}'`，這支腳本只管複製；已經
+ * build 過的話也可以單獨重跑 node scripts/copy-app-bundle.mjs）。
+ *
+ * 那個 --config 覆寫是刻意的：base tauri.conf.json 開了
+ * bundle.createUpdaterArtifacts，若不覆寫，`--bundles app` 也會嘗試產出
+ * updater 用的 .app.tar.gz 並用 TAURI_SIGNING_PRIVATE_KEY 簽章——本機平常
+ * 沒有這把私鑰，簽不出來就會讓整個 `tauri build` 以非零狀態結束（.app 其實
+ * 已經建好，只是簽不出 .sig），這支腳本就不會被 `&&` 接著跑到。這裡只是要
+ * 本機快速試跑 .app，updater 產物與簽章跟這個用途無關，直接關掉最乾脆；
+ * 真正需要簽出 updater 產物的路徑是 `npm run build:dist`（CI 的
+ * release.yml 用的就是這顆，那邊有 TAURI_SIGNING_PRIVATE_KEY 可用）。
  *
  * 無相依，直接 node scripts/copy-app-bundle.mjs。
  */

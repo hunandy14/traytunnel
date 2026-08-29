@@ -139,7 +139,7 @@ const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
     </p>
     <p style="color:#9cdcfe;">正確的驗證方式：</p>
     <ul>
-      <li>執行「npm run tauri dev」（會一併啟動 Vite）</li>
+      <li>執行「npm run dev」（會一併啟動 Vite）</li>
       <li>或改用「tauri build」產出的正式版 App（不需要 Vite）</li>
     </ul>
     <p class="hint">（這則說明只在裸執行檔又沒有開發伺服器時出現，正式產物不受影響）</p>
@@ -162,7 +162,7 @@ fn watch_first_page_load<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
         }
         log::warn!(
             "the main webview has not finished loading {url} after {}s, the window will be blank; \
-             a binary from a plain `cargo build` points at build.devUrl and needs `npm run dev` \
+             a binary from a plain `cargo build` points at build.devUrl and needs `npm run web:dev` \
              running alongside it, build with `tauri build` for one that stands alone",
             PAGE_LOAD_GRACE.as_secs()
         );

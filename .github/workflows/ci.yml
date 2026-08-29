@@ -64,7 +64,7 @@ jobs:
         run: npm ci
 
       - name: Build frontend (tsc + vite)
-        run: npm run build
+        run: npm run web:build
 
       # 排版與 lint 擋在測試之前：這兩關失敗的修法都是機械式的，
       # 不必等一輪測試跑完才知道。
