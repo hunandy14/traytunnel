@@ -818,6 +818,58 @@ mod tests {
         assert_eq!(read_program_arguments(""), None);
     }
 
+    /// 把一份 plist 餵給系統自己的 `plutil`，回 (成功嗎, stdout)。
+    /// `-` 代表從 stdin 讀（見 `plutil(1)`）。
+    fn plutil(args: &[&str], xml: &str) -> (bool, String) {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("plutil")
+            .args(args)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("macOS 上一定有 plutil");
+        child
+            .stdin
+            .take()
+            .expect("剛設成 piped")
+            .write_all(xml.as_bytes())
+            .expect("plist 很小，寫得進去");
+        let out = child.wait_with_output().expect("plutil 要回得來");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// 這份 plist 的 XML 是**手寫**的（[`plist_contents`] 是一串 `format!`，
+    /// 刻意不拉一顆 plist 解析／產生 crate，理由在 [`read_program_arguments`]）。
+    /// 手寫就要有人替它把關格式，而最權威的把關者就是系統自己的 `plutil`
+    /// ——launchd 讀這個檔案用的是同一套解析器。
+    ///
+    /// 兩段：整份 lint 過得了，以及讓 `plutil` 自己把那三個鍵讀出來（不是我們
+    /// 用 `contains` 看字串長得像不像，而是真的被解析成正確的型別與值）。
+    #[test]
+    fn the_plist_is_what_launchd_will_actually_parse() {
+        let exe = Path::new("/Applications/Traytunnel.app/Contents/MacOS/traytunnel");
+        let xml = plist_contents("com.traytunnel.autostart.traytunnel", exe);
+
+        let (ok, _) = plutil(&["-lint"], &xml);
+        assert!(ok, "plutil 認不得我們寫出來的 plist：\n{xml}");
+
+        // `raw` 讓布林印成 true／false 而不是 <true/>
+        assert_eq!(
+            plutil(&["-extract", "AbandonProcessGroup", "raw", "-o", "-"], &xml).1,
+            "true",
+            "AbandonProcessGroup 要真的被解析成布林 true（M3）"
+        );
+        assert_eq!(plutil(&["-extract", "RunAtLoad", "raw", "-o", "-"], &xml).1, "true");
+        assert_eq!(
+            plutil(&["-extract", "ProgramArguments.1", "raw", "-o", "-"], &xml).1,
+            "--tray",
+            "第二個 argv 要是 --tray，否則開機會彈主視窗"
+        );
+    }
+
     /// App Translocation 的偵測：路徑裡有整整一層 `AppTranslocation` 才算，
     /// 名字裡剛好含這個字串的一般資料夾不算。
     #[test]
