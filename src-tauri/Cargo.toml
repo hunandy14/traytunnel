@@ -102,16 +102,18 @@ tracing = { version = "0.1", default-features = false, features = ["log"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
-  # ShellExecuteW 之前要先初始化 COM（見 winsys::open_url 的說明）：
+  # ShellExecuteExW 之前要先初始化 COM（見 winsys::open_url 的說明）：
   # 那條路現在跑在 spawn_blocking 的執行緒上，沒有人替它 CoInitializeEx
   "Win32_System_Com",
   "Win32_System_JobObjects",
+  # 開機自啟寫 Run 值；另外 SHELLEXECUTEINFOW 的 hkeyClass 是 HKEY，
+  # windows-sys 把整個結構與 ShellExecuteExW 都閘在這個 feature 底下
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
-  # 可攜版的 Download 要用 ShellExecuteW 開系統瀏覽器
+  # 可攜版的 Download 要用 ShellExecuteExW 開系統瀏覽器
   "Win32_UI_Shell",
   "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",

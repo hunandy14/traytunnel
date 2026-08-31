@@ -9,7 +9,7 @@
 //! 沒有任何好處，所以上提到這裡，兩平台的 `update.rs` 改成引用同一份。
 //!
 //! `open_page`（連同 [`open_release_page`]／[`open_releases_page`]）仍然要
-//! 「開系統瀏覽器」這件真的碰系統 API 的事——Windows 是 `ShellExecuteW`，
+//! 「開系統瀏覽器」這件真的碰系統 API 的事——Windows 是 `ShellExecuteExW`，
 //! macOS 是 `open` 指令，各自留在 `platform::{macos,windows}::sys`。這裡不直接
 //! 伸手進 `platform::macos::sys`／`platform::windows::winsys` 去挑，而是讓呼叫端
 //! 把 `open_url` 當函式指標傳進來：`platform/mod.rs` 的門面刻意不收

@@ -694,7 +694,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     run_open(&mut cmd)
 }
 
-/// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteW）。
+/// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteExW）。
 ///
 /// 刻意**不**放進 `platform::mod` 那份跨平台門面：唯一的呼叫端是更新那條路
 /// （`update::open_release_page`／`open_releases_page`），而 update 整個子模組本來

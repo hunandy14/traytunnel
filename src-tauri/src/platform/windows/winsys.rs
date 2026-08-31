@@ -303,10 +303,32 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
 
 /// 用系統預設的瀏覽器開一個網址。
 ///
-/// 走 ShellExecuteW 而不是 `explorer.exe <url>` 或 `cmd /c start`：那兩條都要
-/// 另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。ShellExecuteW 是
-/// Windows 開啟關聯程式的正規做法（tauri-plugin-updater 自己叫安裝程式用的
-/// 也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+/// 走 shell 的「開啟關聯程式」API 而不是 `explorer.exe <url>` 或 `cmd /c start`：
+/// 那兩條都要另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。
+/// ShellExecute 系列是 Windows 開啟關聯程式的正規做法（tauri-plugin-updater
+/// 自己叫安裝程式用的也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+///
+/// ## 為什麼是 `ShellExecuteExW` + `SEE_MASK_NOASYNC`，不是 `ShellExecuteW`
+///
+/// `ShellExecuteW` 沒有地方可以帶旗標，等於**固定走非同步啟動**：shell 只要
+/// 把這次啟動排定下去就回傳（>32），真正把瀏覽器叫起來的那一段可能還在跑。
+/// 底下那段 COM 初始化的配對因此開出一個窗口——我們一回來就
+/// `CoUninitialize()`，apartment 被拆掉，還沒跑完的啟動就跟著死。這在預設
+/// 瀏覽器的 http handler 是 DelegateExecute／`IExecuteCommand` 型 COM handler
+/// 時會現形（Edge、Chrome 都有註冊這種 handler）：瀏覽器沒開、`rc > 32` 所以
+/// 我們也不會記下任何錯誤，前端的 invoke 照樣 resolve，是完全無聲的失敗。
+///
+/// `ShellExecuteExW` 的 `SEE_MASK_NOASYNC` 正是為了這件事存在的。MS 文件
+/// （Shell/ns-shellapi-shellexecuteinfow 的 fMask）寫得很直白：呼叫端執行緒
+/// 若沒有訊息迴圈、或即將結束，就 **must** 用這個旗標；用了之後
+/// `ShellExecuteExW` 會等到啟動真的完成才回傳，之後才拆 apartment 就安全了。
+/// 我們這條路（`spawn_blocking` 的一次性執行緒，回來就 `CoUninitialize`）
+/// 兩個條件都命中。
+///
+/// 一併帶 `SEE_MASK_FLAG_NO_UI`：失敗時不要由 shell 自己彈錯誤對話框——這支
+/// 函式回的是 `io::Result`，錯誤該由呼叫端決定怎麼呈現，而且這裡沒有父視窗
+/// （`hwnd` 是 null），彈出來的框會是無主的。
+///
 /// ## 為什麼這裡要自己初始化 COM
 ///
 /// 這支函式以前只被 Tauri 的同步指令從**主執行緒**呼叫，那條執行緒上的 COM
@@ -315,7 +337,7 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
 /// `open_release_page`／`open_releases_page` 挪進 `spawn_blocking`——那是
 /// tokio 的阻塞執行緒池，每一條都是全新的執行緒，**沒有人替它初始化過 COM**。
 ///
-/// `ShellExecuteW` 的文件對此寫得很明白（Shell/nf-shellapi-shellexecutew 的
+/// `ShellExecute` 的文件對此寫得很明白（Shell/nf-shellapi-shellexecutew 的
 /// Remarks）：「Because ShellExecute can delegate execution to Shell extensions
 /// … that use the COM threading model, COM should be initialized before
 /// ShellExecute is called」，並建議用
@@ -335,7 +357,9 @@ pub fn open_url(url: &str) -> io::Result<()> {
     use windows_sys::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let hr = unsafe {
@@ -351,28 +375,38 @@ pub fn open_url(url: &str) -> io::Result<()> {
     } else if hr == RPC_E_CHANGED_MODE {
         log::debug!("COM is already initialized as MTA on this thread, leaving it as it is");
     } else if hr < 0 {
-        log::warn!("CoInitializeEx failed with {hr:#010x}, calling ShellExecuteW anyway");
+        log::warn!("CoInitializeEx failed with {hr:#010x}, calling ShellExecuteExW anyway");
     }
 
+    // 兩個字串緩衝要活過整個呼叫：`lpVerb`／`lpFile` 收的是裸指標，
+    // 綁成具名 local 才不會在建 struct 的那個運算式結束時就被丟掉。
     let verb = wide("open");
     let file = wide(url);
-    let rc = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
+    // 其餘欄位（hwnd、lpParameters、lpDirectory、lpIDList、lpClass、hkeyClass、
+    // dwHotKey、聯合欄位、hProcess）全部歸零：`SHELLEXECUTEINFOW` 的
+    // `Default` 就是 `mem::zeroed()`，這正是 Win32 要的「沒有用到的欄位留 0」。
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
     };
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    // `hInstApp` 只在呼叫回來之後才有意義，而且要在拆 apartment 之前讀完
+    // （欄位是 by-value 讀，不會對 packed struct 取參考）
+    let inst = info.hInstApp as isize;
     if must_uninitialize {
         unsafe { CoUninitialize() };
     }
-    // 舊式 API：回傳值大於 32 才算成功，小於等於 32 的那個數字本身就是錯誤碼
-    let code = rc as isize;
-    if code <= 32 {
-        return Err(io::Error::other(format!("ShellExecuteW failed with code {code}")));
+    // 兩道判斷都要：`ShellExecuteExW` 回 FALSE 是明確失敗，而它回 TRUE 時
+    // `hInstApp` 仍沿用舊式 ShellExecute 的約定——大於 32 才算成功，
+    // 小於等於 32 的那個數字本身就是錯誤碼（SE_ERR_*）
+    if ok == 0 || inst <= 32 {
+        return Err(io::Error::other(format!(
+            "ShellExecuteExW failed (returned {ok}, hInstApp {inst})"
+        )));
     }
     Ok(())
 }
