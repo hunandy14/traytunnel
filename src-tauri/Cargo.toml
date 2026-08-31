@@ -92,7 +92,7 @@ tokio-util = { version = "0.7", default-features = false }
 # StreamMap：把 N 條連線的上行通道合併進一個 select! 分支
 tokio-stream = "0.1"
 # 金鑰解碼（boringtun 內部有 base64，但沒有對外 re-export）
-base64 = "0.22"
+base64 = "0.23"
 # 零複製切片，資料泵大量用到
 bytes = "1"
 # boringtun 用 tracing 記事件；"log" feature 把它們轉發到本專案的 log
