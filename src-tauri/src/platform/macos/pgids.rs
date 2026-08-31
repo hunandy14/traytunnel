@@ -493,15 +493,31 @@ pub(super) fn unregister(pgid: i32) {
 /// （見 [`Entry::owner_pid`]）——single-instance 外掛有一條會讓兩個實例並存的
 /// 錯誤分支，時機本身擋不住它。
 ///
-/// 沒有「檔案不在就早退」「登記簿是空的就刪檔早退」這兩道分支，是刻意的：
-/// [`read_at`] 讀不到檔案本來就回一份空的登記簿，空登記簿的 [`plan_sweep`] 回
-/// 一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），最後 [`write_or_clear_at`]
-/// 對空的登記簿做的正是「把檔案刪掉，本來就沒有也算成功」。兩道早退跟這條主線
-/// 一字不差地等價，留著只是同一件事寫兩遍。
+/// **登記簿是空的就早退**（清完檔案再走）。這是啟動路徑上的常態——上一輪正常
+/// 收尾的話每一筆都退登記過了，檔案根本不存在——而它與主線的關係要說清楚：
+///
+/// * **結果上等價**：[`read_at`] 讀不到檔案回一份空的登記簿，空登記簿的
+///   [`plan_sweep`] 回一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），
+///   [`write_or_clear_at`] 對空的登記簿做的正是「把檔案刪掉，本來沒有也算成功」。
+/// * **成本上不等價**（這裡原本寫「兩道早退跟主線一字不差地等價」，那句話只看了
+///   結果）：走主線要先付一次 `ps -axww` 全表——fork／exec 一支外部程序，把系統上
+///   每一個行程的完整命令列讀回來再解析，忙碌的機器上是數十到百餘毫秒，而且這條路
+///   跑在 `Builder::setup` 裡、系統匣還沒建出來的**主執行緒**上。付這筆錢是為了
+///   回答「登記簿裡這幾筆的群組現在有誰」——一筆都沒有的時候，沒有問題要問。
+///
+/// 早退前仍然要 [`write_or_clear_at`] 一次：登記簿可能是一份**解析不出來**的壞檔
+/// （[`read_at`] 同樣退成空的），那份垃圾該在這裡被清掉，不是留在使用者的資料夾裡
+/// 等下一次寫入。
 pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let reg = read_at(&path);
+    if reg.entries.is_empty() {
+        if let Err(e) = write_or_clear_at(&path, &reg) {
+            log::warn!("could not clear the empty supervised process group registry: {e}");
+        }
+        return;
+    }
     // 一次把全表拿回來，登記簿有幾筆都只問 `ps` 這一次（見 `commands_by_pgid`）
     let by_pgid = commands_by_pgid();
     let plan = plan_sweep(&reg, &mut owner_still_running, &mut |pgid| {
@@ -606,10 +622,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `sweep_leftovers` 拿掉的那兩道早退（「檔案不在」「登記簿是空的」）之所以
-    /// 跟主線等價，靠的就是這裡的三件事：讀不到檔案回一份空的登記簿、空的登記簿
-    /// 規劃不出任何動作、清空的寫入就是「刪掉檔案，本來沒有也算成功」，而且不會
-    /// 順手建出任何東西。
+    /// `sweep_leftovers` 那道「登記簿是空的就早退」之所以在**結果上**與走完主線
+    /// 等價（差別只在省下一次 `ps` 全表，見那支函式的說明），靠的就是這裡的三件事：
+    /// 讀不到檔案回一份空的登記簿、空的登記簿規劃不出任何動作、清空的寫入就是
+    /// 「刪掉檔案，本來沒有也算成功」，而且不會順手建出任何東西。
     #[test]
     fn an_absent_registry_reads_as_empty_and_clears_to_nothing() {
         let dir = tempdir("absent");
