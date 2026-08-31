@@ -7,8 +7,10 @@
  * 「manifest 在 repo 的哪個位置」與「讀檔＋解析」也收在這裡（cargoTomlPath／
  * readRepoCargoVersion）：package.mjs／release.mjs／resolve-release.mjs 過去各自
  * 抄一份 join(root,"src-tauri","Cargo.toml") + readFileSync + readCargoVersion，
- * manifest 位置或編碼處理一改就要動好幾處（REU-4）。bump.mjs 刻意不用
- * readRepoCargoVersion：它要拿原文回寫版號，需要的是那份 text 本身。
+ * manifest 位置或編碼處理一改就要動好幾處（REU-4）。這三支現在都走
+ * readRepoCargoVersion。bump.mjs 是例外：它要拿 Cargo.toml 原文把新版號寫回去，
+ * 需要的是那份 text 本身，所以仍然自己讀檔（也仍然自己組路徑——cargoTomlPath
+ * 匯出給那類「只要路徑、不要解析結果」的呼叫端用）。
  */
 
 import { readFileSync } from "node:fs";
