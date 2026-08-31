@@ -689,10 +689,14 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 // 改成**執行期**由 Rust 端決定：值來自 `cfg(target_os = "macos")`，跟執行機
 // 保證一致，不必像 `@tauri-apps/plugin-os` 那樣引入新依賴或執行期偵測。用官方
 // 的 webview initialization script（`tauri::plugin::Builder::js_init_script`，
-// 語意等同各別 webview 的 `initialization_script`：在全域物件建立後、HTML
-// 文件被解析之前、任何頁面自己的 script 執行之前跑）在頁面載入前把值寫進
-// `<html data-platform>`，vite.config.ts 的 htmlPlatformPlugin 與 index.html
-// 的佔位字串因此可以整段刪掉。
+// 語意等同各別 webview 的 `initialization_script`：在全域物件建立後、任何頁面
+// 自己的 script 執行之前跑）在頁面載入前把值寫進 `<html data-platform>`，
+// vite.config.ts 的 htmlPlatformPlugin 與 index.html 的佔位字串因此可以整段
+// 刪掉。
+//
+// 「全域物件建好了」是這顆 API **唯一**的保證，`<html>` 在不在是另一回事，
+// 兩個 webview 後端在這一點上不一樣——腳本因此不能只寫一行直接設。整段理由
+// 與作法在 `PLATFORM_FLAG_INIT_JS` 的說明。
 //
 // 值直接用 `std::env::consts::OS`，不自己抄一組 `cfg` 常數：那組常數要抄的
 // 正是編譯目標本身，而標準函式庫已經有一份**由編譯器填的**同義字串，兩者
@@ -701,6 +705,49 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 // 與原本手抄的兩個字面值逐字相同，styles.css 的
 // `[data-platform="macos"]` 選擇器不必動。
 const PLATFORM_FLAG: &str = std::env::consts::OS;
+
+/// 把 [`PLATFORM_FLAG`] 寫進 `<html data-platform>` 的初始化腳本模板
+/// （`__PLATFORM__` 由 [`platform_flag_init_script`] 換掉）。
+///
+/// ## 為什麼不能只寫一行 `document.documentElement.dataset.platform = …`
+///
+/// 初始化腳本在兩個平台跑的時機**不一樣**，而舊寫法只在其中一邊成立：
+///
+/// * **WKWebView**（macOS，wry 走 `WKUserScript` 的 `AtDocumentStart`）：
+///   文件的 `<html>` 元素這時已經建好了，直接設就會中。
+/// * **WebView2**（Windows，wry 走 `AddScriptToExecuteOnDocumentCreated`）：
+///   那顆 API 保證的是「global object 建好了」，**HTML 還沒開始解析**，
+///   `document.documentElement` 是 `null`——舊寫法在這裡拋 TypeError，
+///   Windows 於是永遠沒有 `data-platform`，與 index.html／這個模組宣稱的
+///   「執行期保證一致、不存在沒有屬性的 frame」正好相反。
+///
+/// 所以先試直接設；設不到就掛一顆 `MutationObserver` 監聽 `document` 的
+/// `childList`，`<html>` 一被建出來就補寫並 `disconnect()`。
+///
+/// **不用 `DOMContentLoaded`**：那要等整份文件解析完，中間 CSS 已經套完一輪，
+/// mac 上會先畫出一組自繪的 −/×（`[data-platform="macos"]` 那條規則還沒生效）
+/// 再閃掉——正是要避免的 FOUC。MutationObserver 在 `<html>` 出現的那個
+/// microtask 就補上，早於任何樣式套用。
+const PLATFORM_FLAG_INIT_JS: &str = r#"(function () {
+  var flag = "__PLATFORM__";
+  function stamp() {
+    var el = document.documentElement;
+    if (!el) { return false; }
+    el.dataset.platform = flag;
+    return true;
+  }
+  if (stamp()) { return; }
+  var observer = new MutationObserver(function () {
+    if (stamp()) { observer.disconnect(); }
+  });
+  observer.observe(document, { childList: true });
+})();"#;
+
+/// 初始化腳本的成品。抽成函式是為了讓 [`PLATFORM_FLAG`] 真的被換進去這件事
+/// 測得到——模板裡留著沒換掉的佔位字串會是一個完全無聲的錯誤。
+fn platform_flag_init_script() -> String {
+    PLATFORM_FLAG_INIT_JS.replace("__PLATFORM__", PLATFORM_FLAG)
+}
 
 // ---------------------------------------------------------------- 進入點
 
@@ -767,15 +814,13 @@ pub fn run() {
         // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
         // 前端一律走我們自己的指令，不開它的 JS 權限
         .plugin(tauri_plugin_updater::Builder::new().build())
-        // 前端平台旗標（見上方 PLATFORM_FLAG 說明）：頁面解析前把
-        // data-platform 寫進 <html>，取代建置期蓋章。這是一個只帶 init
-        // script、沒有 invoke handler 的迷你外掛，不是真的要接 JS 那一側的
+        // 前端平台旗標（見上方 PLATFORM_FLAG 與 PLATFORM_FLAG_INIT_JS 說明）：
+        // 頁面解析前把 data-platform 寫進 <html>，取代建置期蓋章。這是一個只帶
+        // init script、沒有 invoke handler 的迷你外掛，不是真的要接 JS 那一側的
         // 訊息——`tauri::plugin::Builder` 本身就是官方 API，不算新依賴。
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("platform-flag")
-                .js_init_script(format!(
-                    "document.documentElement.dataset.platform = {PLATFORM_FLAG:?};"
-                ))
+                .js_init_script(platform_flag_init_script())
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
@@ -1335,6 +1380,21 @@ mod tests {
         assert_eq!(PLATFORM_FLAG, "macos");
         #[cfg(windows)]
         assert_eq!(PLATFORM_FLAG, "windows");
+    }
+
+    /// 初始化腳本真的把旗標換進去了，而且**不會只寫一行直接設**（CORE-2）。
+    ///
+    /// WebView2 的 `AddScriptToExecuteOnDocumentCreated` 在 HTML 解析前就跑，
+    /// 那時 `document.documentElement` 是 null；少了 `MutationObserver` 那條
+    /// 退路，Windows 上這行腳本會拋 TypeError、`data-platform` 永遠不存在，
+    /// 而且完全無聲。這條測試釘住兩件事：佔位字串換掉了，退路還在。
+    #[test]
+    fn the_platform_flag_init_script_survives_a_null_document_element() {
+        let js = platform_flag_init_script();
+        assert!(!js.contains("__PLATFORM__"), "佔位字串沒被換掉，前端會拿到一個假的平台名");
+        assert!(js.contains(&format!("\"{PLATFORM_FLAG}\"")), "腳本裡要有這個編譯目標的旗標");
+        assert!(js.contains("MutationObserver"), "documentElement 為 null 時要有退路");
+        assert!(js.contains("disconnect"), "補寫完要把 observer 收掉");
     }
 
     /// 通知裡那句手勢提示由平台門面常數接出來，兩種語境共用同一份描述（M18）。
