@@ -93,31 +93,15 @@ fn show_main(app: &AppHandle) {
 static WEBVIEW_NEEDS_RELOAD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 回收發生時該怎麼辦。抽成純函式是為了能單獨測——這條分支就是上面那段
-/// 說明的全部內容，而它本身跟 webview 無關。
-///
-/// 掛 `cfg(target_os = "macos")` 不是因為這條規則有平台特性，是因為
-/// `on_web_content_process_terminate` 這顆掛鉤本身只有 macOS／iOS 有
-/// （Windows 的 WebView2 沒有對應事件），Windows 上連呼叫端都不存在。旗標與
-/// [`take_pending_reload`] 反而是跨平台的：`show_main` 與視窗的 `Focused(true)`
-/// 兩邊都會問一次，Windows 上那顆旗標永遠是 false，行為零變化。
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadPlan {
-    /// 有人在看，立刻重載。
-    Now,
-    /// 沒人在看，立旗標等下次前景化。
-    Defer,
-}
-
-#[cfg(target_os = "macos")]
-fn plan_reload_after_terminate(window_visible: bool) -> ReloadPlan {
-    if window_visible {
-        ReloadPlan::Now
-    } else {
-        ReloadPlan::Defer
-    }
-}
+// 那條分支（可見就立刻 reload、藏著就立旗標）直接寫在
+// `on_web_content_process_terminate` 的掛鉤裡：它就是一個 if／else，包成
+// 兩變體的 enum ＋ 一支 `plan_…` 函式再 match 回來，只是把同一件事講兩遍，
+// 連帶那條「Now 對應 true、Defer 對應 false」的測試也只是在測改名本身。
+//
+// 掛鉤本身只有 macOS／iOS 有（Windows 的 WebView2 沒有對應事件），所以呼叫端
+// 整段 `cfg(target_os = "macos")`。旗標與 [`take_pending_reload`]／
+// [`reload_if_pending`] 反而是跨平台的：`show_main` 與視窗的 `Focused(true)`
+// 兩邊都會問一次，Windows 上那顆旗標永遠是 false，行為零變化。
 
 /// 領取「欠一次 reload」的旗標：有的話回 true 並就地清掉，重複呼叫只會生效
 /// 一次（`show_main` 每次開窗都會問，不能每次都重載）。
@@ -890,7 +874,7 @@ pub fn run() {
     // **reload 的時機由視窗可不可見決定**，不是無條件立刻做：觸發這顆掛鉤的
     // 前提就是系統缺記憶體，藏著的時候立刻重生一個 WebContent 行程去畫沒有人
     // 在看的頁面，只會被系統再回收一次，一路轉圈。規則整段寫在
-    // `plan_reload_after_terminate` 上面。
+    // `WEBVIEW_NEEDS_RELOAD` 上面。
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(|webview| {
         let visible = webview
@@ -899,26 +883,21 @@ pub fn run() {
             // 問不到就當作看得見：立刻重載最多是多花一次重生，判成藏著卻其實
             // 有人在看的話，那片白屏會一直留到使用者自己去點系統匣才好。
             .unwrap_or(true);
-        match plan_reload_after_terminate(visible) {
-            ReloadPlan::Now => {
-                log::warn!(
-                    "webview content process terminated (label: {}), reloading to self-heal",
-                    webview.label()
-                );
-                if let Err(e) = webview.reload() {
-                    log::warn!(
-                        "could not reload the webview after content process termination: {e}"
-                    );
-                }
+        if visible {
+            log::warn!(
+                "webview content process terminated (label: {}), reloading to self-heal",
+                webview.label()
+            );
+            if let Err(e) = webview.reload() {
+                log::warn!("could not reload the webview after content process termination: {e}");
             }
-            ReloadPlan::Defer => {
-                log::warn!(
-                    "webview content process terminated (label: {}) while the window was hidden, \
-                     deferring the reload until the window is shown again",
-                    webview.label()
-                );
-                WEBVIEW_NEEDS_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+        } else {
+            log::warn!(
+                "webview content process terminated (label: {}) while the window was hidden, \
+                 deferring the reload until the window is shown again",
+                webview.label()
+            );
+            WEBVIEW_NEEDS_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     });
 
@@ -1336,18 +1315,6 @@ mod tests {
         assert!(!dev_server_reachable(None), "沒有 dev_url 就沒有東西可以敲");
         let no_host = tauri::Url::parse("data:text/html,hi").expect("data: URL 要 parse 得起來");
         assert!(!dev_server_reachable(Some(&no_host)), "data: URL 沒有 host:port 可以敲");
-    }
-
-    /// content process 被回收時的處置（M14）：可見才立刻重載。
-    ///
-    /// 藏著的時候立刻 reload 會馬上重生一個 WebContent 行程去畫沒有人在看的
-    /// 頁面——而觸發這顆掛鉤的前提正是系統缺記憶體，於是它再被回收、再 reload，
-    /// 一路轉圈。這條測試釘住「藏著就只立旗標」。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_hidden_window_defers_the_reload() {
-        assert_eq!(plan_reload_after_terminate(true), ReloadPlan::Now);
-        assert_eq!(plan_reload_after_terminate(false), ReloadPlan::Defer);
     }
 
     /// 欠下的那次 reload 只還一次：`show_main` 每次開窗都會問這顆旗標，
