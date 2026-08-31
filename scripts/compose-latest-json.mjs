@@ -42,6 +42,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { readBaselineText } from "./lib/baseline.mjs";
+import { runCli } from "./lib/cli.mjs";
 import { mergeLatestJson } from "./lib/latest-json.mjs";
 import { readManifest } from "./lib/manifest.mjs";
 
@@ -73,10 +75,10 @@ function resolvePlatformsFromManifests(dir, platformKeys, repo, tag) {
   return platforms;
 }
 
+/** 「沒有底稿」在 mergeLatestJson 這一側用空物件表示（見 scripts/lib/baseline.mjs） */
 function readBaseline(path) {
-  if (!path || !existsSync(path)) return {};
-  const raw = readFileSync(path, "utf8").trim();
-  if (!raw) return {};
+  const raw = readBaselineText(path);
+  if (raw === null) return {};
   try {
     return JSON.parse(raw);
   } catch (err) {
@@ -142,12 +144,4 @@ function main() {
   console.log(JSON.stringify(merged, null, 2));
 }
 
-// 這支腳本的每一種失敗都是「刻意擋下來的發佈事故」，訊息本身才是重點——
-// 直接讓例外冒出去只會在 CI log 裡留下一坨 stack trace，真正要看的那句話還
-// 得自己撈。統一收斂成 ::error:: 註記（會浮到 run 摘要），並以 exit 1 結束。
-try {
-  main();
-} catch (err) {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-}
+runCli(main);

@@ -21,9 +21,11 @@
  */
 
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { readBaselineText } from "./lib/baseline.mjs";
+import { runCli } from "./lib/cli.mjs";
 import { formatSha256Sums, mergeSha256Sums } from "./lib/sha256sums.mjs";
 
 /** 跟舊版 `for pattern in '*.exe' '*.dmg' '*.tar.gz'` 等價：只看副檔名，不遞迴 */
@@ -39,12 +41,6 @@ function sha256File(path) {
     stream.on("error", reject);
     stream.on("end", () => resolvePromise(hash.digest("hex")));
   });
-}
-
-function readBaseline(path) {
-  if (!path || !existsSync(path)) return null;
-  const raw = readFileSync(path, "utf8");
-  return raw.trim() === "" ? null : raw;
 }
 
 async function main() {
@@ -79,7 +75,8 @@ async function main() {
     currentMap[filename] = await sha256File(join(dir, filename));
   }
 
-  const baselineText = readBaseline(values.baseline);
+  // mergeSha256Sums 的「沒有底稿」用 null 表示（見 scripts/lib/baseline.mjs）
+  const baselineText = readBaselineText(values.baseline);
   const merged = mergeSha256Sums(baselineText, currentMap);
 
   const formatted = formatSha256Sums(merged);
@@ -88,9 +85,4 @@ async function main() {
   process.stdout.write(formatted);
 }
 
-// 跟 scripts/compose-latest-json.mjs 同樣的收斂方式：每一種失敗都是刻意擋下來的
-// 發佈事故，訊息本身才是重點，不要留一坨 stack trace 在 log 裡。
-main().catch((err) => {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+runCli(main);

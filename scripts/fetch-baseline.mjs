@@ -42,6 +42,7 @@
 
 import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { runCli } from "./lib/cli.mjs";
 import { fetchWithRetry } from "./lib/fetch-retry.mjs";
 import { parseSha256Sums } from "./lib/sha256sums.mjs";
 
@@ -102,7 +103,4 @@ async function main() {
   console.log(result.text);
 }
 
-main().catch((err) => {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+runCli(main);

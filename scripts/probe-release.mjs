@@ -30,6 +30,7 @@
 
 import { appendFileSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { runCli } from "./lib/cli.mjs";
 import { fetchWithRetry } from "./lib/fetch-retry.mjs";
 
 /** 與 softprops/action-gh-release v3.0.2 的 RECENT_RELEASE_SCAN_PAGES 對齊（見檔頭） */
@@ -115,9 +116,4 @@ async function main() {
   appendFileSync(githubOutput, `is_draft=${isDraft}\n`);
 }
 
-// 跟 scripts/fetch-baseline.mjs 等其他發佈用 CLI 一樣：失敗訊息本身才是重點，
-// 收斂成 ::error:: 註記（會浮到 run 摘要）並以 exit 1 結束。
-main().catch((err) => {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+runCli(main);
