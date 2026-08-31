@@ -50,7 +50,45 @@ const LAUNCHD_DEFAULT_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin
 /// 等登入 shell 回答的上限。給得寬（rc 檔厚的機器上一次互動式登入要好幾百毫秒），
 /// 但一定要有——這是 `fix-path-env` 缺的那一格。逾時就放棄修正，維持原樣啟動：
 /// 隧道會失敗，但 app 起得來、日誌上有話說，比永遠卡在第一行好。
+///
+/// 這個值故意窄：它擋在**任何 UI 之前**，每一毫秒都是使用者盯著沒有反應的畫面。
+/// 「第一次沒問到」不再等於整個 session 放棄，背景還會再試一次（見
+/// [`LATE_LOGIN_PATH`]），那一次的預算寬得多。
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 背景重探等多久再開始。
+///
+/// 第一次失敗最常見的原因就是「這台機器現在很忙」：登入當下 LaunchAgent 把我們
+/// 拉起來時，Finder、Dock、一整排登入項目、nvm／conda／oh-my-zsh 的冷快取全都
+/// 在同一時間爭 CPU 與磁碟。馬上重試一次多半會撞上同一堵牆，隔幾秒讓登入風暴
+/// 過去再問，成功率完全不同。
+const LOGIN_SHELL_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// 背景重探的逾時上限，比擋在啟動路徑上的 [`LOGIN_SHELL_TIMEOUT`] 寬得多。
+///
+/// 敢放寬是因為這一次**不擋任何東西**：它跑在自己的執行緒上，UI 早就出來了，
+/// 慢一點只是慢一點。而窄的預算正是第一次失敗的原因，重試若照抄同一個數字，
+/// 等於再賭一次同一場賭局。
+const LOGIN_SHELL_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 背景重探問到的那一份 `PATH`（已經補過系統目錄）。沒問到就一直是空的。
+///
+/// ## 為什麼是 `OnceLock` 而不是再 `set_var` 一次
+///
+/// [`fix_gui_launch_path`] 那條路可以 `std::env::set_var`，因為它跑在**任何執行緒
+/// 被生出來之前**（`lib.rs::run()` 的第一行，`tauri::Builder` 之前）。背景重探
+/// 不在那個位置——它按定義就是「已經有別的執行緒在跑了」，而 `setenv(3)` 不是
+/// 執行緒安全的：改行程共用的環境區塊時，任何一條正在 `getenv` 的執行緒（tokio
+/// 自己就會讀 `TMPDIR`／`RUST_BACKTRACE`，任何一次 `Command::spawn` 也會整份讀
+/// 環境）都可能讀到被 realloc 掉的舊指標。那是 use-after-free，不是理論風險。
+///
+/// 所以問到的答案存在這裡，**由每一次 spawn 自己去取**（[`path_override`]），
+/// 用 `Command::env("PATH", …)` 只改那一個子程序的環境——`Command` 的環境是它
+/// 自己的一份副本，寫它不碰行程的環境區塊，完全沒有上面那個問題。
+///
+/// 只寫一次（`OnceLock::set`）也剛好對得上這件事的語意：使用者的登入 shell PATH
+/// 在一次 app 的生命週期裡不會變，第一次問到就是答案。
+static LATE_LOGIN_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// 輪詢登入 shell 有沒有結束的間隔。
 const LOGIN_SHELL_TICK: Duration = Duration::from_millis(20);
@@ -127,9 +165,15 @@ fn resolve_login_shell(from_env: Option<&str>) -> String {
     }
 }
 
+/// 這次要問哪一支登入 shell。**只在主執行緒（`set_var` 之前）呼叫**：它讀
+/// `SHELL` 環境變數，背景重探那條路要在生執行緒之前先把答案帶著走。
+fn login_shell() -> String {
+    resolve_login_shell(std::env::var("SHELL").ok().as_deref())
+}
+
 /// 跑一次使用者的登入 shell，把它的 `PATH` 問回來。逾時或任何一步失敗都回 `None`。
 fn login_shell_path() -> Option<String> {
-    ask_shell_for_path(&resolve_login_shell(std::env::var("SHELL").ok().as_deref()))
+    ask_shell_for_path(&login_shell())
 }
 
 /// [`login_shell_path`] 的本體，shell 由呼叫端指定（測試才餵得進一支假的）。
@@ -168,6 +212,13 @@ fn login_shell_path() -> Option<String> {
 /// 成敗只看「標記在不在」，不看退出碼：互動式 shell 的退出碼是它 rc 檔最後一個
 /// 命令的結果，跟「我們有沒有問到答案」沒有關係。
 fn ask_shell_for_path(shell: &str) -> Option<String> {
+    ask_shell_for_path_within(shell, LOGIN_SHELL_TIMEOUT)
+}
+
+/// [`ask_shell_for_path`] 但逾時預算由呼叫端決定：擋在啟動路徑上那一次要窄
+/// （[`LOGIN_SHELL_TIMEOUT`]），背景重探那一次不擋任何東西，可以寬
+/// （[`LOGIN_SHELL_RETRY_TIMEOUT`]）。
+fn ask_shell_for_path_within(shell: &str, timeout: Duration) -> Option<String> {
     let tmp = std::env::temp_dir().join(format!(
         "traytunnel-login-path-{}-{}",
         std::process::id(),
@@ -176,14 +227,14 @@ fn ask_shell_for_path(shell: &str) -> Option<String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let found = ask_shell_for_path_into(shell, &tmp);
+    let found = ask_shell_for_path_into(shell, &tmp, timeout);
     // 成功、逾時、失敗都要清掉，暫存檔不留在 /tmp
     let _ = std::fs::remove_file(&tmp);
     found
 }
 
 /// [`ask_shell_for_path`] 扣掉暫存檔清理的那一段，拆開只為了讓清理有唯一一個出口。
-fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
+fn ask_shell_for_path_into(shell: &str, tmp: &Path, timeout: Duration) -> Option<String> {
     let script =
         format!("/bin/echo '{PATH_BEGIN}'; /usr/bin/printenv PATH; /bin/echo '{PATH_END}'");
 
@@ -195,27 +246,75 @@ fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::fs::File::create(tmp).ok()?))
         .stderr(Stdio::null());
-    // 自成一個行程群組，逾時時才收得掉「shell 自己＋它 rc 檔生出來的東西」整棵樹
-    // ——只 kill shell 的話，卡住它的那支孫程序會留下來
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // 自成一個新的 **session**（連帶自成一個新的行程群組，pgid ＝ 子程序的 pid，
+    // 這是 `setsid(2)` 的定義），逾時時才收得掉「shell 自己＋它 rc 檔生出來的
+    // 東西」整棵樹——只 kill shell 的話，卡住它的那支孫程序會留下來。
+    //
+    // ## 為什麼是 `setsid()` 而不是 `process_group(0)`
+    //
+    // 兩者在「自成一個 pgid、pgid ＝ 子程序的 pid」這件事上等價，底下
+    // `kill_group(pgid)` 那段逾時清理一個字都不用改。差別在**控制終端**：
+    // `process_group(0)` 只換群組，子程序仍留在原本的 session 裡——從終端機啟動
+    // 時（`cargo run`、直接跑執行檔）那就是終端機的 session，而且是一個**非前景**
+    // 的行程群組。POSIX 的作業控制規定：非前景群組的行程一旦要從控制終端讀，
+    // 核心就整組送 `SIGTTIN`，預設動作是**停住**。而我們跑的正是 `-i`（互動式）
+    // ——互動式 shell 啟動時會做 job control 初始化（`tcgetpgrp`／把自己搬進前景），
+    // 那一手在非前景群組裡就會踩到這條規則。
+    //
+    // 實測（本機，有控制終端、PATH 是 launchd 最小集的重現路徑）：**zsh 會停住、
+    // bash 不會**——而 macOS 10.15 起的預設登入 shell 正是 zsh，也就是絕大多數
+    // 使用者會走到的那一支。停住之後 `try_wait()` 永遠回 `Ok(None)`（停住不是
+    // 結束），探測必定燒滿整整 5 秒逾時才放棄，而這段時間是花在**任何 UI 之前**
+    // 的啟動路徑上。
+    //
+    // `setsid()` 之後子程序沒有控制終端，那條規則整個不適用，探測正常回答。
+    // `stdin(Stdio::null())` 擋不住這件事：卡住的不是 stdin，是 shell 自己對
+    // 控制終端的操作。同一個手法與同一段推論見 `spawn.rs`（那邊擋的是 ssh 的
+    // `readpassphrase` 直接開 `/dev/tty`）。
+    //
+    // `setsid()` 在剛 `fork` 出來的子程序裡不可能失敗成 `EPERM`：`EPERM` 只發生
+    // 在呼叫者已經是行程群組領袖時，而新 fork 出來的子程序 pid 全新、pgid 繼承
+    // 自父行程，兩者不相等。
+    //
+    // SAFETY：`pre_exec` 的閉包跑在 `fork` 與 `exec` 之間的子程序裡，那個環境只准
+    // 呼叫 async-signal-safe 的東西（不能配置記憶體、不能取鎖）。這裡只呼叫
+    // `setsid()` 一支系統呼叫，沒有配置、沒有鎖、沒有 Rust 端的狀態，符合要求。
+    // 這個 `cmd` 是本函式自己建的區域變數、只 spawn 一次，不會重複掛上 `pre_exec`。
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd.spawn().ok()?;
+    // 子程序的 pid 就是它的 pgid（`setsid()` 讓它自成一組，見上面那段）
     let pgid = child.id() as i32;
-    let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
-    loop {
+    let deadline = Instant::now() + timeout;
+    // 迴圈只回報一件事：這支 shell 是不是**自己**結束了。
+    let finished_on_its_own = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // 整組收掉再 wait，不留殭屍也不留孤兒
-                    super::pgids::kill_group(pgid);
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(LOGIN_SHELL_TICK);
-            }
-            Err(_) => return None,
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() >= deadline => break false,
+            Ok(None) => std::thread::sleep(LOGIN_SHELL_TICK),
+            // `try_wait` 自己出錯與逾時走**同一個出口**。兩種情形下這支互動式
+            // shell（以及它 rc 檔生出來的一整棵東西）都還在跑，而我們已經不要
+            // 它的答案了——差別只在「知不知道它跑到哪」，該做的收尾一模一樣。
+            // 原本這一支是 `Err(_) => return None`，兩件收尾都沒做：那棵樹變成
+            // 孤兒繼續跑，而 `Child` 被 drop 時 std 也不會替我們 `wait`
+            // （`Child::drop` 明文寫著「不會 wait，可能留下殭屍」），行程表裡
+            // 就留下一隻 `<defunct>`。這一支罕見（`ECHILD`／`EINTR` 之外幾乎
+            // 不會發生），但「罕見」不是「可以留下孤兒」的理由。
+            Err(_) => break false,
         }
+    };
+    if !finished_on_its_own {
+        // 整組收掉再 wait，不留殭屍也不留孤兒
+        super::pgids::kill_group(pgid);
+        let _ = child.wait();
+        return None;
     }
     extract_marked_path(&std::fs::read_to_string(tmp).ok()?)
 }
@@ -237,9 +336,11 @@ pub fn fix_gui_launch_path() -> Vec<String> {
         return Vec::new();
     }
     let Some(login) = login_shell_path() else {
+        spawn_late_path_probe();
         return vec![
             "PATH is the launchd default; asking the login shell for the real one failed, \
-             tools installed by Homebrew (e.g. cloudflared for ProxyCommand) may not be found"
+             retrying in the background, until then tools installed by Homebrew (e.g. \
+             cloudflared for ProxyCommand) may not be found"
                 .into(),
         ];
     };
@@ -249,6 +350,83 @@ pub fn fix_gui_launch_path() -> Vec<String> {
     }
     std::env::set_var("PATH", &fixed);
     vec![format!("PATH was the launchd default, replaced with the login shell PATH: {fixed}")]
+}
+
+/// 第一次沒問到時，在背景再問一次（結果進 [`LATE_LOGIN_PATH`]）。
+///
+/// ## 為什麼一定要有這一支
+///
+/// 沒有它的話「第一次沒問到」＝**整個 session 放棄**。而第一次失敗最常見的情境
+/// 正好是最要緊的那一個：登入時 LaunchAgent 把 app 拉起來，那一刻機器最忙
+/// （Finder、Dock、一整排登入項目、nvm／conda／oh-my-zsh 的冷快取），一次互動式
+/// 登入 shell 很容易超過 5 秒。於是整個 session 的 `PATH` 停在 launchd 最小集，
+/// 每一條 `ProxyCommand`（`/opt/homebrew/bin/cloudflared`）都 `not found`、每 5 秒
+/// 重連一次，直到使用者自己重開 app——而幾秒之後再問一次本來就會成功。
+///
+/// ## 這條路上不可以做的事
+///
+/// **絕不呼叫 `std::env::set_var`。** 理由見 [`LATE_LOGIN_PATH`]：這裡按定義已經
+/// 有別的執行緒在跑，改行程共用的環境區塊不是執行緒安全的。答案只存進 `OnceLock`，
+/// 由 [`path_override`] 在每一次 spawn 時取用。
+///
+/// 讀環境變數（`SHELL`）也在**生執行緒之前**就做完（[`login_shell`] 的結果帶進
+/// 閉包），這條執行緒自己一次都不碰行程的環境區塊。
+///
+/// 執行緒不 join：它最多活 [`LOGIN_SHELL_RETRY_DELAY`] ＋
+/// [`LOGIN_SHELL_RETRY_TIMEOUT`]（逾時那一手會把整個行程群組收掉，見
+/// [`ask_shell_for_path_into`]），而且從頭到尾沒有人在等它。app 先結束的話它跟著
+/// 行程一起走。
+fn spawn_late_path_probe() {
+    // 讀 `SHELL` 這件事留在呼叫端的執行緒上（此刻仍是「唯一一條」），閉包帶走的
+    // 是已經解析好的字串
+    let shell = login_shell();
+    let spawned =
+        std::thread::Builder::new().name("traytunnel-login-path-retry".into()).spawn(move || {
+            std::thread::sleep(LOGIN_SHELL_RETRY_DELAY);
+            let Some(login) = ask_shell_for_path_within(&shell, LOGIN_SHELL_RETRY_TIMEOUT) else {
+                log::warn!(
+                    "the background retry could not get a PATH out of the login shell either; \
+                     tools installed by Homebrew (e.g. cloudflared for ProxyCommand) will not \
+                     be found until the app is restarted"
+                );
+                return;
+            };
+            let fixed = with_system_dirs(&login);
+            // 只寫一次；第二次寫入（理論上到不了，這支只 spawn 一次）不算錯誤
+            let _ = LATE_LOGIN_PATH.set(fixed.clone());
+            log::info!(
+                "the background retry got the login shell PATH: {fixed}; new child processes \
+                 (ssh and its ProxyCommand) will be started with it"
+            );
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start the background login shell PATH retry: {e}");
+    }
+}
+
+/// 這一次 spawn 要不要覆寫子程序的 `PATH`，要的話是哪一份。
+///
+/// `None` 是絕大多數情況：從終端機啟動（`PATH` 本來就是使用者的）、第一次探測就
+/// 成功（`fix_gui_launch_path` 已經 `set_var` 過，行程的 `PATH` 就是對的），
+/// 或背景重探還沒問到／問不到。
+pub(super) fn path_override() -> Option<&'static str> {
+    let discovered = LATE_LOGIN_PATH.get()?;
+    let current = std::env::var("PATH").unwrap_or_default();
+    should_inject_path(&current, discovered).then_some(discovered.as_str())
+}
+
+/// 「要不要注入」的判定，純函式。
+///
+/// 三道都要成立：
+///
+/// 1. 問到的那一份不是空的——空的 `PATH` 比最小集更糟，寧可什麼都不做；
+/// 2. 它與目前這個行程的 `PATH` 不同——一樣的話注入是白做工；
+/// 3. **目前的 `PATH` 仍然是 GUI 最小集**（[`path_is_the_gui_minimum`]）。這一道
+///    是保險：`fix_gui_launch_path` 成功時會 `set_var`，那之後行程的 `PATH` 就是
+///    使用者自己的那一份，不該再被一份「背景另外問到的」蓋掉——兩者理論上相同，
+///    但真的不同時，該贏的是啟動時就套用、整個 session 一致的那一份。
+fn should_inject_path(current: &str, discovered: &str) -> bool {
+    !discovered.trim().is_empty() && discovered != current && path_is_the_gui_minimum(current)
 }
 
 // ---------------------------------------------------------------- 本地埠偵測
@@ -540,20 +718,29 @@ fn read_autostart_command_at(base: &Path, name: &str) -> Option<String> {
 /// 把 LaunchAgent plist 寫進 `base` 資料夾，回傳寫出去的路徑。
 /// 覆寫既有檔案就是「更新登記內容」（自癒改寫 `ProgramArguments` 走的正是這條），
 /// launchd 下次登入讀到的自然是新的那一份。
+///
+/// **一定要走 [`crate::config::write_atomic`]（先寫 `.tmp` 再 `rename`），
+/// 不可以是 `fs::write`。** `fs::write` 是「先把舊檔截成 0 位元組，再一路寫進去」
+/// ——中間被 SIGKILL 帶走、或磁碟寫滿，留下的就是一份**殘缺的 XML**。launchd
+/// 下次登入解析不了它，開機自啟從此靜默失效，而 [`autostart_enabled_at`] 只看
+/// 「檔案在不在」，開關照樣顯示 ON：使用者看到的是一個打開著、卻什麼都不做的
+/// 開關，沒有任何線索。`rename(2)` 在同一個檔案系統上是原子的，於是同樣被打斷
+/// 時留下的是**完整的舊版**（自啟仍然有效），不是半截的新版。
+///
+/// 同一份理由讓 pgids 登記簿也走這一支（見 `pgids::write_at`），兩邊共用同一份
+/// 原子寫入實作。`create_dir_all` 留在這裡：`~/Library/LaunchAgents` 第一次啟用
+/// 自啟時可能還不存在，而 `write_atomic` 不管建資料夾這件事。
 fn write_autostart_plist_at(base: &Path, name: &str, exe: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(base)?;
     let path = plist_path_in(base, name);
-    std::fs::write(&path, plist_contents(&plist_label(name), exe))?;
+    crate::config::write_atomic(&path, &plist_contents(&plist_label(name), exe))?;
     Ok(path)
 }
 
-/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功）。
+/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功，見
+/// [`super::paths::remove_file_if_present`]）。
 fn remove_autostart_plist_at(base: &Path, name: &str) -> io::Result<()> {
-    match std::fs::remove_file(plist_path_in(base, name)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    super::paths::remove_file_if_present(&plist_path_in(base, name))
 }
 
 /// 開機自啟目前是不是真的登記著。
@@ -580,18 +767,39 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
 /// 這個路徑是**這一次執行才存在的**：app 結束、掛載點消失，下次登入時它不存在。
 /// 比對整段 `/AppTranslocation/` 而不是只比 `AppTranslocation`，是為了確保比到的
 /// 是一整層路徑元件，不會被某個剛好叫 `MyAppTranslocationTool` 的資料夾騙過去。
-fn is_app_translocated(exe: &Path) -> bool {
+///
+/// `pub(super)` 是因為更新那條路也要問同一件事：translocated 的掛載點是**唯讀**的，
+/// 就地替換 bundle 會死在 `EROFS`（見 `update` 模組開頭「App Translocation」那段），
+/// 所以 `update::is_installed`／`update::install` 與這裡共用同一份判定，不要有第二種寫法。
+pub(super) fn is_app_translocated(exe: &Path) -> bool {
     exe.to_string_lossy().contains("/AppTranslocation/")
 }
 
-/// 從 App Translocation 的唯讀影本跑起來時，寫開機自啟一律拒絕，錯誤訊息直接
-/// 是給使用者看的處理方式（`commands::set_autostart` 原樣往前端送）。
-fn translocation_refusal() -> io::Error {
-    io::Error::other(
+/// 從 App Translocation 的唯讀影本跑起來時，給使用者看的那一段話。
+///
+/// 兩個呼叫端共用同一份文案：這裡的 [`enable_autostart`]（寫 LaunchAgent plist）
+/// 與 `update::install`（就地替換 bundle）。兩者拒絕的**理由**不同（一個是「登記的
+/// 路徑下次登入不存在」，一個是「掛載點是唯讀的」），但**處理方式**一模一樣
+/// ——把 app 搬進應用程式資料夾、從那裡打開——而那句話才是使用者真正要看的東西。
+/// 各寫一份的話遲早會漂成兩種說法，所以差異的那半句由呼叫端傳進來，共同的那半句
+/// 只有這一份。
+///
+/// `consequence`：這一次「所以會怎樣」；`next_step`：搬完之後請他再做什麼。
+pub(super) fn translocation_refusal_text(consequence: &str, next_step: &str) -> String {
+    format!(
         "Traytunnel is running from a temporary read-only copy made by macOS App Translocation, \
-         so the path it would record here no longer exists at the next login. Move Traytunnel.app \
-         into the Applications folder, open it from there, and turn this on again.",
+         so {consequence}. Move Traytunnel.app into the Applications folder, open it from there, \
+         and {next_step}."
     )
+}
+
+/// 寫開機自啟一律拒絕，錯誤訊息直接是給使用者看的處理方式
+/// （`commands::set_autostart` 原樣往前端送）。
+fn translocation_refusal() -> io::Error {
+    io::Error::other(translocation_refusal_text(
+        "the path it would record here no longer exists at the next login",
+        "turn this on again",
+    ))
 }
 
 /// 寫出（或覆寫）LaunchAgent plist，**下次登入生效**。
@@ -758,6 +966,32 @@ mod tests {
              啟動都要多跑一次登入 shell"
         );
         assert!(!path_is_the_gui_minimum("/usr/local/bin:/usr/bin"));
+    }
+
+    /// 背景重探問到 `PATH` 之後，**哪些情況該把它注入子程序**（`Command::env`）。
+    ///
+    /// 這道判定是 MAC-2 的整個要害：注入得太少，登入時被 launchd 拉起來、第一次
+    /// 探測逾時的那個 session 就永遠找不到 `cloudflared`；注入得太多，會把啟動時
+    /// 就套用好、整個 session 一致的那一份 `PATH` 蓋掉。
+    #[test]
+    fn a_late_path_is_only_injected_while_the_process_path_is_still_the_gui_minimum() {
+        let good = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+        // 這就是要救的那一格：行程的 PATH 還是 launchd 最小集
+        assert!(should_inject_path("/usr/bin:/bin:/usr/sbin:/sbin", good));
+        assert!(should_inject_path("", good), "連 PATH 都沒有時更該注入");
+
+        // 第一次探測就成功（set_var 過）→ 行程的 PATH 已經是使用者的那一份，
+        // 不可以再被背景那份蓋掉
+        assert!(
+            !should_inject_path(good, "/opt/homebrew/bin:/usr/local/bin:/usr/bin"),
+            "行程的 PATH 已經不是最小集了，該贏的是啟動時就套用的那一份"
+        );
+        // 一模一樣：注入是白做工
+        assert!(!should_inject_path(good, good));
+        // 問到的是空的（或只有空白）：空 PATH 比最小集更糟，寧可什麼都不做
+        assert!(!should_inject_path("/usr/bin:/bin", ""));
+        assert!(!should_inject_path("/usr/bin:/bin", "   "));
     }
 
     /// 互動式 shell 的 rc 檔什麼都可能往 stdout 印，標記中間那一段才是答案。

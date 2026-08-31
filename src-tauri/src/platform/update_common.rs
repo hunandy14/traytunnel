@@ -46,6 +46,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use semver::Version;
+use tauri::AppHandle;
+use tauri_plugin_updater::{Update, Updater, UpdaterExt};
 
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -156,6 +158,46 @@ pub fn accept(remote: &str, current: &str, installed: bool) -> Option<UpdateInfo
         return None;
     }
     Some(UpdateInfo { version: normalize_version(remote).to_string(), installed })
+}
+
+// ---------------------------------------------------------------- 外掛的兩道逾時
+//
+// 這兩支收的不是「邏輯」，是**兩道逾時**——而逾時在這條路上是安全屬性，不是調味：
+// updater 外掛的 builder 預設 `timeout: None`，`Update` 物件的 `timeout` 更是寫死
+// 的 `None`（2.10.1 的 updater.rs），兩處都完全沒有上限。三個呼叫點
+// （macOS 的 `fetch_update`、Windows 的 `check_installed` 與 `install`）原本各抄
+// 一份「builder(CHECK_TIMEOUT).build()」與「timeout = DOWNLOAD_TIMEOUT; download」，
+// 抄三份的下場是漏掉其中一份時**完全靜默**：那一條路平常跑起來一模一樣，只有遇到
+// 半開的連線才會永遠掛著，而那正是逾時要擋的唯一情境。
+//
+// 刻意只收這兩小塊，控制流一步都不動：各呼叫點自己的日誌字串、macOS 的
+// `is_target_missing` 降級、Windows 的 `accept`／落地順序全部原樣留在原處。
+
+/// 建一個帶檢查逾時的 updater。
+///
+/// **不可以用 `app.updater()` 那個便利方法**：它建出來的 updater 沒有逾時上限，
+/// 遇到半開的連線（封包進得去、回應永遠不來）整個檢查任務就再也不會回來——背景
+/// 檢查每 24 小時起一次、卡住的任務一直累積，手動按下的「Check now」更糟，前端的
+/// await 沒有逾時，按鈕會永遠停在轉圈。所以一律走 builder 自己補一道
+/// [`CHECK_TIMEOUT`]。
+pub fn build_updater(app: &AppHandle) -> Result<Updater, String> {
+    app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())
+}
+
+/// 下載更新包（下載前先補上 [`DOWNLOAD_TIMEOUT`]）。
+///
+/// builder 上那個逾時只管 check 那次請求，`Update` 物件的 `timeout` 是外掛寫死的
+/// `None`（＝下載沒有任何上限），只能在拿到物件之後對它的 pub 欄位直接賦值。
+/// 兩段的合理值差了一個數量級，理由見兩個常數本身。
+///
+/// 兩個回呼都是空的：進度條這條路上沒有人畫（macOS 是按下去就等，Windows 是背景
+/// 靜默下載），留著只是外掛的簽章要求。
+///
+/// 回來的 bytes **已經過 minisign 驗簽**（外掛 updater.rs 的 `verify_signature`，
+/// 驗不過就是 Err），呼叫端拿到的一定是簽章對得上的那一份。
+pub async fn download(update: &mut Update) -> Result<Vec<u8>, String> {
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
+    update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())
 }
 
 /// 某一版的 release 頁網址。版本給 None（還沒查到新版）就退回 releases/latest，
@@ -283,9 +325,22 @@ pub fn conf_str(key: &str) -> String {
         .to_string()
 }
 
-/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
-/// productName）。只有 Windows 用得到（NSIS 的解除安裝機碼），macOS 沒有對應
-/// 概念。
+/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串。
+///
+/// **這是 Windows 的出貨值，這個常數不適用於 macOS。** 它讀的是
+/// [`TAURI_CONF`]（`tauri.conf.json`）的 `productName`，而 macOS 那一腿是帶著
+/// `tauri.macos.conf.json` 出貨的，那份 overlay 把 `productName` 蓋成
+/// `Traytunnel`（大寫 T，也就是 `Traytunnel.app` 與 bundle 內執行檔的名字）。
+/// 換句話說這一支在 macOS 上回的是一個**沒有任何東西叫這個名字**的字串。
+///
+/// 今天沒有人踩到：唯一的消費者是 Windows 的 NSIS 解除安裝機碼，macOS 側整個
+/// `allow(dead_code)`。日後 macOS 真的需要「產品名」時，要的是 overlay 之後的
+/// 值，不是這一份——請另外解 `tauri.macos.conf.json`，不要直接拿它來用。
+///
+/// 刻意**不**在這裡做 overlay 合併：那等於在執行期重做一次 tauri CLI 的設定合併
+/// （`--config` 的深層合併規則、平台判定、還有它會不會再蓋別的鍵），為了一個目前
+/// 零消費者的值背一套與 CLI 對齊的責任，划不來。誠實標註它是什麼、不是什麼，
+/// 比悄悄給一個看起來對的錯值安全得多。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
 
@@ -401,9 +456,17 @@ mod tests {
     /// Windows 的暫存區資料夾、single-instance 具名互斥鎖、通知 AUMID、NSIS
     /// 解除安裝機碼全部以它們定位，換掉的話既有使用者的這些東西全部靜默失聯
     /// ——不是這次更新失敗，是連「有更新」這件事都不會再發生。
+    ///
+    /// **兩個值的適用範圍不一樣，這裡說清楚**：`identifier` 兩個平台都吃這一份
+    /// （沒有 overlay 蓋它）；`productName` 則是 **Windows 的出貨值**——macOS 那一腿
+    /// 帶著 `tauri.macos.conf.json` 出貨，那份 overlay 把它蓋成 `Traytunnel`，所以
+    /// 這條測試釘的 `"traytunnel"` 對 macOS 不成立，[`PRODUCT_NAME`] 本身也不適用
+    /// 於 macOS（見那個常數的說明）。這裡不去合併 overlay，只是不再假裝這是一個
+    /// 平台中立的值。
     #[test]
     fn the_shipped_identifier_and_product_name_are_the_ones_users_already_have() {
         assert_eq!(*IDENTIFIER, "com.traytunnel.desktop");
+        // Windows 出貨值（NSIS 解除安裝機碼名）；macOS 由 overlay 蓋成 Traytunnel
         assert_eq!(*PRODUCT_NAME, "traytunnel");
     }
 }

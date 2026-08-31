@@ -107,6 +107,18 @@ impl ProcessSupervisor {
     /// 靜默失敗：程序本身已經起來了，讓它跑總比為了收尾機制炸掉呼叫端好，
     /// 但至少要在日誌上留一筆讓人查得到。
     pub fn spawn(&self, cmd: &mut Command, log_context: &str) -> io::Result<Child> {
+        // GUI 啟動時的 `PATH` 修正若是**背景重探**才問到的（第一次探測逾時，見
+        // `sys::spawn_late_path_probe`），那份答案不能寫回行程的環境區塊——
+        // `setenv(3)` 不是執行緒安全的，而那時整個 app 早就多執行緒了。所以改在
+        // 這裡、每一次 spawn 的當下注入：`Command` 的環境是它自己的一份副本，
+        // 只影響這一個子程序（連同它的孫程序，例如 ProxyCommand 的 cloudflared），
+        // 不碰任何共用狀態。兩個呼叫端（`tunnel::supervise` 的監看迴圈與
+        // `tunnel::test_connection`）都走這一支，所以只要擋在這裡一次。
+        //
+        // 絕大多數情況下這裡是 no-op（見 `sys::path_override`）。
+        if let Some(path) = super::sys::path_override() {
+            cmd.env("PATH", path);
+        }
         // SAFETY：`pre_exec` 的閉包跑在 `fork` 與 `exec` 之間的子程序裡，那個
         // 環境只准呼叫 async-signal-safe 的東西（不能配置記憶體、不能取鎖）。
         // 這裡只呼叫 `setsid()` 一支系統呼叫，沒有配置、沒有鎖、沒有 Rust 端的

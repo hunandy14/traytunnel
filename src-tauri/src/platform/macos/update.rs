@@ -99,11 +99,10 @@
 use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::Update;
 
 use crate::platform::update_common::{
-    self, accept, current_version, normalize_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY,
-    INTERVAL,
+    self, accept, current_version, normalize_version, FIRST_DELAY, INTERVAL,
 };
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -147,13 +146,35 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
     Some(bundle.to_path_buf())
 }
 
-/// 這次跑的這一份能不能就地更新自己（＝跑在一顆 `.app` bundle 裡）。
+/// 這一份執行檔能不能就地更新自己。純函式，實機與測試共用。
+///
+/// 兩道都要成立：
+///
+/// 1. **跑在一顆 `.app` bundle 裡**（[`bundle_of`]）——沒有 bundle 就沒有東西可換；
+/// 2. **不是 App Translocation 的唯讀影本**（`sys::is_app_translocated`）。第二道
+///    是這一版補上的：從 dmg 視窗或 `~/Downloads` 直接雙擊時，macOS 跑的是一份掛在
+///    唯讀掛載點上的隨機路徑影本，它**看起來完全是一顆合格的 `.app`**（第一道照樣
+///    成立），但外掛第一步 `std::fs::rename(extract_path, backup)` 會拿到 **EROFS**
+///    ——不是 `PermissionDenied`，所以連外掛那條 AppleScript 提權退路都不會走，
+///    使用者看到的是「update failed: Read-only file system (os error 30)」，而且每
+///    24 小時的背景檢查會持續重新推薦同一版（`plugins-workspace#2148`，本檔開頭
+///    「App Translocation」那一段早就寫著這是已知失敗，卻一直沒有閘）。
+///
+/// 少了第二道的症狀不只是「更新失敗」：使用者是先等完一次十幾 MB 的下載，才收到
+/// 一句看不懂的 os error。加上之後，前端那顆鈕從一開始就是「Get vX.Y.Z」
+/// （開 release 頁），與「這一份不能更新自己」的事實一致。
+fn can_update_in_place(exe: &Path) -> bool {
+    bundle_of(exe).is_some() && !super::sys::is_app_translocated(exe)
+}
+
+/// 這次跑的這一份能不能就地更新自己。
 ///
 /// 對應 Windows 的 `is_installed`，也是 `UpdateInfo.installed` 的來源：
 /// `true` 前端給「Update to vX.Y.Z」（走 [`install`]），
-/// `false` 給「Get vX.Y.Z」（走 [`open_release_page`]）。
+/// `false` 給「Get vX.Y.Z」（走 [`open_release_page`]）。判定本身見
+/// [`can_update_in_place`]。
 pub fn is_installed() -> bool {
-    std::env::current_exe().ok().as_deref().and_then(bundle_of).is_some()
+    std::env::current_exe().ok().is_some_and(|exe| can_update_in_place(&exe))
 }
 
 /// 這台機器在 latest.json 的 `platforms` 裡對應的鍵。
@@ -206,12 +227,10 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
 /// 吞掉，同一件事在活動日誌裡看起來厚此薄彼。統一在這裡記那一行日誌，兩個呼叫端
 /// 都看得到同一句話，也不會有人漏記。
 ///
-/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
-/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
-/// [`CHECK_TIMEOUT`]。
+/// 建 updater 那一步（連同它那道非有不可的檢查逾時）走
+/// [`update_common::build_updater`]——兩個平台三個呼叫點共用同一份，理由見那裡。
 async fn fetch_update(app: &AppHandle) -> Result<Option<Update>, String> {
-    let updater =
-        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    let updater = update_common::build_updater(app)?;
     match updater.check().await {
         Ok(found) => Ok(found),
         // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
@@ -347,10 +366,13 @@ pub fn apply_now(_st: &Shared) -> Result<(), String> {
 ///
 /// 順序上有兩件事是規格的一部分：
 ///
-/// 1. **`is_installed()` 那道閘排在最前面。** 不在 bundle 裡就沒有 bundle 可以換，
-///    而外掛的 `extract_path` 這時會退成「執行檔所在的資料夾」——真讓它裝下去，
-///    被 rename 掉的是 `target/debug/`。前端在這種情形下本來就走
-///    [`open_release_page`]（`installed` 是 `false`），這道閘是第二層保險。
+/// 1. **能不能就地更新那道閘排在最前面**（[`can_update_in_place`]）。不在 bundle 裡
+///    就沒有 bundle 可以換，而外掛的 `extract_path` 這時會退成「執行檔所在的資料夾」
+///    ——真讓它裝下去，被 rename 掉的是 `target/debug/`；translocated 的唯讀影本則是
+///    會死在 `EROFS`。前端在這兩種情形下本來就走 [`open_release_page`]
+///    （`installed` 是 `false`），這道閘是第二層保險。
+///    translocation 單獨挑出來先擋，是因為它有話可以對使用者說（把 app 搬進
+///    應用程式資料夾），而「這一份不能更新自己」那句話對他毫無幫助。
 /// 2. **替換那一步一定要離開 async 執行緒。** 它要解開十幾 MB 的 tar 並搬動整個
 ///    bundle，是純阻塞的檔案 IO；而且外掛在權限不足時會走 AppleScript 的管理員
 ///    提權，那條路是「把閉包丟到主執行緒、然後在原地 `rx.recv()` 等結果」——在
@@ -359,7 +381,19 @@ pub fn apply_now(_st: &Shared) -> Result<(), String> {
 /// 正常路徑上這支函式**不會回來**：`AppHandle::restart()` 的回傳型別是 `!`。
 /// 前端那顆鈕因此只需要處理 Err（`sheet.ts::startUpdate` 正是這樣寫的）。
 pub async fn install(st: &Shared) -> Result<(), String> {
-    if !is_installed() {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if super::sys::is_app_translocated(&exe) {
+        log::warn!(
+            "refusing to install an update: this run is an App Translocation copy ({}), \
+             the bundle is on a read-only mount",
+            exe.display()
+        );
+        return Err(super::sys::translocation_refusal_text(
+            "it cannot replace its own bundle (the copy is on a read-only mount)",
+            "check for updates again",
+        ));
+    }
+    if !can_update_in_place(&exe) {
         return Err("This build cannot update itself".into());
     }
     let mut update =
@@ -368,17 +402,16 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if accept(&update.version, current_version(), true).is_none() {
         return Err("No update available".into());
     }
-    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
-    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
-    update.timeout = Some(DOWNLOAD_TIMEOUT);
-
     let version = normalize_version(&update.version).to_string();
     st.log(format!("downloading update v{version}"));
+    // 下載那一步（連同外掛寫死成 None、只能事後補上的 DOWNLOAD_TIMEOUT）走
+    // [`update_common::download`]，三個呼叫點共用同一份逾時。
+    //
     // 下載回來的 bytes **已經過 minisign 驗簽**（外掛 updater.rs 的
     // `verify_signature`，驗不過就是 Err），所以交給 install 的一定是簽章對得上
     // 的那一份。macOS 不像 Windows 需要再記一份 SHA-256——那是給「在磁碟上躺到
     // 下一次啟動」的暫存檔用的，這裡的 bytes 從驗簽到解開都沒有離開過記憶體。
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    let bytes = update_common::download(&mut update).await?;
 
     st.log(format!("installing update v{version}"));
     tauri::async_runtime::spawn_blocking(move || update.install(bytes).map_err(|e| e.to_string()))
@@ -512,6 +545,30 @@ mod tests {
                 tauri_plugin_updater::extract_path_from_executable(&exe).expect("外掛也算得出來");
             assert_eq!(ours, theirs, "替換目標必須一致：{}", exe.display());
         }
+    }
+
+    /// **App Translocation 的影本不算「能就地更新」**，即使它每一層路徑都長得
+    /// 像一顆合格的 `.app`。
+    ///
+    /// 這是使用者從 dmg 視窗或 `~/Downloads` 直接雙擊時實際會走到的路徑：外掛的
+    /// 第一步 `rename` 在那個唯讀掛載點上拿到的是 `EROFS`（不是 `PermissionDenied`，
+    /// 所以連提權退路都不會走），而在這道閘補上之前，前端顯示的是「Update to vX」
+    /// ——使用者要等完一次十幾 MB 的下載才收到一句看不懂的 os error。
+    #[test]
+    fn a_translocated_copy_cannot_update_itself() {
+        let translocated = PathBuf::from(
+            "/private/var/folders/9x/abc/T/AppTranslocation/8B1F-4/d/Traytunnel.app/Contents/MacOS/traytunnel",
+        );
+        assert!(bundle_of(&translocated).is_some(), "前提：它每一層都長得像一顆 bundle");
+        assert!(
+            !can_update_in_place(&translocated),
+            "translocated 影本在唯讀掛載點上，替換 bundle 必定死在 EROFS"
+        );
+
+        // 正常安裝的那一份不受影響
+        assert!(can_update_in_place(&exe_in("/Applications/traytunnel.app")));
+        // 非 bundle 照舊不算
+        assert!(!can_update_in_place(Path::new("/repo/src-tauri/target/debug/traytunnel")));
     }
 
     /// latest.json 的 `platforms` 要用哪個鍵，權威是外掛自己的 `target()`。

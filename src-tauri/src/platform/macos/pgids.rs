@@ -59,21 +59,27 @@ use crate::platform::update_common::IDENTIFIER;
 /// 登記簿檔名。
 const FILE_NAME: &str = "supervised-pgids.json";
 
-/// 讀改寫的整段互斥。
+/// 讀改寫的整段互斥（**行程內**那一半）。
 ///
 /// `register`／`unregister` 會被多條 tokio 工作執行緒同時呼叫（每個出口一條
 /// 監看迴圈），而每一次都是「讀整份檔案→改一筆→寫回去」。沒有這把鎖的話兩次
 /// 並行的 `register` 會各自讀到同一份舊內容，後寫的那一份把前一筆蓋掉——被蓋掉
 /// 的那個 pgid 就再也不會被收屍。
 ///
-/// 這把鎖只管**行程內部**的並行。跨行程（兩個實例同時在跑，見 [`Entry::owner_pid`]
-/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個暫存檔
-/// （[`crate::config::write_atomic`] 的 `<檔名>.tmp`），最壞情況是其中一邊
-/// `rename` 過去的是另一邊寫到一半的內容，
-/// [`parse`] 讀不懂就退成空的登記簿。後果是**漏殺**（下一次啟動少收幾具屍體），
-/// 不是誤殺，方向可接受；為了一個「single-instance 失手才會發生」的情境去背一套
-/// 跨行程鎖的複雜度（還得處理鎖檔本身的殘留與死鎖）划不來。
+/// **跨行程**那一半由 [`with_locked_registry`] 的檔案鎖負責。兩把一定要按
+/// 「先 Mutex、再檔案鎖」的順序取（那正是 `with_locked_registry` 唯一的取法）：
+/// 反過來的話同一個行程的兩條執行緒會各自開一個 fd 去搶同一把 `flock`——那是
+/// 兩個不同的 open file description，核心認為它們互相衝突，於是自己鎖死自己。
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+/// 跨行程鎖用的鎖檔名（與登記簿同一個資料夾）。
+///
+/// **不鎖登記簿檔案自己**：那份檔案每次寫入都是「寫 `.tmp` 再 `rename` 蓋上去」
+/// （[`crate::config::write_atomic`]），rename 換掉的是 inode，鎖在舊 inode 上的
+/// 那把 `flock` 從此保護不到任何人。所以另外開一個**永遠不會被改名也不會被刪掉**
+/// 的空檔案專門當鎖。它會一直留在資料夾裡（0 位元組），這是這種做法的必要條件，
+/// 不是垃圾。
+const LOCK_FILE_NAME: &str = "supervised-pgids.lock";
 
 /// 一筆登記：一個行程群組、它應該長什麼樣、以及它是誰 spawn 的。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +147,7 @@ pub(super) fn to_json(reg: &Registry) -> String {
 ///
 /// pid（＝pgid）會回收，登記簿裡一個舊 pgid 剛好對上今天別人的群組時，這一條
 /// 就是「拿一個舊數字去砍不相干的程式」。當初放行反方向的理由是「`ps` 在極端長
-/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`commands_by_pgid`]），
+/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`ps_table`]），
 /// 截斷這件事根本不會發生，等於用一個不存在的問題換來一個真的誤殺面。
 ///
 /// 空字串一律不算相符：`ps` 問不到東西（行程已經不在）會回空字串，那時候
@@ -296,15 +302,63 @@ fn write_at(path: &Path, reg: &Registry) -> io::Result<()> {
 }
 
 /// 檔案沒有東西可留時就刪掉，不留一份空殼在使用者的資料夾裡。
+/// 「刪掉，本來就沒有也算成功」是 [`super::paths::remove_file_if_present`]
+/// （這個平台另一條路也要同一件事）。
 fn write_or_clear_at(path: &Path, reg: &Registry) -> io::Result<()> {
     if reg.entries.is_empty() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
+        return super::paths::remove_file_if_present(path);
     }
     write_at(path, reg)
+}
+
+/// 把一整段「讀→改→寫」包在兩把鎖裡跑：行程內的 [`REGISTRY_LOCK`]，加上
+/// 跨行程的檔案鎖（[`LOCK_FILE_NAME`]）。
+///
+/// ## 為什麼跨行程那一把是必要的
+///
+/// 正常情況下 single-instance 外掛保證同時只有一個實例，但它有一條會讓兩個實例
+/// 並存的錯誤分支（socket 回了 `NotFound`／`ConnectionRefused` 以外的錯就照常
+/// 啟動，見 [`Entry::owner_pid`]）。那時兩邊各自做「讀整份→改自己那一筆→寫回去」，
+/// 沒有跨行程互斥就是教科書上的 lost update：B 讀到的是 A 寫之前的內容，B 寫回去
+/// 時把 A 剛登記的那一筆整個蓋掉——那個**活著**的 pgid 從登記簿消失，下一次啟動
+/// 的 [`plan_sweep`] 看不到它，於是那條 ssh 繼續握著 `-L` 的本地埠不放，正是這整份
+/// 登記簿要救的那一格。
+///
+/// （原本這裡的說明只承認 `.tmp` 撞名、把後果算成「漏殺，方向可接受」。撞名確實
+/// 只造成漏殺，但 lost update 不是撞名造成的，它在兩邊的寫入都完全成功時照樣發生。）
+///
+/// ## 用 `File::lock()`
+///
+/// 標準庫 1.89 起穩定，底層在 Unix 上就是 `flock`，不必多拉一顆 crate。它是
+/// **阻塞**的：對面那個實例正在讀改寫時這裡就等，而那一段是一次讀檔＋一次
+/// write＋rename，微秒等級。
+///
+/// 拿不到鎖（開不了鎖檔、鎖本身失敗）時**照樣把事情做完**，只記一行 debug：
+/// 這份登記簿是純粹的自我修復輔助，為了拿不到一把保險鎖就整個不做，換來的是
+/// 「這個 pgid 從此沒有人收屍」——比它要防的 lost update 更糟。
+fn with_locked_registry<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    // 順序見 [`REGISTRY_LOCK`]：一定是先 Mutex 再檔案鎖
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 綁一個變數（不是 `_`）才會活到這一格結束——`let _ = …` 會當場 drop，
+    // 鎖等於沒上
+    let _file_lock = lock_registry_file(path);
+    f()
+}
+
+/// 開鎖檔並取得獨佔鎖，回傳的 `File` 一 drop 就解鎖。
+fn lock_registry_file(path: &Path) -> Option<std::fs::File> {
+    let dir = path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE_NAME))
+        .map_err(|e| log::debug!("could not open the registry lock file: {e}"))
+        .ok()?;
+    file.lock().map_err(|e| log::debug!("could not lock the registry lock file: {e}")).ok()?;
+    Some(file)
 }
 
 /// 加一筆。**只動自己那一筆**——別的 owner 的條目原封不動留著，這是
@@ -348,8 +402,24 @@ pub(super) fn kill_group(pgid: i32) {
     }
 }
 
-/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成「pgid → 這一組裡每一支的
-/// 命令列」。純函式，`ps` 的實際執行在 [`commands_by_pgid`]。
+/// 問一次 `ps` 拿回來的全表，兩種索引各一份。
+///
+/// 同一份輸出、同一次解析：收屍要問的兩個問題（「這個 pgid 的群組裡現在有誰」與
+/// 「這個 owner pid 現在是什麼命令列」）本來就都在 `ps -axww -o pid=,pgid=,command=`
+/// 的同一行裡。原本 [`parse_ps_pgid_table`] 把 pid 欄**丟掉**，於是
+/// [`owner_still_running`] 只好對每一個 owner 再 fork 一次 `ps -p`——登記簿有 N 個
+/// 不同 owner 就多 N 次外部程序，與 [`ps_table`] 自己 doc 上寫的「一次就好」
+/// 直接矛盾。留著 pid 這一欄，那 N 次全部消失。
+#[derive(Debug, Default)]
+struct PsTable {
+    /// pgid → 這一組裡每一支的命令列
+    by_pgid: std::collections::HashMap<i32, Vec<String>>,
+    /// pid → 那一支的命令列
+    by_pid: std::collections::HashMap<i32, String>,
+}
+
+/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成 [`PsTable`]。純函式，
+/// `ps` 的實際執行在 [`ps_table`]。
 ///
 /// 每一行的形狀固定是「pid、pgid、命令列」，前兩欄是**靠右對齊、寬度不定**的
 /// 數字（欄與欄之間可能有好幾個空白），第三欄開始整個都是命令，而命令本身含
@@ -357,8 +427,9 @@ pub(super) fn kill_group(pgid: i32) {
 /// `split_whitespace` 全切開再用單一空白拼回去——那樣會把命令列裡連續的空白
 /// 壓掉，`ps -o command=` 印的是什麼就不再是什麼，而 [`commands_match`] 是逐字
 /// 前綴比對，壓掉就對不上了。解不開的行（`ps` 哪天多印了什麼）整行跳過，
-/// 不要瞎猜。
-fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<String>> {
+/// 不要瞎猜；pid 欄單獨解不出數字時只是少一筆 `by_pid` 索引，`by_pgid` 照舊收下
+/// ——收屍的主判斷是 pgid 那一份，不該被另一欄的意外拖下水。
+fn parse_ps_pgid_table(stdout: &str) -> PsTable {
     /// 切掉開頭的空白與第一個欄位，回 (那個欄位, 剩下的整段)。
     fn split_first_field(s: &str) -> Option<(&str, &str)> {
         let s = s.trim_start();
@@ -366,10 +437,9 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
         Some((&s[..end], &s[end..]))
     }
 
-    let mut table: std::collections::HashMap<i32, Vec<String>> = std::collections::HashMap::new();
+    let mut table = PsTable::default();
     for line in stdout.lines() {
-        // 第一欄是 pid，這裡用不到（比對只看命令列），但一定要切掉才輪得到 pgid
-        let Some((_pid, rest)) = split_first_field(line) else {
+        let Some((pid, rest)) = split_first_field(line) else {
             continue;
         };
         let Some((pgid, command)) = split_first_field(rest) else {
@@ -383,17 +453,24 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
         if command.is_empty() {
             continue;
         }
-        table.entry(pgid).or_default().push(command.to_string());
+        if let Ok(pid) = pid.parse::<i32>() {
+            table.by_pid.insert(pid, command.to_string());
+        }
+        table.by_pgid.entry(pgid).or_default().push(command.to_string());
     }
     table
 }
 
-/// 問 `ps` 一次，把系統上每一個行程按 pgid 分好組。
+/// 問 `ps` 一次，把系統上每一個行程按 pgid 與 pid 各索引一份。
 ///
 /// **一次就好**。這條路的呼叫端只有 [`sweep_leftovers`]，而它要問的是登記簿裡
 /// 每一筆 pgid「這一組現在有誰」——原本是逐筆 `ps -g <pgid>`，登記簿有 N 筆就
-/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建
-/// 成 `HashMap` 完全等價，而且是啟動路徑上唯一一次外部程序。
+/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建成
+/// `HashMap` 完全等價，而且是**收屍這條路上**唯一一次外部程序（原本這裡寫的是
+/// 「啟動路徑上唯一一次」，那句話當時就不成立：`owner_still_running` 每個 owner
+/// 還會再 fork 一次 `ps -p`，而啟動路徑上另外還有 `sys::fix_gui_launch_path` 的
+/// 登入 shell。owner 那 N 次已經隨 [`PsTable::by_pid`] 一起拿掉了，登入 shell
+/// 不歸這裡管）。
 ///
 /// `-ww` 一定要在：它關掉「照終端機寬度截斷」的預設行為，截斷會讓命令列比對
 /// 無謂地失手——[`commands_match`] 只認一個方向（`ps` 至少要印出我們登記的
@@ -401,65 +478,73 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
 ///
 /// 用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者要解一份 Apple 沒有公開穩定
 /// 文件的核心緩衝格式，還得整段 unsafe，而這條路一輩子只在啟動時跑這一次。
-fn commands_by_pgid() -> std::collections::HashMap<i32, Vec<String>> {
+fn ps_table() -> PsTable {
     match std::process::Command::new("ps").args(["-axww", "-o", "pid=,pgid=,command="]).output() {
         Ok(out) => parse_ps_pgid_table(&String::from_utf8_lossy(&out.stdout)),
         Err(e) => {
             log::warn!("could not ask ps about the running process groups: {e}");
-            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺。
-            // 方向是漏殺不是誤殺，與整個模組的原則一致
-            std::collections::HashMap::new()
+            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺，
+            // 而且每一個 owner 都會被 [`owner_is_still_ours`] 當成還活著＝不掃。
+            // 兩個方向都是漏殺不是誤殺，與整個模組的原則一致
+            PsTable::default()
         }
     }
+}
+
+/// 「這個 owner pid 現在還是我們自己的另一個實例嗎」的純判定，`ps` 全表由呼叫端
+/// 查好傳進來（抽成純函式才測得到，同 [`plan_sweep`]）。
+///
+/// 比對用的是**執行檔檔名**，不是完整路徑。
+///
+/// 這裡的每一個判斷失誤都要往「主人還活著」偏（＝那一筆不掃＝漏殺），因為反方向
+/// 是誤殺。用完整路徑當前綴比對就正好偏錯邊：同一個使用者同時跑「裝在
+/// /Applications 的正式版」與「開發中的 cargo build 產物」，而 single-instance 又
+/// 失手讓兩邊並存時，兩邊的 `current_exe()` 完全不同，於是互相判定「對方那個 pid
+/// 不是我們的程式、主人已死」，接著把對方現役的隧道全部 SIGKILL——正是這個機制
+/// 最不該做的事。
+///
+/// 換成檔名包含之後，誤判方向翻過來了：系統上剛好有另一支同名的 `traytunnel`
+/// 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆不掃。代價只是那一輪
+/// 少收一具屍體，下一次啟動再收；而且要湊齊「pid 剛好被回收」＋「新主人剛好也叫
+/// 這個名字」兩件事，機率本來就極低。比對本身不分大小寫，理由見 [`ps_output_mentions`]。
+///
+/// 兩道「問不到就當主人還活著」的退讓一個都不能少，這是原本 `ps -p` 版本的語意，
+/// 換成查全表之後必須逐字保留：
+///
+/// * `exe_name` 是空的（問不到自己叫什麼）→ 活著；
+/// * **`ps` 整張表是空的**（`ps` 跑不起來，或輸出一行都解不開）→ 活著。這一條對應
+///   原本 `Command::output()` 回 `Err` 那一支；沒有它的話，`ps` 一旦失敗就會變成
+///   「每一個 owner 都判定已死」，接著把另一個現役實例的隧道全部掃掉——正好是
+///   最壞的方向。
+///
+/// 表拿得到、而這個 pid 不在裡面，才是真的「這個 owner 已經不在了」。
+fn owner_is_still_ours(ps: &PsTable, owner_pid: i32, exe_name: &str) -> bool {
+    if exe_name.is_empty() || ps.by_pid.is_empty() {
+        return true;
+    }
+    ps.by_pid.get(&owner_pid).is_some_and(|line| ps_output_mentions(line, exe_name))
 }
 
 /// 某一筆登記的主人（spawn 它的那個 app 行程）是不是還在跑。
 ///
 /// 兩道都要成立才算：pid 還活著（`kill(pid, 0)`），而且那個 pid 的命令列裡
-/// 出現得了我們這支執行檔的**檔名**——只看 pid 活不活著會被 pid 回收騙過去。
-/// 為什麼比檔名而不是完整路徑（以及這個取捨往哪邊偏）見函式內的說明。
+/// 出現得了我們這支執行檔的檔名（[`owner_is_still_ours`]）——只看 pid 活不活著
+/// 會被 pid 回收騙過去。
 ///
 /// 「主人就是我自己」回 `false`：收屍只在啟動時、任何 `register` 之前跑，
 /// 這時候檔案裡不可能有本輪自己的條目，會對到只可能是 pid 回收的巧合。
-fn owner_still_running(owner_pid: i32) -> bool {
+fn owner_still_running(ps: &PsTable, owner_pid: i32) -> bool {
     if owner_pid <= 1 || owner_pid == std::process::id() as i32 {
         return false;
     }
     if unsafe { libc::kill(owner_pid, 0) } != 0 {
         return false;
     }
-    // 比對用的是**執行檔檔名**，不是完整路徑。
-    //
-    // 這裡的每一個判斷失誤都要往「主人還活著」偏（＝那一筆不掃＝漏殺），
-    // 因為反方向是誤殺。用完整路徑當前綴比對就正好偏錯邊：同一個使用者同時
-    // 跑「裝在 /Applications 的正式版」與「開發中的 cargo build 產物」，而
-    // single-instance 又失手讓兩邊並存時，兩邊的 `current_exe()` 完全不同，
-    // 於是互相判定「對方那個 pid 不是我們的程式、主人已死」，接著把對方
-    // 現役的隧道全部 SIGKILL——正是這個機制最不該做的事。
-    //
-    // 換成檔名包含之後，誤判方向翻過來了：系統上剛好有另一支同名的
-    // `traytunnel` 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆
-    // 不掃。代價只是那一輪少收一具屍體，下一次啟動再收；而且要湊齊
-    // 「pid 剛好被回收」＋「新主人剛好也叫這個名字」兩件事，機率本來就極低。
-    //
-    // 比對本身不分大小寫，理由見 [`ps_output_mentions`]。
     let name = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    if name.is_empty() {
-        // 問不到自己叫什麼的話，寧可保守：pid 還活著就當主人還在，不要掃
-        return true;
-    }
-    let out = std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p"])
-        .arg(owner_pid.to_string())
-        .output();
-    match out {
-        Ok(out) => ps_output_mentions(&String::from_utf8_lossy(&out.stdout), &name),
-        // 連 ps 都跑不起來時同樣往「主人還活著」偏
-        Err(_) => true,
-    }
+    owner_is_still_ours(ps, owner_pid, &name)
 }
 
 // ---------------------------------------------------------------- 對外
@@ -468,19 +553,21 @@ fn owner_still_running(owner_pid: i32) -> bool {
 /// 讓它跑總比為了收尾機制炸掉呼叫端好（與 `spawn` 那邊「記不到 pgid」同一種取捨）。
 pub(super) fn register(pgid: i32, command: &str) {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = register_at(&path, std::process::id() as i32, pgid, command) {
-        log::warn!("could not record supervised process group {pgid}: {e}");
-    }
+    with_locked_registry(&path, || {
+        if let Err(e) = register_at(&path, std::process::id() as i32, pgid, command) {
+            log::warn!("could not record supervised process group {pgid}: {e}");
+        }
+    });
 }
 
 /// 正常收尾時把一筆拿掉。
 pub(super) fn unregister(pgid: i32) {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = unregister_at(&path, std::process::id() as i32, pgid) {
-        log::warn!("could not clear supervised process group {pgid}: {e}");
-    }
+    with_locked_registry(&path, || {
+        if let Err(e) = unregister_at(&path, std::process::id() as i32, pgid) {
+            log::warn!("could not clear supervised process group {pgid}: {e}");
+        }
+    });
 }
 
 /// 啟動時收屍：把上一輪被 `SIGKILL`／當機帶走、卻還活著的 ssh 程序樹清掉。
@@ -493,20 +580,42 @@ pub(super) fn unregister(pgid: i32) {
 /// （見 [`Entry::owner_pid`]）——single-instance 外掛有一條會讓兩個實例並存的
 /// 錯誤分支，時機本身擋不住它。
 ///
-/// 沒有「檔案不在就早退」「登記簿是空的就刪檔早退」這兩道分支，是刻意的：
-/// [`read_at`] 讀不到檔案本來就回一份空的登記簿，空登記簿的 [`plan_sweep`] 回
-/// 一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），最後 [`write_or_clear_at`]
-/// 對空的登記簿做的正是「把檔案刪掉，本來就沒有也算成功」。兩道早退跟這條主線
-/// 一字不差地等價，留著只是同一件事寫兩遍。
+/// **登記簿是空的就早退**（清完檔案再走）。這是啟動路徑上的常態——上一輪正常
+/// 收尾的話每一筆都退登記過了，檔案根本不存在——而它與主線的關係要說清楚：
+///
+/// * **結果上等價**：[`read_at`] 讀不到檔案回一份空的登記簿，空登記簿的
+///   [`plan_sweep`] 回一份空計畫（三個 `len()` 相減是 0，一行日誌都不會記），
+///   [`write_or_clear_at`] 對空的登記簿做的正是「把檔案刪掉，本來沒有也算成功」。
+/// * **成本上不等價**（這裡原本寫「兩道早退跟主線一字不差地等價」，那句話只看了
+///   結果）：走主線要先付一次 `ps -axww` 全表——fork／exec 一支外部程序，把系統上
+///   每一個行程的完整命令列讀回來再解析，忙碌的機器上是數十到百餘毫秒，而且這條路
+///   跑在 `Builder::setup` 裡、系統匣還沒建出來的**主執行緒**上。付這筆錢是為了
+///   回答「登記簿裡這幾筆的群組現在有誰」——一筆都沒有的時候，沒有問題要問。
+///
+/// 早退前仍然要 [`write_or_clear_at`] 一次：登記簿可能是一份**解析不出來**的壞檔
+/// （[`read_at`] 同樣退成空的），那份垃圾該在這裡被清掉，不是留在使用者的資料夾裡
+/// 等下一次寫入。
 pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let reg = read_at(&path);
-    // 一次把全表拿回來，登記簿有幾筆都只問 `ps` 這一次（見 `commands_by_pgid`）
-    let by_pgid = commands_by_pgid();
-    let plan = plan_sweep(&reg, &mut owner_still_running, &mut |pgid| {
-        by_pgid.get(&pgid).cloned().unwrap_or_default()
-    });
+    with_locked_registry(&path, || sweep_locked(&path));
+}
+
+/// [`sweep_leftovers`] 的本體，兩把鎖都在手上時才會跑到。
+fn sweep_locked(path: &Path) {
+    let reg = read_at(path);
+    if reg.entries.is_empty() {
+        if let Err(e) = write_or_clear_at(path, &reg) {
+            log::warn!("could not clear the empty supervised process group registry: {e}");
+        }
+        return;
+    }
+    // 一次把全表拿回來，登記簿有幾筆、有幾個不同的 owner，都只問 `ps` 這一次
+    // （見 `ps_table`：pgid 與 pid 兩種索引都從同一份輸出來）
+    let ps = ps_table();
+    let plan =
+        plan_sweep(&reg, &mut |owner_pid| owner_still_running(&ps, owner_pid), &mut |pgid| {
+            ps.by_pgid.get(&pgid).cloned().unwrap_or_default()
+        });
     for pgid in &plan.doomed {
         log::warn!(
             "killing a process group left behind by a previous run (pgid {pgid}); the last run \
@@ -530,7 +639,7 @@ pub fn sweep_leftovers() {
     }
     // 只留下主人還活著的那些條目；主人已死的不論殺沒殺到都清掉，留著只會讓
     // 下一次啟動重問一次同樣的死 pgid。本輪自己的東西會由 `register` 重新寫進來。
-    if let Err(e) = write_or_clear_at(&path, &Registry { entries: plan.keep }) {
+    if let Err(e) = write_or_clear_at(path, &Registry { entries: plan.keep }) {
         log::warn!("could not rewrite the supervised process group registry after sweeping: {e}");
     }
 }
@@ -606,10 +715,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `sweep_leftovers` 拿掉的那兩道早退（「檔案不在」「登記簿是空的」）之所以
-    /// 跟主線等價，靠的就是這裡的三件事：讀不到檔案回一份空的登記簿、空的登記簿
-    /// 規劃不出任何動作、清空的寫入就是「刪掉檔案，本來沒有也算成功」，而且不會
-    /// 順手建出任何東西。
+    /// `sweep_leftovers` 那道「登記簿是空的就早退」之所以在**結果上**與走完主線
+    /// 等價（差別只在省下一次 `ps` 全表，見那支函式的說明），靠的就是這裡的三件事：
+    /// 讀不到檔案回一份空的登記簿、空的登記簿規劃不出任何動作、清空的寫入就是
+    /// 「刪掉檔案，本來沒有也算成功」，而且不會順手建出任何東西。
     #[test]
     fn an_absent_registry_reads_as_empty_and_clears_to_nothing() {
         let dir = tempdir("absent");
@@ -625,6 +734,48 @@ mod tests {
 
         write_or_clear_at(&path, &Registry::default()).expect("清空一份本來就不存在的檔案不算錯");
         assert!(!path.exists(), "不可以憑空生出一份空殼：{}", path.display());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 讀改寫必須是**整段**互斥的：兩條執行緒同時做「讀整份→加一筆→寫回去」，
+    /// 兩筆都必須留在檔案裡。
+    ///
+    /// 這一條釘的是 [`with_locked_registry`] 這支包裝本身——它把 `read_at` 到
+    /// `write_at` 之間整段圈起來，沒有它的話（或哪天有人把某條路徑改成繞過它
+    /// 直接呼叫 `register_at`）就是教科書上的 lost update：後寫的那一份是拿
+    /// 「對方寫入之前」的內容改出來的，會把對方剛登記的 pgid 整個蓋掉，而那個
+    /// **活著**的 pgid 從此沒有人收屍。
+    ///
+    /// 誠實說明測得到什麼：同一個行程裡真正擋下交錯的是 `REGISTRY_LOCK` 這把
+    /// `Mutex`；檔案鎖負責的是**跨行程**那一半（兩個實例並存，見
+    /// [`Entry::owner_pid`]），要驗它得起兩個行程，不適合放進單元測試輪。這一條
+    /// 因此同時是一道回歸測試：它會在「包裝被拆掉」與「兩把鎖的取用順序寫反而
+    /// 自己鎖死自己」時失敗（後者會直接卡在這裡逾時）。
+    #[test]
+    fn two_threads_never_lose_each_others_entries() {
+        let dir = tempdir("locked");
+        let path = dir.join(FILE_NAME);
+
+        std::thread::scope(|s| {
+            for (owner, pgid) in [(900, 111), (901, 222)] {
+                let path = path.clone();
+                s.spawn(move || {
+                    with_locked_registry(&path, || {
+                        // 刻意在讀與寫之間留一個窗口：沒有整段互斥的話，
+                        // 兩邊都會在這裡讀到同一份舊內容
+                        let mut reg = read_at(&path);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        reg.entries.push(entry(pgid, owner, "ssh -N bob@a"));
+                        write_at(&path, &reg).expect("寫得進去");
+                    });
+                });
+            }
+        });
+
+        let mut pgids: Vec<i32> = read_at(&path).entries.iter().map(|e| e.pgid).collect();
+        pgids.sort_unstable();
+        assert_eq!(pgids, vec![111, 222], "兩筆都要在——少一筆就是 lost update");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -897,6 +1048,9 @@ mod tests {
     /// `ps -axww -o pid=,pgid=,command=` 的輸出要按 pgid 分好組，而且命令列
     /// 必須**原樣**保留（含裡面的連續空白）——`commands_match` 是逐字前綴比對，
     /// 把空白壓掉就再也對不上我們登記的那一行。
+    ///
+    /// 同一次解析還要留下 pid 那一欄的索引：收屍問「這個 owner 還在不在」靠的
+    /// 就是它，原本把 pid 丟掉才逼得每個 owner 再 fork 一次 `ps -p`。
     #[test]
     fn the_ps_table_groups_commands_by_pgid() {
         // 前兩欄靠右對齊、寬度不定，這是 `ps -o pid=,pgid=` 真的會印出來的樣子
@@ -907,7 +1061,7 @@ mod tests {
         let table = parse_ps_pgid_table(out);
 
         assert_eq!(
-            table.get(&900).map(Vec::as_slice),
+            table.by_pgid.get(&900).map(Vec::as_slice),
             Some(
                 &[
                     "ssh -N  -L 1080:127.0.0.1:1080 bob@a".to_string(),
@@ -917,23 +1071,72 @@ mod tests {
             "同一個 pgid 的兩支（ssh 與它 ProxyCommand 生的孫程序）要收在一起，\
              而且 `ssh -N  -L` 中間那兩個空白不可以被壓成一個"
         );
-        assert_eq!(table.get(&9100).map(Vec::len), Some(1));
-        assert_eq!(table.get(&12345), None, "沒出現過的 pgid 就是沒有");
+        assert_eq!(table.by_pgid.get(&9100).map(Vec::len), Some(1));
+        assert_eq!(table.by_pgid.get(&12345), None, "沒出現過的 pgid 就是沒有");
+
+        // pid 索引：同一份輸出、同一次解析，每一支都查得到自己那一行
+        assert_eq!(
+            table.by_pid.get(&900).map(String::as_str),
+            Some("ssh -N  -L 1080:127.0.0.1:1080 bob@a")
+        );
+        assert_eq!(
+            table.by_pid.get(&9001).map(String::as_str),
+            Some("cloudflared access ssh --hostname a"),
+            "群組領袖以外的行程同樣要進 pid 索引"
+        );
+        assert_eq!(table.by_pid.get(&12345), None);
 
         // 解不開的行整行跳過，不要瞎猜也不要炸掉
-        assert!(parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n").is_empty());
+        let garbage = parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n");
+        assert!(garbage.by_pgid.is_empty());
+        assert!(garbage.by_pid.is_empty());
+    }
+
+    /// 「這個 owner 還是我們的另一個實例嗎」的兩道退讓，一個都不能少——它們是
+    /// 原本 `ps -p <pid>` 版本的語意，換成查全表之後必須逐字保留。
+    ///
+    /// 最要緊的是**空表那一條**：`ps` 跑不起來時原本回的是 `Err(_) => true`
+    /// （當主人還活著、不掃）。查全表之後若把「表裡沒有這個 pid」一律當成
+    /// 「主人已死」，`ps` 一失敗就會變成把另一個現役實例的隧道全部掃掉——這個
+    /// 模組「寧可漏殺不誤殺」原則下最壞的那個方向。
+    #[test]
+    fn an_unreadable_ps_table_means_the_owner_is_assumed_alive() {
+        let ps = parse_ps_pgid_table(
+            " 900   900 /Applications/Traytunnel.app/Contents/MacOS/Traytunnel --tray\n\
+             \x209100  9100 /usr/libexec/some-daemon --serve\n",
+        );
+
+        assert!(ps.by_pid.contains_key(&900), "前提：這張表查得到 900");
+        assert!(owner_is_still_ours(&ps, 900, "traytunnel"), "命令列對得上就是還活著");
+        assert!(!owner_is_still_ours(&ps, 9100, "traytunnel"), "那個 pid 是別人的程式");
+        assert!(
+            !owner_is_still_ours(&ps, 4242, "traytunnel"),
+            "表拿得到、pid 不在裡面＝已經不在了"
+        );
+
+        // 兩道退讓：問不到自己叫什麼、以及整張表是空的（ps 跑不起來）
+        assert!(owner_is_still_ours(&ps, 4242, ""), "問不到自己叫什麼就不要掃");
+        assert!(
+            owner_is_still_ours(&PsTable::default(), 4242, "traytunnel"),
+            "ps 拿不到任何東西時一律當主人還活著，否則一次 ps 失敗就會掃掉現役實例的隧道"
+        );
     }
 
     /// 這台機器上真的跑一次 `ps`，確認上面那支解析器吃的格式沒有猜錯：
-    /// **本行程自己**一定要出現在自己的 pgid 底下。純唯讀查詢，不動任何東西。
+    /// **本行程自己**一定要出現在自己的 pgid 底下，pid 索引也查得到自己。
+    /// 純唯讀查詢，不動任何東西。
     #[test]
     fn the_ps_table_can_find_this_very_process() {
-        let table = commands_by_pgid();
+        let table = ps_table();
         let me = std::process::id() as i32;
         let my_pgid = unsafe { libc::getpgid(me) };
         assert!(
-            table.contains_key(&my_pgid),
+            table.by_pgid.contains_key(&my_pgid),
             "ps 的全表裡找不到本行程自己的 pgid {my_pgid}——解析器跟真實輸出對不上了"
+        );
+        assert!(
+            table.by_pid.contains_key(&me),
+            "pid 索引裡找不到本行程自己的 pid {me}——owner 的判定就是靠這一份"
         );
     }
 

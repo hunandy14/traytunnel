@@ -1041,13 +1041,23 @@ impl AppState {
         self.with_exit_mut(local, |rt| rt.job.take());
     }
 
-    /// 只在世代相符時清掉 job，避免誤殺新的一輪連線
+    /// 只在世代相符時清掉 job，避免誤殺新的一輪連線。
+    ///
+    /// `take()` 到的東西**從閉包回傳出來**，於是它在 `with_exit_mut` 已經放掉
+    /// `exits` 鎖之後才 drop——理由與 [`Self::kill_all_jobs`] 那段一樣：drop 一個
+    /// [`Worker`] 在 macOS 上要 `killpg` 再讀改寫磁碟上的 pgid 登記簿，那是一段
+    /// 同步檔案 I/O，沒有理由讓它拖著整個 app 的 `exits` 鎖（`kill_job` 本來就是
+    /// 靠尾表達式回傳做到這件事的，這一支只是把同樣的寫法補齊）。
     pub fn kill_job_of(&self, local: u16, generation: u64) {
-        self.with_exit_mut(local, |rt| {
+        let taken = self.with_exit_mut(local, |rt| {
             if rt.job.as_ref().map(|(g, _)| *g) == Some(generation) {
-                rt.job.take();
+                rt.job.take()
+            } else {
+                None
             }
         });
+        // 這一行才是真正的「殺」，而它跑在鎖外
+        drop(taken);
     }
 
     /// 收掉所有出口的 ssh 程序，離開程式時用。
@@ -1076,15 +1086,21 @@ impl AppState {
             }
         }
         let mut stopped = Vec::new();
+        // **這個變數的作用域是刻意撐到鎖外的。** `slots` 裡裝的是每個出口摘下來的
+        // worker，而 drop 一個 [`Worker`] 不是把一個指標歸零：macOS 上是
+        // `killpg(SIGKILL)` 再讀改寫磁碟上的 pgid 登記簿（一次讀檔＋一次
+        // write＋rename，每一條隧道各一輪），Windows 上才是單純的 `CloseHandle`。
+        // 宣告在區塊裡的話那 N 輪同步檔案 I/O 全部發生在 `exits` 鎖裡面，而這把鎖
+        // 是 UI 與系統匣每一次狀態查詢都要取的——退出時 N 條隧道一起收，主執行緒
+        // 就跟著等 N 次磁碟往返。宣告在外面，鎖裡只剩下把 `Option` 搬進 map 的
+        // 指標移動，真正的收尾在 `drain_workers` 那一行、鎖已經放掉之後才做。
+        let mut slots: BTreeMap<u16, Option<(u64, Worker)>> = BTreeMap::new();
         {
             let mut exits = self.exits.lock().unwrap();
-            // 先把每個出口的 worker 摘出來交給 drain_workers 統一收掉：「拿走即
-            // 殺掉」那條語意只有一份實作，ssh 的程序樹與 wg 的任務樹都涵蓋（W6.3）。
-            // 它回報的是「真的收掉了東西」的埠，這裡用不到——底下要把**每一個**
-            // 出口都壓成 stopped，不只是有 worker 的那些
-            let mut slots: BTreeMap<u16, Option<(u64, Worker)>> =
-                exits.iter_mut().map(|(local, rt)| (*local, rt.job.take())).collect();
-            drop(drain_workers(&mut slots));
+            // 先把每個出口的 worker 摘出來（只是移動，沒有任何 Drop 在這裡跑），
+            // 之後交給 drain_workers 統一收掉：「拿走即殺掉」那條語意只有一份實作，
+            // ssh 的程序樹與 wg 的任務樹都涵蓋（W6.3）。
+            slots.extend(exits.iter_mut().map(|(local, rt)| (*local, rt.job.take())));
             for (local, rt) in exits.iter_mut() {
                 rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 rt.supervisor = None;
@@ -1093,6 +1109,12 @@ impl AppState {
                 }
             }
         }
+        // 鎖放掉了，這裡才是真的「收掉」：每個 worker 的 Drop（macOS 是 killpg
+        // ＋改寫磁碟上的登記簿）都在這一行跑完。它回報的是「真的收掉了東西」的
+        // 埠，這裡用不到——上面已經把**每一個**出口都壓成 stopped 了，不只是
+        // 有 worker 的那些。**必須排在底下那道 `stopped.is_empty()` 早退之前**，
+        // 不然「每個出口本來就都是 stopped、但 worker 還在」那一輪會把它們漏掉。
+        drop(drain_workers(&mut slots));
         if stopped.is_empty() {
             return;
         }
