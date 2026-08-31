@@ -513,9 +513,9 @@ jobs:
       # 帶的固定字串蓋掉。單平台補腿（例如 v0.6.6 先發了 Windows，人工潤飾過
       # release notes，之後再補 macOS 那條腿）會直接把潤飾過的內容清空重寫。
       #
-      # 修法：先用唯讀的 `gh api repos/.../releases/tags/<tag>` 確認這個 tag
-      # 底下「現在」有沒有 release，並把結果分流成兩個 Create GitHub Release
-      # 步驟（見下面）：
+      # 修法：先用唯讀的 scripts/probe-release.mjs（列舉 releases、比對
+      # tag_name）確認這個 tag 底下「現在」有沒有 release，並把結果分流成兩個
+      # Create GitHub Release 步驟（見下面）：
       #   尚不存在  → 照舊帶固定的 body（macOS 安裝說明）＋
       #               generate_release_notes: true，第一次建立時的說明文字
       #               沒有「人工編輯」這件事可覆寫。
@@ -526,12 +526,18 @@ jobs:
       #               只有 body／generate_release_notes 都不傳，softprops
       #               才不會在 PATCH 這個欄位，既有 description 原樣保留。
       #
+      # SCR-4：判斷方式是「列舉 releases 比對 tag_name」，不是
+      # `releases/tags/<tag>`——後者對 draft release 一律回 404，會把「已存在
+      # 的 draft」誤判成「不存在」（詳見 scripts/probe-release.mjs 檔頭）。
+      #
       # 這一步刻意不受 dry_run 限制（跟上面兩個 Fetch baseline 步驟一樣的
-      # 理由）：純讀公開資料，不建立/修改任何東西，dry-run 也要能跑到、把
-      # 分流結果印進 log，才能在不建真 release 的情況下驗證這條判斷邏輯本身
-      # 是對的。404 與「其他任何失敗」的分野照抄本檔案一貫的作法：只有確定
-      # 404 才視為「不存在」；其餘一律重試，重試用盡就硬失敗，不能把暫時性
-      # 錯誤誤判成「不存在」進而覆寫掉真正存在、人工編輯過的 release notes。
+      # 理由）：純讀取，不建立/修改任何東西，dry-run 也要能跑到、把分流結果
+      # 印進 log，才能在不建真 release 的情況下驗證這條判斷邏輯本身是對的。
+      # 404 與「其他任何失敗」的分野照抄本檔案一貫的作法（實作在
+      # scripts/lib/fetch-retry.mjs，與 fetch-baseline.mjs 共用同一份政策）：
+      # 只有確定的狀態碼才算答案；其餘一律重試，重試用盡就硬失敗，不能把
+      # 暫時性錯誤誤判成「不存在」進而覆寫掉真正存在、人工編輯過的 release
+      # notes。分流一律看 HTTP 狀態碼，不再 grep gh CLI 的 stderr 文字。
       - name: Check whether a GitHub Release already exists for this tag
         id: check_release
         shell: bash
@@ -539,41 +545,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tag="${{ needs.plan.outputs.release_tag }}"
-          attempts=5
-          status="unknown"
-          detail=""
+          node scripts/probe-release.mjs \
+            --repo "${{ github.repository }}" \
+            --tag "${{ needs.plan.outputs.release_tag }}"
 
-          for i in $(seq 1 "${attempts}"); do
-            if err="$(gh api "repos/${{ github.repository }}/releases/tags/${tag}" 2>&1 >/dev/null)"; then
-              status="exists"
-              break
-            fi
-            detail="${err}"
-            if printf '%s' "${err}" | grep -q "HTTP 404"; then
-              status="absent"
-              break
-            fi
-            echo "第 ${i} 次查詢 release 是否存在失敗（非 404）：${err}"
-            if [ "${i}" -lt "${attempts}" ]; then
-              sleep $(( i * 5 ))
-            fi
-          done
-
-          case "${status}" in
-            exists)
-              echo "release ${tag} 已存在：這次 Create GitHub Release 不會傳 body／generate_release_notes，保留人工編輯過的說明"
-              echo "exists=true" >> "$GITHUB_OUTPUT"
-              ;;
-            absent)
-              echo "release ${tag} 尚不存在：這次會用固定的 macOS 安裝說明當 body 建立新 release"
-              echo "exists=false" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "::error::連續 ${attempts} 次都無法確認 release ${tag} 是否存在（最後一次：${detail}），且不是確定的 404。無法判斷這次該不該覆寫 body，因此中止，避免誤判成『不存在』而覆寫掉人工編輯過的 release notes。請稍後重跑。"
-              exit 1
-              ;;
-          esac
+      # draft release 命中就硬失敗，不把資產靜默塞進去：softprops 會把檔案
+      # 上傳到那個 draft，但 draft 的資產下載網址對外一律 404——updater 的
+      # latest.json／SHA256SUMS.txt 於是抓不到，下一次補另一條腿時
+      # fetch-baseline 會拿到空底稿，另一個平台的條目就永久消失，而且整條
+      # 流程全綠。這種狀態只能人工決策，不能由 workflow 猜。
+      - name: Fail if the existing release is a draft
+        if: steps.check_release.outputs.is_draft == 'true'
+        shell: bash
+        run: |
+          echo "::error::${{ needs.plan.outputs.release_tag }} 底下已經有一個 **draft** release。繼續下去會把這次的資產上傳進那個 draft，但 draft 的資產下載網址對外是 404：updater 抓不到 latest.json，下次補另一條腿時底稿會是空的，另一個平台的條目/checksum 會永久消失。請先到 Releases 頁面把該 draft 正式發佈（Publish release）或刪掉，再重跑這個 workflow。"
+          exit 1
 
       # body 與 generate_release_notes 並用時，GitHub API 會把 body 放在前面、
       # 自動生成的變更記錄接在後面（不是互斥，兩者都會出現在最終 release

@@ -35,12 +35,16 @@
  *   訊號——這正是這條腳本要擋下來的那類發佈事故。
  *
  * 重試：預設 5 次，第 i 次失敗後 sleep i*5 秒再重試（跟原本 bash 版本一致）。
+ * 這套「404 立刻分類／其餘退避重試」的政策實作在 scripts/lib/fetch-retry.mjs，
+ * 這支腳本只負責「404 要寫什麼、200 要寫哪裡」這層檔案語意；scripts/probe-release.mjs
+ * 共用同一份政策（過去 release.yml 的 bash 又手刻了第四份）。
  *
  * 無外部套件相依：用 Node 內建 global fetch，直接 node scripts/fetch-baseline.mjs ...。
  */
 
 import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { fetchWithRetry } from "./lib/fetch-retry.mjs";
 import { parseSha256Sums } from "./lib/sha256sums.mjs";
 
 const VALIDATORS = {
@@ -56,10 +60,6 @@ const ON_404_CONTENT = {
   "empty-json": "{}\n",
   empty: "",
 };
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function main() {
   const { values } = parseArgs({
@@ -93,53 +93,26 @@ async function main() {
   }
 
   const label = values.label || values.url;
-  const attempts = Number(values.attempts);
-  let lastFailureDetail = "（尚未嘗試）";
 
-  for (let i = 1; i <= attempts; i += 1) {
-    let response;
-    try {
-      // 60 秒逾時、跟隨轉址，跟原本 bash 版本的 `curl -sSL --max-time 60` 對齊。
-      response = await fetch(values.url, { redirect: "follow", signal: AbortSignal.timeout(60_000) });
-    } catch (err) {
-      lastFailureDetail = `連線失敗：${err instanceof Error ? err.message : String(err)}`;
-      console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-      if (i < attempts) await sleep(i * 5_000);
-      continue;
-    }
+  // 60 秒逾時、跟隨轉址，跟原本 bash 版本的 `curl -sSL --max-time 60` 對齊；
+  // 重試次數／退避秒數／404 與暫時性失敗的分野都由 fetchWithRetry 統一處理。
+  const result = await fetchWithRetry(values.url, {
+    attempts: Number(values.attempts),
+    validate,
+    label: `現行 ${label}`,
+    exhaustedHint:
+      "無法確認線上底稿內容，繼續下去可能把其他平台的條目/checksum 從底稿抹掉，因此中止。請稍後重跑。",
+  });
 
-    if (response.status === 404) {
-      console.log(`HTTP 404：${label} 目前不存在——視為空底稿`);
-      writeFileSync(values.out, emptyContent, "utf8");
-      return;
-    }
-
-    if (response.status === 200) {
-      const text = await response.text();
-      try {
-        validate(text);
-      } catch (err) {
-        lastFailureDetail = `HTTP 200 但內容驗證失敗：${err instanceof Error ? err.message : String(err)}`;
-        console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-        if (i < attempts) await sleep(i * 5_000);
-        continue;
-      }
-      writeFileSync(values.out, text, "utf8");
-      console.log(`抓到現行 ${label} 當底稿：`);
-      console.log(text);
-      return;
-    }
-
-    lastFailureDetail = `HTTP ${response.status}`;
-    console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-    if (i < attempts) await sleep(i * 5_000);
+  if (result.notFound) {
+    console.log(`HTTP 404：${label} 目前不存在——視為空底稿`);
+    writeFileSync(values.out, emptyContent, "utf8");
+    return;
   }
 
-  console.error(
-    `::error::連續 ${attempts} 次都拿不到現行 ${label}（最後一次：${lastFailureDetail}），且不是 404。` +
-      `無法確認線上底稿內容，繼續下去可能把其他平台的條目/checksum 從底稿抹掉，因此中止。請稍後重跑。`,
-  );
-  process.exit(1);
+  writeFileSync(values.out, result.text, "utf8");
+  console.log(`抓到現行 ${label} 當底稿：`);
+  console.log(result.text);
 }
 
 main().catch((err) => {
