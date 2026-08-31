@@ -592,14 +592,19 @@ jobs:
 
       # M11：更新既有 release 時不傳 body、也不傳 generate_release_notes——
       # 兩者只要有一個帶了值，softprops 都會把 description 整份覆寫掉，人工
-      # 編輯過的 release notes 就這樣消失。這裡只更新 tag_name／name／files，
-      # 現有 description 原樣保留。
+      # 編輯過的 release notes 就這樣消失。這裡只更新 tag_name／files，現有
+      # description 原樣保留。
+      #
+      # LANG-6：name 也一併不傳。softprops v3.0.2 省略 name 時不會 PATCH 這個
+      # 欄位（github.ts:650），既有標題原樣保留；傳了 name 就等於每次補腿都把
+      # 人工改過的標題（例如「v0.6.6 — hotfix for X」）靜默重設回 v<version>，
+      # 跟 body 的問題是同一種，M11 當時只修了一半。下面「new」步驟仍然傳
+      # name：第一次建立時本來就沒有「人工編輯」這件事可以覆寫。
       - name: Create GitHub Release (existing — preserve manually edited notes)
         if: inputs.dry_run != true && steps.check_release.outputs.exists == 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.plan.outputs.release_tag }}
-          name: v${{ needs.plan.outputs.version }}
           files: |
             out/*.exe
             out/*.dmg
