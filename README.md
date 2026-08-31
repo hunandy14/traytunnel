@@ -2,17 +2,30 @@
 
 <h1 align="center">traytunnel</h1>
 
-<p align="center">Windows 系統匣 SSH 隧道管理工具</p>
-<p align="center"><i>Windows tray SSH tunnel manager built with Tauri</i></p>
+<p align="center">Windows／macOS 系統匣 SSH 隧道管理工具</p>
+<p align="center"><i>Windows/macOS tray SSH tunnel manager built with Tauri</i></p>
 
 <p align="center">
   <a href="https://github.com/hunandy14/traytunnel/releases"><img src="https://img.shields.io/github/v/release/hunandy14/traytunnel" alt="GitHub release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/hunandy14/traytunnel" alt="License"></a>
 </p>
 
-Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri.app/) 撰寫，前端是 vanilla TypeScript + Vite，隧道管理、設定檔讀寫與連通檢測全部在 Rust 側完成。
+Windows／macOS 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri.app/) 撰寫，前端是 vanilla TypeScript + Vite，隧道管理、設定檔讀寫與連通檢測全部在 Rust 側完成。
 
-程式讀取一份 TOML 設定檔（預設是 `%USERPROFILE%\.traytunnel.toml`），支援**多組連線（connection）**（各自的 host／user／ProxyCommand），**每條隧道（tunnel）各自維持一條獨立的 SSH 連線**並在斷線時各自重連，同時對每條隧道做連通自我檢測，狀態即時顯示在系統匣圖示與主視窗中。
+程式讀取一份 TOML 設定檔，支援**多組連線（connection）**（各自的 host／user／ProxyCommand），**每條隧道（tunnel）各自維持一條獨立的 SSH 連線**並在斷線時各自重連，同時對每條隧道做連通自我檢測，狀態即時顯示在系統匣圖示與主視窗中。
+
+## 目錄
+
+- [截圖](#截圖)
+- [功能](#功能)
+- [下載與安裝](#下載與安裝)
+  - [Windows](#windows)
+  - [macOS](#macos)
+- [使用介面](#使用介面)
+- [設定檔](#設定檔)
+- [開發](#開發)
+- [建置](#建置)
+- [授權](#授權)
 
 ## 截圖
 
@@ -25,7 +38,6 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
   <img src="docs/screenshots/tray-menu.png" width="700" alt="托盤選單">
 </p>
 -->
-
 
 ## 功能
 
@@ -47,9 +59,21 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 - 通知掛在自己的 AppUserModelID 底下：啟動時自註冊開始選單捷徑與 `HKCU\Software\Classes\AppUserModelId`，toast 顯示的是 Traytunnel 而不是 Windows PowerShell
 - 每條 ssh 子程序各自放在一個 Windows Job Object 內，隧道停掉或程式結束時整棵程序樹（含 `cloudflared`）一起收掉
 
-## 下載
+## 下載與安裝
 
-到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面抓最新版，依需求挑一種：
+到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面下載最新版，依作業系統挑一種。
+
+每個 Release 都會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）；另外還有一個 `latest.json`，那是應用內更新自己要讀的清單（版本號、安裝檔網址與簽章，兩個平台共用同一份），不必手動下載。
+
+### Windows
+
+執行需求：
+
+- Windows 10/11，內建 WebView2 Runtime（Windows 11 已預裝）
+- `ssh.exe`（OpenSSH 用戶端）
+- 選配：`cloudflared`，若你的 SSH 主機需要透過 Cloudflare Access 存取
+
+依需求挑一種：
 
 | 檔名 | 說明 |
 | --- | --- |
@@ -57,26 +81,22 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 | `traytunnel-<版本>p.exe` | 可攜版，與上面**同一顆二進位**，檔名以 `p` 結尾＝設定檔跟著 exe 走 |
 | `traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
-每個 Release 也會附上 `SHA256SUMS.txt`，可用它核對下載檔案的完整性（例如 `Get-FileHash -Algorithm SHA256 <檔案>` 比對雜湊值是否一致）。另外還有一個 `latest.json`，那是應用內更新自己要讀的清單（版本號、安裝檔網址與簽章），不必手動下載。
-
 本專案使用 SignPath Foundation 提供的憑證做程式碼簽章。
 
 Free code signing provided by [SignPath.io](https://signpath.io/) , certificate by [SignPath Foundation](https://signpath.org/) .
 
-## macOS 支援
+### macOS
 
 macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機驗證的時間還沒有 Windows 版久，發佈時會在 Release 說明中標註為 beta。
 
-### 需求
+執行需求：
 
 - macOS 12（Monterey）以上
 - **僅支援 Apple Silicon（`arm64`）**，沒有 Intel（`x86_64`）版本
 - `ssh`（系統內建的 OpenSSH 用戶端即可，不必額外安裝）
 - 選配：`cloudflared`，若你的 SSH 主機需要透過 Cloudflare Access 存取
 
-### 安裝
-
-到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面下載其中一種：
+依需求挑一種：
 
 | 檔名 | 說明 |
 | --- | --- |
@@ -85,9 +105,9 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 
 **不論哪一種，都務必先把 `Traytunnel.app` 拖進「應用程式」資料夾再開啟**，不要直接從掛載的 dmg 視窗或 `~/Downloads` 裡雙擊執行。這不只是慣例：macOS 對「帶隔離標記、卻沒被搬進正式位置」的 app 會做 App Translocation（Gatekeeper 的路徑隨機化），直接執行的話系統會把它塞進一個唯讀的隨機路徑跑，應用內更新在那個路徑下必定失敗（寫入被拒絕）；搬進「應用程式」資料夾之後 macOS 才不會再套用這個機制。
 
-我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `Traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。
+我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `Traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。也可以改用終端機一次性解除隔離標記：`xattr -dr com.apple.quarantine /Applications/Traytunnel.app`。
 
-### 已知限制
+#### 已知限制
 
 - **從 Finder／開機自啟啟動時，`PATH` 會由登入 shell 補回來**：launchd 給 GUI 行程的 `PATH` 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，你在 `.zshrc`／`.zprofile` 裡加的東西一概不在裡面——而 ssh 的 `ProxyCommand`（預設值 `cloudflared access ssh --hostname %h`）是交給 `/bin/sh -c` 跑的，Homebrew 裝的 `cloudflared` 在 `/opt/homebrew/bin`，於是雙擊啟動的實例會每一條隧道都在 `sh: cloudflared: not found` 上失敗，從終端機啟動的同一支程式卻完全正常。traytunnel 啟動時若發現 `PATH` 就是那份最小集，會跑一次 `$SHELL -ilc` 把你真正的 `PATH` 問回來（五秒逾時，問不到就照原樣啟動並在活動日誌留一行）。從終端機啟動時這一步完全不會跑。Windows 版沒有這個問題（GUI 行程本來就繼承使用者的 `PATH`）。
 - **開機自啟的開關是「下一次登入」生效**：打開就是寫一份 plist 進 `~/Library/LaunchAgents`，關掉就是把它刪掉，launchd 在下一次登入時讀那個資料夾。程式**不會**呼叫 `launchctl load`／`unload` 讓它立即生效——那樣做會有兩個很不舒服的副作用：`load` 會當場多開一個實例（因為那份 plist 的 `RunAtLoad` 是 true），而 `unload` 在「這一次就是開機自啟進來的」情況下等於請系統把 traytunnel 自己殺掉（連同它管的 ssh 一起變成孤兒）。Windows 版寫 HKCU 的 Run 值同樣是下次登入才生效，兩邊語意一致。
@@ -95,7 +115,7 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 - **開機自啟的偵測不含「使用者在系統設定裡手動停用」的狀態**：程式判斷開機自啟是否生效，看的是自己有沒有寫入 `~/Library/LaunchAgents` 底下的 plist；如果你在「系統設定 → 一般 → 登入項目」把它關掉，程式不會發現，畫面上的開關依然顯示為開啟。Windows 版有對齊「工作管理員」的停用紀錄，macOS 版目前還沒有對應的偵測。
 - **被強制結束（`kill -9`）或當掉時，那一瞬間的 ssh 會活下來，但下一次啟動會清掉**：Windows 版靠 Job Object 由核心保證「主程式沒了，整棵程序樹就沒了」，macOS 沒有等價機制。正常退出、Dock 的 Quit、登出、`kill`（SIGTERM）、Ctrl+C 都會走過完整的收尾；只有 `kill -9` 與真正的當機來不及。那種情況下 traytunnel 會在下一次啟動時，比對 `~/Library/Application Support/com.traytunnel.desktop/supervised-pgids.json` 裡記下的命令列，把上一輪留下、還握著本地埠的 ssh 清掉。
 
-## 介面
+## 使用介面
 
 介面上的用詞與設定檔的結構對應：一個 `[[sources]]` 在畫面上叫一條**連線**（connection），底下的每個 `[[sources.forwards]]` 叫一條**隧道**（tunnel）。
 
@@ -111,20 +131,98 @@ macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機�
 - **連線編輯**：⋯ 選單的 Edit connection 或側欄的「＋」會開出置中的編輯 sheet（name／host／user／ProxyCommand），驗證錯誤逐欄顯示；刪除連線需要一次確認。頁腳左側的 Test 鈕可以在存檔前就拿表單當下填的值試連一次（spawn 一次性 `ssh ... exit`，不建立任何轉發），結果就地顯示成功的綠字「Connected」或失敗的紅字（帶 ssh 的錯誤原因，例如 DNS 解析失敗、逾時、金鑰被拒），逾時 15 秒兜底；host／user 空白時按 Test 直接顯示欄位驗證錯誤，不會真的去連。
 - **隧道編輯**：列上的鉛筆、⋯ 選單的 Add tunnel、以及零隧道時的虛線引導卡，都開同一個 sheet（name／local port／remote）。remote 欄的提示是 `1080 (server-side port) or host:port`——只填埠號就是伺服器本機的那個埠，補成 `host:port` 由後端做。刪除隧道不跳確認，先從畫面移除、5 秒內可以按 Undo 收回。
 
-## 需求
+## 設定檔
 
-執行：
+**Windows** 版設定檔的位置在啟動時解析一次，優先序如下：
 
-- Windows 10/11，內建 WebView2 Runtime（Windows 11 已預裝）
-- `ssh.exe`（OpenSSH 用戶端）
-- 選配：`cloudflared`，若你的 SSH 主機需要透過 Cloudflare Access 存取
+| 順序 | 位置 | 何時生效 |
+| --- | --- | --- |
+| 1 | `<執行檔同目錄>\traytunnel.toml` | **可攜模式**。兩個觸發條件任一成立即可（見下方摺疊區塊），整支程式的讀寫都留在執行檔旁邊 |
+| 2 | `%USERPROFILE%\.traytunnel.toml` | 預設位置。沒進可攜模式時一律用它 |
 
-開發與建置另外需要：
+可攜模式概述：執行檔主檔名以 `p` 結尾，或執行檔旁放一個 `traytunnel.toml`，任一成立即進可攜模式，設定檔就在執行檔旁邊。完整判定規則、誤判排除見下方摺疊區塊。
+
+**macOS** 版**不支援可攜模式**：程式以 `.app` bundle 發佈，「設定檔放執行檔旁邊」等於寫進 bundle 內部，會破壞簽章、也會在下次更新時被整包換掉，因此一律使用家目錄的 `~/.traytunnel.toml`。
+
+第一次啟動若檔案不存在會自動在生效位置產生一份預設值，也可以直接複製範本：
+
+```
+copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
+```
+
+（macOS／Linux shell 用 `cp traytunnel.toml.example ~/.traytunnel.toml`。）
+
+實際生效的完整路徑一律以程式為準：設定頁的 About 分節有「Config file」一列，副標就是那個路徑，點整列會開檔案總管並選中該檔；啟動時的活動日誌也會記一行 `config: <路徑>`。
+
+<details>
+<summary>可攜模式完整判定規則</summary>
+
+兩種觸發方式，任一成立就進可攜模式，設定檔都是執行檔旁邊的 `traytunnel.toml`：
+
+- **執行檔名以 `p` 結尾**（Rufus 那套命名記號，本尊就是 `rufus-4.5p.exe`）：產品名 `traytunnel` 不是 p 結尾，所以主檔名（副檔名以外的部分）的最後一個字元是 p 就是刻意加上去的可攜記號。大小寫不敏感，例如 `traytunnel-0.2.0p.exe`、`traytunnel-p.exe`。這種情況下設定檔還不存在時會**自動在執行檔旁邊建一份預設值**，就像 Rufus 建自己的 ini。
+  只認結尾是為了避開誤判：`traytunnel - Copy.exe`（Windows 複製檔案自動取的名字，Copy 裡有 p）、`traytunnel-preview.exe` 這種都**不算**可攜。
+- **執行檔旁放一個 `traytunnel.toml`**（KeePass／Rufus 那套同名檔偵測）：檔案存在就改用它，空檔也算（程式會補齊內容）；把它刪掉或改名就回到家目錄那份。
+
+放在隨身碟上、或想讓同一台機器的多份執行檔各自帶設定時用得到。要注意檔名記號一旦成立就沒得退回：`traytunnel-p.exe` 不會再去讀家目錄那份設定。
+
+</details>
+
+<details>
+<summary>術語對照與欄位詳表</summary>
+
+**術語對照**：介面上稱 **Connection**（一組 SSH 連線）與 **Tunnel**（一條轉發），設定檔的鍵名維持原樣不動——`[[sources]]` 就是 Connection、`[[sources.forwards]]` 就是 Tunnel。手改檔案的人不必跟著改名，舊檔案也照吃。
+
+頂層欄位：
+
+| 欄位 | 說明 |
+| --- | --- |
+| `closeToTray` | 關閉鈕（X）是否只隱藏到系統匣 |
+| `checkForUpdates` | 是否在**背景**檢查新版（啟動後一次，之後每 24 小時一次）。**省略時的預設值跟著模式走**：一般模式視為 `true`，可攜模式視為 `false`。關閉時背景完全不發網路請求，但版本列上手動按下的檢查不受它管（親手按鈕就是對那一次連外的明示同意）。設定頁 General 分節有對應的開關，動過開關才會把這個鍵寫進檔案 |
+| `[[sources]]` | 一組連線（介面稱 Connection），含 `name`、`host`、`user`、`proxyCommand` 與底下的 `[[sources.forwards]]` |
+
+`[[sources]]` 的欄位：
+
+| 欄位 | 說明 |
+| --- | --- |
+| `name` | 連線名稱，不可空白也不可含空格，且不可與其他連線重複 |
+| `host` | SSH 主機 |
+| `user` | SSH 使用者 |
+| `proxyCommand` | ssh 的 `ProxyCommand`，不需要時留空字串 |
+
+`[[sources.forwards]]` 的欄位（介面稱 Tunnel）：
+
+| 欄位 | 說明 |
+| --- | --- |
+| `name` | 隧道名稱，不可空白也不可含空格 |
+| `local` | 本地埠，同時是這條隧道的**全域**唯一鍵，跨連線也不可重複（含停用中的） |
+| `remote` | 轉發目的地，格式 `host:port`。**只填埠號**（1-65535）代表伺服器本機的那個埠：介面上可以這樣填，直接手寫在檔案裡也算數，兩條路都會補成完整的 `127.0.0.1:<port>`，下次存檔後檔案裡就是完整形式 |
+| `enabled` | 是否要保持連線；省略時視為 `true` |
+
+每條隧道各自跑一條 `ssh`，連線參數（`host`／`user`／`proxyCommand`）取自它所屬的那組連線，並以自己的 `local` 埠是否進入 Listen 狀態判斷這條隧道是否連上。在介面上按 Connect／Disconnect 會即時寫回對應的 `enabled`。
+
+也可以在程式裡編輯，存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單一 `[[sources]]` 或單筆 `[[sources.forwards]]` 上方的註解）。
+
+</details>
+
+<details>
+<summary>`.broken` 與遷移相關</summary>
+
+- **舊制設定檔自動遷移**：偵測到頂層還有 `host` 欄位（只有單一連線的舊格式）時，會把它整包成一個 `[[sources]]`（連線名稱預設用 `host` 的值，其中的空白與中括號會被剝掉，例如 `[::1]` 會變成名稱 `::1`）、把原本的 `[[forwards]]` 搬成 `[[sources.forwards]]`，並就地寫回新格式；檔頭與逐筆隧道上方的註解都會保留
+- **不會自動搬家**：舊版把設定檔固定放在執行檔同目錄，升級後那份檔案會直接被當成可攜模式繼續使用；想改用家目錄的預設位置，請自行把 `traytunnel.toml` 移到 `%USERPROFILE%\.traytunnel.toml`（執行檔旁邊那份要刪掉或改名，否則它優先）
+- 升級注意：舊設定檔如果含有**重複的 `local` 埠**（舊版沒擋下來的話），升級時會被判為無法解析，另存一份 `.broken` 並改用預設值啟動，請手動把重複的埠改掉再放回去
+- 設定檔解析失敗時**不會被覆寫**，程式會在同一個資料夾另存一份「生效檔名 + `.broken`」（家目錄模式是 `.traytunnel.toml.broken`，可攜模式是 `traytunnel.toml.broken`）並改用預設值繼續執行；內容自相矛盾（連線名稱重複、跨連線撞埠、`host`／`user` 空白）也算解析失敗
+- 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
+
+</details>
+
+設定檔為個人本機設定，`traytunnel.toml` 已加入 `.gitignore`，不會被提交。
+
+## 開發
+
+開發與建置需要：
 
 - [Rust 工具鏈](https://www.rust-lang.org/tools/install)（含 MSVC Build Tools）
 - [Node.js](https://nodejs.org/) 20 以上
-
-## 開發
 
 ```
 npm install
@@ -182,6 +280,8 @@ npm run web:dev
 | `out/traytunnel-<版本>.exe` | 一般單檔，設定檔走 `%USERPROFILE%\.traytunnel.toml` |
 | `out/traytunnel-<版本>p.exe` | 可攜版。**與上面同一顆二進位**，差別只在檔名結尾的 `p`——那個 p 就是可攜模式的記號，設定檔改放 exe 旁邊 |
 | `out/traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
+| `out/traytunnel-<版本>-aarch64.dmg` | macOS DMG 安裝映像（`build:dist` 在 macOS 上產出） |
+| `out/traytunnel-<版本>-aarch64.app.tar.gz` | macOS updater 用的 `.app` 壓縮包（`build:dist` 在 macOS 上產出） |
 
 `build:mac` 跑的是另一支腳本 `node scripts/copy-app-bundle.mjs`，把 `.app` 複製到根目錄的 `bin/`（同樣每次重跑先清空），不寫 `out/`——macOS 的正式發佈檔（`.dmg`／`.app.tar.gz`）是 `build:dist` 的產物。
 
@@ -191,7 +291,7 @@ npm run web:dev
 
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
-免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成 `p` 結尾（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見下方「設定檔」）。
+免安裝使用時把 `traytunnel.exe` 放哪裡都行，設定檔預設落在 `%USERPROFILE%\.traytunnel.toml`；想連設定一起帶著走，把執行檔改名成 `p` 結尾（例如 `traytunnel-0.2.0p.exe`）或在旁邊放一個 `traytunnel.toml` 即可（見上方「設定檔」）。
 
 ### 版本管理
 
@@ -263,88 +363,6 @@ push tag（`v*`）會自動觸發 `release.yml`，比對 tag 版號與 `src-taur
 發佈失敗要重跑時，改走 Actions 頁面的 *Run workflow*（`release.yml` 的 `workflow_dispatch`）：不用帶參數，直接以目前 `src-tauri/Cargo.toml` 的版號去掛對應的既有 tag（例如版號是 `0.4.1` 就掛 `v0.4.1`）；tag 還沒建立會直接 fail 並在 log 裡註明要先 tag、push --tags。
 
 </details>
-
-## 設定檔
-
-設定檔的位置在啟動時解析一次，優先序如下：
-
-| 順序 | 位置 | 何時生效 |
-| --- | --- | --- |
-| 1 | `<執行檔同目錄>\traytunnel.toml` | **可攜模式**。兩個觸發條件任一成立即可（見下方摺疊區塊），整支程式的讀寫都留在執行檔旁邊 |
-| 2 | `%USERPROFILE%\.traytunnel.toml` | 預設位置。沒進可攜模式時一律用它 |
-
-可攜模式概述：執行檔主檔名以 `p` 結尾，或執行檔旁放一個 `traytunnel.toml`，任一成立即進可攜模式，設定檔就在執行檔旁邊。完整判定規則、誤判排除見下方摺疊區塊。
-
-第一次啟動若檔案不存在會自動在生效位置產生一份預設值，也可以直接複製範本：
-
-```
-copy traytunnel.toml.example %USERPROFILE%\.traytunnel.toml
-```
-
-實際生效的完整路徑一律以程式為準：設定頁的 About 分節有「Config file」一列，副標就是那個路徑，點整列會開檔案總管並選中該檔；啟動時的活動日誌也會記一行 `config: <路徑>`。
-
-<details>
-<summary>可攜模式完整判定規則</summary>
-
-兩種觸發方式，任一成立就進可攜模式，設定檔都是執行檔旁邊的 `traytunnel.toml`：
-
-- **執行檔名以 `p` 結尾**（Rufus 那套命名記號，本尊就是 `rufus-4.5p.exe`）：產品名 `traytunnel` 不是 p 結尾，所以主檔名（副檔名以外的部分）的最後一個字元是 p 就是刻意加上去的可攜記號。大小寫不敏感，例如 `traytunnel-0.2.0p.exe`、`traytunnel-p.exe`。這種情況下設定檔還不存在時會**自動在執行檔旁邊建一份預設值**，就像 Rufus 建自己的 ini。
-  只認結尾是為了避開誤判：`traytunnel - Copy.exe`（Windows 複製檔案自動取的名字，Copy 裡有 p）、`traytunnel-preview.exe` 這種都**不算**可攜。
-- **執行檔旁放一個 `traytunnel.toml`**（KeePass／Rufus 那套同名檔偵測）：檔案存在就改用它，空檔也算（程式會補齊內容）；把它刪掉或改名就回到家目錄那份。
-
-放在隨身碟上、或想讓同一台機器的多份執行檔各自帶設定時用得到。要注意檔名記號一旦成立就沒得退回：`traytunnel-p.exe` 不會再去讀家目錄那份設定。
-
-</details>
-
-<details>
-<summary>術語對照與欄位詳表</summary>
-
-**術語對照**：介面上稱 **Connection**（一組 SSH 連線）與 **Tunnel**（一條轉發），設定檔的鍵名維持原樣不動——`[[sources]]` 就是 Connection、`[[sources.forwards]]` 就是 Tunnel。手改檔案的人不必跟著改名，舊檔案也照吃。
-
-頂層欄位：
-
-| 欄位 | 說明 |
-| --- | --- |
-| `closeToTray` | 關閉鈕（X）是否只隱藏到系統匣 |
-| `checkForUpdates` | 是否在**背景**檢查新版（啟動後一次，之後每 24 小時一次）。**省略時的預設值跟著模式走**：一般模式視為 `true`，可攜模式視為 `false`。關閉時背景完全不發網路請求，但版本列上手動按下的檢查不受它管（親手按鈕就是對那一次連外的明示同意）。設定頁 General 分節有對應的開關，動過開關才會把這個鍵寫進檔案 |
-| `[[sources]]` | 一組連線（介面稱 Connection），含 `name`、`host`、`user`、`proxyCommand` 與底下的 `[[sources.forwards]]` |
-
-`[[sources]]` 的欄位：
-
-| 欄位 | 說明 |
-| --- | --- |
-| `name` | 連線名稱，不可空白也不可含空格，且不可與其他連線重複 |
-| `host` | SSH 主機 |
-| `user` | SSH 使用者 |
-| `proxyCommand` | ssh 的 `ProxyCommand`，不需要時留空字串 |
-
-`[[sources.forwards]]` 的欄位（介面稱 Tunnel）：
-
-| 欄位 | 說明 |
-| --- | --- |
-| `name` | 隧道名稱，不可空白也不可含空格 |
-| `local` | 本地埠，同時是這條隧道的**全域**唯一鍵，跨連線也不可重複（含停用中的） |
-| `remote` | 轉發目的地，格式 `host:port`。**只填埠號**（1-65535）代表伺服器本機的那個埠：介面上可以這樣填，直接手寫在檔案裡也算數，兩條路都會補成完整的 `127.0.0.1:<port>`，下次存檔後檔案裡就是完整形式 |
-| `enabled` | 是否要保持連線；省略時視為 `true` |
-
-每條隧道各自跑一條 `ssh`，連線參數（`host`／`user`／`proxyCommand`）取自它所屬的那組連線，並以自己的 `local` 埠是否進入 Listen 狀態判斷這條隧道是否連上。在介面上按 Connect／Disconnect 會即時寫回對應的 `enabled`。
-
-也可以在程式裡編輯，存檔會寫回同一個檔案並保留你手寫的註解（包含寫在單一 `[[sources]]` 或單筆 `[[sources.forwards]]` 上方的註解）。
-
-</details>
-
-<details>
-<summary>`.broken` 與遷移相關</summary>
-
-- **舊制設定檔自動遷移**：偵測到頂層還有 `host` 欄位（只有單一連線的舊格式）時，會把它整包成一個 `[[sources]]`（連線名稱預設用 `host` 的值，其中的空白與中括號會被剝掉，例如 `[::1]` 會變成名稱 `::1`）、把原本的 `[[forwards]]` 搬成 `[[sources.forwards]]`，並就地寫回新格式；檔頭與逐筆隧道上方的註解都會保留
-- **不會自動搬家**：舊版把設定檔固定放在執行檔同目錄，升級後那份檔案會直接被當成可攜模式繼續使用；想改用家目錄的預設位置，請自行把 `traytunnel.toml` 移到 `%USERPROFILE%\.traytunnel.toml`（執行檔旁邊那份要刪掉或改名，否則它優先）
-- 升級注意：舊設定檔如果含有**重複的 `local` 埠**（舊版沒擋下來的話），升級時會被判為無法解析，另存一份 `.broken` 並改用預設值啟動，請手動把重複的埠改掉再放回去
-- 設定檔解析失敗時**不會被覆寫**，程式會在同一個資料夾另存一份「生效檔名 + `.broken`」（家目錄模式是 `.traytunnel.toml.broken`，可攜模式是 `traytunnel.toml.broken`）並改用預設值繼續執行；內容自相矛盾（連線名稱重複、跨連線撞埠、`host`／`user` 空白）也算解析失敗
-- 用 PowerShell 之類的工具存檔若帶了 UTF-8 BOM，也能正常解析
-
-</details>
-
-設定檔為個人本機設定，`traytunnel.toml` 已加入 `.gitignore`，不會被提交。
 
 ## 授權
 
