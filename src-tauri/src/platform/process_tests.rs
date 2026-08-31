@@ -230,23 +230,32 @@ fn a_port_nobody_holds_is_not_reported_as_listening() {
 /// （例如漏掉 v6 那張表、或沒濾掉非 LISTEN 的連線），逐條 `is_listening`
 /// 的舊路徑不會有事，只有這條會紅。
 ///
-/// 期限與輪詢紀律比照 §1(i)：綁定到掃描得到之間隔著一次核心表更新。
+/// 期限與輪詢紀律比照 §1(i)：綁定到掃描得到之間隔著一次核心表更新。輪詢到
+/// 看得見之後**只取一份快照**，兩個方向（有人佔的要在、沒人佔的不在）都問
+/// 它——`busy_rows` 那條路要的正是「一批答案來自同一個瞬間」，分兩次取就沒有
+/// 在測那件事。
 #[test]
 fn a_bound_port_shows_up_in_the_listening_ports_snapshot() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("要綁得起來");
     let port = listener.local_addr().expect("listener 一定有本地位址").port();
-    // 同一輪順便驗「沒人佔的埠不在集合裡」，兩個方向共用同一份快照才有意義
+    // 同一份快照順便驗「沒人佔的埠不在集合裡」
     let free = borrow_a_free_port();
 
     let seen = poll_until(DEADLINE, || listening_ports().contains(&port));
-    let free_is_absent = !listening_ports().contains(&free);
+    // listener 還活著的時候取，所以 `seen` 為真時這一份必定也收錄得到 port
+    let snapshot = listening_ports();
+    // listener 撐到快照取完才放掉：提早 drop 就變成在測一個已經關掉的埠
     drop(listener);
 
     assert!(
         seen,
         "127.0.0.1:{port} 上有 TcpListener 在 LISTEN，listening_ports() 卻在 {DEADLINE:?} 內都沒收錄它"
     );
-    assert!(free_is_absent, "沒有任何程序佔著埠 {free}，它卻出現在 listening_ports() 的快照裡");
+    assert!(
+        snapshot.contains(&port),
+        "同一份快照裡應該還看得到 {port}（listener 到這一刻都還綁著）"
+    );
+    assert!(!snapshot.contains(&free), "沒有任何程序佔著埠 {free}，它卻出現在同一份快照裡");
 }
 
 // ------------------------------------------------------------------
