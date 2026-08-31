@@ -141,7 +141,7 @@ pub(super) fn to_json(reg: &Registry) -> String {
 ///
 /// pid（＝pgid）會回收，登記簿裡一個舊 pgid 剛好對上今天別人的群組時，這一條
 /// 就是「拿一個舊數字去砍不相干的程式」。當初放行反方向的理由是「`ps` 在極端長
-/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`commands_by_pgid`]），
+/// 的命令列上可能截斷」——但這裡問 `ps` 一律帶 `-ww`（見 [`ps_table`]），
 /// 截斷這件事根本不會發生，等於用一個不存在的問題換來一個真的誤殺面。
 ///
 /// 空字串一律不算相符：`ps` 問不到東西（行程已經不在）會回空字串，那時候
@@ -348,8 +348,24 @@ pub(super) fn kill_group(pgid: i32) {
     }
 }
 
-/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成「pgid → 這一組裡每一支的
-/// 命令列」。純函式，`ps` 的實際執行在 [`commands_by_pgid`]。
+/// 問一次 `ps` 拿回來的全表，兩種索引各一份。
+///
+/// 同一份輸出、同一次解析：收屍要問的兩個問題（「這個 pgid 的群組裡現在有誰」與
+/// 「這個 owner pid 現在是什麼命令列」）本來就都在 `ps -axww -o pid=,pgid=,command=`
+/// 的同一行裡。原本 [`parse_ps_pgid_table`] 把 pid 欄**丟掉**，於是
+/// [`owner_still_running`] 只好對每一個 owner 再 fork 一次 `ps -p`——登記簿有 N 個
+/// 不同 owner 就多 N 次外部程序，與 [`ps_table`] 自己 doc 上寫的「一次就好」
+/// 直接矛盾。留著 pid 這一欄，那 N 次全部消失。
+#[derive(Debug, Default)]
+struct PsTable {
+    /// pgid → 這一組裡每一支的命令列
+    by_pgid: std::collections::HashMap<i32, Vec<String>>,
+    /// pid → 那一支的命令列
+    by_pid: std::collections::HashMap<i32, String>,
+}
+
+/// 把 `ps -axww -o pid=,pgid=,command=` 的輸出解成 [`PsTable`]。純函式，
+/// `ps` 的實際執行在 [`ps_table`]。
 ///
 /// 每一行的形狀固定是「pid、pgid、命令列」，前兩欄是**靠右對齊、寬度不定**的
 /// 數字（欄與欄之間可能有好幾個空白），第三欄開始整個都是命令，而命令本身含
@@ -357,8 +373,9 @@ pub(super) fn kill_group(pgid: i32) {
 /// `split_whitespace` 全切開再用單一空白拼回去——那樣會把命令列裡連續的空白
 /// 壓掉，`ps -o command=` 印的是什麼就不再是什麼，而 [`commands_match`] 是逐字
 /// 前綴比對，壓掉就對不上了。解不開的行（`ps` 哪天多印了什麼）整行跳過，
-/// 不要瞎猜。
-fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<String>> {
+/// 不要瞎猜；pid 欄單獨解不出數字時只是少一筆 `by_pid` 索引，`by_pgid` 照舊收下
+/// ——收屍的主判斷是 pgid 那一份，不該被另一欄的意外拖下水。
+fn parse_ps_pgid_table(stdout: &str) -> PsTable {
     /// 切掉開頭的空白與第一個欄位，回 (那個欄位, 剩下的整段)。
     fn split_first_field(s: &str) -> Option<(&str, &str)> {
         let s = s.trim_start();
@@ -366,10 +383,9 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
         Some((&s[..end], &s[end..]))
     }
 
-    let mut table: std::collections::HashMap<i32, Vec<String>> = std::collections::HashMap::new();
+    let mut table = PsTable::default();
     for line in stdout.lines() {
-        // 第一欄是 pid，這裡用不到（比對只看命令列），但一定要切掉才輪得到 pgid
-        let Some((_pid, rest)) = split_first_field(line) else {
+        let Some((pid, rest)) = split_first_field(line) else {
             continue;
         };
         let Some((pgid, command)) = split_first_field(rest) else {
@@ -383,17 +399,24 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
         if command.is_empty() {
             continue;
         }
-        table.entry(pgid).or_default().push(command.to_string());
+        if let Ok(pid) = pid.parse::<i32>() {
+            table.by_pid.insert(pid, command.to_string());
+        }
+        table.by_pgid.entry(pgid).or_default().push(command.to_string());
     }
     table
 }
 
-/// 問 `ps` 一次，把系統上每一個行程按 pgid 分好組。
+/// 問 `ps` 一次，把系統上每一個行程按 pgid 與 pid 各索引一份。
 ///
 /// **一次就好**。這條路的呼叫端只有 [`sweep_leftovers`]，而它要問的是登記簿裡
 /// 每一筆 pgid「這一組現在有誰」——原本是逐筆 `ps -g <pgid>`，登記簿有 N 筆就
-/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建
-/// 成 `HashMap` 完全等價，而且是啟動路徑上唯一一次外部程序。
+/// fork／exec N 次。一次 `-ax`（所有使用者、含沒有控制終端的）把全表拿回來建成
+/// `HashMap` 完全等價，而且是**收屍這條路上**唯一一次外部程序（原本這裡寫的是
+/// 「啟動路徑上唯一一次」，那句話當時就不成立：`owner_still_running` 每個 owner
+/// 還會再 fork 一次 `ps -p`，而啟動路徑上另外還有 `sys::fix_gui_launch_path` 的
+/// 登入 shell。owner 那 N 次已經隨 [`PsTable::by_pid`] 一起拿掉了，登入 shell
+/// 不歸這裡管）。
 ///
 /// `-ww` 一定要在：它關掉「照終端機寬度截斷」的預設行為，截斷會讓命令列比對
 /// 無謂地失手——[`commands_match`] 只認一個方向（`ps` 至少要印出我們登記的
@@ -401,65 +424,73 @@ fn parse_ps_pgid_table(stdout: &str) -> std::collections::HashMap<i32, Vec<Strin
 ///
 /// 用 `ps` 而不是手刻 `sysctl KERN_PROCARGS2`：後者要解一份 Apple 沒有公開穩定
 /// 文件的核心緩衝格式，還得整段 unsafe，而這條路一輩子只在啟動時跑這一次。
-fn commands_by_pgid() -> std::collections::HashMap<i32, Vec<String>> {
+fn ps_table() -> PsTable {
     match std::process::Command::new("ps").args(["-axww", "-o", "pid=,pgid=,command="]).output() {
         Ok(out) => parse_ps_pgid_table(&String::from_utf8_lossy(&out.stdout)),
         Err(e) => {
             log::warn!("could not ask ps about the running process groups: {e}");
-            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺。
-            // 方向是漏殺不是誤殺，與整個模組的原則一致
-            std::collections::HashMap::new()
+            // 問不到就是一張空表，於是每一筆都「群組裡沒有任何行程」＝不殺，
+            // 而且每一個 owner 都會被 [`owner_is_still_ours`] 當成還活著＝不掃。
+            // 兩個方向都是漏殺不是誤殺，與整個模組的原則一致
+            PsTable::default()
         }
     }
+}
+
+/// 「這個 owner pid 現在還是我們自己的另一個實例嗎」的純判定，`ps` 全表由呼叫端
+/// 查好傳進來（抽成純函式才測得到，同 [`plan_sweep`]）。
+///
+/// 比對用的是**執行檔檔名**，不是完整路徑。
+///
+/// 這裡的每一個判斷失誤都要往「主人還活著」偏（＝那一筆不掃＝漏殺），因為反方向
+/// 是誤殺。用完整路徑當前綴比對就正好偏錯邊：同一個使用者同時跑「裝在
+/// /Applications 的正式版」與「開發中的 cargo build 產物」，而 single-instance 又
+/// 失手讓兩邊並存時，兩邊的 `current_exe()` 完全不同，於是互相判定「對方那個 pid
+/// 不是我們的程式、主人已死」，接著把對方現役的隧道全部 SIGKILL——正是這個機制
+/// 最不該做的事。
+///
+/// 換成檔名包含之後，誤判方向翻過來了：系統上剛好有另一支同名的 `traytunnel`
+/// 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆不掃。代價只是那一輪
+/// 少收一具屍體，下一次啟動再收；而且要湊齊「pid 剛好被回收」＋「新主人剛好也叫
+/// 這個名字」兩件事，機率本來就極低。比對本身不分大小寫，理由見 [`ps_output_mentions`]。
+///
+/// 兩道「問不到就當主人還活著」的退讓一個都不能少，這是原本 `ps -p` 版本的語意，
+/// 換成查全表之後必須逐字保留：
+///
+/// * `exe_name` 是空的（問不到自己叫什麼）→ 活著；
+/// * **`ps` 整張表是空的**（`ps` 跑不起來，或輸出一行都解不開）→ 活著。這一條對應
+///   原本 `Command::output()` 回 `Err` 那一支；沒有它的話，`ps` 一旦失敗就會變成
+///   「每一個 owner 都判定已死」，接著把另一個現役實例的隧道全部掃掉——正好是
+///   最壞的方向。
+///
+/// 表拿得到、而這個 pid 不在裡面，才是真的「這個 owner 已經不在了」。
+fn owner_is_still_ours(ps: &PsTable, owner_pid: i32, exe_name: &str) -> bool {
+    if exe_name.is_empty() || ps.by_pid.is_empty() {
+        return true;
+    }
+    ps.by_pid.get(&owner_pid).is_some_and(|line| ps_output_mentions(line, exe_name))
 }
 
 /// 某一筆登記的主人（spawn 它的那個 app 行程）是不是還在跑。
 ///
 /// 兩道都要成立才算：pid 還活著（`kill(pid, 0)`），而且那個 pid 的命令列裡
-/// 出現得了我們這支執行檔的**檔名**——只看 pid 活不活著會被 pid 回收騙過去。
-/// 為什麼比檔名而不是完整路徑（以及這個取捨往哪邊偏）見函式內的說明。
+/// 出現得了我們這支執行檔的檔名（[`owner_is_still_ours`]）——只看 pid 活不活著
+/// 會被 pid 回收騙過去。
 ///
 /// 「主人就是我自己」回 `false`：收屍只在啟動時、任何 `register` 之前跑，
 /// 這時候檔案裡不可能有本輪自己的條目，會對到只可能是 pid 回收的巧合。
-fn owner_still_running(owner_pid: i32) -> bool {
+fn owner_still_running(ps: &PsTable, owner_pid: i32) -> bool {
     if owner_pid <= 1 || owner_pid == std::process::id() as i32 {
         return false;
     }
     if unsafe { libc::kill(owner_pid, 0) } != 0 {
         return false;
     }
-    // 比對用的是**執行檔檔名**，不是完整路徑。
-    //
-    // 這裡的每一個判斷失誤都要往「主人還活著」偏（＝那一筆不掃＝漏殺），
-    // 因為反方向是誤殺。用完整路徑當前綴比對就正好偏錯邊：同一個使用者同時
-    // 跑「裝在 /Applications 的正式版」與「開發中的 cargo build 產物」，而
-    // single-instance 又失手讓兩邊並存時，兩邊的 `current_exe()` 完全不同，
-    // 於是互相判定「對方那個 pid 不是我們的程式、主人已死」，接著把對方
-    // 現役的隧道全部 SIGKILL——正是這個機制最不該做的事。
-    //
-    // 換成檔名包含之後，誤判方向翻過來了：系統上剛好有另一支同名的
-    // `traytunnel` 佔著那個回收來的 pid 時會被誤認成「主人還在」，於是那一筆
-    // 不掃。代價只是那一輪少收一具屍體，下一次啟動再收；而且要湊齊
-    // 「pid 剛好被回收」＋「新主人剛好也叫這個名字」兩件事，機率本來就極低。
-    //
-    // 比對本身不分大小寫，理由見 [`ps_output_mentions`]。
     let name = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    if name.is_empty() {
-        // 問不到自己叫什麼的話，寧可保守：pid 還活著就當主人還在，不要掃
-        return true;
-    }
-    let out = std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p"])
-        .arg(owner_pid.to_string())
-        .output();
-    match out {
-        Ok(out) => ps_output_mentions(&String::from_utf8_lossy(&out.stdout), &name),
-        // 連 ps 都跑不起來時同樣往「主人還活著」偏
-        Err(_) => true,
-    }
+    owner_is_still_ours(ps, owner_pid, &name)
 }
 
 // ---------------------------------------------------------------- 對外
@@ -518,11 +549,13 @@ pub fn sweep_leftovers() {
         }
         return;
     }
-    // 一次把全表拿回來，登記簿有幾筆都只問 `ps` 這一次（見 `commands_by_pgid`）
-    let by_pgid = commands_by_pgid();
-    let plan = plan_sweep(&reg, &mut owner_still_running, &mut |pgid| {
-        by_pgid.get(&pgid).cloned().unwrap_or_default()
-    });
+    // 一次把全表拿回來，登記簿有幾筆、有幾個不同的 owner，都只問 `ps` 這一次
+    // （見 `ps_table`：pgid 與 pid 兩種索引都從同一份輸出來）
+    let ps = ps_table();
+    let plan =
+        plan_sweep(&reg, &mut |owner_pid| owner_still_running(&ps, owner_pid), &mut |pgid| {
+            ps.by_pgid.get(&pgid).cloned().unwrap_or_default()
+        });
     for pgid in &plan.doomed {
         log::warn!(
             "killing a process group left behind by a previous run (pgid {pgid}); the last run \
@@ -913,6 +946,9 @@ mod tests {
     /// `ps -axww -o pid=,pgid=,command=` 的輸出要按 pgid 分好組，而且命令列
     /// 必須**原樣**保留（含裡面的連續空白）——`commands_match` 是逐字前綴比對，
     /// 把空白壓掉就再也對不上我們登記的那一行。
+    ///
+    /// 同一次解析還要留下 pid 那一欄的索引：收屍問「這個 owner 還在不在」靠的
+    /// 就是它，原本把 pid 丟掉才逼得每個 owner 再 fork 一次 `ps -p`。
     #[test]
     fn the_ps_table_groups_commands_by_pgid() {
         // 前兩欄靠右對齊、寬度不定，這是 `ps -o pid=,pgid=` 真的會印出來的樣子
@@ -923,7 +959,7 @@ mod tests {
         let table = parse_ps_pgid_table(out);
 
         assert_eq!(
-            table.get(&900).map(Vec::as_slice),
+            table.by_pgid.get(&900).map(Vec::as_slice),
             Some(
                 &[
                     "ssh -N  -L 1080:127.0.0.1:1080 bob@a".to_string(),
@@ -933,23 +969,72 @@ mod tests {
             "同一個 pgid 的兩支（ssh 與它 ProxyCommand 生的孫程序）要收在一起，\
              而且 `ssh -N  -L` 中間那兩個空白不可以被壓成一個"
         );
-        assert_eq!(table.get(&9100).map(Vec::len), Some(1));
-        assert_eq!(table.get(&12345), None, "沒出現過的 pgid 就是沒有");
+        assert_eq!(table.by_pgid.get(&9100).map(Vec::len), Some(1));
+        assert_eq!(table.by_pgid.get(&12345), None, "沒出現過的 pgid 就是沒有");
+
+        // pid 索引：同一份輸出、同一次解析，每一支都查得到自己那一行
+        assert_eq!(
+            table.by_pid.get(&900).map(String::as_str),
+            Some("ssh -N  -L 1080:127.0.0.1:1080 bob@a")
+        );
+        assert_eq!(
+            table.by_pid.get(&9001).map(String::as_str),
+            Some("cloudflared access ssh --hostname a"),
+            "群組領袖以外的行程同樣要進 pid 索引"
+        );
+        assert_eq!(table.by_pid.get(&12345), None);
 
         // 解不開的行整行跳過，不要瞎猜也不要炸掉
-        assert!(parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n").is_empty());
+        let garbage = parse_ps_pgid_table("這一行不是 ps 的輸出\n\n  1\n");
+        assert!(garbage.by_pgid.is_empty());
+        assert!(garbage.by_pid.is_empty());
+    }
+
+    /// 「這個 owner 還是我們的另一個實例嗎」的兩道退讓，一個都不能少——它們是
+    /// 原本 `ps -p <pid>` 版本的語意，換成查全表之後必須逐字保留。
+    ///
+    /// 最要緊的是**空表那一條**：`ps` 跑不起來時原本回的是 `Err(_) => true`
+    /// （當主人還活著、不掃）。查全表之後若把「表裡沒有這個 pid」一律當成
+    /// 「主人已死」，`ps` 一失敗就會變成把另一個現役實例的隧道全部掃掉——這個
+    /// 模組「寧可漏殺不誤殺」原則下最壞的那個方向。
+    #[test]
+    fn an_unreadable_ps_table_means_the_owner_is_assumed_alive() {
+        let ps = parse_ps_pgid_table(
+            " 900   900 /Applications/Traytunnel.app/Contents/MacOS/Traytunnel --tray\n\
+             \x209100  9100 /usr/libexec/some-daemon --serve\n",
+        );
+
+        assert!(ps.by_pid.contains_key(&900), "前提：這張表查得到 900");
+        assert!(owner_is_still_ours(&ps, 900, "traytunnel"), "命令列對得上就是還活著");
+        assert!(!owner_is_still_ours(&ps, 9100, "traytunnel"), "那個 pid 是別人的程式");
+        assert!(
+            !owner_is_still_ours(&ps, 4242, "traytunnel"),
+            "表拿得到、pid 不在裡面＝已經不在了"
+        );
+
+        // 兩道退讓：問不到自己叫什麼、以及整張表是空的（ps 跑不起來）
+        assert!(owner_is_still_ours(&ps, 4242, ""), "問不到自己叫什麼就不要掃");
+        assert!(
+            owner_is_still_ours(&PsTable::default(), 4242, "traytunnel"),
+            "ps 拿不到任何東西時一律當主人還活著，否則一次 ps 失敗就會掃掉現役實例的隧道"
+        );
     }
 
     /// 這台機器上真的跑一次 `ps`，確認上面那支解析器吃的格式沒有猜錯：
-    /// **本行程自己**一定要出現在自己的 pgid 底下。純唯讀查詢，不動任何東西。
+    /// **本行程自己**一定要出現在自己的 pgid 底下，pid 索引也查得到自己。
+    /// 純唯讀查詢，不動任何東西。
     #[test]
     fn the_ps_table_can_find_this_very_process() {
-        let table = commands_by_pgid();
+        let table = ps_table();
         let me = std::process::id() as i32;
         let my_pgid = unsafe { libc::getpgid(me) };
         assert!(
-            table.contains_key(&my_pgid),
+            table.by_pgid.contains_key(&my_pgid),
             "ps 的全表裡找不到本行程自己的 pgid {my_pgid}——解析器跟真實輸出對不上了"
+        );
+        assert!(
+            table.by_pid.contains_key(&me),
+            "pid 索引裡找不到本行程自己的 pid {me}——owner 的判定就是靠這一份"
         );
     }
 
