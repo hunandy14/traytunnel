@@ -1,7 +1,13 @@
 /**
- * 讀取 scripts/package.mjs 產出的 out/manifest.<platform_key>.json——release.yml
- * 的 compose job（組 latest.json）與 build job（驗證簽章一致性）共用同一套讀取
- * 邏輯，兩邊都不再手寫 traytunnel-<version>-... 這類檔名字面值。
+ * 讀取 scripts/package.mjs 產出的 out/manifest.<platform_key>.json，讓消費端不必
+ * 手寫 traytunnel-<version>-... 這類檔名字面值。
+ *
+ * 誠實的現況：目前只有 compose job 這一側（scripts/compose-latest-json.mjs）真的
+ * 用這支模組。release.yml 的 build job「Verify updater signature matches release
+ * asset」步驟是自己用 jq 讀同一份 manifest 的 .bundle_source／.asset，並沒有共用
+ * 這裡的讀取與驗證邏輯——所以這支模組加的欄位檢查（型別、platform_key／version
+ * 一致性）對 build job 那一側不生效。把那一步也 node 化、讓兩側共用同一個讀取點
+ * 是 backlog（REU-2），不是這支模組現在的事實。
  *
  * 檔名帶 platform_key 後綴的理由見 scripts/package.mjs 開頭註解：
  * download-artifact 的 merge-multiple 會把兩腿的 out/ 攤平進同一個目錄，共用
