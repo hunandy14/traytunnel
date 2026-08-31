@@ -195,11 +195,51 @@ fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::fs::File::create(tmp).ok()?))
         .stderr(Stdio::null());
-    // 自成一個行程群組，逾時時才收得掉「shell 自己＋它 rc 檔生出來的東西」整棵樹
-    // ——只 kill shell 的話，卡住它的那支孫程序會留下來
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // 自成一個新的 **session**（連帶自成一個新的行程群組，pgid ＝ 子程序的 pid，
+    // 這是 `setsid(2)` 的定義），逾時時才收得掉「shell 自己＋它 rc 檔生出來的
+    // 東西」整棵樹——只 kill shell 的話，卡住它的那支孫程序會留下來。
+    //
+    // ## 為什麼是 `setsid()` 而不是 `process_group(0)`
+    //
+    // 兩者在「自成一個 pgid、pgid ＝ 子程序的 pid」這件事上等價，底下
+    // `kill_group(pgid)` 那段逾時清理一個字都不用改。差別在**控制終端**：
+    // `process_group(0)` 只換群組，子程序仍留在原本的 session 裡——從終端機啟動
+    // 時（`cargo run`、直接跑執行檔）那就是終端機的 session，而且是一個**非前景**
+    // 的行程群組。POSIX 的作業控制規定：非前景群組的行程一旦要從控制終端讀，
+    // 核心就整組送 `SIGTTIN`，預設動作是**停住**。而我們跑的正是 `-i`（互動式）
+    // ——互動式 shell 啟動時會做 job control 初始化（`tcgetpgrp`／把自己搬進前景），
+    // 那一手在非前景群組裡就會踩到這條規則。
+    //
+    // 實測（本機，有控制終端、PATH 是 launchd 最小集的重現路徑）：**zsh 會停住、
+    // bash 不會**——而 macOS 10.15 起的預設登入 shell 正是 zsh，也就是絕大多數
+    // 使用者會走到的那一支。停住之後 `try_wait()` 永遠回 `Ok(None)`（停住不是
+    // 結束），探測必定燒滿整整 5 秒逾時才放棄，而這段時間是花在**任何 UI 之前**
+    // 的啟動路徑上。
+    //
+    // `setsid()` 之後子程序沒有控制終端，那條規則整個不適用，探測正常回答。
+    // `stdin(Stdio::null())` 擋不住這件事：卡住的不是 stdin，是 shell 自己對
+    // 控制終端的操作。同一個手法與同一段推論見 `spawn.rs`（那邊擋的是 ssh 的
+    // `readpassphrase` 直接開 `/dev/tty`）。
+    //
+    // `setsid()` 在剛 `fork` 出來的子程序裡不可能失敗成 `EPERM`：`EPERM` 只發生
+    // 在呼叫者已經是行程群組領袖時，而新 fork 出來的子程序 pid 全新、pgid 繼承
+    // 自父行程，兩者不相等。
+    //
+    // SAFETY：`pre_exec` 的閉包跑在 `fork` 與 `exec` 之間的子程序裡，那個環境只准
+    // 呼叫 async-signal-safe 的東西（不能配置記憶體、不能取鎖）。這裡只呼叫
+    // `setsid()` 一支系統呼叫，沒有配置、沒有鎖、沒有 Rust 端的狀態，符合要求。
+    // 這個 `cmd` 是本函式自己建的區域變數、只 spawn 一次，不會重複掛上 `pre_exec`。
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd.spawn().ok()?;
+    // 子程序的 pid 就是它的 pgid（`setsid()` 讓它自成一組，見上面那段）
     let pgid = child.id() as i32;
     let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
     // 迴圈只回報一件事：這支 shell 是不是**自己**結束了。
