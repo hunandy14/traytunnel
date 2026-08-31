@@ -13,8 +13,10 @@
  * 標成 darwin-aarch64 發出去，使用者抓到跑不動的檔案，而且沒有任何訊號。
  * release.yml 的 build 步驟一律會帶 --target（見該檔 matrix.rust_target）；
  * 這裡沒收到 --target 時（本機手動 `npm run build:dist` 之類）才退回用
- * process.platform／process.arch 猜，並印警告——純粹是本機開發便利，不代表
- * CI 允許猜。
+ * process.platform／process.arch 猜出一個 target triple，並印警告——純粹是
+ * 本機開發便利，不代表 CI 允許猜。不論明確傳的還是猜出來的，target 一律要
+ * 出現在下面的 TARGETS 表裡（目前只有 aarch64-apple-darwin 與
+ * x86_64-pc-windows-msvc），否則直接 exit 1；理由見該表的註解。
  *
  * Windows 分支多出一筆 .sig：舊管線是 Windows 單平台，compose 那步就跑在同一個
  * job 裡，直接從 src-tauri/target/release/bundle/nsis/ 讀簽章，不需要經過 out/。
@@ -82,20 +84,43 @@ function bytes(n) {
   return n.toLocaleString("en-US");
 }
 
-// Rust target triple → release.yml plan job 用的 platform_key。新增平台
-// （例如 x86_64-apple-darwin／aarch64-pc-windows-msvc）先在這裡補一筆，
-// 再去 release.yml 的 plan job 補對應的 matrix entry。
-const TARGET_PLATFORM_KEYS = {
-  "aarch64-apple-darwin": "darwin-aarch64",
-  "x86_64-apple-darwin": "darwin-x86_64",
-  "x86_64-pc-windows-msvc": "windows-x86_64",
-  "aarch64-pc-windows-msvc": "windows-aarch64",
-};
-
-// mac 架構驗證用：target triple 的 CPU 段 → lipo/file 認得的架構名稱。
-const TARGET_LIPO_ARCH = {
-  "aarch64-apple-darwin": "arm64",
-  "x86_64-apple-darwin": "x86_64",
+/**
+ * 這條管線「實際支援」的 Rust target triple，一筆一個 target（SCR-1）。
+ *
+ * 刻意只列真的能出貨的兩個。舊版的 TARGET_PLATFORM_KEYS 另外宣告支援
+ * x86_64-apple-darwin／aarch64-pc-windows-msvc，但下面的來源檔名與 out/
+ * 檔名全部寫死 aarch64／x64，target 與檔名根本脫鉤：帶
+ * --target x86_64-apple-darwin 會以「產物缺失」失敗（訊息完全誤導），而在
+ * Intel Mac 本機不帶 --target 跑 build:dist 時，platformKey 猜成
+ * darwin-x86_64、dmg 因此跳過，.app.tar.gz 卻仍複製成 -aarch64.app.tar.gz，
+ * manifest 指向標錯架構的檔案，架構驗證還因為 expectedArch=x86_64 而通過。
+ * 與其留一份「宣稱支援但其實會壞」的表，不如只列支援的，其餘明確擋掉。
+ *
+ * 每筆欄位：
+ *   platformKey  release.yml plan job 的 matrix.platform_key、latest.json 的
+ *                platforms key
+ *   osFamily     決定要複製哪一組產物
+ *   archToken    出現在檔名裡的架構字樣（mac 的 dmg／.app.tar.gz 用
+ *                aarch64；Windows 的 tauri NSIS bundle 用 x64）——下面所有
+ *                檔名一律由它內插，不再各處寫死
+ *   lipoArch     mac 專用：lipo -archs／file -b 認得的架構名稱（Windows 為 null）
+ *
+ * 新增平台要三處一起動：這裡補一筆、release.yml plan job 補對應的 matrix
+ * entry、README 的檔名表跟著補。
+ */
+const TARGETS = {
+  "aarch64-apple-darwin": {
+    platformKey: "darwin-aarch64",
+    osFamily: "darwin",
+    archToken: "aarch64",
+    lipoArch: "arm64",
+  },
+  "x86_64-pc-windows-msvc": {
+    platformKey: "windows-x86_64",
+    osFamily: "windows",
+    archToken: "x64",
+    lipoArch: null,
+  },
 };
 
 function parseCliTarget() {
@@ -124,28 +149,34 @@ const release = target
   ? join(root, "src-tauri", "target", target, "release")
   : join(root, "src-tauri", "target", "release");
 
-let platformKey;
-let osFamily; // "darwin" | "windows"
-if (target) {
-  platformKey = TARGET_PLATFORM_KEYS[target];
-  if (!platformKey) {
-    console.error(
-      `::error::不認得的建置目標 --target ${target}（支援：${Object.keys(TARGET_PLATFORM_KEYS).join("、")}）。` +
-        `新增平台前先在 scripts/package.mjs 的 TARGET_PLATFORM_KEYS 補上對應的 platform_key，` +
-        `不要放行一個猜出來、可能標錯架構的 key。`,
-    );
-    process.exit(1);
-  }
-  osFamily = target.includes("windows") ? "windows" : "darwin";
-} else {
-  const archMap = { arm64: "aarch64", x64: "x86_64" };
-  osFamily = process.platform === "darwin" ? "darwin" : "windows";
-  const guessedArch = archMap[process.arch] || "x86_64";
-  platformKey = `${osFamily}-${guessedArch}`;
+/** 沒帶 --target 時（本機開發）用 process.platform／process.arch 猜一個 target triple */
+function guessTargetTriple() {
+  const cpu = process.arch === "arm64" ? "aarch64" : "x86_64";
+  return process.platform === "darwin" ? `${cpu}-apple-darwin` : `${cpu}-pc-windows-msvc`;
+}
+
+const triple = target ?? guessTargetTriple();
+const spec = TARGETS[triple];
+if (!spec) {
+  const supported = Object.keys(TARGETS).join("、");
+  console.error(
+    target
+      ? `::error::不支援的建置目標 --target ${target}（目前支援：${supported}）。要新增平台，` +
+          `先在 scripts/package.mjs 的 TARGETS 補一筆（platformKey／osFamily／archToken／` +
+          `lipoArch），再補 release.yml plan job 的 matrix entry 與 README 的檔名表——` +
+          `不要放行一個表裡沒有、檔名與架構對不上的 target。`
+      : `::error::沒有帶 --target（或 TAURI_BUILD_TARGET），依 process.platform=${process.platform}／` +
+          `process.arch=${process.arch} 猜出的 target ${triple} 不在支援清單裡（目前支援：${supported}）。` +
+          `這台機器不能用來產生發佈用產物：硬做出來的檔名會標成別的架構，使用者會抓到跑不動的二進位。`,
+  );
+  process.exit(1);
+}
+const { platformKey, osFamily, archToken, lipoArch } = spec;
+if (!target) {
   console.log(
     `  警告：沒有帶 --target（或 TAURI_BUILD_TARGET 環境變數），退回用 process.platform／` +
-      `process.arch 猜出 platform_key=${platformKey}。這只適合本機開發；release.yml 的 CI ` +
-      `建置一律會明確傳 --target，不應該依賴這裡的猜測。`,
+      `process.arch 猜出 target=${triple}（platform_key=${platformKey}）。這只適合本機開發；` +
+      `release.yml 的 CI 建置一律會明確傳 --target，不應該依賴這裡的猜測。`,
   );
 }
 
@@ -177,13 +208,13 @@ const baseJobs =
           // 的說明）。Windows 那邊 productName 維持 "traytunnel" 沒有動，這條
           // 大小寫差異只在這裡的 from 路徑出現；out/ 的目標檔名兩邊都刻意保持
           // 小寫 traytunnel-<version>-...，不隨 productName 變。
-          from: join(release, "bundle", "dmg", `Traytunnel_${version}_aarch64.dmg`),
-          to: `traytunnel-${version}-aarch64.dmg`,
+          from: join(release, "bundle", "dmg", `Traytunnel_${version}_${archToken}.dmg`),
+          to: `traytunnel-${version}-${archToken}.dmg`,
           note: "DMG 安裝映像",
         },
         {
           from: join(release, "bundle", "macos", "Traytunnel.app.tar.gz"),
-          to: `traytunnel-${version}-aarch64.app.tar.gz`,
+          to: `traytunnel-${version}-${archToken}.app.tar.gz`,
           note: "updater 用的壓縮包",
           // 這顆是 latest.json 會提到、release.yml 要驗證簽章一致性的「已簽署
           // updater 產物」——manifest 的 asset／bundle_source 就是從這筆算出來的
@@ -203,7 +234,7 @@ const baseJobs =
           note: "可攜版（檔名結尾 p，設定檔放 exe 旁邊）",
         },
         {
-          from: join(release, "bundle", "nsis", `traytunnel_${version}_x64-setup.exe`),
+          from: join(release, "bundle", "nsis", `traytunnel_${version}_${archToken}-setup.exe`),
           to: `traytunnel-${version}-setup.exe`,
           note: "NSIS 安裝檔",
           signed: true,
@@ -258,7 +289,7 @@ console.log(
  * 不支援的 runner 上要求交叉編譯，這裡是最後一道能在發佈前擋下來的關卡）。
  */
 function verifyMacBinaryArch() {
-  const expectedArch = TARGET_LIPO_ARCH[target] ?? (platformKey === "darwin-aarch64" ? "arm64" : "x86_64");
+  const expectedArch = lipoArch;
   // Tauri 沒設 mainBinaryName，bundle 內執行檔預設用 Cargo [package] name
   // （見 src-tauri/Cargo.toml），跟 out/traytunnel.exe 用的是同一個名字。
   const appBinary = join(release, "bundle", "macos", "Traytunnel.app", "Contents", "MacOS", "traytunnel");
