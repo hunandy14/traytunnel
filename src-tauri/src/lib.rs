@@ -222,7 +222,7 @@ pub(crate) fn mark_frontend_ready() {
 #[cfg(dev)]
 const PAGE_LOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 寬限時間到時的三種結局。抽成純函式（[`verdict`]）是為了讓它可以單獨測——
+/// 寬限時間到時的四種結局。抽成純函式（[`verdict`]）是為了讓它可以單獨測——
 /// 這是整段診斷唯一真的有分支的地方，其餘都是 I/O。
 #[cfg(dev)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,20 +232,89 @@ enum LoadVerdict {
     /// 沒就緒，但 webview 指的不是 dev server：只記一行 warn。這種情況畫面上
     /// 是什麼我們並不知道（可能正在慢慢載），不該擅自覆蓋掉。
     WarnOnly,
-    /// 沒就緒又確實指著 `build.devUrl`：記 warn 並把說明頁蓋上去。
+    /// 沒就緒、指著 `build.devUrl`，而那個 host:port **敲得到**：dev server
+    /// 就在那裡，只是還沒把第一份模組送到（Vite 冷機時 pre-bundling ＋ 抓幾十
+    /// 個 ESM 模組很容易超過寬限時間）。記一行 warn 就好，**永不接管畫面**。
+    WaitForDevServer,
+    /// 沒就緒、指著 `build.devUrl`，而那個 host:port **連不上**：這才是真的
+    /// 「裸執行檔配沒開的 Vite」。記 warn 並把說明頁蓋上去。
     ShowDevNotice,
 }
 
-/// 寬限時間到之後要做什麼，只看兩顆布林。
+/// 寬限時間到之後要做什麼，只看三顆布林。
+///
+/// 第三顆 `dev_server_reachable` 是對 `build.devUrl` 的 host:port 敲一次 TCP
+/// 的結果（見 [`dev_server_reachable`]）。加這一顆是因為原本的兩顆布林會把
+/// **正常的 `npm run dev`** 誤判成「沒有開發伺服器」：Vite 冷機第一次啟動要
+/// 做 dependency pre-bundling 再送幾十個 ESM 模組，超過 5 秒是常態，而一旦
+/// 被 `navigate` 到說明頁，之後前端就算送出 `frontend_ready` 也回不去，HMR
+/// 一併死掉——開發者只能重開。多敲這一次 TCP 之後，**只有 dev server 真的
+/// 不在**（連線被拒／逾時）才會接管，與 `tauri dev` CLI 自己等 dev server
+/// 的判準同一套語意。
+///
+/// 前兩格（`frontend_ready` 為真，或根本不是 dev URL）的結論與探測無關，
+/// 呼叫端因此可以在那兩格直接傳 `false` 省下那一次連線，不必真的去敲。
 #[cfg(dev)]
-fn verdict(frontend_ready: bool, is_dev_url: bool) -> LoadVerdict {
+fn verdict(frontend_ready: bool, is_dev_url: bool, dev_server_reachable: bool) -> LoadVerdict {
     if frontend_ready {
         LoadVerdict::Ready
-    } else if is_dev_url {
-        LoadVerdict::ShowDevNotice
-    } else {
+    } else if !is_dev_url {
         LoadVerdict::WarnOnly
+    } else if dev_server_reachable {
+        LoadVerdict::WaitForDevServer
+    } else {
+        LoadVerdict::ShowDevNotice
     }
+}
+
+/// 「等到寬限時間都沒等到前端」那行 warn。兩種結局（[`LoadVerdict::WarnOnly`]
+/// 與 [`LoadVerdict::ShowDevNotice`]）共用同一段字，抽出來才不會哪天只改一邊。
+#[cfg(dev)]
+fn blank_window_warning(url_text: &str) -> String {
+    format!(
+        "the frontend has not reported ready {}s after start (webview url {url_text}), the \
+         window will be blank; a binary from a plain `cargo build` points at build.devUrl and \
+         needs `npm run web:dev` running alongside it, build with `tauri build` for one that \
+         stands alone",
+        PAGE_LOAD_GRACE.as_secs()
+    )
+}
+
+/// 敲一次 dev server 的 host:port，看它在不在。連得上就是在。
+///
+/// 只用 TCP 連線、不發 HTTP 請求：要回答的問題是「有沒有人在那個埠上聽」，
+/// 三次交握就已經給完答案；發 GET 反而要處理 Vite 對未知路徑的各種回應。
+///
+/// 位址由 `Url` 的 host 與 port 現組（`port_or_known_default` 讓沒寫埠的
+/// `http://…` 也有 80 可用），不寫死 `127.0.0.1:1420`——`build.devUrl` 是設定，
+/// 不是規格。`to_socket_addrs` 一併涵蓋兩種寫法：字面位址（含 IPv6 的
+/// `[::1]` 方括號形式）直接 parse，主機名則走系統解析。
+///
+/// 解析結果可能同時有 IPv4 與 IPv6（`localhost` 就是），**逐個試到第一個連得
+/// 上為止**：Vite 預設只綁一族，只試第一個會把「綁在另一族」誤判成沒開。
+/// 逾時給 1 秒——對象是本機，連得上的話遠遠用不到；這個數字只是「不要在
+/// 一個沒人聽的位址上無限等下去」的上限。
+#[cfg(dev)]
+fn dev_server_reachable(dev_url: Option<&tauri::Url>) -> bool {
+    use std::net::ToSocketAddrs as _;
+
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let Some(url) = dev_url else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        log::debug!("build.devUrl ({url}) has no host:port to probe");
+        return false;
+    };
+    let addrs = match format!("{host}:{port}").to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            log::debug!("could not resolve the dev server address {host}:{port}: {e}");
+            return false;
+        }
+    };
+    addrs.into_iter().any(|addr| std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
 }
 
 /// 空白 webview 要 `navigate` 過去的說明頁。深色底、繁體中文，讓拿到裸執行檔的
@@ -295,7 +364,12 @@ const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
 "##;
 
 /// 記下主 webview 的來源，並在寬限時間後複查一次前端有沒有真的跑起來；沒有、
-/// 又指著 dev URL 的話，順手把說明頁 `navigate` 進空白的 webview。
+/// 又指著 dev URL、**而且那個 dev server 敲不到**的話，才把說明頁 `navigate`
+/// 進空白的 webview。
+///
+/// 那道 TCP 探測是接管前的最後一道閘（見 [`verdict`]）：`npm run dev` 冷機時
+/// Vite 的 pre-bundling 超過寬限時間是常態，少了這道閘，正常的開發流程會被
+/// 說明頁劫持，而且回不去。
 ///
 /// `dev_url` 的單一來源是 `app.config().build.dev_url`（呼叫端傳進來，見
 /// `setup()`），不在這裡寫死 `"http://localhost:1420"`——那是目前
@@ -330,34 +404,50 @@ fn watch_first_page_load<R: tauri::Runtime>(
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(PAGE_LOAD_GRACE).await;
             let ready = FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed);
-            let verdict = verdict(ready, is_dev_url);
-            if verdict == LoadVerdict::Ready {
-                return;
-            }
-            log::warn!(
-                "the frontend has not reported ready {}s after start (webview url {url_text}), \
-                 the window will be blank; a binary from a plain `cargo build` points at \
-                 build.devUrl and needs `npm run web:dev` running alongside it, build with \
-                 `tauri build` for one that stands alone",
-                PAGE_LOAD_GRACE.as_secs()
-            );
-            // 只有真的指著 dev server 才覆蓋畫面：其餘情形我們並不知道畫面上
-            // 是什麼（可能正在慢慢載），蓋上去會把使用者正在等的頁面吃掉。
-            if verdict != LoadVerdict::ShowDevNotice {
-                return;
-            }
-            use base64::Engine as _;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
-            let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
-            match tauri::Url::parse(&data_url) {
-                Ok(notice_url) => {
-                    if let Err(e) = win.navigate(notice_url) {
-                        log::warn!(
-                            "could not navigate the blank webview to the dev-build notice: {e}"
-                        );
+            // 探測只在「沒就緒又指著 dev server」那一格才有意義（另外兩格的
+            // 結論與它無關，見 `verdict` 的說明），`&&` 的短路正好省掉那一次
+            // 連線。`connect_timeout` 是同步阻塞的（最多 1 秒 × 解析出來的
+            // 位址數），丟進阻塞執行緒池，不要佔著 tokio 的工作執行緒。
+            let dev_server_alive = !ready
+                && is_dev_url
+                && tauri::async_runtime::spawn_blocking(move || {
+                    dev_server_reachable(dev_url.as_ref())
+                })
+                .await
+                .unwrap_or(false);
+            match verdict(ready, is_dev_url, dev_server_alive) {
+                LoadVerdict::Ready => {}
+                // dev server 就在那裡，只是還沒把第一份模組送過來。**不接管**
+                // ——蓋上說明頁之後前端再送 `frontend_ready` 也回不去，HMR 一起
+                // 死掉，開發者只能重開；等它自己載完才是對的。
+                LoadVerdict::WaitForDevServer => log::warn!(
+                    "the frontend has not reported ready {}s after start, but the dev server at \
+                     {url_text} answers a TCP connect: it is probably still pre-bundling, \
+                     leaving the webview alone",
+                    PAGE_LOAD_GRACE.as_secs()
+                ),
+                // 畫面上是什麼我們並不知道（可能正在慢慢載），不擅自覆蓋。
+                LoadVerdict::WarnOnly => log::warn!("{}", blank_window_warning(&url_text)),
+                // 指著 dev server、那個埠又沒人在聽：這才是「裸執行檔配沒開的
+                // Vite」，把說明頁蓋上去。
+                LoadVerdict::ShowDevNotice => {
+                    log::warn!("{}", blank_window_warning(&url_text));
+                    use base64::Engine as _;
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
+                    let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
+                    match tauri::Url::parse(&data_url) {
+                        Ok(notice_url) => {
+                            if let Err(e) = win.navigate(notice_url) {
+                                log::warn!(
+                                    "could not navigate the blank webview to the dev-build \
+                                     notice: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
                     }
                 }
-                Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
             }
         });
     }
@@ -1153,23 +1243,48 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     /// 白屏複查的判斷（M13）：**唯一**讓說明頁蓋上去的組合是「前端沒回報就緒」
-    /// 且「webview 指著 build.devUrl」。
+    /// 且「webview 指著 build.devUrl」且「那個 dev server 敲不到」。
     ///
     /// 舊版守衛看的是 `on_page_load` 的 Started／Finished，而 WebView2 對連線
     /// 失敗的錯誤頁也照發那兩顆事件——說明頁在 Windows 上因此永遠不會出現。
     /// 換成前端自己 invoke 的就緒信標之後，兩個平台走的才是同一套語意；這條
     /// 測試釘住的就是那張真值表。
+    ///
+    /// 第三顆輸入（TCP 探測結果）是 CORE-1 補的：少了它，冷機時 Vite
+    /// pre-bundling 超過 5 秒的**正常** `npm run dev` 會被說明頁劫持，而且
+    /// 之後前端回報就緒也回不去。這裡直接注入布林，測試本身不連任何線。
     #[cfg(dev)]
     #[test]
-    fn dev_notice_only_when_the_frontend_is_silent_on_a_dev_url() {
-        // 前端回報就緒 → 不管是不是 dev URL 都不必做任何事
-        assert_eq!(verdict(true, true), LoadVerdict::Ready);
-        assert_eq!(verdict(true, false), LoadVerdict::Ready);
-        // 沒回報就緒又指著 dev server → 這才是要蓋說明頁的那一格
-        assert_eq!(verdict(false, true), LoadVerdict::ShowDevNotice);
+    fn dev_notice_only_when_the_frontend_is_silent_and_the_dev_server_is_gone() {
+        // 前端回報就緒 → 不管是不是 dev URL、dev server 在不在，都不必做任何事
+        for is_dev_url in [true, false] {
+            for reachable in [true, false] {
+                assert_eq!(verdict(true, is_dev_url, reachable), LoadVerdict::Ready);
+            }
+        }
         // 沒回報就緒但不是 dev URL（例如正式協定真的取不到資源）→ 只記一行
-        // warn，畫面上是什麼我們不知道，不擅自覆蓋
-        assert_eq!(verdict(false, false), LoadVerdict::WarnOnly);
+        // warn，畫面上是什麼我們不知道，不擅自覆蓋。探測結果在這一格不影響結論
+        assert_eq!(verdict(false, false, false), LoadVerdict::WarnOnly);
+        assert_eq!(verdict(false, false, true), LoadVerdict::WarnOnly);
+        // 沒回報就緒、指著 dev server，而 dev server 敲得到 → 它只是還在
+        // pre-bundling，永遠不接管
+        assert_eq!(verdict(false, true, true), LoadVerdict::WaitForDevServer);
+        // 沒回報就緒、指著 dev server，那個埠又沒人在聽 → 這才是要蓋說明頁的
+        // 那一格（裸執行檔配沒開的 Vite）
+        assert_eq!(verdict(false, true, false), LoadVerdict::ShowDevNotice);
+    }
+
+    /// 探測本身的兩道退場：沒有 dev_url、或那個 URL 沒有 host 可以敲，
+    /// 一律回 false（＝當作 dev server 不在）。
+    ///
+    /// 真的去連線的那一格不在這裡測——那要靠一個真的在聽的埠，屬於整合層；
+    /// 這條只釘住「拿不到位址時不會 panic，也不會誤判成連得上」。
+    #[cfg(dev)]
+    #[test]
+    fn the_dev_server_probe_gives_up_without_a_host() {
+        assert!(!dev_server_reachable(None), "沒有 dev_url 就沒有東西可以敲");
+        let no_host = tauri::Url::parse("data:text/html,hi").expect("data: URL 要 parse 得起來");
+        assert!(!dev_server_reachable(Some(&no_host)), "data: URL 沒有 host:port 可以敲");
     }
 
     /// content process 被回收時的處置（M14）：可見才立刻重載。
