@@ -1,5 +1,6 @@
-//! W3-A：程序管理門面的跨平台契約測試——`platform::is_listening` 與
-//! `platform::ProcessSupervisor` 的不變量（§1／§2）；F3 車道起，順帶收留其餘
+//! W3-A：程序管理門面的跨平台契約測試——`platform::is_listening`／
+//! `platform::listening_ports` 與 `platform::ProcessSupervisor` 的不變量
+//! （§1／§2）；F3 車道起，順帶收留其餘
 //! 「兩平台原本各自測試模組逐字重複」的門面契約（§3：`local_time_hms`、
 //! `small_icon_size`／`large_icon_size`），不必為了兩三支測試另開一個檔案。
 //!
@@ -32,7 +33,10 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
-use super::{is_listening, large_icon_size, local_time_hms, small_icon_size, ProcessSupervisor};
+use super::{
+    is_listening, large_icon_size, listening_ports, local_time_hms, small_icon_size,
+    ProcessSupervisor,
+};
 
 /// 等一件「應該會發生」的事的上限。給得很寬：CI runner 上程序建立與埠狀態
 /// 更新都可能慢上一個數量級，這個數字只負責讓測試不要無限掛住。
@@ -142,8 +146,18 @@ async fn stays_alive(child: &mut Child, window: Duration) -> bool {
 }
 
 // ------------------------------------------------------------------
-// 規格 §1：is_listening
+// 規格 §1：is_listening／listening_ports
 // ------------------------------------------------------------------
+//
+// **這一節的可見範圍在兩個平台不一樣，不是疏漏**（WRP-1）：Windows 讀的是
+// `GetExtendedTcpTable` 的全系統 LISTEN 表，誰開的都看得見；macOS 走 libproc
+// 逐一問程序的 fd，只看得到**同一個 uid** 的程序——root 或別的使用者佔住的埠
+// 在沒有 root 權限時一律查不到，會回「沒人在聽」。
+//
+// 底下的斷言之所以兩平台共用，是因為它們綁的 listener 都是**測試自己**（同一
+// 個 uid），落在兩邊都成立的那個交集裡。差額（別人佔住我們要用的埠時，mac 上
+// 判不出 PORT_BUSY）在門面 `is_listening` 的說明裡寫得更完整，真正的補洞是
+// backlog 的「ssh stderr → PORT_BUSY（方案 A）」，不在這一層。
 
 /// §1(i)：綁了一個 TcpListener 的埠必須回 true。
 ///
@@ -206,6 +220,33 @@ fn a_port_nobody_holds_is_not_reported_as_listening() {
         assert!(!is_listening(port), "沒人佔的埠 {port} 在觀察窗內冒出了一次 true");
         std::thread::sleep(TICK);
     }
+}
+
+/// §1(iv)：`listening_ports()` 的快照與 `is_listening` 是同一份答案——綁上去
+/// 的埠要出現在集合裡，沒人佔的埠不可以出現。
+///
+/// 這一條是 `wg::busy_rows` 換成快照之後的護欄：那條路現在只問一次
+/// `listening_ports()` 再 `contains`，若哪天某一邊的實作把過濾條件寫歪
+/// （例如漏掉 v6 那張表、或沒濾掉非 LISTEN 的連線），逐條 `is_listening`
+/// 的舊路徑不會有事，只有這條會紅。
+///
+/// 期限與輪詢紀律比照 §1(i)：綁定到掃描得到之間隔著一次核心表更新。
+#[test]
+fn a_bound_port_shows_up_in_the_listening_ports_snapshot() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("要綁得起來");
+    let port = listener.local_addr().expect("listener 一定有本地位址").port();
+    // 同一輪順便驗「沒人佔的埠不在集合裡」，兩個方向共用同一份快照才有意義
+    let free = borrow_a_free_port();
+
+    let seen = poll_until(DEADLINE, || listening_ports().contains(&port));
+    let free_is_absent = !listening_ports().contains(&free);
+    drop(listener);
+
+    assert!(
+        seen,
+        "127.0.0.1:{port} 上有 TcpListener 在 LISTEN，listening_ports() 卻在 {DEADLINE:?} 內都沒收錄它"
+    );
+    assert!(free_is_absent, "沒有任何程序佔著埠 {free}，它卻出現在 listening_ports() 的快照裡");
 }
 
 // ------------------------------------------------------------------

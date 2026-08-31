@@ -156,6 +156,35 @@ fn listening_v6(port: u16) -> bool {
     }
 }
 
+/// 一次取回本機所有正在 TCP LISTEN 的埠號（v4 ＋ v6 各掃一次表）。
+///
+/// 存在的理由是**成本**，不是語意：`is_listening` 每問一個埠就要走一次
+/// v4 表再走一次 v6 表。要問 K 個埠的呼叫端（`wg::busy_rows` 一次要問一整條
+/// 連線底下的每一列）於是做了 K 次同樣的表走訪，答案還都來自不同的瞬間。
+/// 取一次快照再 `contains` 只走一次，順帶讓那 K 個答案來自同一個時間點。
+///
+/// 語意與 [`is_listening`] 逐字相同：同樣兩張 `TCP_TABLE_OWNER_PID_LISTENER`
+/// 表、同樣的 `local_port` 位元組序換算。取表失敗時該族貢獻零筆（與
+/// `is_listening` 在那一族回 false 一致）——不要把「問不到」誤判成「有人佔著」。
+pub fn listening_ports() -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    if let Some(buf) = listener_table(AF_INET as u32) {
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
+        }
+    }
+    if let Some(buf) = listener_table(AF_INET6 as u32) {
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
+            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
+        }
+    }
+    ports
+}
+
 /// 本地時間的 `HH:mm:ss`，活動日誌每一行的時間戳。
 ///
 /// 只為了這一個格式扛一整包 chrono 不划算，時區換算交給 Windows 自己做：
