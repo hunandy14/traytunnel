@@ -1,11 +1,21 @@
 name: Release
 
 # 安全紅線：任何演練/測試性質的執行都要走 dry_run=true。dry_run=false（含
-# autotag.yml 觸發的 tag push，以及手動 workflow_dispatch 沒勾 dry_run 的
+# autotag.yml 觸發的自動發佈，以及手動 workflow_dispatch 沒勾 dry_run 的
 # 情況）都會建立/覆寫真實 GitHub Release，並改動 releases/latest 這個固定
 # 指標——它就是應用程式 updater 查詢的 endpoint，直接影響線上使用者。
 # 不要為了「看看跑不跑得動」而拿掉 dry_run=true，也不要在 dry_run 分支之外
 # 動這條防線。
+#
+# SCR-5：自動發佈的實際觸發路徑是 **workflow_dispatch**，不是 tag push。
+# autotag.yml 建完 tag 之後是用 `gh workflow run release.yml --ref <tag>`
+# 觸發這個 workflow（GitHub 的防遞迴機制：用 GITHUB_TOKEN 推的 tag 不會觸發
+# 任何 on: push: tags，所以 autotag 必須自己 dispatch）。它不帶任何 inputs，
+# 因此每個 input 都由 API 套用下面宣告的 default（platform=all、
+# allow_stale_platforms=false、dry_run=false）——換句話說，那些 default 是
+# 自動發佈主路徑真正依賴的東西，不是「懶得填時的方便值」，不要拿掉。
+# 下面的 on: push: tags 分支仍然保留給「人工 git push --tags」的情境，
+# resolve-release.mjs 的 tag↔Cargo.toml 一致性檢查也只在那條路徑上會跑到。
 
 # 單平台發佈的先天限制（platform=windows / macos 時務必理解）：Tauri 的
 # latest.json manifest 只有一個全域 version 欄位，沒有 per-platform 版本。所以
@@ -56,7 +66,9 @@ concurrency:
 
 jobs:
   # 把 workflow_dispatch 的 platform 輸入換算成實際要跑的 matrix。
-  # tag push（autotag.yml 觸發，不帶參數）一律視為 all、dry_run=false。
+  # autotag.yml 的自動發佈也走 workflow_dispatch，只是不帶 inputs，由 API
+  # 套用上面宣告的 default（platform=all、dry_run=false）；人工 push tag 走
+  # push 事件，這裡一律視為 all、dry_run=false。
   plan:
     name: plan
     runs-on: ubuntu-latest
@@ -98,6 +110,15 @@ jobs:
           platform="all"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             platform="${{ inputs.platform }}"
+          fi
+          # 保險：dispatch 不帶 inputs 時（autotag.yml 的自動發佈就是這樣）
+          # 靠的是 platform 那個 input 的 default: all。萬一哪天 default 被
+          # 拿掉／改名，inputs.platform 會渲染成空字串，下面的 case 會落到
+          # 「未知的 platform」直接讓每一次自動發佈硬失敗。空字串一律當 all，
+          # 語意跟 default 一致。（寫成 if 而不是 `[ -z … ] && …`：後者在
+          # platform 非空時整句回非零，會被 set -e 當成失敗直接中止。）
+          if [ -z "$platform" ]; then
+            platform="all"
           fi
 
           # 每個平台的 matrix 物件只在這裡定義一次；windows／macos／all 三個
