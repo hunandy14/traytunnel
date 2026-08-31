@@ -1026,7 +1026,11 @@ mod tests {
         assert_eq!(accept_staging(false), Err(GATE_CLOSED_MID_DOWNLOAD.to_string()));
 
         let body = body_of("async fn download_and_stage");
-        let download = body.find(".download(").expect("要有下載那一步");
+        // 下載那一步現在走共用的 `update_common::download`（它把外掛寫死成 None
+        // 的 DOWNLOAD_TIMEOUT 一起補上，三個呼叫點只有一份，見 REU-3），所以這裡
+        // 找的字面從 `.download(` 換成新的呼叫形式。**這一條要釘的東西一個字都
+        // 沒變**：下載、閘、落地三者的先後順序。
+        let download = body.find("update_common::download(").expect("要有下載那一步");
         let gate = body.find("accept_staging(").expect("下載完一定要再看一次開關");
         let stage = body.find("staged::stage(").expect("要有落地那一步");
         assert!(download < gate && gate < stage, "閘必須夾在下載與落地之間：{body}");
@@ -1081,7 +1085,10 @@ mod tests {
     #[test]
     fn the_manual_update_downloads_then_stages_then_hands_over_off_thread() {
         let body = body_of("pub async fn install");
-        let download = body.find(".download(").expect("要有下載那一步");
+        // 字面換成 `update_common::download(` 的理由同
+        // `a_download_that_finishes_after_the_switch_was_turned_off_is_thrown_away`
+        // ——釘的順序（下載→落地→交棒）一個字都沒變。
+        let download = body.find("update_common::download(").expect("要有下載那一步");
         let stage = body.find("staged::stage(").expect("下載回來要先落地成暫存");
         let hand = body.rfind("hand_over(").expect("最後要交棒");
         assert!(download < stage && stage < hand, "順序必須是下載→落地→交棒：{body}");
