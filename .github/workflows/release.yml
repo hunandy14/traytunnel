@@ -570,6 +570,14 @@ jobs:
       #
       # 只在 steps.check_release 判定「這個 tag 尚不存在 release」時跑：見上面
       # check_release 步驟與 M11 說明。
+      #
+      # SCR-3：body 第一行標註「macOS 版目前為 beta」（對齊 README 的說法）。
+      # **絕對不要改用 GitHub 的 prerelease 旗標達成同樣的事**：
+      # releases/latest 這個端點會直接跳過標記為 prerelease 的 release，而
+      # Windows updater 的 latest.json 就掛在 releases/latest/download/ 底下
+      # ——一旦把正式發佈標成 prerelease，那個 endpoint 會停在上一個非
+      # prerelease 的 release，Windows 使用者從此收不到任何更新，而且整條
+      # 流程全綠、沒有任何訊號。beta 這件事只在說明文字裡講。
       - name: Create GitHub Release (new)
         if: inputs.dry_run != true && steps.check_release.outputs.exists != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -577,6 +585,8 @@ jobs:
           tag_name: ${{ needs.plan.outputs.release_tag }}
           name: v${{ needs.plan.outputs.version }}
           body: |
+            > macOS 版目前為 beta
+
             ## macOS 安裝說明
 
             下載 `.dmg` 打開後，請把 `Traytunnel.app` 拖進「應用程式」資料夾再開啟——這不只是慣例，而是避開 App Translocation 的必要步驟：macOS 會讓還沒搬進「應用程式」的下載檔案在唯讀的隨機掛載點上執行，自動更新機制在那裡寫不了檔案會直接失敗。
