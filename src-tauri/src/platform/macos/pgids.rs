@@ -59,21 +59,27 @@ use crate::platform::update_common::IDENTIFIER;
 /// 登記簿檔名。
 const FILE_NAME: &str = "supervised-pgids.json";
 
-/// 讀改寫的整段互斥。
+/// 讀改寫的整段互斥（**行程內**那一半）。
 ///
 /// `register`／`unregister` 會被多條 tokio 工作執行緒同時呼叫（每個出口一條
 /// 監看迴圈），而每一次都是「讀整份檔案→改一筆→寫回去」。沒有這把鎖的話兩次
 /// 並行的 `register` 會各自讀到同一份舊內容，後寫的那一份把前一筆蓋掉——被蓋掉
 /// 的那個 pgid 就再也不會被收屍。
 ///
-/// 這把鎖只管**行程內部**的並行。跨行程（兩個實例同時在跑，見 [`Entry::owner_pid`]
-/// 那一段）的並行沒有用檔案鎖（`flock`）擋：那時兩邊會共用同一個暫存檔
-/// （[`crate::config::write_atomic`] 的 `<檔名>.tmp`），最壞情況是其中一邊
-/// `rename` 過去的是另一邊寫到一半的內容，
-/// [`parse`] 讀不懂就退成空的登記簿。後果是**漏殺**（下一次啟動少收幾具屍體），
-/// 不是誤殺，方向可接受；為了一個「single-instance 失手才會發生」的情境去背一套
-/// 跨行程鎖的複雜度（還得處理鎖檔本身的殘留與死鎖）划不來。
+/// **跨行程**那一半由 [`with_locked_registry`] 的檔案鎖負責。兩把一定要按
+/// 「先 Mutex、再檔案鎖」的順序取（那正是 `with_locked_registry` 唯一的取法）：
+/// 反過來的話同一個行程的兩條執行緒會各自開一個 fd 去搶同一把 `flock`——那是
+/// 兩個不同的 open file description，核心認為它們互相衝突，於是自己鎖死自己。
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+/// 跨行程鎖用的鎖檔名（與登記簿同一個資料夾）。
+///
+/// **不鎖登記簿檔案自己**：那份檔案每次寫入都是「寫 `.tmp` 再 `rename` 蓋上去」
+/// （[`crate::config::write_atomic`]），rename 換掉的是 inode，鎖在舊 inode 上的
+/// 那把 `flock` 從此保護不到任何人。所以另外開一個**永遠不會被改名也不會被刪掉**
+/// 的空檔案專門當鎖。它會一直留在資料夾裡（0 位元組），這是這種做法的必要條件，
+/// 不是垃圾。
+const LOCK_FILE_NAME: &str = "supervised-pgids.lock";
 
 /// 一筆登記：一個行程群組、它應該長什麼樣、以及它是誰 spawn 的。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +311,56 @@ fn write_or_clear_at(path: &Path, reg: &Registry) -> io::Result<()> {
     write_at(path, reg)
 }
 
+/// 把一整段「讀→改→寫」包在兩把鎖裡跑：行程內的 [`REGISTRY_LOCK`]，加上
+/// 跨行程的檔案鎖（[`LOCK_FILE_NAME`]）。
+///
+/// ## 為什麼跨行程那一把是必要的
+///
+/// 正常情況下 single-instance 外掛保證同時只有一個實例，但它有一條會讓兩個實例
+/// 並存的錯誤分支（socket 回了 `NotFound`／`ConnectionRefused` 以外的錯就照常
+/// 啟動，見 [`Entry::owner_pid`]）。那時兩邊各自做「讀整份→改自己那一筆→寫回去」，
+/// 沒有跨行程互斥就是教科書上的 lost update：B 讀到的是 A 寫之前的內容，B 寫回去
+/// 時把 A 剛登記的那一筆整個蓋掉——那個**活著**的 pgid 從登記簿消失，下一次啟動
+/// 的 [`plan_sweep`] 看不到它，於是那條 ssh 繼續握著 `-L` 的本地埠不放，正是這整份
+/// 登記簿要救的那一格。
+///
+/// （原本這裡的說明只承認 `.tmp` 撞名、把後果算成「漏殺，方向可接受」。撞名確實
+/// 只造成漏殺，但 lost update 不是撞名造成的，它在兩邊的寫入都完全成功時照樣發生。）
+///
+/// ## 用 `File::lock()`
+///
+/// 標準庫 1.89 起穩定，底層在 Unix 上就是 `flock`，不必多拉一顆 crate。它是
+/// **阻塞**的：對面那個實例正在讀改寫時這裡就等，而那一段是一次讀檔＋一次
+/// write＋rename，微秒等級。
+///
+/// 拿不到鎖（開不了鎖檔、鎖本身失敗）時**照樣把事情做完**，只記一行 debug：
+/// 這份登記簿是純粹的自我修復輔助，為了拿不到一把保險鎖就整個不做，換來的是
+/// 「這個 pgid 從此沒有人收屍」——比它要防的 lost update 更糟。
+fn with_locked_registry<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    // 順序見 [`REGISTRY_LOCK`]：一定是先 Mutex 再檔案鎖
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 綁一個變數（不是 `_`）才會活到這一格結束——`let _ = …` 會當場 drop，
+    // 鎖等於沒上
+    let _file_lock = lock_registry_file(path);
+    f()
+}
+
+/// 開鎖檔並取得獨佔鎖，回傳的 `File` 一 drop 就解鎖。
+fn lock_registry_file(path: &Path) -> Option<std::fs::File> {
+    let dir = path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE_NAME))
+        .map_err(|e| log::debug!("could not open the registry lock file: {e}"))
+        .ok()?;
+    file.lock().map_err(|e| log::debug!("could not lock the registry lock file: {e}")).ok()?;
+    Some(file)
+}
+
 /// 加一筆。**只動自己那一筆**——別的 owner 的條目原封不動留著，這是
 /// [`Entry::owner_pid`] 那條誤殺鏈的第 2 步不成立的原因。
 pub(super) fn register_at(path: &Path, owner_pid: i32, pgid: i32, command: &str) -> io::Result<()> {
@@ -497,19 +553,21 @@ fn owner_still_running(ps: &PsTable, owner_pid: i32) -> bool {
 /// 讓它跑總比為了收尾機制炸掉呼叫端好（與 `spawn` 那邊「記不到 pgid」同一種取捨）。
 pub(super) fn register(pgid: i32, command: &str) {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = register_at(&path, std::process::id() as i32, pgid, command) {
-        log::warn!("could not record supervised process group {pgid}: {e}");
-    }
+    with_locked_registry(&path, || {
+        if let Err(e) = register_at(&path, std::process::id() as i32, pgid, command) {
+            log::warn!("could not record supervised process group {pgid}: {e}");
+        }
+    });
 }
 
 /// 正常收尾時把一筆拿掉。
 pub(super) fn unregister(pgid: i32) {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = unregister_at(&path, std::process::id() as i32, pgid) {
-        log::warn!("could not clear supervised process group {pgid}: {e}");
-    }
+    with_locked_registry(&path, || {
+        if let Err(e) = unregister_at(&path, std::process::id() as i32, pgid) {
+            log::warn!("could not clear supervised process group {pgid}: {e}");
+        }
+    });
 }
 
 /// 啟動時收屍：把上一輪被 `SIGKILL`／當機帶走、卻還活著的 ssh 程序樹清掉。
@@ -539,10 +597,14 @@ pub(super) fn unregister(pgid: i32) {
 /// 等下一次寫入。
 pub fn sweep_leftovers() {
     let Some(path) = registry_path() else { return };
-    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let reg = read_at(&path);
+    with_locked_registry(&path, || sweep_locked(&path));
+}
+
+/// [`sweep_leftovers`] 的本體，兩把鎖都在手上時才會跑到。
+fn sweep_locked(path: &Path) {
+    let reg = read_at(path);
     if reg.entries.is_empty() {
-        if let Err(e) = write_or_clear_at(&path, &reg) {
+        if let Err(e) = write_or_clear_at(path, &reg) {
             log::warn!("could not clear the empty supervised process group registry: {e}");
         }
         return;
@@ -577,7 +639,7 @@ pub fn sweep_leftovers() {
     }
     // 只留下主人還活著的那些條目；主人已死的不論殺沒殺到都清掉，留著只會讓
     // 下一次啟動重問一次同樣的死 pgid。本輪自己的東西會由 `register` 重新寫進來。
-    if let Err(e) = write_or_clear_at(&path, &Registry { entries: plan.keep }) {
+    if let Err(e) = write_or_clear_at(path, &Registry { entries: plan.keep }) {
         log::warn!("could not rewrite the supervised process group registry after sweeping: {e}");
     }
 }
@@ -672,6 +734,48 @@ mod tests {
 
         write_or_clear_at(&path, &Registry::default()).expect("清空一份本來就不存在的檔案不算錯");
         assert!(!path.exists(), "不可以憑空生出一份空殼：{}", path.display());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 讀改寫必須是**整段**互斥的：兩條執行緒同時做「讀整份→加一筆→寫回去」，
+    /// 兩筆都必須留在檔案裡。
+    ///
+    /// 這一條釘的是 [`with_locked_registry`] 這支包裝本身——它把 `read_at` 到
+    /// `write_at` 之間整段圈起來，沒有它的話（或哪天有人把某條路徑改成繞過它
+    /// 直接呼叫 `register_at`）就是教科書上的 lost update：後寫的那一份是拿
+    /// 「對方寫入之前」的內容改出來的，會把對方剛登記的 pgid 整個蓋掉，而那個
+    /// **活著**的 pgid 從此沒有人收屍。
+    ///
+    /// 誠實說明測得到什麼：同一個行程裡真正擋下交錯的是 `REGISTRY_LOCK` 這把
+    /// `Mutex`；檔案鎖負責的是**跨行程**那一半（兩個實例並存，見
+    /// [`Entry::owner_pid`]），要驗它得起兩個行程，不適合放進單元測試輪。這一條
+    /// 因此同時是一道回歸測試：它會在「包裝被拆掉」與「兩把鎖的取用順序寫反而
+    /// 自己鎖死自己」時失敗（後者會直接卡在這裡逾時）。
+    #[test]
+    fn two_threads_never_lose_each_others_entries() {
+        let dir = tempdir("locked");
+        let path = dir.join(FILE_NAME);
+
+        std::thread::scope(|s| {
+            for (owner, pgid) in [(900, 111), (901, 222)] {
+                let path = path.clone();
+                s.spawn(move || {
+                    with_locked_registry(&path, || {
+                        // 刻意在讀與寫之間留一個窗口：沒有整段互斥的話，
+                        // 兩邊都會在這裡讀到同一份舊內容
+                        let mut reg = read_at(&path);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        reg.entries.push(entry(pgid, owner, "ssh -N bob@a"));
+                        write_at(&path, &reg).expect("寫得進去");
+                    });
+                });
+            }
+        });
+
+        let mut pgids: Vec<i32> = read_at(&path).entries.iter().map(|e| e.pgid).collect();
+        pgids.sort_unstable();
+        assert_eq!(pgids, vec![111, 222], "兩筆都要在——少一筆就是 lost update");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
