@@ -210,8 +210,14 @@ const baseJobs =
         },
       ];
 
-const signedBaseJob = baseJobs.find((job) => job.signed);
-const jobs = signedBaseJob ? [...baseJobs, sigJobFor(signedBaseJob, "的 minisign 簽章")] : baseJobs;
+// signedJob（已簽署的 updater 產物）與 sigJob（它的 .sig）在這裡一次算出來就留著，
+// 下面 manifest 直接用同一組物件——過去 manifest 那段是用
+// `jobs.find(job => job.from === `${signedJob.from}.sig`)` 把 sigJob「找回來」，靠的是
+// 字串巧合，正是 sigJobFor 的註解要避免的事：.sig 命名規則一改，find 回 undefined，
+// manifest 就靜默不寫，要等 compose job 才炸（SIM-7）。
+const signedJob = baseJobs.find((job) => job.signed) ?? null;
+const sigJob = signedJob ? sigJobFor(signedJob, "的 minisign 簽章") : null;
+const jobs = sigJob ? [...baseJobs, sigJob] : baseJobs;
 
 // 每次都重來，才不會留下上一版的檔案讓人拿錯
 rmSync(outDir, { recursive: true, force: true });
@@ -304,8 +310,6 @@ function verifyMacBinaryArch() {
   console.log(`  架構驗證通過：${appBinary} 是 ${expectedArch}（platform_key ${platformKey}）`);
 }
 
-const signedJob = jobs.find((job) => job.signed);
-const sigJob = signedJob && jobs.find((job) => job.from === `${signedJob.from}.sig`);
 const signedProduced = Boolean(signedJob && sigJob && producedTo.has(signedJob.to) && producedTo.has(sigJob.to));
 
 if (osFamily === "darwin" && signedProduced) {
