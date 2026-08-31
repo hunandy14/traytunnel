@@ -325,9 +325,22 @@ pub fn conf_str(key: &str) -> String {
         .to_string()
 }
 
-/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串（tauri.conf.json 的
-/// productName）。只有 Windows 用得到（NSIS 的解除安裝機碼），macOS 沒有對應
-/// 概念。
+/// 產品名，也就是 NSIS 拿去當解除安裝機碼名的那個字串。
+///
+/// **這是 Windows 的出貨值，這個常數不適用於 macOS。** 它讀的是
+/// [`TAURI_CONF`]（`tauri.conf.json`）的 `productName`，而 macOS 那一腿是帶著
+/// `tauri.macos.conf.json` 出貨的，那份 overlay 把 `productName` 蓋成
+/// `Traytunnel`（大寫 T，也就是 `Traytunnel.app` 與 bundle 內執行檔的名字）。
+/// 換句話說這一支在 macOS 上回的是一個**沒有任何東西叫這個名字**的字串。
+///
+/// 今天沒有人踩到：唯一的消費者是 Windows 的 NSIS 解除安裝機碼，macOS 側整個
+/// `allow(dead_code)`。日後 macOS 真的需要「產品名」時，要的是 overlay 之後的
+/// 值，不是這一份——請另外解 `tauri.macos.conf.json`，不要直接拿它來用。
+///
+/// 刻意**不**在這裡做 overlay 合併：那等於在執行期重做一次 tauri CLI 的設定合併
+/// （`--config` 的深層合併規則、平台判定、還有它會不會再蓋別的鍵），為了一個目前
+/// 零消費者的值背一套與 CLI 對齊的責任，划不來。誠實標註它是什麼、不是什麼，
+/// 比悄悄給一個看起來對的錯值安全得多。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub static PRODUCT_NAME: LazyLock<String> = LazyLock::new(|| conf_str("productName"));
 
@@ -443,9 +456,17 @@ mod tests {
     /// Windows 的暫存區資料夾、single-instance 具名互斥鎖、通知 AUMID、NSIS
     /// 解除安裝機碼全部以它們定位，換掉的話既有使用者的這些東西全部靜默失聯
     /// ——不是這次更新失敗，是連「有更新」這件事都不會再發生。
+    ///
+    /// **兩個值的適用範圍不一樣，這裡說清楚**：`identifier` 兩個平台都吃這一份
+    /// （沒有 overlay 蓋它）；`productName` 則是 **Windows 的出貨值**——macOS 那一腿
+    /// 帶著 `tauri.macos.conf.json` 出貨，那份 overlay 把它蓋成 `Traytunnel`，所以
+    /// 這條測試釘的 `"traytunnel"` 對 macOS 不成立，[`PRODUCT_NAME`] 本身也不適用
+    /// 於 macOS（見那個常數的說明）。這裡不去合併 overlay，只是不再假裝這是一個
+    /// 平台中立的值。
     #[test]
     fn the_shipped_identifier_and_product_name_are_the_ones_users_already_have() {
         assert_eq!(*IDENTIFIER, "com.traytunnel.desktop");
+        // Windows 出貨值（NSIS 解除安裝機碼名）；macOS 由 overlay 蓋成 Traytunnel
         assert_eq!(*PRODUCT_NAME, "traytunnel");
     }
 }
