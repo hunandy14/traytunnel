@@ -171,14 +171,16 @@ pub fn listening_ports() -> std::collections::HashSet<u16> {
     if let Some(buf) = listener_table(AF_INET as u32) {
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            let rows =
+                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
             ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
         }
     }
     if let Some(buf) = listener_table(AF_INET6 as u32) {
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
-            let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            let rows =
+                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
             ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
         }
     }
