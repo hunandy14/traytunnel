@@ -56,12 +56,7 @@ fn show_main(app: &AppHandle) {
         let _ = w.set_focus();
         // 視窗藏著的時候被系統回收掉 content process 的話，reload 被延到
         // 這裡才做——理由見 WEBVIEW_NEEDS_RELOAD 那段。
-        if take_pending_reload(&WEBVIEW_NEEDS_RELOAD) {
-            log::info!("reloading the webview that was reclaimed while hidden");
-            if let Err(e) = w.reload() {
-                log::warn!("could not reload the webview on show: {e}");
-            }
-        }
+        reload_if_pending(&w, "show");
     }
 }
 
@@ -85,8 +80,9 @@ fn show_main(app: &AppHandle) {
 // * **視窗藏著**：只立旗標（外加一行 warn），什麼都不畫。等視窗真的回到使用者
 //   面前才 reload，那時他本來就在等畫面，重生一個 WebContent 行程是划算的。
 //
-// 欠下的那次 reload 有**兩個**還款點，缺一不可，兩邊都靠
-// [`take_pending_reload`]（`swap(false)`）保證只還一次：
+// 欠下的那次 reload 有**兩個**還款點，缺一不可，兩邊都走同一支
+// [`reload_if_pending`]（底下的 [`take_pending_reload`] 是 `swap(false)`，
+// 保證只還一次）：
 //
 // * `show_main`——系統匣的 Open window、第二實例喚醒、Windows 的雙擊圖示。
 // * 主視窗的 `WindowEvent::Focused(true)`（見 `setup` 裡那顆處理常式）——
@@ -130,6 +126,21 @@ fn plan_reload_after_terminate(window_visible: bool) -> ReloadPlan {
 /// 一顆來測，不必碰行程全域狀態。
 fn take_pending_reload(flag: &std::sync::atomic::AtomicBool) -> bool {
     flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 欠下的那次 reload 的**還款動作**：領得到旗標就重載，領不到就什麼都不做。
+///
+/// 兩個還款點（`show_main` 與主視窗的 `Focused(true)`）逐字做同一件事，只差
+/// warn 那一行的字尾，所以抽在這裡；`why` 就是那個字尾（`"show"`／`"focus"`），
+/// 使用者回報時看得出是哪一條路把畫面救回來的。
+fn reload_if_pending(win: &tauri::WebviewWindow, why: &str) {
+    if !take_pending_reload(&WEBVIEW_NEEDS_RELOAD) {
+        return;
+    }
+    log::info!("reloading the webview that was reclaimed while hidden");
+    if let Err(e) = win.reload() {
+        log::warn!("could not reload the webview on {why}: {e}");
+    }
 }
 
 // ------------------------------------------------- 白屏診斷（前端就緒複查）
@@ -1036,20 +1047,15 @@ pub fn run() {
                     // 點「Open window」為止（舊碼在這一格是立刻 reload，這是
                     // 延後 reload 之後才開出來的窄縫）。
                     //
-                    // 兩條路各領一次不會重複 reload：`take_pending_reload` 是
-                    // `swap(false)`，`show_main` 先領走的話這裡拿到的就是 false。
+                    // 兩條路各領一次不會重複 reload：領旗標的 `take_pending_reload`
+                    // 是 `swap(false)`，`show_main` 先領走的話這裡拿到的就是 false。
                     //
                     // 用 `matches!` 併成一個條件、不寫成 match arm 加 guard：
-                    // `take_pending_reload` 會改狀態，藏進 match guard 就變成
-                    // 「條件沒過但旗標已經被領走」，那是最不該放在 guard 裡的
-                    // 那種副作用。
-                    if matches!(event, WindowEvent::Focused(true))
-                        && take_pending_reload(&WEBVIEW_NEEDS_RELOAD)
-                    {
-                        log::info!("reloading the webview that was reclaimed while hidden");
-                        if let Err(e) = focus_target.reload() {
-                            log::warn!("could not reload the webview on focus: {e}");
-                        }
+                    // `reload_if_pending` 會改狀態（它領旗標），藏進 match guard
+                    // 就變成「條件沒過但旗標已經被領走」，那是最不該放在 guard
+                    // 裡的那種副作用。
+                    if matches!(event, WindowEvent::Focused(true)) {
+                        reload_if_pending(&focus_target, "focus");
                     }
                 });
             }
