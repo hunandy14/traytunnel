@@ -202,20 +202,28 @@ fn ask_shell_for_path_into(shell: &str, tmp: &Path) -> Option<String> {
     let mut child = cmd.spawn().ok()?;
     let pgid = child.id() as i32;
     let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
-    loop {
+    // 迴圈只回報一件事：這支 shell 是不是**自己**結束了。
+    let finished_on_its_own = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // 整組收掉再 wait，不留殭屍也不留孤兒
-                    super::pgids::kill_group(pgid);
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(LOGIN_SHELL_TICK);
-            }
-            Err(_) => return None,
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() >= deadline => break false,
+            Ok(None) => std::thread::sleep(LOGIN_SHELL_TICK),
+            // `try_wait` 自己出錯與逾時走**同一個出口**。兩種情形下這支互動式
+            // shell（以及它 rc 檔生出來的一整棵東西）都還在跑，而我們已經不要
+            // 它的答案了——差別只在「知不知道它跑到哪」，該做的收尾一模一樣。
+            // 原本這一支是 `Err(_) => return None`，兩件收尾都沒做：那棵樹變成
+            // 孤兒繼續跑，而 `Child` 被 drop 時 std 也不會替我們 `wait`
+            // （`Child::drop` 明文寫著「不會 wait，可能留下殭屍」），行程表裡
+            // 就留下一隻 `<defunct>`。這一支罕見（`ECHILD`／`EINTR` 之外幾乎
+            // 不會發生），但「罕見」不是「可以留下孤兒」的理由。
+            Err(_) => break false,
         }
+    };
+    if !finished_on_its_own {
+        // 整組收掉再 wait，不留殭屍也不留孤兒
+        super::pgids::kill_group(pgid);
+        let _ = child.wait();
+        return None;
     }
     extract_marked_path(&std::fs::read_to_string(tmp).ok()?)
 }
