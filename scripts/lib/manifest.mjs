@@ -19,9 +19,10 @@ export function manifestFileName(platformKey) {
 /**
  * @param {string} dir out/ 目錄路徑
  * @param {string} platformKey 例如 "windows-x86_64" / "darwin-aarch64"
+ * @param {string} [expectedVersion] 這次發佈的版本；有給就一併比對 manifest.version
  * @returns {{ platform_key: string, version: string, asset: string, sig: string, bundle_source: string }}
  */
-export function readManifest(dir, platformKey) {
+export function readManifest(dir, platformKey, expectedVersion) {
   const path = join(dir, manifestFileName(platformKey));
   if (!existsSync(path)) {
     throw new Error(
@@ -40,6 +41,18 @@ export function readManifest(dir, platformKey) {
   if (manifest.platform_key !== platformKey) {
     throw new Error(
       `${path} 的 platform_key（${manifest.platform_key}）跟檔名裡的 ${platformKey} 對不起來`,
+    );
+  }
+  // WRP-5：跟上面的 platform_key 檢查同構的防禦。manifest 的 asset／sig 會被
+  // 拿去組 latest.json 的下載網址，而網址的版本段來自這次發佈的 tag——out/
+  // 底下若殘留上一版的 manifest（今天 package.mjs 每次都 rmSync，所以不會
+  // 發生；但這條假設不該是唯一的防線），latest.json 的 version 就會跟下載
+  // URL 的版本對不上，updater 下載 404 或直接裝回舊版。
+  if (expectedVersion !== undefined && manifest.version !== expectedVersion) {
+    throw new Error(
+      `${path} 的 version（${manifest.version}）跟這次發佈的 ${expectedVersion} 對不起來——` +
+        `out/ 底下可能殘留上一版的產物。latest.json 會用這次的版本組下載網址，` +
+        `跟舊 manifest 指到的檔名對不上，因此中止。`,
     );
   }
   return manifest;

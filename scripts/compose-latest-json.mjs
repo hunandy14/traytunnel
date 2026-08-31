@@ -51,12 +51,16 @@ import { readManifest } from "./lib/manifest.mjs";
  * 對每個「這次應建置」的平台 key，讀 manifest 取得 asset／sig 檔名，驗證簽章檔
  * 真的存在，並用 --repo／--tag 現組下載網址。任何一步缺失都直接丟例外中止
  * （fail-closed）——見上面檔頭註解「--platforms」段落。
+ *
+ * version 一併傳給 readManifest 比對 manifest.version（WRP-5）：manifest 說的
+ * 版本必須就是這次發佈的版本，否則 latest.json 的 version 會跟下載網址的版本段
+ * 分岔（見 scripts/lib/manifest.mjs）。
  */
-function resolvePlatformsFromManifests(dir, platformKeys, repo, tag) {
+function resolvePlatformsFromManifests(dir, platformKeys, repo, tag, version) {
   const platforms = {};
   for (const key of platformKeys) {
     // 缺 manifest 或欄位不全時，readManifest 自己就會丟出清楚的錯誤訊息
-    const manifest = readManifest(dir, key);
+    const manifest = readManifest(dir, key, version);
     const sigPath = join(dir, manifest.sig);
     if (!existsSync(sigPath)) {
       throw new Error(
@@ -123,7 +127,13 @@ function main() {
     throw new Error("--platforms 至少要有一個平台 key");
   }
 
-  const platforms = resolvePlatformsFromManifests(values.dir, platformKeys, values.repo, values.tag);
+  const platforms = resolvePlatformsFromManifests(
+    values.dir,
+    platformKeys,
+    values.repo,
+    values.tag,
+    values.version,
+  );
 
   const baseline = readBaseline(values.baseline);
   const current = {
