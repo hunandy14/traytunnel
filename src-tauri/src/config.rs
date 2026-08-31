@@ -53,28 +53,25 @@ pub fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| TOML_NAME.to_string())
 }
 
-/// 執行檔主檔名裡的可攜記號：沿用 Rufus 的 `rufus-4.5p.exe` 慣例，記號是**結尾**的 p。
-///
-/// 只認結尾而不是任意位置，否則 Windows 複製檔案自動取的
-/// 「traytunnel - Copy.exe」（Copy 裡有 p）會莫名其妙變成可攜模式。
-/// `traytunnel` 本身不是 p 結尾，所以結尾的 p 一定是使用者刻意加的，
-/// 例如 `traytunnel-p.exe`、`traytunnel-0.2.0p.exe`。大小寫不敏感。
-pub fn stem_marks_portable(exe_stem: &str) -> bool {
-    matches!(exe_stem.chars().next_back(), Some(c) if c.eq_ignore_ascii_case(&'p'))
-}
+// 可攜模式的兩個觸發條件都是平台的事——Windows 沿用 Rufus 的「結尾 p」慣例
+// （`rufus-4.5p.exe`）加上「exe 旁已有 traytunnel.toml」；macOS 兩條都恆 false
+// （程式包在 .app bundle 裡發佈，設定檔放不進執行檔旁邊，W3 決議不做可攜模式）。
+// 判定分別在 `platform::stem_marks_portable` 與 `platform::exe_toml_marks_portable`。
+use crate::platform::{exe_toml_marks_portable, stem_marks_portable};
 
 /// 路徑優先序的純邏輯，實機與測試共用。可攜模式兩個觸發條件**任一成立**即可，
 /// 兩者都指向執行檔旁邊的 `traytunnel.toml`：
 ///
 /// 1. 執行檔主檔名以 p 結尾（[`stem_marks_portable`]）→ 可攜模式；檔案還不存在也算，
 ///    後面 `load_from_path` 會就地建一份預設檔（Rufus 建 ini 的行為）；
-/// 2. 執行檔旁邊已經有 `traytunnel.toml` → 可攜模式，直接用它；
+/// 2. 執行檔旁邊已經有 `traytunnel.toml`（[`exe_toml_marks_portable`]）→ 可攜模式，
+///    直接用它；
 /// 3. 都不成立就用家目錄的 `.traytunnel.toml`；
 /// 4. 連家目錄都問不出來時退回執行檔目錄，檔名仍維持點檔，
 ///    才不會反過來把自己變成可攜模式。
 pub fn resolve_location(exe_dir: &Path, exe_stem: &str, home: Option<&Path>) -> ConfigLocation {
     let portable = exe_dir.join(TOML_NAME);
-    if stem_marks_portable(exe_stem) || portable.is_file() {
+    if stem_marks_portable(exe_stem) || exe_toml_marks_portable(&portable) {
         return ConfigLocation { path: portable, portable: true };
     }
     let base = home.unwrap_or(exe_dir);
@@ -98,10 +95,8 @@ fn exe_parts() -> (PathBuf, String) {
     (dir, stem)
 }
 
-/// 使用者家目錄；空字串視同沒有
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()).map(PathBuf::from)
-}
+// 使用者家目錄。問的是哪一個環境變數、空值算不算數，都是平台的事
+use crate::platform::home_dir;
 
 /// 這次執行實際生效的設定檔位置，順手把資料夾補出來。
 /// 全程式只有這一個入口，讀寫與備份都從回傳值派生。
@@ -123,6 +118,12 @@ pub const DEFAULT_AUTOMATIC_UPDATES: bool = true;
 /// 刻意不走 `load_from_path`：那一支會做遷移判定、壞檔備份、必要時建檔，全都是
 /// 這個時間點不該發生的副作用（正常的載入流程幾毫秒後就會在 setup 裡完整跑一次）。
 /// 這裡只讀一個鍵，讀不到就用預設值。
+// 這個 cfg_attr 要長期留著，不是等哪一個車道接上就能拿掉的過渡措施：唯一的呼叫端
+// 是 `platform::update::apply_pending_at_startup`，而 macOS 那一支是**刻意的 no-op**
+// ——macOS 沒有 NSIS 那種「暫存一顆安裝程式、下次啟動再交棒」的機制（理由整段寫在
+// `platform/macos/update.rs` 的模組說明），沒有東西可以交棒，也就沒有理由去讀這個鍵。
+// 拿掉的話 macOS 那一腿會 dead_code 撞上 `-D warnings` 紅燈。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn automatic_updates_enabled() -> bool {
     let (dir, stem) = exe_parts();
     let loc = resolve_location(&dir, &stem, home_dir().as_deref());
@@ -137,6 +138,7 @@ pub fn automatic_updates_enabled() -> bool {
 ///
 /// 壞檔回預設是對的方向：設定檔壞掉時整支程式本來就是用預設值在跑
 /// （見 `LoadOutcome::Broken`），這一個鍵沒有理由自成一格。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn read_automatic_updates(raw: &str) -> bool {
     raw.parse::<DocumentMut>()
         .ok()
@@ -1345,7 +1347,14 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> std::io::Result<()> {
 /// `fs::write` 是「先截斷再寫」，中途斷電、磁碟滿或行程被砍都會留下一個半截的
 /// 設定檔，下次啟動就是壞檔。rename 在同一個資料夾內是原子的（Windows 的
 /// `MoveFileEx` 帶 REPLACE_EXISTING），使用者手上永遠只會看到完整的舊版或新版。
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+///
+/// 之所以是 `pub(crate)` 而不是這個模組私有：macOS 的受監督行程群組登記簿
+/// （`platform::macos::pgids`）要的是一模一樣的東西——同一份「兩種失敗都要把
+/// 暫存檔清掉」的形狀，連暫存檔命名慣例（[`tmp_path`]：生效檔名接上 `.tmp`，
+/// 一定落在同一個資料夾，`rename` 才是同磁碟區的原子換名）都一樣。那邊本來
+/// 各自維護一份逐字相同的實作，正是 `platform/mod.rs` 開頭第四條規則
+/// （不看平台的純邏輯不准兩邊各抄一份）在講的東西，因此上提到唯一一份。
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = tmp_path(path);
     // 寫到一半失敗（最典型的就是磁碟寫滿）時，暫存檔已經開出來而且是半截的，
     // 一樣要清掉——「不留半成品」的承諾得涵蓋兩種失敗，不是只有換名那一種

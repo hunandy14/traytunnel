@@ -8,8 +8,9 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::config::{self, Config, ConnKind, RowKind, Source, WgProxy};
+use crate::platform::{self, update};
 use crate::state::{autostart_name, Snapshot, UpdateInfo, MAIN_WINDOW};
-use crate::{close_main, do_exit, tunnel, update, wg, winsys, Shared};
+use crate::{close_main, do_exit, tunnel, wg, Shared};
 
 /// 存檔失敗時回給前端的訊息開頭，回傳字串的那幾個指令共用同一份字面值
 const SAVE_FAILED: &str = "Failed to save settings";
@@ -626,19 +627,25 @@ pub fn upsert_wg_proxy(
         return Some(err);
     }
 
-    // 附贈預設 SOCKS5 列的執行期條件，**在 cfg 鎖外先問完**：`is_listening` 是一次
-    // `GetExtendedTcpTable` 全表列舉，沒有理由讓設定鎖撐在那裡等一趟系統呼叫。
-    // 編輯路徑永不附贈，所以那一路連問都不問。
+    // 附贈預設 SOCKS5 列的執行期條件，**在 cfg 鎖外先問完**：`is_listening` 在
+    // 兩個平台上都要問一趟系統（Windows 是一次系統呼叫的全表列舉，macOS 是
+    // 唯讀查一趟 libproc 記著的行程／socket 表），沒有理由讓設定鎖撐在那裡
+    // 等它。編輯路徑永不附贈，所以那一路連問都不問。
     //
-    // 這個答案有兩處刻意記在這裡的不精確，都是**保守**方向、都不改行為：
-    //   * `is_listening` 掃的是全介面（含 0.0.0.0 與 ::），而我們的監聽器只綁
-    //     127.0.0.1。別人綁在某張外部網卡的 1080 會被算成「忙」而讓我們不附贈——
-    //     寧可少送一條列，也不要附一條起不來的。
-    //   * `GetExtendedTcpTable` 失敗時回 false（＝當作沒人在聽）。那是查不到答案，
-    //     不是查到「空」；真撞上了會在附贈的列上以 port_busy 現形，那條路徑本來
-    //     就有完整的錯誤顯示。
+    // 這個答案有兩處刻意記在這裡的不精確：
+    //   * 兩個平台查的範圍都是系統上所有介面（含 0.0.0.0 與 ::），不只是
+    //     「我們自己會綁的 127.0.0.1」——別人綁在某張外部網卡的 1080 一樣會
+    //     被算成「忙」而讓我們不附贈，這是保守方向，兩平台一致。macOS 這條
+    //     路唯一沒補齊的是「不同 uid 的行程」：libproc 對不是自己也不是 root
+    //     的行程之 fd 資訊有存取限制（見 `platform::macos::sys::is_listening`
+    //     的說明），別的使用者或 root 擁有的程序（例如 launchd 隨選啟動的
+    //     `sshd`）佔住 1080 時查不到，方向是「可能誤判成沒人聽」——但我們自己
+    //     的監聽器一律跟查詢者同一個 uid，不受影響。
+    //   * `is_listening` 查詢失敗時一律回 false（＝當作沒人在聽）。那是查不到
+    //     答案，不是查到「空」；真撞上了會在附贈的列上以 port_busy 現形，
+    //     那條路徑本來就有完整的錯誤顯示。
     let socks_port_listening =
-        original_name.is_none() && winsys::is_listening(config::DEFAULT_SOCKS_PORT);
+        original_name.is_none() && platform::is_listening(config::DEFAULT_SOCKS_PORT);
 
     let written = st.update_config_checked(|c| {
         // 便宜的重驗，理由同 upsert_source：這一次是在 cfg 鎖裡做的
@@ -881,9 +888,9 @@ pub fn set_autostart(app: AppHandle, state: State<'_, Shared>, on: bool) -> Resu
     let st = state.inner();
     let name = autostart_name(&app);
     let result = if on {
-        std::env::current_exe().and_then(|exe| winsys::enable_autostart(&name, &exe))
+        std::env::current_exe().and_then(|exe| platform::enable_autostart(&name, &exe))
     } else {
-        winsys::disable_autostart(&name)
+        platform::disable_autostart(&name)
     };
     result.map_err(|e| format!("Failed to change autostart:\n{e}"))?;
     st.log(if on { "autostart enabled" } else { "autostart disabled" });
@@ -897,13 +904,33 @@ pub fn get_config_path(state: State<'_, Shared>) -> String {
     state.path.to_string_lossy().into_owned()
 }
 
+// ---------------------------------------------------------------- 開外部程式
+//
+// 底下三支都是「請系統開一個東西給使用者看」，共同的紀律是**不可以在指令函式
+// 裡同步等它**：Tauri 的同步指令跑在主執行緒上，而這幾條路底下是
+// `open`（macOS）／`ShellExecuteExW`（Windows），冷啟一個 Finder 視窗或瀏覽器
+// 動輒一到三秒——那段時間整個 UI 會凍住。
+//
+// 作法是把阻塞那一段丟到 `spawn_blocking`（阻塞 I/O 專用的執行緒池，不佔
+// tokio 的工作執行緒），指令本身立刻返回，成敗照舊記進活動日誌。刻意**不**
+// 改成 `async fn` 去 await 它：這三支的回傳值前端一個都沒有用（`ipc.ts` 一律
+// `invoke<void>`），await 只會把「promise 什麼時候 resolve」跟「系統視窗什麼
+// 時候真的開出來」綁在一起，換不到任何東西；而帶 `State<'_, _>` 的 async 指令
+// 又被 Tauri 逼著回一個永遠是 `Ok` 的 `Result`（`Result<(), ()>` 還會撞上
+// `clippy::result_unit_err`）。
+//
+// 這一段是共用核心，沒有任何 `cfg`：「怎麼開」在 `platform` 那一層，
+// 兩個平台的實作都不必為此改動。
+
 /// 在檔案總管裡開啟設定檔所在資料夾，並選中設定檔本身
 #[tauri::command]
 pub fn open_config_dir(state: State<'_, Shared>) {
-    let st = state.inner();
-    if let Err(e) = winsys::reveal_in_explorer(&st.path) {
-        st.log(format!("could not open the config folder: {e}"));
-    }
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = platform::reveal_in_file_manager(&st.path) {
+            st.log(format!("could not open the config folder: {e}"));
+        }
+    });
 }
 
 /// 自動更新的總開關（設定頁的「Automatic updates」）。
@@ -977,14 +1004,18 @@ pub async fn install_update(state: State<'_, Shared>) -> Result<(), String> {
 /// version 給 None 時退回 releases/latest。
 #[tauri::command]
 pub fn open_release_page(state: State<'_, Shared>, version: Option<String>) {
-    update::open_release_page(state.inner(), version.as_deref());
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        update::open_release_page(&st, version.as_deref());
+    });
 }
 
 /// 下拉的「Download from Releases」：開系統瀏覽器到 Releases 列表頁，
 /// 剩下的交給使用者。這條路不下載任何東西，也不會動到執行中的這顆 exe。
 #[tauri::command]
 pub fn open_releases_page(state: State<'_, Shared>) {
-    update::open_releases_page(state.inner());
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || update::open_releases_page(&st));
 }
 
 #[tauri::command]
@@ -1002,4 +1033,16 @@ pub fn window_minimize(app: AppHandle) {
 #[tauri::command]
 pub fn exit_app(state: State<'_, Shared>) {
     do_exit(state.inner());
+}
+
+/// 前端就緒信標：`main.ts` 的啟動鏈跑完就 invoke 一次。
+///
+/// 白屏診斷唯一的守衛（見 `lib.rs` 那段「白屏診斷」的說明）。這支指令不帶
+/// 參數、不回值、也不碰 `AppState`——它的全部意義就是「這個 invoke 發生過」：
+/// 只有我們自己的前端真的跑起來才發得出來，WebView2 對連線失敗自己畫的錯誤頁
+/// 與 WKWebView 的空白頁都不可能。舊守衛看的 page-load 事件在前者身上會照發，
+/// 那正是說明頁在 Windows 上永遠不出現的原因。
+#[tauri::command]
+pub fn frontend_ready() {
+    crate::mark_frontend_ready();
 }

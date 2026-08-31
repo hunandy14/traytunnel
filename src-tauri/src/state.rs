@@ -13,7 +13,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::Config;
-use crate::winsys::Job;
+use crate::platform::ProcessSupervisor;
 
 /// 活動日誌保留的行數上限
 const LOG_CAPACITY: usize = 500;
@@ -432,7 +432,7 @@ pub fn autostart_name(app: &AppHandle) -> String {
 
 /// 組一行日誌：`HH:mm:ss  [源名] 訊息`，app 級事件不帶源名。
 fn format_log(source: Option<&str>, msg: &str) -> String {
-    let ts = crate::winsys::local_time_hms();
+    let ts = crate::platform::local_time_hms();
     match source {
         Some(s) => format!("{ts}  [{s}] {msg}"),
         None => format!("{ts}  {msg}"),
@@ -479,7 +479,7 @@ pub(crate) enum Worker {
     // 兩個欄位都**只為了 Drop 而持有**，沒有讀取端是刻意的：handle 一關，
     // 整棵 ssh 程序樹（含 ProxyCommand 的孫程序）就結束；權杖一取消，
     // 整棵 wg 任務樹（引擎 + 所有列的監聽器）就結束
-    Ssh(#[allow(dead_code)] Job),
+    Ssh(#[allow(dead_code)] ProcessSupervisor),
     Wg(#[allow(dead_code)] crate::wg::CancelGuard),
 }
 
@@ -605,7 +605,7 @@ pub struct AppState {
     /// 背景更新檢查的結果，None 代表目前沒有新版可用
     update: Mutex<Option<UpdateInfo>>,
     /// 已經下載好、等下一次啟動才安裝的那一版，None 代表暫存區是空的
-    pending: Mutex<Option<crate::update::Pending>>,
+    pending: Mutex<Option<crate::platform::update::Pending>>,
     /// 「知道有新版，但下載失敗了、正在退避等下一次試」。
     ///
     /// 沒有這一格的話，介面只看得到「有新版」與「有東西就緒」兩個事實，
@@ -1041,13 +1041,23 @@ impl AppState {
         self.with_exit_mut(local, |rt| rt.job.take());
     }
 
-    /// 只在世代相符時清掉 job，避免誤殺新的一輪連線
+    /// 只在世代相符時清掉 job，避免誤殺新的一輪連線。
+    ///
+    /// `take()` 到的東西**從閉包回傳出來**，於是它在 `with_exit_mut` 已經放掉
+    /// `exits` 鎖之後才 drop——理由與 [`Self::kill_all_jobs`] 那段一樣：drop 一個
+    /// [`Worker`] 在 macOS 上要 `killpg` 再讀改寫磁碟上的 pgid 登記簿，那是一段
+    /// 同步檔案 I/O，沒有理由讓它拖著整個 app 的 `exits` 鎖（`kill_job` 本來就是
+    /// 靠尾表達式回傳做到這件事的，這一支只是把同樣的寫法補齊）。
     pub fn kill_job_of(&self, local: u16, generation: u64) {
-        self.with_exit_mut(local, |rt| {
+        let taken = self.with_exit_mut(local, |rt| {
             if rt.job.as_ref().map(|(g, _)| *g) == Some(generation) {
-                rt.job.take();
+                rt.job.take()
+            } else {
+                None
             }
         });
+        // 這一行才是真正的「殺」，而它跑在鎖外
+        drop(taken);
     }
 
     /// 收掉所有出口的 ssh 程序，離開程式時用。
@@ -1076,15 +1086,21 @@ impl AppState {
             }
         }
         let mut stopped = Vec::new();
+        // **這個變數的作用域是刻意撐到鎖外的。** `slots` 裡裝的是每個出口摘下來的
+        // worker，而 drop 一個 [`Worker`] 不是把一個指標歸零：macOS 上是
+        // `killpg(SIGKILL)` 再讀改寫磁碟上的 pgid 登記簿（一次讀檔＋一次
+        // write＋rename，每一條隧道各一輪），Windows 上才是單純的 `CloseHandle`。
+        // 宣告在區塊裡的話那 N 輪同步檔案 I/O 全部發生在 `exits` 鎖裡面，而這把鎖
+        // 是 UI 與系統匣每一次狀態查詢都要取的——退出時 N 條隧道一起收，主執行緒
+        // 就跟著等 N 次磁碟往返。宣告在外面，鎖裡只剩下把 `Option` 搬進 map 的
+        // 指標移動，真正的收尾在 `drain_workers` 那一行、鎖已經放掉之後才做。
+        let mut slots: BTreeMap<u16, Option<(u64, Worker)>> = BTreeMap::new();
         {
             let mut exits = self.exits.lock().unwrap();
-            // 先把每個出口的 worker 摘出來交給 drain_workers 統一收掉：「拿走即
-            // 殺掉」那條語意只有一份實作，ssh 的程序樹與 wg 的任務樹都涵蓋（W6.3）。
-            // 它回報的是「真的收掉了東西」的埠，這裡用不到——底下要把**每一個**
-            // 出口都壓成 stopped，不只是有 worker 的那些
-            let mut slots: BTreeMap<u16, Option<(u64, Worker)>> =
-                exits.iter_mut().map(|(local, rt)| (*local, rt.job.take())).collect();
-            drop(drain_workers(&mut slots));
+            // 先把每個出口的 worker 摘出來（只是移動，沒有任何 Drop 在這裡跑），
+            // 之後交給 drain_workers 統一收掉：「拿走即殺掉」那條語意只有一份實作，
+            // ssh 的程序樹與 wg 的任務樹都涵蓋（W6.3）。
+            slots.extend(exits.iter_mut().map(|(local, rt)| (*local, rt.job.take())));
             for (local, rt) in exits.iter_mut() {
                 rt.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 rt.supervisor = None;
@@ -1093,6 +1109,12 @@ impl AppState {
                 }
             }
         }
+        // 鎖放掉了，這裡才是真的「收掉」：每個 worker 的 Drop（macOS 是 killpg
+        // ＋改寫磁碟上的登記簿）都在這一行跑完。它回報的是「真的收掉了東西」的
+        // 埠，這裡用不到——上面已經把**每一個**出口都壓成 stopped 了，不只是
+        // 有 worker 的那些。**必須排在底下那道 `stopped.is_empty()` 早退之前**，
+        // 不然「每個出口本來就都是 stopped、但 worker 還在」那一輪會把它們漏掉。
+        drop(drain_workers(&mut slots));
         if stopped.is_empty() {
             return;
         }
@@ -1196,8 +1218,24 @@ impl AppState {
         self.exiting.store(true, Ordering::SeqCst);
     }
 
+    /// 收尾：立退出旗標 → 收掉所有程序樹。
+    ///
+    /// 這兩支從來只成對出現，而且**順序就是規格**：先 `mark_exiting()` 讓所有
+    /// 「還活著就重連」的路徑（watchdog、隧道的重試迴圈、`RunEvent::Exit` 的
+    /// 補救掛鉤）看得到「要走了」，再 `kill_all_jobs()` 動手殺；反過來的話，
+    /// 殺完到立旗標之間有一個窗口，重連迴圈會醒過來把剛收掉的隧道再拉一條起來。
+    ///
+    /// 收成一支方法就是為了讓這個順序沒有第二種寫法。**不是**「exit 專用」：
+    /// 更新交棒那條路（`platform::*::update`）也走同一組收尾，那裡程式不一定會
+    /// 結束（安裝失敗就留在原地），所以 `kill_all_jobs` 只收 worker、不刪項目，
+    /// 狀態會被壓成 stopped——語意見該函式的說明。
+    pub fn shutdown(&self) {
+        self.mark_exiting();
+        self.kill_all_jobs();
+    }
+
     pub fn autostart(&self) -> bool {
-        crate::winsys::autostart_enabled(&autostart_name(&self.app))
+        crate::platform::autostart_enabled(&autostart_name(&self.app))
     }
 
     /// 這次執行要不要自動更新。設定檔沒寫的話兩種模式都算開，
@@ -1231,7 +1269,7 @@ impl AppState {
     ///
     /// 變了就全量推一次：設定頁那顆鈕與系統匣的「Restart to update」都吃這一份，
     /// 而它們平常是靠 config-changed 更新的，這裡沿用同一條路就不必再多一種事件。
-    pub fn set_staged(&self, pending: Option<crate::update::Pending>) {
+    pub fn set_staged(&self, pending: Option<crate::platform::update::Pending>) {
         {
             let mut slot = self.pending.lock().unwrap();
             if *slot == pending {
@@ -1406,6 +1444,7 @@ mod tests {
     }
 
     /// 日誌行格式：源底下的事件帶 [源名]，app 級事件不帶
+    // 時間戳走 platform::local_time_hms，兩平台都已實作（W3-B 起 macOS 也是）
     #[test]
     fn log_line_carries_source_name_only_when_it_has_one() {
         let with = format_log(Some("hk"), "exit-a : up");

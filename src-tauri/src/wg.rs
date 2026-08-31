@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::platform::listening_ports;
 use crate::state::{status, AppState, Worker};
-use crate::winsys::is_listening;
 
 /// 引擎斷線後的重連間隔，與 `ssh::tunnel::RETRY` 同值同理由
 pub const RETRY: Duration = Duration::from_secs(5);
@@ -710,12 +710,25 @@ fn spread(
 }
 
 /// 逐條列預檢埠佔用，含 `PORT_GRACE` 複查。某一條被佔只影響那一條（§5.2）
+///
+/// 走 `listening_ports()` 取一次快照再 `contains`，不對每一條列各問一次
+/// `is_listening`：後者每問一個埠就要跑一次全表走訪（macOS 是一次
+/// `listeners::get_all()`，Windows 是 v4＋v6 兩張表），K 條列就是 K 次同樣的
+/// 走訪，`PORT_GRACE` 之後再 K 次，而重連迴圈每 5 秒就會再來一輪。快照另外還
+/// 順手修掉一件事：一批答案現在來自**同一個瞬間**，不會出現「第 1 列看到的
+/// 世界跟第 K 列看到的不同」。
+///
+/// 複查那次**重新取一次快照**（不是拿舊的再篩）——那正是這一步存在的理由：
+/// 自己的舊監聽器剛被收掉時，埠可能還殘留幾百毫秒才真的放掉，要問的是
+/// 「現在」的表。
 async fn busy_rows(locals: &[u16]) -> Vec<u16> {
-    let mut busy: Vec<u16> = locals.iter().copied().filter(|l| is_listening(*l)).collect();
+    let listening = listening_ports();
+    let mut busy: Vec<u16> = locals.iter().copied().filter(|l| listening.contains(l)).collect();
     if !busy.is_empty() {
         // 自己的舊監聽器剛被收掉時，埠可能還殘留幾百毫秒才真的放掉
         tokio::time::sleep(PORT_GRACE).await;
-        busy.retain(|l| is_listening(*l));
+        let listening = listening_ports();
+        busy.retain(|l| listening.contains(l));
     }
     busy
 }

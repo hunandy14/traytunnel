@@ -156,6 +156,48 @@ body {
   color: #fff;
 }
 
+/* 純排版用的包裹層，讓 −/× 兩顆鈕在 mac 上可以整組一次隱藏（見下方
+   [data-platform="macos"] 規則）。flex 屬性照抄 .titlebar 本來的排列方式，
+   多這層 wrapper 不能改變 Windows 那邊的既有間距。 */
+.win-controls {
+  display: flex;
+  align-items: center;
+}
+
+/* ------------------------------------------------------------ macOS 原生視窗風格
+   data-platform 由 Rust 端在頁面載入前用 webview initialization script 寫進
+   <html>（src-tauri/src/lib.rs 的 PLATFORM_FLAG／platform-flag 外掛，值來自
+   cfg(target_os = "macos")，執行期判斷；見 index.html 開頭註解），兩邊唯一的
+   視覺分歧收在這裡：
+   - 藏掉 Windows 風格的自繪 −/×，原生紅綠燈接手同樣的語意（見 lib.rs 的
+     window_close／window_minimize，兩邊呼叫的是同一批指令）。
+   - 標題列讓出左上角，紅綠燈（trafficLightPosition 用 tauri.macos.conf.json
+     的預設值）才不會被 app icon／標題文字蓋住或疊在一起。72px 是先抓一個
+     略寬於原生三顆燈＋內距的估計值，實機跑起來偏了再調。 */
+html[data-platform="macos"] .win-controls {
+  display: none;
+}
+
+html[data-platform="macos"] .titlebar {
+  height: 38px;
+  padding-left: 72px;
+}
+
+html[data-platform="macos"] .titlebar .app-icon {
+  margin-left: 0;
+}
+
+/* mac 上不重複顯示 app 名稱＋icon：自訂標題列＋側欄的介面裡，系統選單列
+   已經有 app 名稱，HIG 建議自訂標題列不要再標一次；緊貼紅綠燈的位置也
+   容易被原生視窗控制熱區蓋到。只藏視覺內容——DOM、pointer-events:none、
+   data-tauri-drag-region 都不動，佔位高度與寬度照舊（不塌陷），拖曳區
+   仍是整條 .titlebar 本身的 data-tauri-drag-region 在接手，不靠這兩個
+   子元素的可見度。Windows 維持原樣（保留標題是該平台慣例）。 */
+html[data-platform="macos"] .titlebar .app-icon,
+html[data-platform="macos"] .titlebar .app-title {
+  opacity: 0;
+}
+
 /* ------------------------------------------------------------ 骨架 */
 
 .shell {
@@ -841,12 +883,22 @@ body {
   min-width: 0;
 }
 
+/* 標題與逐欄錯誤同一行：標題固定在左，錯誤訊息靠右——省下獨立一行的
+   垂直空間。長訊息允許換到第二行（可讀性優先，不截斷），但仍維持右對齊。 */
+.field-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .edit-label {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.6px;
   text-transform: uppercase;
   color: var(--muted);
+  flex-shrink: 0;
 }
 
 .input {
@@ -894,10 +946,19 @@ body {
   font-size: 10.5px;
   line-height: 14px;
   color: var(--red);
+  overflow-wrap: anywhere;
 }
 
 .field-error.show {
   display: block;
+}
+
+/* 掛在 .field-head 裡的逐欄錯誤：靠右對齊，長訊息換行也維持右對齊；
+   不設固定寬度，讓 flex 依可用空間收縮換行（min-width:0 在 .field-head 上）。 */
+.field-head .field-error {
+  margin-left: auto;
+  text-align: right;
+  min-width: 0;
 }
 
 .field-error.general {

@@ -63,6 +63,38 @@ Windows 系統匣（tray）SSH 隧道管理工具，以 [Tauri v2](https://tauri
 
 Free code signing provided by [SignPath.io](https://signpath.io/) , certificate by [SignPath Foundation](https://signpath.org/) .
 
+## macOS 支援
+
+macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機驗證的時間還沒有 Windows 版久，發佈時會在 Release 說明中標註為 beta。
+
+### 需求
+
+- macOS 12（Monterey）以上
+- **僅支援 Apple Silicon（`arm64`）**，沒有 Intel（`x86_64`）版本
+- `ssh`（系統內建的 OpenSSH 用戶端即可，不必額外安裝）
+- 選配：`cloudflared`，若你的 SSH 主機需要透過 Cloudflare Access 存取
+
+### 安裝
+
+到 [Releases](https://github.com/hunandy14/traytunnel/releases) 頁面下載其中一種：
+
+| 檔名 | 說明 |
+| --- | --- |
+| `traytunnel-<版本>-aarch64.dmg` | 安裝映像，掛載後把 `Traytunnel.app` 拖進「應用程式」資料夾 |
+| `traytunnel-<版本>-aarch64.app.tar.gz` | 免安裝的 `.app` 壓縮包，解壓後一樣要拖進「應用程式」資料夾 |
+
+**不論哪一種，都務必先把 `Traytunnel.app` 拖進「應用程式」資料夾再開啟**，不要直接從掛載的 dmg 視窗或 `~/Downloads` 裡雙擊執行。這不只是慣例：macOS 對「帶隔離標記、卻沒被搬進正式位置」的 app 會做 App Translocation（Gatekeeper 的路徑隨機化），直接執行的話系統會把它塞進一個唯讀的隨機路徑跑，應用內更新在那個路徑下必定失敗（寫入被拒絕）；搬進「應用程式」資料夾之後 macOS 才不會再套用這個機制。
+
+我們用的是 **ad-hoc 簽章**（沒有 Apple Developer 憑證），所以第一次開啟會被 Gatekeeper 擋下「無法驗證開發者」。解法：在「應用程式」資料夾裡對 `Traytunnel.app` 按右鍵 → **打開**，跳出的對話框再按一次「打開」即可；只有第一次需要這樣做，之後雙擊就能正常啟動。
+
+### 已知限制
+
+- **從 Finder／開機自啟啟動時，`PATH` 會由登入 shell 補回來**：launchd 給 GUI 行程的 `PATH` 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，你在 `.zshrc`／`.zprofile` 裡加的東西一概不在裡面——而 ssh 的 `ProxyCommand`（預設值 `cloudflared access ssh --hostname %h`）是交給 `/bin/sh -c` 跑的，Homebrew 裝的 `cloudflared` 在 `/opt/homebrew/bin`，於是雙擊啟動的實例會每一條隧道都在 `sh: cloudflared: not found` 上失敗，從終端機啟動的同一支程式卻完全正常。traytunnel 啟動時若發現 `PATH` 就是那份最小集，會跑一次 `$SHELL -ilc` 把你真正的 `PATH` 問回來（五秒逾時，問不到就照原樣啟動並在活動日誌留一行）。從終端機啟動時這一步完全不會跑。Windows 版沒有這個問題（GUI 行程本來就繼承使用者的 `PATH`）。
+- **開機自啟的開關是「下一次登入」生效**：打開就是寫一份 plist 進 `~/Library/LaunchAgents`，關掉就是把它刪掉，launchd 在下一次登入時讀那個資料夾。程式**不會**呼叫 `launchctl load`／`unload` 讓它立即生效——那樣做會有兩個很不舒服的副作用：`load` 會當場多開一個實例（因為那份 plist 的 `RunAtLoad` 是 true），而 `unload` 在「這一次就是開機自啟進來的」情況下等於請系統把 traytunnel 自己殺掉（連同它管的 ssh 一起變成孤兒）。Windows 版寫 HKCU 的 Run 值同樣是下次登入才生效，兩邊語意一致。
+- **沒搬進「應用程式」資料夾就開啟時，開機自啟會拒絕開啟**：直接從 dmg 視窗或 `~/Downloads` 雙擊時，macOS 會做 App Translocation，把程式掛在一個唯讀的隨機路徑（`/private/var/folders/…/AppTranslocation/…`）底下跑。那個路徑下次登入就不存在了，寫進 LaunchAgent 只會得到「開關顯示為開、實際永遠啟動不到」。因此這種情況下開關會直接回一句「請先把 `Traytunnel.app` 搬進『應用程式』資料夾再開啟」而不寫入；同一道保護也讓自啟自癒不會把你原本指向 `/Applications` 的那份好設定覆寫掉。
+- **開機自啟的偵測不含「使用者在系統設定裡手動停用」的狀態**：程式判斷開機自啟是否生效，看的是自己有沒有寫入 `~/Library/LaunchAgents` 底下的 plist；如果你在「系統設定 → 一般 → 登入項目」把它關掉，程式不會發現，畫面上的開關依然顯示為開啟。Windows 版有對齊「工作管理員」的停用紀錄，macOS 版目前還沒有對應的偵測。
+- **被強制結束（`kill -9`）或當掉時，那一瞬間的 ssh 會活下來，但下一次啟動會清掉**：Windows 版靠 Job Object 由核心保證「主程式沒了，整棵程序樹就沒了」，macOS 沒有等價機制。正常退出、Dock 的 Quit、登出、`kill`（SIGTERM）、Ctrl+C 都會走過完整的收尾；只有 `kill -9` 與真正的當機來不及。那種情況下 traytunnel 會在下一次啟動時，比對 `~/Library/Application Support/com.traytunnel.desktop/supervised-pgids.json` 裡記下的命令列，把上一輪留下、還握著本地埠的 ssh 清掉。
+
 ## 介面
 
 介面上的用詞與設定檔的結構對應：一個 `[[sources]]` 在畫面上叫一條**連線**（connection），底下的每個 `[[sources.forwards]]` 叫一條**隧道**（tunnel）。
@@ -96,15 +128,19 @@ Free code signing provided by [SignPath.io](https://signpath.io/) , certificate 
 
 ```
 npm install
-npm run tauri dev
+npm run dev
 ```
+
+要在 `src-tauri/src/platform/` 底下加平台相依功能，或想知道跨平台程式碼的規則，先看
+[`docs/platform-guide.md`](docs/platform-guide.md)（一頁內講完：資料夾結構、共用核心的
+可見性規則、新增功能的流程、CI 雙腿守門、live 測試慣例）。
 
 ### 瀏覽器 UI 開發模式
 
 只想調畫面、不想每次都等 Rust 編譯時，可以只開前端：
 
 ```
-npm run dev
+npm run web:dev
 ```
 
 然後用瀏覽器打開 http://localhost:1420/ 。整個 UI 只有這一頁，主區靠左側欄切換。
@@ -124,19 +160,22 @@ npm run dev
   - `__mock.updateFails()` 讓按下 `Restart to update` 演成失敗，看鈕從 `Restarting…` 彈回來、原因寫進設定頁的錯誤列
   - 真後端的背景車道對「已是最新」與「檢查失敗」都是靜默的（失敗只在活動日誌留一行），畫面上沒有對應的狀態，所以那兩種結果沒有東西好演
 
-假後端只在 `npm run dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
+假後端只在 `npm run web:dev` 且偵測不到 Tauri 時才會動態載入。正式建置時 `import.meta.env.DEV` 是常數 `false`，整段連同 `src/dev-mock.ts` 都會被搖掉，不會進打包產物。
 
 ## 建置
 
-三個指令，差別只在要不要順便打包安裝檔：
+四個指令，差別只在目標平台、要不要順便打包安裝檔：
 
 | 指令 | 做什麼 |
 | --- | --- |
-| `npm run build:exe` | 只編免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
-| `npm run build:setup` | 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
-| `npm run build:all` | 走設定檔裡列的全部 bundle 目標（`tauri build`），要發佈時用 |
+| `npm run build:win:exe` | 只編 Windows 免安裝執行檔，跳過打包（`tauri build --no-bundle`），平常改完程式驗一下最快 |
+| `npm run build:win:setup` | Windows 執行檔＋NSIS 安裝檔（`tauri build --bundles nsis`） |
+| `npm run build:mac` | macOS `.app`（`tauri build --bundles app`），建完複製一份到 `bin/` 方便本機直接雙擊試跑 |
+| `npm run build:dist` | 走設定檔裡列的全部 bundle 目標（`tauri build`），當前平台的完整發佈建置＋打包，要發佈時用；CI 的 `release.yml` 走的是同一套邏輯，但直接呼叫 `tauri build --target <matrix.rust_target>` + `node scripts/package.mjs --target <matrix.rust_target>`（見該檔 build job），`build:dist` 是本機等價流程，不帶 `--target` |
 
-三個指令都會在建置後跑 `node scripts/package.mjs`，把產物複製成發佈用的檔名放進根目錄的 `out/`（每次重跑會先清空）：
+沒有裸的 `npm run build`：光看這個名字猜不出是要建前端還是建整個 app，改名後打錯字會直接得到明確的 `missing script` 錯誤（腳本命名規則見 [`docs/platform-guide.md`](docs/platform-guide.md#scripts-命名規則)）。
+
+`build:win:exe`／`build:win:setup`／`build:dist` 會在建置後跑 `node scripts/package.mjs`，把產物複製成發佈用的檔名放進根目錄的 `out/`（每次重跑會先清空）：
 
 | 發佈檔 | 說明 |
 | --- | --- |
@@ -144,9 +183,11 @@ npm run dev
 | `out/traytunnel-<版本>p.exe` | 可攜版。**與上面同一顆二進位**，差別只在檔名結尾的 `p`——那個 p 就是可攜模式的記號，設定檔改放 exe 旁邊 |
 | `out/traytunnel-<版本>-setup.exe` | NSIS 安裝檔 |
 
-版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/` 只是複製出來的發佈命名版本，已列入 `.gitignore`。
+`build:mac` 跑的是另一支腳本 `node scripts/copy-app-bundle.mjs`，把 `.app` 複製到根目錄的 `bin/`（同樣每次重跑先清空），不寫 `out/`——macOS 的正式發佈檔（`.dmg`／`.app.tar.gz`）是 `build:dist` 的產物。
 
-更新簽章：`tauri.conf.json` 開了 `bundle.createUpdaterArtifacts`，打包時會替 NSIS 安裝檔簽出一份 `.sig`（就落在安裝檔旁邊）。因此 `build:setup`／`build:all` 在**沒有簽章私鑰**的環境會在最後一步失敗——安裝檔本身已經產出，但簽不出 `.sig`，`tauri` 以非零狀態結束，後面的 `scripts/package.mjs` 也就不會跑到。平常只是要驗程式請用 `build:exe`（`--no-bundle` 根本不會走到簽章那一步）；真的要在本地打包安裝檔時，先設好 `TAURI_SIGNING_PRIVATE_KEY`（私鑰檔的**內容**）與 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（沒設密碼也要給空字串，否則 tauri 會停下來問）。私鑰放在 repo 的 `secrets\`，已列入 `.gitignore`；CI 的 `release.yml` 則從 GitHub Secrets 取同一把鑰匙。私鑰與 `tauri.conf.json` 裡的 `plugins.updater.pubkey` 對不起來時 tauri 會印一行警告，那種簽章在使用者端會驗不過。
+版本號取自 `src-tauri/Cargo.toml` 的 `[package]` `version`（單一來源）。來源檔還沒建出來的那一項會跳過並印一行提示，所以 `build:win:exe` 不產安裝檔也能照跑。原始產物仍留在 `src-tauri/target/release/` 底下，`out/`／`bin/` 只是複製出來的方便命名版本，都已列入 `.gitignore`。
+
+更新簽章：`tauri.conf.json` 開了 `bundle.createUpdaterArtifacts`，打包時會替 updater 產物（Windows 的 NSIS 安裝檔、macOS 的 `.app.tar.gz`）簽出一份 `.sig`。**本機沒有簽章私鑰時**：`build:win:setup`／`build:dist` 會在最後一步失敗——安裝檔本身已經產出，但簽不出 `.sig`，`tauri` 以非零狀態結束，後面的 `scripts/package.mjs` 也就不會跑到；`build:win:exe`（`--no-bundle`）完全不受影響，本來就不會走到打包與簽章那一步。`build:mac` 則是刻意在指令裡多帶一個 `--config '{"bundle":{"createUpdaterArtifacts":false}}'`，只為本機快速試跑 `.app` 這個用途覆寫掉 updater 產物開關——沒有這個覆寫的話，`--bundles app` 一樣會嘗試產出 `.app.tar.gz` 並簽章，本機沒有私鑰時會在最後一步炸掉，`.app` 明明已經建好卻因為 `&&` 短路，`scripts/copy-app-bundle.mjs` 完全不會被跑到，`bin/` 什麼都拿不到（這正是 `build:mac` 曾經回報過的「npm run 跑失敗、直接下 `tauri build --bundles app` 卻像是成功」的根因：兩者其實同樣會失敗，只是後者的失敗訊號很容易在只看終端機最後幾行、或指令有接 `| tee`／`| tail` 之類管線吃掉 exit code 時被忽略掉）。平常只是要驗程式請用 `build:win:exe`（Windows）或 `build:mac`（macOS），兩者都不需要簽章私鑰也能穩定出 `.exe`／`.app`；真的要在本地打包安裝檔或 updater 產物時，先設好 `TAURI_SIGNING_PRIVATE_KEY`（私鑰檔的**內容**）與 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（沒設密碼也要給空字串，否則 tauri 會停下來問）。私鑰放在 repo 的 `secrets\`，已列入 `.gitignore`；CI 的 `release.yml` 則從 GitHub Secrets 取同一把鑰匙。私鑰與 `tauri.conf.json` 裡的 `plugins.updater.pubkey` 對不起來時 tauri 會印一行警告，那種簽章在使用者端會驗不過。
 
 注意：一定要走上面這幾個指令（底層都是 `tauri build`）。直接下 `cargo build --release` 產出的執行檔會去連 Vite 開發伺服器（`devUrl`），而不是內嵌的前端檔案，開起來會是一片空白。`cargo build` 只適合拿來檢查 Rust 端能不能編譯。
 
@@ -164,13 +205,15 @@ npm run bump <x.y.z>
 
 ### Release 流程
 
-發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` runner 上跑 `npm run build:all`，並把 `out/*.exe`、`SHA256SUMS.txt` 與應用內更新用的 `latest.json` 一起上傳成 GitHub Release。主流程只需要一個指令：
+發版走兩個 workflow 接力：`.github/workflows/autotag.yml` 負責建立並推送 tag，`.github/workflows/release.yml` 在 `windows-latest` 與 `macos-14` 兩個 runner 上分別呼叫 `tauri build --target <matrix.rust_target>` + `node scripts/package.mjs --target <matrix.rust_target>`（`build:dist` 是本機等價流程，不帶 `--target`），兩腿的建置產物與簽章下載回來後，再由 compose job 合併成一份雙平台的 `latest.json`，與 `out/*.exe`、`out/*.dmg`、`out/*.app.tar.gz`、`SHA256SUMS.txt` 一起上傳成 GitHub Release。主流程只需要一個指令：
 
 ```
 npm run release <x.y.z>
 ```
 
 它（`scripts/release.mjs`）會依序：建立 `release/<x.y.z>` 分支 → 跑 `npm run bump <x.y.z>` 同步版本號 → 同步 `Cargo.lock`／`package-lock.json` → commit → push → `gh pr create` 開 PR → `gh pr merge --auto --merge` 掛上 auto-merge → 切回 `main`。
+
+`release.yml` 也支援 `workflow_dispatch` 只重建其中一個平台（例如單獨補發 macOS）；`latest.json` 只有一個全域 `version` 欄位、沒有 per-platform 版本，因此單平台發佈有先天限制，用法與風險見 [`docs/release-risk-register.md`](docs/release-risk-register.md)。
 
 `main` 已開 branch protection，required status check 綁定的是 job 名稱，目前是 `.github/workflows/ci.yml` 裡的 `ci` 這個 job，要它綠燈才能合併（若之後改了這個 job 的 id，記得同步更新 branch protection 設定，否則 required check 會找不到對應狀態而永遠卡住）；`gh pr merge --auto` 會等 CI 通過後自動合併，合併進 `main` 後 `autotag.yml` 偵測到版號變動，自動建立並推送 tag `v<x.y.z>`，接著觸發 `release.yml` 建置發佈——全程不必再手動介入。
 

@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - main
+      # macOS 移植的整合分支與其下各車道分支，PR 一樣要跑完整 CI
+      - "agent/**"
   push:
     branches:
       - main
@@ -16,9 +18,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    runs-on: windows-latest
-    timeout-minutes: 20
+  # matrix job 本身刻意不叫 `ci`：branch protection 設定的必過 check context
+  # 是單一名字 `ci`，matrix 化之後這個 job 的 check 名會變成
+  # `build (windows-latest)` / `build (macos-latest)`，跟原本的 `ci` 對不上。
+  # 真正給 branch protection 看的 `ci` 是下面彙總 job，這樣保護規則完全不用動。
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      # 兩腿互不相依：其中一腿先炸掉時，另一腿照樣跑完，才能一次拿到雙平台的
+      # 完整診斷，不必炸一腿、修、再等下一輪才看到另一腿的結果。
+      fail-fast: false
+      matrix:
+        # primary 標記「平台無關的一次性關卡跑在哪一腿」（見下面 cargo fmt）。
+        # SCR-6：過去那些關卡是用 `matrix.os == 'windows-latest'` 綁 runner
+        # 標籤——標籤一改（windows-latest → windows-2025）或加第三腿，條件
+        # 就永遠不成立，關卡靜默消失而 ci 依然全綠。改成綁這個明確的旗標，
+        # 換 runner 標籤不再影響它。
+        include:
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            timeout_minutes: 20
+            primary: true
+          - os: macos-latest
+            rust_target: aarch64-apple-darwin
+            timeout_minutes: 30
+            primary: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,11 +55,11 @@ jobs:
           node-version: "24"
           cache: "npm"
 
-      - name: Setup Rust (stable-msvc)
+      - name: Setup Rust (stable, ${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
           components: clippy, rustfmt
 
       - name: Cache Rust build
@@ -44,14 +70,30 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      # scripts/lib/*.mjs（latest.json／SHA256SUMS.txt 的底稿合併邏輯，見
+      # release.yml 的 compose job）是純 Node 邏輯，只要幾秒鐘。SCR-6：兩腿
+      # 都跑——不是為了保險而重複，而是這組測試會碰到路徑處理，Windows 與
+      # POSIX 的路徑分隔符差異只有真的在兩個平台上跑才驗得到；成本是幾秒，
+      # 不值得為它省。放在最前面（Build frontend 之前）是因為 test:release
+      # 不依賴前端或 Rust 產物，能給出這個 workflow 裡最快的失敗訊號；這組
+      # 測試以前完全沒有被任何 CI 跑過，合併邏輯改壞了也不會被擋下來。
+      - name: Run release pipeline unit tests
+        run: npm run test:release
+
       - name: Build frontend (tsc + vite)
-        run: npm run build
+        run: npm run web:build
 
       # 排版與 lint 擋在測試之前：這兩關失敗的修法都是機械式的，
       # 不必等一輪測試跑完才知道。
       # clippy 一定要排在「Build frontend」之後——tauri 的 generate_context!
       # 會把 ../dist 的前端產物嵌進去，dist 不存在的話連 check 都過不了。
+      #
+      # cargo fmt --check 是純原始碼排版檢查，跟平台無關（不碰路徑、不碰
+      # 條件編譯），兩腿跑出來的結果必然一致，只留 primary 腿跑一次即可，
+      # 省下另一腿重複這一步的時間。條件綁 matrix.primary 而不是 runner
+      # 標籤——見上面 matrix 的說明。
       - name: Check Rust formatting
+        if: matrix.primary
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
       - name: Run clippy
@@ -59,3 +101,20 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  # 彙總 job：branch protection 唯一認得的 check context。matrix 腿的名字
+  # 再怎麼變都不影響它，只要這個 job 還叫 `ci`。
+  ci:
+    name: ci
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        run: |
+          result="${{ needs.build.result }}"
+          echo "build matrix result: $result"
+          if [ "$result" != "success" ]; then
+            echo "至少一腿 matrix 失敗或被取消，判定 ci 失敗。"
+            exit 1
+          fi

@@ -4,6 +4,7 @@ import { el, h, setToggle } from "./dom";
 import { hydrateIcons, icon } from "./icons";
 import {
   deleteForward,
+  frontendReady,
   getState,
   onConfigChanged,
   onExitStatus,
@@ -827,9 +828,11 @@ function requestDelete(local: number) {
 
 /**
  * 關窗前把所有還在倒數的刪除 undo toast 立刻補提交，不要讓倒數被視窗關閉打斷。
- * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit
- * 與 Alt+F4 都是不經過這顆按鈕的關窗路徑（前者是 Rust 端直接處理，後者是
- * 視窗系統直接關閉），前端這裡一律攔不到，是已知限制。
+ * 只覆蓋前端自己攔得到的關窗路徑（標題列的 Close 按鈕）；系統匣選單的 Exit、
+ * Alt+F4、mac 原生紅綠燈的關閉鈕（mac 上這顆按鈕本來就藏起來，紅綠燈接手同一份
+ * window_close 語意，見 styles.css 的 [data-platform="macos"] 規則）都是不經過
+ * 這顆按鈕的關窗路徑（前兩者是 Rust 端／視窗系統直接處理，後者是 AppKit 標準的
+ * performClose 直接觸發 CloseRequested），前端這裡一律攔不到，是已知限制。
  *
  * 回傳 Promise.allSettled，讓呼叫端能等所有 commit 真的送出去再繼續往下
  * 呼叫 windowClose——這是裁決採納的廉價保險：目前驗證過同一 tick 內派送
@@ -1096,6 +1099,16 @@ initSourceSheet({
 initTunnelSheet({ onDelete: requestDelete });
 initSocksSheet({ onDelete: requestDelete });
 render();
+/**
+ * 就緒信標，Rust 端的白屏診斷等的就是這一下（見 ipc.ts 的 frontendReady）。
+ *
+ * 刻意排在 render() 之後、bootstrap() 之前：它要回答的是「這份 JS 到底有沒有
+ * 跑起來、畫面有沒有東西」，render() 一跑完答案就已經是「有」了。掛在
+ * bootstrap 那條非同步鏈的尾巴反而會答錯——loadSnapshot 最多重試 5 秒，
+ * 那正好是 Rust 端的寬限時間，慢啟動會被誤判成「前端沒載進來」而被說明頁
+ * 蓋掉。信標本身失敗不影響任何功能，catch 掉不必往上丟。
+ */
+void frontendReady().catch(() => {});
 /**
  * initSettingsPage() 一開頭就會問 get_config_path，dev-mock 是動態 import、
  * 得等 bootstrap 把假後端裝好才問得到；正式版走真的 Tauri runtime，

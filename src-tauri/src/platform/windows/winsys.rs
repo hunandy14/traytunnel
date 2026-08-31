@@ -156,6 +156,37 @@ fn listening_v6(port: u16) -> bool {
     }
 }
 
+/// 一次取回本機所有正在 TCP LISTEN 的埠號（v4 ＋ v6 各掃一次表）。
+///
+/// 存在的理由是**成本**，不是語意：`is_listening` 每問一個埠就要走一次
+/// v4 表再走一次 v6 表。要問 K 個埠的呼叫端（`wg::busy_rows` 一次要問一整條
+/// 連線底下的每一列）於是做了 K 次同樣的表走訪，答案還都來自不同的瞬間。
+/// 取一次快照再 `contains` 只走一次，順帶讓那 K 個答案來自同一個時間點。
+///
+/// 語意與 [`is_listening`] 逐字相同：同樣兩張 `TCP_TABLE_OWNER_PID_LISTENER`
+/// 表、同樣的 `local_port` 位元組序換算。取表失敗時該族貢獻零筆（與
+/// `is_listening` 在那一族回 false 一致）——不要把「問不到」誤判成「有人佔著」。
+pub fn listening_ports() -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    if let Some(buf) = listener_table(AF_INET as u32) {
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+            let rows =
+                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
+        }
+    }
+    if let Some(buf) = listener_table(AF_INET6 as u32) {
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
+            let rows =
+                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            ports.extend(rows.iter().map(|r| local_port(r.dwLocalPort)));
+        }
+    }
+    ports
+}
+
 /// 本地時間的 `HH:mm:ss`，活動日誌每一行的時間戳。
 ///
 /// 只為了這一個格式扛一整包 chrono 不划算，時區換算交給 Windows 自己做：
@@ -210,26 +241,9 @@ fn metrics(cx: i32, cy: i32, fallback: (u32, u32)) -> (u32, u32) {
     }
 }
 
-/// 從多層 ICO 的尺寸清單裡挑一層，回傳索引。
-///
-/// 優先完全相符（完全不縮放）；沒有就取「大於它的最小一層」，讓系統縮小而不是
-/// 放大（縮小遠比放大乾淨）；再沒有就退而取最大的一層。
-pub fn pick_icon_layer(sizes: &[u32], want: u32) -> Option<usize> {
-    if sizes.is_empty() {
-        return None;
-    }
-    let exact = sizes.iter().position(|s| *s == want);
-    if exact.is_some() {
-        return exact;
-    }
-    let bigger = sizes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s > want)
-        .min_by_key(|(_, s)| **s)
-        .map(|(i, _)| i);
-    bigger.or_else(|| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i))
-}
+// 「從多層 ICO 的尺寸清單裡挑一層」（pick_icon_layer）不靠任何系統 API，是純
+// 數字邏輯，原本這裡與 macOS 版（`platform::macos::sys`）各自維護一份逐字相同的
+// 演算法，已上提到唯一的呼叫端 `crate::appicon`，不再由這個模組提供。
 
 /// 在 HKCU 底下寫一個字串值，subkey 不存在就建出來。
 pub fn write_hkcu_string(subkey: &str, name: &str, data: &str) -> io::Result<()> {
@@ -320,30 +334,110 @@ pub fn reveal_in_explorer(path: &std::path::Path) -> io::Result<()> {
 
 /// 用系統預設的瀏覽器開一個網址。
 ///
-/// 走 ShellExecuteW 而不是 `explorer.exe <url>` 或 `cmd /c start`：那兩條都要
-/// 另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。ShellExecuteW 是
-/// Windows 開啟關聯程式的正規做法（tauri-plugin-updater 自己叫安裝程式用的
-/// 也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+/// 走 shell 的「開啟關聯程式」API 而不是 `explorer.exe <url>` 或 `cmd /c start`：
+/// 那兩條都要另外生一個程序，命令列引號與 `&` 的轉義規則也各有各的坑。
+/// ShellExecute 系列是 Windows 開啟關聯程式的正規做法（tauri-plugin-updater
+/// 自己叫安裝程式用的也是它），呼叫端傳進來的又只有寫死的常數網址，沒有注入面。
+///
+/// ## 為什麼是 `ShellExecuteExW` + `SEE_MASK_NOASYNC`，不是 `ShellExecuteW`
+///
+/// `ShellExecuteW` 沒有地方可以帶旗標，等於**固定走非同步啟動**：shell 只要
+/// 把這次啟動排定下去就回傳（>32），真正把瀏覽器叫起來的那一段可能還在跑。
+/// 底下那段 COM 初始化的配對因此開出一個窗口——我們一回來就
+/// `CoUninitialize()`，apartment 被拆掉，還沒跑完的啟動就跟著死。這在預設
+/// 瀏覽器的 http handler 是 DelegateExecute／`IExecuteCommand` 型 COM handler
+/// 時會現形（Edge、Chrome 都有註冊這種 handler）：瀏覽器沒開、`rc > 32` 所以
+/// 我們也不會記下任何錯誤，前端的 invoke 照樣 resolve，是完全無聲的失敗。
+///
+/// `ShellExecuteExW` 的 `SEE_MASK_NOASYNC` 正是為了這件事存在的。MS 文件
+/// （Shell/ns-shellapi-shellexecuteinfow 的 fMask）寫得很直白：呼叫端執行緒
+/// 若沒有訊息迴圈、或即將結束，就 **must** 用這個旗標；用了之後
+/// `ShellExecuteExW` 會等到啟動真的完成才回傳，之後才拆 apartment 就安全了。
+/// 我們這條路（`spawn_blocking` 的一次性執行緒，回來就 `CoUninitialize`）
+/// 兩個條件都命中。
+///
+/// 一併帶 `SEE_MASK_FLAG_NO_UI`：失敗時不要由 shell 自己彈錯誤對話框——這支
+/// 函式回的是 `io::Result`，錯誤該由呼叫端決定怎麼呈現，而且這裡沒有父視窗
+/// （`hwnd` 是 null），彈出來的框會是無主的。
+///
+/// ## 為什麼這裡要自己初始化 COM
+///
+/// 這支函式以前只被 Tauri 的同步指令從**主執行緒**呼叫，那條執行緒上的 COM
+/// 早就被 Tauri／wry 初始化成 STA 了，所以什麼都不必做。macOS 車道為了不讓
+/// `open` 冷啟一個瀏覽器的一到三秒凍住 UI，把 `commands.rs` 的
+/// `open_release_page`／`open_releases_page` 挪進 `spawn_blocking`——那是
+/// tokio 的阻塞執行緒池，每一條都是全新的執行緒，**沒有人替它初始化過 COM**。
+///
+/// `ShellExecute` 的文件對此寫得很明白（Shell/nf-shellapi-shellexecutew 的
+/// Remarks）：「Because ShellExecute can delegate execution to Shell extensions
+/// … that use the COM threading model, COM should be initialized before
+/// ShellExecute is called」，並建議用
+/// `CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)`。
+/// 沒有初始化時症狀是「有些機器上開得起來、有些開不起來」——取決於使用者的
+/// 預設瀏覽器關聯有沒有走到需要 STA 的 Shell 擴充，是最難查的那一種。
+///
+/// 回傳值的兩種特殊情況都要照顧到：
+///
+/// * `S_FALSE`：這條執行緒**先前已經**初始化過（同一種模式），這仍然算成功，
+///   而且依規定一樣要配對一次 `CoUninitialize`。
+/// * `RPC_E_CHANGED_MODE`：這條執行緒已經以**另一種**模式（MTA）初始化過。
+///   這一次的 `CoInitializeEx` 沒有生效，因此**不可以**配對 `CoUninitialize`
+///   （那會把別人的初始化計數扣掉）；COM 本身是可用的，直接往下做。
 pub fn open_url(url: &str) -> io::Result<()> {
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+    let hr = unsafe {
+        CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
+    };
+    // 規則是「每一次**成功**的 CoInitializeEx（含回 S_FALSE 的那些）配一次
+    // CoUninitialize」，失敗的那些一律不配。`HRESULT` 是 i32，非負就是 SUCCEEDED
+    // ——這一個判斷同時涵蓋 S_OK、S_FALSE（要配）與 RPC_E_CHANGED_MODE、
+    // 其餘錯誤（不配），見上面那段說明
+    let must_uninitialize = hr >= 0;
+    if hr == S_FALSE {
+        log::debug!("COM was already initialized on this thread");
+    } else if hr == RPC_E_CHANGED_MODE {
+        log::debug!("COM is already initialized as MTA on this thread, leaving it as it is");
+    } else if hr < 0 {
+        log::warn!("CoInitializeEx failed with {hr:#010x}, calling ShellExecuteExW anyway");
+    }
+
+    // 兩個字串緩衝要活過整個呼叫：`lpVerb`／`lpFile` 收的是裸指標，
+    // 綁成具名 local 才不會在建 struct 的那個運算式結束時就被丟掉。
     let verb = wide("open");
     let file = wide(url);
-    let rc = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
+    // 其餘欄位（hwnd、lpParameters、lpDirectory、lpIDList、lpClass、hkeyClass、
+    // dwHotKey、聯合欄位、hProcess）全部歸零：`SHELLEXECUTEINFOW` 的
+    // `Default` 就是 `mem::zeroed()`，這正是 Win32 要的「沒有用到的欄位留 0」。
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
     };
-    // 舊式 API：回傳值大於 32 才算成功，小於等於 32 的那個數字本身就是錯誤碼
-    let code = rc as isize;
-    if code <= 32 {
-        return Err(io::Error::other(format!("ShellExecuteW failed with code {code}")));
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    // `hInstApp` 只在呼叫回來之後才有意義，而且要在拆 apartment 之前讀完
+    // （欄位是 by-value 讀，不會對 packed struct 取參考）
+    let inst = info.hInstApp as isize;
+    if must_uninitialize {
+        unsafe { CoUninitialize() };
+    }
+    // 兩道判斷都要：`ShellExecuteExW` 回 FALSE 是明確失敗，而它回 TRUE 時
+    // `hInstApp` 仍沿用舊式 ShellExecute 的約定——大於 32 才算成功，
+    // 小於等於 32 的那個數字本身就是錯誤碼（SE_ERR_*）
+    if ok == 0 || inst <= 32 {
+        return Err(io::Error::other(format!(
+            "ShellExecuteExW failed (returned {ok}, hInstApp {inst})"
+        )));
     }
     Ok(())
 }
@@ -497,64 +591,20 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// 圖示工廠產出的層序，測試照著它走
-    const LAYERS: [u32; 9] = [16, 20, 24, 28, 32, 48, 64, 128, 256];
+    // `pick_icon_layer` 本身的測試（完全相符優先、DPI 進位表、退讓方向、超過
+    // 最大層與空清單）已隨函式本體搬到 `crate::appicon`，與 macOS 版合併保留
+    // 兩邊的斷言資料，不在這裡重複一份。
 
-    /// 完全相符的層優先，這樣 GDI 完全不用縮放
-    #[test]
-    fn exact_layer_wins() {
-        assert_eq!(pick_icon_layer(&LAYERS, 16), Some(0));
-        // 175% DPI 的 28px 有專用層
-        assert_eq!(pick_icon_layer(&LAYERS, 28), Some(3));
-        assert_eq!(pick_icon_layer(&LAYERS, 32), Some(4));
-    }
+    // `metrics_are_sane_on_this_machine` 與 macOS 逐字相同（只差一句失敗訊息
+    // 的措辭），已搬到 `platform::process_tests`（跨平台契約容器），不在這裡
+    // 重複一份。
 
-    /// 視窗大圖示（SM_CXICON）在各 DPI 下都該挑到「不小於它」的層：
-    /// 放大會模糊，縮小不會
-    #[test]
-    fn large_icon_sizes_never_upscale() {
-        // 100%／125%／150%／175%／200%／250%／300% 的 SM_CXICON
-        let ladder = [(32, 32), (40, 48), (48, 48), (56, 64), (64, 64), (80, 128), (96, 128)];
-        for (want, expect) in ladder {
-            let idx = pick_icon_layer(&LAYERS, want).expect("一定挑得到一層");
-            assert_eq!(LAYERS[idx], expect, "{want}px 挑錯層");
-        }
-    }
-
-    /// 這台機器兩種圖示尺寸的合理性：大圖示不會比小圖示小，也不會是 0
-    #[test]
-    fn metrics_are_sane_on_this_machine() {
-        let (sw, sh) = small_icon_size();
-        let (lw, lh) = large_icon_size();
-        assert_eq!(sw, sh, "小圖示應為正方");
-        assert_eq!(lw, lh, "大圖示應為正方");
-        assert!(sw >= 16 && lw >= 32, "SM_CXSMICON={sw} SM_CXICON={lw}");
-        assert!(lw >= sw && lh >= sh, "大圖示不該小於小圖示");
-    }
-
-    /// 沒有專用層時寧可讓系統縮小，也不要放大
-    #[test]
-    fn falls_back_to_the_next_size_up() {
-        let sizes = [16, 24, 32];
-        assert_eq!(pick_icon_layer(&sizes, 20), Some(1)); // 24 縮到 20
-        assert_eq!(pick_icon_layer(&sizes, 28), Some(2)); // 32 縮到 28
-    }
-
-    /// 要的比所有層都大時只能拿最大的那層
-    #[test]
-    fn falls_back_to_the_largest_layer() {
-        assert_eq!(pick_icon_layer(&[16, 32, 24], 64), Some(1));
-        assert_eq!(pick_icon_layer(&[], 16), None);
-    }
-
-    /// 取表那段是手寫 FFI，用一個真的 listener 釘住行為：
-    /// 綁得起來的埠一定要被看見，否則 spawn 前的埠檢查就失去意義
-    #[test]
-    fn detects_a_real_listener() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("綁得起來");
-        let port = l.local_addr().unwrap().port();
-        assert!(is_listening(port), "剛綁上的 {port} 應該查得到");
-    }
+    // `detects_a_real_listener`：綁一個真的 listener、確認 `is_listening` 查得到，
+    // 已經被 `platform::process_tests` 的
+    // `a_bound_loopback_port_is_reported_as_listening`（§1(i)）涵蓋——那一支測的
+    // 是同一支門面函式 `platform::is_listening`（在 Windows 上就是這裡的
+    // `is_listening`），斷言同一件事，只是多了輪詢＋期限而不是綁完當場問一次，
+    // 覆蓋範圍只多不少，所以這裡整支刪掉不留副本。
 
     /// 自啟登錄值的內容格式是與 tauri-plugin-autostart 相容的關鍵：
     /// 一定要有 --tray，路徑一定要有引號（安裝路徑含空白時沒引號會被截斷）
@@ -640,19 +690,8 @@ mod tests {
         assert!(approved_enabled(&name), "沒有紀錄就當成啟用");
     }
 
-    /// 時間戳的形狀就是日誌行的格式契約：固定八個字元的 HH:mm:ss
-    #[test]
-    fn local_time_is_a_fixed_width_hms() {
-        let ts = local_time_hms();
-        assert_eq!(ts.len(), 8, "{ts}");
-        let parts: Vec<&str> = ts.split(':').collect();
-        assert_eq!(parts.len(), 3, "{ts}");
-        let bounds = [24, 60, 60];
-        for (p, max) in parts.iter().zip(bounds) {
-            assert_eq!(p.len(), 2, "每段都要補到兩位：{ts}");
-            assert!(p.parse::<u32>().unwrap() < max, "{ts}");
-        }
-    }
+    // `local_time_is_a_fixed_width_hms` 與 macOS 逐字相同，已搬到
+    // `platform::process_tests`（跨平台契約容器），不在這裡重複一份。
 
     #[test]
     fn wide_is_nul_terminated() {

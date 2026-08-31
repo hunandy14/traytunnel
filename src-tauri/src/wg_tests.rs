@@ -5,6 +5,8 @@
 
 use super::*;
 
+// 只有 cfg(windows) 的 draining_covers_both_ssh_and_wg_workers 用得到
+#[cfg_attr(not(windows), allow(unused_imports))]
 use std::collections::BTreeMap;
 
 use crate::config::{
@@ -98,11 +100,13 @@ fn a_stale_worker_is_dropped_instead_of_overwriting_the_new_one() {
 }
 
 /// W6.3 收全部：ssh 與 wg 兩種 worker 都要被收掉，兩邊的埠都要回報成 stopped
+// 要有一個真的 Worker::Ssh 才測得到，而它得先建出 platform::ProcessSupervisor
+// （Windows 是 Job Object，macOS 是行程群組看管，兩邊都已實作，W3-A），兩平台都會跑
 #[test]
 fn draining_covers_both_ssh_and_wg_workers() {
     let wg_token = tokio_util::sync::CancellationToken::new();
     let mut slots: BTreeMap<u16, Option<(u64, Worker)>> = BTreeMap::new();
-    slots.insert(1080, Some((1, Worker::Ssh(crate::winsys::Job::new().unwrap()))));
+    slots.insert(1080, Some((1, Worker::Ssh(crate::platform::ProcessSupervisor::new().unwrap()))));
     slots.insert(1085, Some((2, Worker::Wg(CancelGuard(wg_token.clone())))));
     // 本來就沒人在跑的列不必回報
     slots.insert(2222, None);

@@ -1,4 +1,12 @@
 <!doctype html>
+<!-- data-platform 由 Rust 端在頁面載入前用 webview initialization script 寫進來
+     （src-tauri/src/lib.rs 的 PLATFORM_FLAG／platform-flag 外掛，值來自
+     cfg(target_os = "macos")，執行期判斷，不是建置期蓋章）。styles.css 靠這個
+     屬性做兩邊唯一的視覺分歧：mac 藏自繪的 −/× 換原生紅綠燈、幫紅綠燈留左上角
+     空間。這裡沒有預設值——script 在任何頁面內容解析之前就跑完，正常情況下
+     不會有沒套到屬性的一幀；若真的透過瀏覽器直接開這個檔案（不經 tauri），
+     屬性單純不存在，等同套用 Windows 那組樣式（styles.css 沒有另外的
+     [data-platform] 選擇器管這個狀態）。 -->
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -13,8 +21,19 @@
     <div class="titlebar" data-tauri-drag-region>
       <img class="app-icon" src="/icon.svg" alt="" data-tauri-drag-region />
       <span class="app-title" data-tauri-drag-region>Traytunnel</span>
-      <button class="tbtn" id="btn-min" title="Minimize" data-icon="minus"></button>
-      <button class="tbtn close" id="btn-close" title="Close" data-icon="x"></button>
+      <!-- Windows 專用的自繪最小化／關閉鈕。mac 上原生紅綠燈接手，這一組整組
+           靠 styles.css 的 [data-platform="macos"] 規則隱藏（見該檔說明），
+           DOM 與事件繫結不變——隱藏純粹是視覺，避免兩邊按鈕重疊。
+
+           這層容器要 data-tauri-drag-region：按鈕之間與右緣那幾 px 空隙
+           以前是 .titlebar 的拖曳區，包進這個 div 之後點到就拖不動了。
+           **不加 deep 值**：drag.js 只把 composedPath[0] 恰好等於帶屬性的
+           那個元素視為拖曳，兩顆 −／× 是 BUTTON、被 isClickableElement
+           擋掉，照樣點得到；bare 版剛好只補回空隙那一塊。 -->
+      <div class="win-controls" data-tauri-drag-region>
+        <button class="tbtn" id="btn-min" title="Minimize" data-icon="minus"></button>
+        <button class="tbtn close" id="btn-close" title="Close" data-icon="x"></button>
+      </div>
     </div>
 
     <div class="shell">
@@ -129,7 +148,10 @@
           <div class="setting-row">
             <span class="setting-icon" data-icon="power" data-icon-size="17"></span>
             <div class="setting-text">
-              <div class="setting-name">Start with Windows</div>
+              <!-- 平台中立：這一列在 macOS 上走的是 LaunchAgent、Windows 上是
+                   HKCU 的 Run 機碼，同一個 toggle 兩邊都成立，標題不該只寫其中
+                   一邊。副標本來就是中立的「at sign-in」，標題跟上。 -->
+              <div class="setting-name">Start at login</div>
               <div class="setting-hint">Launch Traytunnel at sign-in</div>
             </div>
             <button class="toggle" id="tg-autostart" role="switch" aria-checked="false"></button>
@@ -219,24 +241,32 @@
           <!-- SSH 欄位 -->
           <div class="type-fields" id="src-fields-ssh">
             <label class="sheet-field field-name">
-              <span class="edit-label">Name</span>
+              <span class="field-head">
+                <span class="edit-label">Name</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-name" spellcheck="false" placeholder="tokyo" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-host">
-              <span class="edit-label">Host</span>
+              <span class="field-head">
+                <span class="edit-label">Host</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-host" spellcheck="false" placeholder="gateway.example.com" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-user">
-              <span class="edit-label">User</span>
+              <span class="field-head">
+                <span class="edit-label">User</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-user" spellcheck="false" placeholder="ubuntu" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-proxyCommand">
-              <span class="edit-label">ProxyCommand</span>
+              <span class="field-head">
+                <span class="edit-label">ProxyCommand</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="src-proxy" class="mono" spellcheck="false" placeholder="cloudflared access ssh --hostname %h" /></span>
-              <span class="field-error"></span>
             </label>
           </div>
 
@@ -245,26 +275,32 @@
                在 DOM 裡撞到（兩組欄位同時存在，只是靠 hidden 切換）。 -->
           <div class="type-fields" id="src-fields-wg" hidden>
             <label class="sheet-field field-wgName">
-              <span class="edit-label">Name</span>
+              <span class="field-head">
+                <span class="edit-label">Name</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="wg-name" spellcheck="false" placeholder="home-relay" /></span>
-              <span class="field-error"></span>
             </label>
             <label class="sheet-field field-conf">
-              <span class="edit-label">.conf path</span>
+              <span class="field-head">
+                <span class="edit-label">.conf path</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input with-icon">
                 <!-- 路徑可以手打／貼上，不是唯讀的選檔結果；送出期間由 setBusy 暫時鎖成唯讀 -->
                 <input id="wg-conf" class="mono" spellcheck="false" placeholder="C:\Users\you\wg\home-relay.conf" />
                 <button class="input-icon-btn" id="wg-pick" type="button" title="Browse…" data-icon="folder-open" data-icon-size="14"></button>
               </span>
-              <span class="field-error"></span>
             </label>
             <!-- 選填的 MTU 覆寫，緊貼 .conf 路徑欄下方：它修飾的就是上面那份檔案。
                  空白＝照 .conf（.conf 也沒寫就用 1280），永遠不回寫那份檔案。 -->
             <label class="sheet-field field-mtu">
-              <span class="edit-label">MTU</span>
+              <span class="field-head">
+                <span class="edit-label">MTU</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="wg-mtu" class="mono" spellcheck="false" placeholder="Auto (1280 or config value)" /></span>
               <span class="setting-hint">Overrides the config file. Raise it (e.g. 1400) for throughput if your line allows; lower it if pages stall.</span>
-              <span class="field-error"></span>
             </label>
           </div>
 
@@ -302,21 +338,27 @@
 
         <div class="sheet-body">
           <label class="sheet-field field-name">
-            <span class="edit-label">Name</span>
+            <span class="field-head">
+              <span class="edit-label">Name</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="fwd-name" spellcheck="false" placeholder="forward" /></span>
-            <span class="field-error"></span>
           </label>
           <label class="sheet-field field-local">
-            <span class="edit-label">Local port</span>
+            <span class="field-head">
+              <span class="edit-label">Local port</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="fwd-local" class="mono" spellcheck="false" placeholder="1080" /></span>
-            <span class="field-error"></span>
           </label>
 
           <div class="proxy-flag-group">
             <label class="sheet-field field-remote">
-              <span class="edit-label">Remote</span>
+              <span class="field-head">
+                <span class="edit-label">Remote</span>
+                <span class="field-error"></span>
+              </span>
               <span class="input"><input id="fwd-remote" class="mono" spellcheck="false" placeholder="1080 (server-side port) or host:port" /></span>
-              <span class="field-error"></span>
             </label>
             <div class="sheet-toggle-row proxy-flag-row">
               <span class="toggle-row-label">Destination is a proxy</span>
@@ -348,14 +390,18 @@
 
         <div class="sheet-body">
           <label class="sheet-field field-name">
-            <span class="edit-label">Name</span>
+            <span class="field-head">
+              <span class="edit-label">Name</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="socks-name" spellcheck="false" placeholder="proxy" /></span>
-            <span class="field-error"></span>
           </label>
           <label class="sheet-field field-local">
-            <span class="edit-label">Local port</span>
+            <span class="field-head">
+              <span class="edit-label">Local port</span>
+              <span class="field-error"></span>
+            </span>
             <span class="input"><input id="socks-local" class="mono" spellcheck="false" placeholder="1080" /></span>
-            <span class="field-error"></span>
           </label>
           <span class="setting-hint">Starts a local SOCKS5 proxy server on this connection</span>
 

@@ -97,6 +97,11 @@ fn pf(
 const PLAIN: &str = "traytunnel";
 
 /// 四象限之一：exe 旁有同名檔、家目錄問得出來 → 可攜模式優先
+// 可攜模式的第二個觸發條件（exe 旁已有 traytunnel.toml）判定在 platform：
+// Windows 是 is_file()，macOS 一律 false（決議已定，不做可攜模式）。
+// 這一條釘的是 Windows 那半邊的規則；macOS 對應的規則見
+// `a_toml_beside_the_exe_does_not_mark_portable_on_macos`。
+#[cfg(windows)]
 #[test]
 fn portable_file_beside_the_exe_wins() {
     let exe = tmp_dir("loc-portable");
@@ -122,6 +127,8 @@ fn falls_back_to_the_home_dotfile() {
 }
 
 /// 之三：exe 旁有同名檔、家目錄問不出來 → 一樣是可攜模式
+// 同上，這一條也是 exe-adjacent 觸發條件，只在 Windows 成立。
+#[cfg(windows)]
 #[test]
 fn portable_wins_even_without_a_home_dir() {
     let exe = tmp_dir("loc-portable-nohome");
@@ -153,6 +160,9 @@ fn the_product_name_itself_does_not_end_with_p() {
 }
 
 /// 記號是結尾的 p，大小寫不敏感（Rufus 本尊就是 rufus-4.5p.exe 這種寫法）
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn a_trailing_p_marks_portable() {
     assert!(stem_marks_portable("traytunnel-0.2.0p"));
@@ -187,6 +197,9 @@ fn a_windows_copy_is_not_portable() {
 }
 
 /// 檔名含 p 時，設定檔就在 exe 旁邊，即使檔案還不存在、家目錄也問得出來
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn p_in_the_stem_wins_over_the_home_dotfile() {
     let exe = tmp_dir("loc-pstem");
@@ -199,6 +212,9 @@ fn p_in_the_stem_wins_over_the_home_dotfile() {
 }
 
 /// 檔名含 p 但檔案還不存在時，load 要就地建一份預設檔（Rufus 建 ini 的行為）
+// 可攜記號的判定在 platform：Windows 是結尾 p，macOS 一律 false（決議已定，
+// 不做可攜模式）。這一條釘的是 Windows 那半邊的規則。
+#[cfg(windows)]
 #[test]
 fn p_in_the_stem_creates_the_file_next_to_the_exe() {
     let exe = tmp_dir("loc-pstem-create");
@@ -233,6 +249,9 @@ fn an_empty_file_is_filled_in_with_defaults() {
 }
 
 /// 空檔擺在 exe 旁邊就是可攜模式的開關：程式補內容，家目錄那份不碰
+// 同樣是 exe-adjacent 觸發條件，只在 Windows 成立（macOS 見下方 cfg(target_os =
+// "macos") 那兩條）。
+#[cfg(windows)]
 #[test]
 fn an_empty_file_beside_the_exe_turns_on_portable_mode() {
     let exe = tmp_dir("empty-portable");
@@ -248,6 +267,9 @@ fn an_empty_file_beside_the_exe_turns_on_portable_mode() {
 
 /// 兩個觸發條件同時成立（檔名 p 結尾 ＋ exe 旁已有檔案）時是同一個結果，
 /// 而且既有檔案要被讀進來，不可以被預設值蓋掉
+// 兩個觸發條件都是 Windows 專屬（macOS 上兩者恆 false，這條在 macOS 上會退到
+// 家目錄點檔，`by_stem.portable` 斷言不成立）。
+#[cfg(windows)]
 #[test]
 fn both_portable_triggers_agree_on_the_same_file() {
     let exe = tmp_dir("loc-both");
@@ -273,6 +295,44 @@ fn a_directory_named_like_the_config_is_not_portable() {
     let home = tmp_dir("loc-home3");
     std::fs::create_dir_all(exe.join(TOML_NAME)).unwrap();
     assert!(!resolve_location(&exe, PLAIN, Some(&home)).portable);
+}
+
+// ------------------------------ macOS：兩個可攜觸發條件都恆不成立（W3 決議）
+
+/// macOS 決議：可攜模式的第一個觸發條件（檔名尾碼 p）一律不成立，
+/// 與 Windows 那半邊（見 `a_trailing_p_marks_portable`）相反——程式包在 `.app`
+/// bundle 裡發佈，「設定檔放執行檔旁邊」在 macOS 上根本不成立。
+#[cfg(target_os = "macos")]
+#[test]
+fn a_trailing_p_does_not_mark_portable_on_macos() {
+    assert!(!stem_marks_portable("traytunnel-0.2.0p"));
+    assert!(!stem_marks_portable("traytunnel-p"));
+    assert!(!stem_marks_portable("traytunnelp"));
+    assert!(!stem_marks_portable("traytunnel-0.2.0P"));
+    assert!(!stem_marks_portable("TRAYTUNNEL-P"));
+
+    let exe = tmp_dir("loc-pstem-macos");
+    let home = tmp_dir("loc-home-pstem-macos");
+    let loc = resolve_location(&exe, "traytunnel-p", Some(&home));
+    assert!(!loc.portable, "macOS 不做可攜模式，檔名 p 記號不該生效");
+    assert_eq!(loc.path, home.join(HOME_TOML_NAME));
+}
+
+/// macOS 決議：可攜模式的第二個觸發條件（exe 旁已有 `traytunnel.toml`）同樣一律
+/// 不成立。即使那份檔案真的存在，程式也不該把它當成生效設定去讀——一律走家目錄
+/// 的點檔，exe 旁那份原封不動。
+#[cfg(target_os = "macos")]
+#[test]
+fn a_toml_beside_the_exe_does_not_mark_portable_on_macos() {
+    let exe = tmp_dir("loc-adjacent-macos");
+    let home = tmp_dir("loc-home-adjacent-macos");
+    std::fs::write(exe.join(TOML_NAME), "closeToTray = true\n").unwrap();
+
+    let loc = resolve_location(&exe, PLAIN, Some(&home));
+    assert!(!loc.portable, "macOS 不做可攜模式，exe 旁的 traytunnel.toml 不該生效");
+    assert_eq!(loc.path, home.join(HOME_TOML_NAME));
+    // exe 旁那份檔案原封不動，不該被程式當成生效設定去讀
+    assert!(exe.join(TOML_NAME).is_file());
 }
 
 /// 壞檔備份跟著生效檔名走，兩種模式各自不同名
