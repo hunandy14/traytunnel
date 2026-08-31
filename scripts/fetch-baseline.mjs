@@ -44,11 +44,15 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { runCli } from "./lib/cli.mjs";
 import { fetchWithRetry } from "./lib/fetch-retry.mjs";
+import { assertBaselineShape } from "./lib/latest-json.mjs";
 import { parseSha256Sums } from "./lib/sha256sums.mjs";
 
 const VALIDATORS = {
+  // 不只是「解得開」：形狀壞掉的 latest.json（頂層是 null／陣列／字串，或
+  // platforms 是陣列）同樣視為暫時性失敗，而不是「拿到了一份空底稿」——與
+  // scripts/lib/latest-json.mjs 的 fail-closed 檢查同一份判定（SCR-2）。
   json: (text) => {
-    JSON.parse(text);
+    assertBaselineShape(JSON.parse(text), { allowAbsent: false });
   },
   sha256sums: (text) => {
     parseSha256Sums(text);

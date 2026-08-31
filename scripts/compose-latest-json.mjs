@@ -44,7 +44,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { readBaselineText } from "./lib/baseline.mjs";
 import { runCli } from "./lib/cli.mjs";
-import { mergeLatestJson } from "./lib/latest-json.mjs";
+import { assertBaselineShape, mergeLatestJson } from "./lib/latest-json.mjs";
 import { readManifest } from "./lib/manifest.mjs";
 
 /**
@@ -79,15 +79,22 @@ function resolvePlatformsFromManifests(dir, platformKeys, repo, tag, version) {
   return platforms;
 }
 
-/** 「沒有底稿」在 mergeLatestJson 這一側用空物件表示（見 scripts/lib/baseline.mjs） */
+/**
+ * 「沒有底稿」在 mergeLatestJson 這一側用空物件表示（見 scripts/lib/baseline.mjs）。
+ * 檔案裡真的有內容時就走 fail-closed 的形狀驗證（allowAbsent:false）：那份內容
+ * 必須是有效的 updater manifest，連 JSON null 都不算「沒有底稿」（SCR-2）。
+ */
 function readBaseline(path) {
   const raw = readBaselineText(path);
   if (raw === null) return {};
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(`底稿 ${path} 不是合法 JSON：${err.message}`);
   }
+  assertBaselineShape(parsed, { allowAbsent: false });
+  return parsed;
 }
 
 function main() {
