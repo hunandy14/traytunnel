@@ -548,10 +548,22 @@ fn read_autostart_command_at(base: &Path, name: &str) -> Option<String> {
 /// 把 LaunchAgent plist 寫進 `base` 資料夾，回傳寫出去的路徑。
 /// 覆寫既有檔案就是「更新登記內容」（自癒改寫 `ProgramArguments` 走的正是這條），
 /// launchd 下次登入讀到的自然是新的那一份。
+///
+/// **一定要走 [`crate::config::write_atomic`]（先寫 `.tmp` 再 `rename`），
+/// 不可以是 `fs::write`。** `fs::write` 是「先把舊檔截成 0 位元組，再一路寫進去」
+/// ——中間被 SIGKILL 帶走、或磁碟寫滿，留下的就是一份**殘缺的 XML**。launchd
+/// 下次登入解析不了它，開機自啟從此靜默失效，而 [`autostart_enabled_at`] 只看
+/// 「檔案在不在」，開關照樣顯示 ON：使用者看到的是一個打開著、卻什麼都不做的
+/// 開關，沒有任何線索。`rename(2)` 在同一個檔案系統上是原子的，於是同樣被打斷
+/// 時留下的是**完整的舊版**（自啟仍然有效），不是半截的新版。
+///
+/// 同一份理由讓 pgids 登記簿也走這一支（見 `pgids::write_at`），兩邊共用同一份
+/// 原子寫入實作。`create_dir_all` 留在這裡：`~/Library/LaunchAgents` 第一次啟用
+/// 自啟時可能還不存在，而 `write_atomic` 不管建資料夾這件事。
 fn write_autostart_plist_at(base: &Path, name: &str, exe: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(base)?;
     let path = plist_path_in(base, name);
-    std::fs::write(&path, plist_contents(&plist_label(name), exe))?;
+    crate::config::write_atomic(&path, &plist_contents(&plist_label(name), exe))?;
     Ok(path)
 }
 
