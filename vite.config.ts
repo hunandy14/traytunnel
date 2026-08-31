@@ -34,11 +34,17 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 打包後的 webview 是靠 tauri 的自訂協定（不是真的 http 伺服器根目錄）讀資源。
   // Vite 預設輸出的是絕對路徑（/assets/xxx.js），這在 dev（真的 http://localhost）
-  // 底下永遠正常，但在正式建置後由自訂協定載入時，絕對路徑要不要解得回同一份
-  // 資源，實測會隨 WebKit／WebView2 版本而不一致——這正是 Tauri 官方與社群多篇
-  // 「white screen in production」文章共同指向的頭號成因。改成相對路徑
-  // （./assets/xxx.js）就不依賴協定有沒有一個「根」，兩邊都吃得動，是 Tauri＋Vite
-  // 專案的標準建議做法，不是 mac 專屬修正。
+  // 底下永遠正常；改成相對路徑（./assets/xxx.js）是 Tauri＋Vite 專案常見的建議
+  // 做法，出發點是「不要依賴協定有沒有一個『根』」。
+  //
+  // 誠實記錄這個改動的份量：**這是一次推測性的緩解，不是有證據的修復**。原始
+  // 白屏在本機從來沒有重現過，Windows 的 WebView2 也沒有實測過這一版產物；
+  // 「解不回同一份資源」是社群文章的說法，不是我們自己量到的。
+  //
+  // 之所以留著而不是退回：prod 唯一的載入點就在協定的根（index.html 由自訂
+  // 協定從根送出），在那個位置 `/assets/x.js` 與 `./assets/x.js` 解出來的是
+  // 同一個 URL，兩種寫法等價——留著的成本是零，能不能真的擋掉那個症狀則未知。
+  // 真要確認只有一條路：拿 Windows 的正式產物開窗看一眼。
   base: "./",
   plugins: [htmlVersionPlugin(pkgVersion)],
   define: {
