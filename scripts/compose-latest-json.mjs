@@ -42,19 +42,25 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { mergeLatestJson } from "./lib/latest-json.mjs";
+import { readBaselineText } from "./lib/baseline.mjs";
+import { runCli } from "./lib/cli.mjs";
+import { assertBaselineShape, mergeLatestJson } from "./lib/latest-json.mjs";
 import { readManifest } from "./lib/manifest.mjs";
 
 /**
  * 對每個「這次應建置」的平台 key，讀 manifest 取得 asset／sig 檔名，驗證簽章檔
  * 真的存在，並用 --repo／--tag 現組下載網址。任何一步缺失都直接丟例外中止
  * （fail-closed）——見上面檔頭註解「--platforms」段落。
+ *
+ * version 一併傳給 readManifest 比對 manifest.version（WRP-5）：manifest 說的
+ * 版本必須就是這次發佈的版本，否則 latest.json 的 version 會跟下載網址的版本段
+ * 分岔（見 scripts/lib/manifest.mjs）。
  */
-function resolvePlatformsFromManifests(dir, platformKeys, repo, tag) {
+function resolvePlatformsFromManifests(dir, platformKeys, repo, tag, version) {
   const platforms = {};
   for (const key of platformKeys) {
     // 缺 manifest 或欄位不全時，readManifest 自己就會丟出清楚的錯誤訊息
-    const manifest = readManifest(dir, key);
+    const manifest = readManifest(dir, key, version);
     const sigPath = join(dir, manifest.sig);
     if (!existsSync(sigPath)) {
       throw new Error(
@@ -73,15 +79,22 @@ function resolvePlatformsFromManifests(dir, platformKeys, repo, tag) {
   return platforms;
 }
 
+/**
+ * 「沒有底稿」在 mergeLatestJson 這一側用空物件表示（見 scripts/lib/baseline.mjs）。
+ * 檔案裡真的有內容時就走 fail-closed 的形狀驗證（allowAbsent:false）：那份內容
+ * 必須是有效的 updater manifest，連 JSON null 都不算「沒有底稿」（SCR-2）。
+ */
 function readBaseline(path) {
-  if (!path || !existsSync(path)) return {};
-  const raw = readFileSync(path, "utf8").trim();
-  if (!raw) return {};
+  const raw = readBaselineText(path);
+  if (raw === null) return {};
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(`底稿 ${path} 不是合法 JSON：${err.message}`);
   }
+  assertBaselineShape(parsed, { allowAbsent: false });
+  return parsed;
 }
 
 function main() {
@@ -121,7 +134,13 @@ function main() {
     throw new Error("--platforms 至少要有一個平台 key");
   }
 
-  const platforms = resolvePlatformsFromManifests(values.dir, platformKeys, values.repo, values.tag);
+  const platforms = resolvePlatformsFromManifests(
+    values.dir,
+    platformKeys,
+    values.repo,
+    values.tag,
+    values.version,
+  );
 
   const baseline = readBaseline(values.baseline);
   const current = {
@@ -142,12 +161,4 @@ function main() {
   console.log(JSON.stringify(merged, null, 2));
 }
 
-// 這支腳本的每一種失敗都是「刻意擋下來的發佈事故」，訊息本身才是重點——
-// 直接讓例外冒出去只會在 CI log 裡留下一坨 stack trace，真正要看的那句話還
-// 得自己撈。統一收斂成 ::error:: 註記（會浮到 run 摘要），並以 exit 1 結束。
-try {
-  main();
-} catch (err) {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-}
+runCli(main);

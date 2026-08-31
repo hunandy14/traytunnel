@@ -8,8 +8,7 @@
  *
  * Usage:
  *   node scripts/fetch-baseline.mjs --url <URL> --out <輸出檔> \
- *     --validator json|sha256sums --on-404 empty-json|empty \
- *     [--attempts 5] [--label <log 用說明文字>]
+ *     --validator json|sha256sums [--attempts 5] [--label <log 用說明文字>]
  *
  * --validator  200 回應後，用什麼邏輯確認內容真的是合法底稿（不是被中間層
  *              換掉的錯誤頁、或半截內容）：
@@ -18,15 +17,14 @@
  *                             能解開即可（給 SHA256SUMS.txt 用）
  *              驗證失敗跟其他狀態碼一樣，視為暫時性失敗、進入重試。
  *
- * --on-404     確定 404（該資產目前線上真的不存在——首發，或這個 tag 還沒
- *              發過任何一腿）時要寫進 --out 的內容：
- *                empty-json   寫 `{}`（latest.json 用：mergeLatestJson 讀到
- *                             空物件視為沒有底稿）
- *                empty        寫空字串（SHA256SUMS.txt 用：mergeSha256Sums
- *                             讀到空字串視為沒有底稿）
+ * 確定 404（該資產目前線上真的不存在——首發，或這個 tag 還沒發過任何一腿）
+ * 時一律寫空字串。兩邊的合併邏輯對「空底稿」的判定本來就一致：
+ * compose-latest-json.mjs 的底稿讀取把純空白視為「沒有底稿」（等同 {}），
+ * mergeSha256Sums 讀到空字串也視為沒有底稿——過去的 --on-404 empty-json|empty
+ * 兩個值下游沒有任何行為差異，純粹是死重量（SIM-2）。
  *
  * 404 與「其他任何失敗」的分野是這支腳本存在的核心理由，不能弄反：
- *   HTTP 404      → 確定沒有底稿，寫 --on-404 指定的內容，不擋流程。
+ *   HTTP 404      → 確定沒有底稿，寫空字串，不擋流程。
  *   其他任何失敗  → 網路抖動、5xx、rate limit、或 200 但驗證不過（被攔截的
  *                   錯誤頁、半截內容）——一律視為暫時性，重試；重試用盡仍
  *                   失敗就以非零狀態退出，並印 ::error::。
@@ -35,31 +33,31 @@
  *   訊號——這正是這條腳本要擋下來的那類發佈事故。
  *
  * 重試：預設 5 次，第 i 次失敗後 sleep i*5 秒再重試（跟原本 bash 版本一致）。
+ * 這套「404 立刻分類／其餘退避重試」的政策實作在 scripts/lib/fetch-retry.mjs，
+ * 這支腳本只負責「404 要寫什麼、200 要寫哪裡」這層檔案語意；scripts/probe-release.mjs
+ * 共用同一份政策（過去 release.yml 的 bash 又手刻了第四份）。
  *
  * 無外部套件相依：用 Node 內建 global fetch，直接 node scripts/fetch-baseline.mjs ...。
  */
 
 import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { runCli } from "./lib/cli.mjs";
+import { fetchWithRetry } from "./lib/fetch-retry.mjs";
+import { assertBaselineShape } from "./lib/latest-json.mjs";
 import { parseSha256Sums } from "./lib/sha256sums.mjs";
 
 const VALIDATORS = {
+  // 不只是「解得開」：形狀壞掉的 latest.json（頂層是 null／陣列／字串，或
+  // platforms 是陣列）同樣視為暫時性失敗，而不是「拿到了一份空底稿」——與
+  // scripts/lib/latest-json.mjs 的 fail-closed 檢查同一份判定（SCR-2）。
   json: (text) => {
-    JSON.parse(text);
+    assertBaselineShape(JSON.parse(text), { allowAbsent: false });
   },
   sha256sums: (text) => {
     parseSha256Sums(text);
   },
 };
-
-const ON_404_CONTENT = {
-  "empty-json": "{}\n",
-  empty: "",
-};
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function main() {
   const { values } = parseArgs({
@@ -67,16 +65,15 @@ async function main() {
       url: { type: "string" },
       out: { type: "string" },
       validator: { type: "string" },
-      "on-404": { type: "string" },
       attempts: { type: "string", default: "5" },
       label: { type: "string" },
     },
   });
 
-  if (!values.url || !values.out || !values.validator || !values["on-404"]) {
+  if (!values.url || !values.out || !values.validator) {
     console.error(
       "用法：node scripts/fetch-baseline.mjs --url <URL> --out <輸出檔> " +
-        "--validator json|sha256sums --on-404 empty-json|empty [--attempts 5] [--label <說明文字>]",
+        "--validator json|sha256sums [--attempts 5] [--label <說明文字>]",
     );
     process.exit(1);
   }
@@ -86,63 +83,28 @@ async function main() {
     console.error(`::error::不認得的 --validator ${values.validator}（要 json 或 sha256sums）`);
     process.exit(1);
   }
-  const emptyContent = ON_404_CONTENT[values["on-404"]];
-  if (emptyContent === undefined) {
-    console.error(`::error::不認得的 --on-404 ${values["on-404"]}（要 empty-json 或 empty）`);
-    process.exit(1);
-  }
 
   const label = values.label || values.url;
-  const attempts = Number(values.attempts);
-  let lastFailureDetail = "（尚未嘗試）";
 
-  for (let i = 1; i <= attempts; i += 1) {
-    let response;
-    try {
-      // 60 秒逾時、跟隨轉址，跟原本 bash 版本的 `curl -sSL --max-time 60` 對齊。
-      response = await fetch(values.url, { redirect: "follow", signal: AbortSignal.timeout(60_000) });
-    } catch (err) {
-      lastFailureDetail = `連線失敗：${err instanceof Error ? err.message : String(err)}`;
-      console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-      if (i < attempts) await sleep(i * 5_000);
-      continue;
-    }
+  // 60 秒逾時、跟隨轉址，跟原本 bash 版本的 `curl -sSL --max-time 60` 對齊；
+  // 重試次數／退避秒數／404 與暫時性失敗的分野都由 fetchWithRetry 統一處理。
+  const result = await fetchWithRetry(values.url, {
+    attempts: Number(values.attempts),
+    validate,
+    label: `現行 ${label}`,
+    exhaustedHint:
+      "無法確認線上底稿內容，繼續下去可能把其他平台的條目/checksum 從底稿抹掉，因此中止。請稍後重跑。",
+  });
 
-    if (response.status === 404) {
-      console.log(`HTTP 404：${label} 目前不存在——視為空底稿`);
-      writeFileSync(values.out, emptyContent, "utf8");
-      return;
-    }
-
-    if (response.status === 200) {
-      const text = await response.text();
-      try {
-        validate(text);
-      } catch (err) {
-        lastFailureDetail = `HTTP 200 但內容驗證失敗：${err instanceof Error ? err.message : String(err)}`;
-        console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-        if (i < attempts) await sleep(i * 5_000);
-        continue;
-      }
-      writeFileSync(values.out, text, "utf8");
-      console.log(`抓到現行 ${label} 當底稿：`);
-      console.log(text);
-      return;
-    }
-
-    lastFailureDetail = `HTTP ${response.status}`;
-    console.log(`第 ${i} 次：${lastFailureDetail}，視為暫時性失敗`);
-    if (i < attempts) await sleep(i * 5_000);
+  if (result.notFound) {
+    console.log(`HTTP 404：${label} 目前不存在——視為空底稿`);
+    writeFileSync(values.out, "", "utf8");
+    return;
   }
 
-  console.error(
-    `::error::連續 ${attempts} 次都拿不到現行 ${label}（最後一次：${lastFailureDetail}），且不是 404。` +
-      `無法確認線上底稿內容，繼續下去可能把其他平台的條目/checksum 從底稿抹掉，因此中止。請稍後重跑。`,
-  );
-  process.exit(1);
+  writeFileSync(values.out, result.text, "utf8");
+  console.log(`抓到現行 ${label} 當底稿：`);
+  console.log(result.text);
 }
 
-main().catch((err) => {
-  console.error(`::error::${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+runCli(main);

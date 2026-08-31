@@ -1,7 +1,13 @@
 /**
- * 讀取 scripts/package.mjs 產出的 out/manifest.<platform_key>.json——release.yml
- * 的 compose job（組 latest.json）與 build job（驗證簽章一致性）共用同一套讀取
- * 邏輯，兩邊都不再手寫 traytunnel-<version>-... 這類檔名字面值。
+ * 讀取 scripts/package.mjs 產出的 out/manifest.<platform_key>.json，讓消費端不必
+ * 手寫 traytunnel-<version>-... 這類檔名字面值。
+ *
+ * 誠實的現況：目前只有 compose job 這一側（scripts/compose-latest-json.mjs）真的
+ * 用這支模組。release.yml 的 build job「Verify updater signature matches release
+ * asset」步驟是自己用 jq 讀同一份 manifest 的 .bundle_source／.asset，並沒有共用
+ * 這裡的讀取與驗證邏輯——所以這支模組加的欄位檢查（型別、platform_key／version
+ * 一致性）對 build job 那一側不生效。把那一步也 node 化、讓兩側共用同一個讀取點
+ * 是 backlog（REU-2），不是這支模組現在的事實。
  *
  * 檔名帶 platform_key 後綴的理由見 scripts/package.mjs 開頭註解：
  * download-artifact 的 merge-multiple 會把兩腿的 out/ 攤平進同一個目錄，共用
@@ -19,9 +25,10 @@ export function manifestFileName(platformKey) {
 /**
  * @param {string} dir out/ 目錄路徑
  * @param {string} platformKey 例如 "windows-x86_64" / "darwin-aarch64"
+ * @param {string} [expectedVersion] 這次發佈的版本；有給就一併比對 manifest.version
  * @returns {{ platform_key: string, version: string, asset: string, sig: string, bundle_source: string }}
  */
-export function readManifest(dir, platformKey) {
+export function readManifest(dir, platformKey, expectedVersion) {
   const path = join(dir, manifestFileName(platformKey));
   if (!existsSync(path)) {
     throw new Error(
@@ -40,6 +47,18 @@ export function readManifest(dir, platformKey) {
   if (manifest.platform_key !== platformKey) {
     throw new Error(
       `${path} 的 platform_key（${manifest.platform_key}）跟檔名裡的 ${platformKey} 對不起來`,
+    );
+  }
+  // WRP-5：跟上面的 platform_key 檢查同構的防禦。manifest 的 asset／sig 會被
+  // 拿去組 latest.json 的下載網址，而網址的版本段來自這次發佈的 tag——out/
+  // 底下若殘留上一版的 manifest（今天 package.mjs 每次都 rmSync，所以不會
+  // 發生；但這條假設不該是唯一的防線），latest.json 的 version 就會跟下載
+  // URL 的版本對不上，updater 下載 404 或直接裝回舊版。
+  if (expectedVersion !== undefined && manifest.version !== expectedVersion) {
+    throw new Error(
+      `${path} 的 version（${manifest.version}）跟這次發佈的 ${expectedVersion} 對不起來——` +
+        `out/ 底下可能殘留上一版的產物。latest.json 會用這次的版本組下載網址，` +
+        `跟舊 manifest 指到的檔名對不上，因此中止。`,
     );
   }
   return manifest;

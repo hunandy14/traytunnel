@@ -8,10 +8,22 @@
  * 手刻翻版）、macOS 腿、compose job 三處各自呼叫一次同一套邏輯的作法已經
  * 拿掉，避免三份同步改壞其中一處卻沒改到另外兩處的風險。
  *
+ * 兩條觸發路徑（SCR-5：自動發佈走的是 dispatch，不是 tag push）：
+ *   workflow_dispatch  **自動發佈的主路徑**。autotag.yml 建完 tag 之後是用
+ *                      `gh workflow run release.yml --ref <tag>` 觸發
+ *                      release.yml——GitHub 的防遞迴機制讓「用 GITHUB_TOKEN
+ *                      推的 tag」不會觸發任何 on: push: tags，所以 autotag
+ *                      必須自己 dispatch。這條路徑走下面的 else 分支：tag 由
+ *                      Cargo.toml 版本推導成 v<version>，再向遠端確認該 tag
+ *                      真的存在。
+ *   push               人工 `git push --tags` 時才會發生。只有這條路徑會做
+ *                      「tag 名稱與 Cargo.toml 版本一致」的檢查——也就是說，
+ *                      那道檢查在自動流程裡從來不會執行，不要把它當成唯一防線。
+ *
  * 環境變數（GITHUB_EVENT_NAME / GITHUB_REF_NAME / GITHUB_OUTPUT 由 Actions 自動提供）：
- *   GITHUB_EVENT_NAME  tag push 事件是 "push"，其餘（workflow_dispatch）視為手動觸發
+ *   GITHUB_EVENT_NAME  人工 tag push 是 "push"，其餘（workflow_dispatch）視為手動/自動觸發
  *   GITHUB_REF_NAME    push 事件時的 tag 名稱（例如 v0.6.5）
- *   DRY_RUN            "true" 時，手動觸發情境下略過「遠端 tag 是否存在」的檢查
+ *   DRY_RUN            "true" 時，dispatch 情境下略過「遠端 tag 是否存在」的檢查
  *                       （純演練用；正式發佈路徑，也就是 tag push 或
  *                       dry_run!=true 的 workflow_dispatch，這關卡照舊）
  *
@@ -20,15 +32,14 @@
  * 無相依，直接 node scripts/resolve-release.mjs。
  */
 
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readCargoVersion } from "./lib/cargo-version.mjs";
+import { readRepoCargoVersion } from "./lib/cargo-version.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const cargoTomlPath = join(root, "src-tauri", "Cargo.toml");
-const version = readCargoVersion(cargoTomlPath, readFileSync(cargoTomlPath, "utf8"));
+const version = readRepoCargoVersion(root);
 console.log(`Cargo.toml 版本：${version}`);
 
 const eventName = process.env.GITHUB_EVENT_NAME || "";

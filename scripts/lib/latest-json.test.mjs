@@ -157,19 +157,38 @@ test("邊界：options.tag 缺省要丟錯（陳舊條目斷言不能被靜默�
   assert.throws(() => mergeLatestJson(null, current, {}), /tag/);
 });
 
-test("邊界：baseline 是壞掉的形狀（platforms 不是物件、或整個是字串）不應炸掉，視同無底稿", () => {
+// SCR-2 規格翻轉：這個案例原本鎖定「壞形狀底稿＝視同無底稿」（fail-open），
+// 現在改成硬失敗（fail-closed）。理由：底稿是合法 JSON 但形狀壞掉時靜默當成
+// 「沒有底稿」，會讓這次沒建置的那個平台的條目從 latest.json 無聲消失，
+// 而且整條發佈流程全綠——正是這支模組要擋下來的那類事故。
+test("邊界：baseline 是壞掉的形狀（platforms 不是物件、或整個是字串）要丟錯，不可視同無底稿", () => {
   const current = {
     version: "0.1.0",
     pub_date: "2026-01-01T00:00:00.000Z",
     platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
   };
 
-  assert.deepEqual(mergeLatestJson({ platforms: "not-an-object" }, current, { tag: "v0.1.0" }).platforms, {
-    "windows-x86_64": WINDOWS_ENTRY_NEW,
-  });
-  assert.deepEqual(mergeLatestJson("garbage", current, { tag: "v0.1.0" }).platforms, {
-    "windows-x86_64": WINDOWS_ENTRY_NEW,
-  });
+  assert.throws(
+    () => mergeLatestJson({ platforms: "not-an-object" }, current, { tag: "v0.1.0" }),
+    /platforms/,
+  );
+  assert.throws(() => mergeLatestJson({ platforms: [] }, current, { tag: "v0.1.0" }), /platforms/);
+  assert.throws(() => mergeLatestJson("garbage", current, { tag: "v0.1.0" }), /不是 JSON 物件/);
+  assert.throws(() => mergeLatestJson([], current, { tag: "v0.1.0" }), /陣列/);
+});
+
+test("邊界：baseline 是 null／undefined／{} 仍視同無底稿（首發的 404 路徑必須保持綠）", () => {
+  const current = {
+    version: "0.1.0",
+    pub_date: "2026-01-01T00:00:00.000Z",
+    platforms: { "windows-x86_64": WINDOWS_ENTRY_NEW },
+  };
+
+  for (const baseline of [null, undefined, {}]) {
+    assert.deepEqual(mergeLatestJson(baseline, current, { tag: "v0.1.0" }).platforms, {
+      "windows-x86_64": WINDOWS_ENTRY_NEW,
+    });
+  }
 });
 
 // --- 保留條目的形狀驗證（壞條目原樣傳播會讓 updater 整份 manifest 反序列化

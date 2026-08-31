@@ -38,10 +38,69 @@
  * 3. version 單調性：這次的 version 比底稿還舊時發出警告（不硬擋）。取捨理由
  *    寫在 checkVersionMonotonicity 上面。
  *
+ * 4. 底稿本身的形狀（assertBaselineShape，fail-closed）：底稿只有「null／
+ *    undefined＝確定沒有」與「合法的 updater manifest」兩種合法狀態。是合法
+ *    JSON 但形狀壞掉（頂層 null／陣列／字串，或 platforms 是陣列）時硬失敗，
+ *    不再靜默視為「沒有底稿」——後者會讓另一個平台的條目無聲消失。
+ *
  * 純函式，不碰檔案系統／網路——I/O 交給呼叫端（見 scripts/compose-latest-json.mjs）。
  */
 
 import { SEMVER_RE, compareSemver } from "./semver.mjs";
+
+/** 非 null、非陣列的物件（JSON 物件）——陣列也是 typeof "object"，要另外排除 */
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * 底稿的形狀驗證（SCR-2，fail-closed）。
+ *
+ * 舊行為是 fail-open：底稿只要不是「物件且 platforms 是物件」就靜默當成
+ * 「沒有底稿」。那正好與這支模組的目標相反——底稿是合法 JSON 但形狀壞掉
+ * （頂層是 null／陣列／字串，或 platforms 是陣列）時，另一個平台的條目會
+ * 無聲消失：platform=macos 單腿補發時 releases/latest 回 200 但內容是
+ * null／[]，產出的 latest.json 只剩 darwin-aarch64，windows-x86_64 從
+ * updater endpoint 消失，而且整條流程全綠。
+ *
+ * 所以：null／undefined（＝確定沒有底稿，首發的 404 路徑）放行；其餘一律
+ * 必須是「非陣列物件」，platforms 若存在也必須是「非陣列物件」，否則丟錯。
+ *
+ * allowAbsent=false 給「手上已經有一份實際內容」的呼叫端用（例如
+ * fetch-baseline 對 HTTP 200 回應做的驗證、或 compose 讀到一個非空的底稿
+ * 檔）：那種情境下連 JSON null 都是壞形狀，不是「沒有底稿」——「沒有底稿」
+ * 只能由 404／檔案不存在／檔案空白來表示。
+ *
+ * @param {unknown} baseline
+ * @param {{ allowAbsent?: boolean }} [options]
+ * @returns {Record<string, unknown>} 底稿的 platforms（沒有底稿時是空物件）
+ */
+export function assertBaselineShape(baseline, options = {}) {
+  const { allowAbsent = true } = options;
+  if (baseline === null || baseline === undefined) {
+    if (allowAbsent) return {};
+    throw new Error(
+      "現行 latest.json 的內容是 JSON null／undefined，不是有效的 updater manifest。" +
+        "「沒有底稿」只能由 HTTP 404（或底稿檔不存在／空白）表示，不能由內容本身表示，因此中止。",
+    );
+  }
+  if (!isPlainObject(baseline)) {
+    throw new Error(
+      `現行 latest.json 的底稿不是 JSON 物件（實際是 ${Array.isArray(baseline) ? "陣列" : typeof baseline}）。` +
+        `這代表抓到的內容不是有效的 updater manifest；靜默當成「沒有底稿」會把另一個平台的條目` +
+        `從 latest.json 抹掉，因此中止。`,
+    );
+  }
+  if (baseline.platforms === undefined) return {};
+  if (!isPlainObject(baseline.platforms)) {
+    throw new Error(
+      `現行 latest.json 底稿的 platforms 不是 JSON 物件（實際是 ` +
+        `${baseline.platforms === null ? "null" : Array.isArray(baseline.platforms) ? "陣列" : typeof baseline.platforms}）。` +
+        `靜默當成「沒有底稿」會把另一個平台的條目從 latest.json 抹掉，因此中止。`,
+    );
+  }
+  return baseline.platforms;
+}
 
 /** 條目必須是 { signature: 非空字串, url: 非空字串 }；其餘欄位不管 */
 function isWellFormedEntry(entry) {
@@ -113,11 +172,8 @@ export function mergeLatestJson(baseline, current, options = {}) {
     }
   }
 
-  const baselineIsObject = !!baseline && typeof baseline === "object";
-  const basePlatforms =
-    baselineIsObject && baseline.platforms && typeof baseline.platforms === "object"
-      ? baseline.platforms
-      : {};
+  // fail-closed：形狀壞掉的底稿直接丟錯，不當成「沒有底稿」（見 assertBaselineShape）
+  const basePlatforms = assertBaselineShape(baseline);
 
   // 只驗「這次沒建置、要從底稿沿用」的條目：這次有建置的 key 反正會被覆寫掉，
   // 底稿裡就算是壞的也無所謂。
@@ -146,7 +202,7 @@ export function mergeLatestJson(baseline, current, options = {}) {
     }
   }
 
-  checkVersionMonotonicity(baselineIsObject ? baseline.version : undefined, current.version, onWarning);
+  checkVersionMonotonicity(isPlainObject(baseline) ? baseline.version : undefined, current.version, onWarning);
 
   return {
     version: current.version,

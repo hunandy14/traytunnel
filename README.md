@@ -65,7 +65,7 @@ Free code signing provided by [SignPath.io](https://signpath.io/) , certificate 
 
 ## macOS 支援
 
-macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機驗證的時間還沒有 Windows 版久，發佈時 Release 也會標記為 beta。
+macOS 版目前仍屬 **beta**：核心功能與 Windows 版對齊，但實機驗證的時間還沒有 Windows 版久，發佈時會在 Release 說明中標註為 beta。
 
 ### 需求
 
