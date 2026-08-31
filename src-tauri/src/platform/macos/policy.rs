@@ -71,12 +71,27 @@ pub fn enter_foreground(app: &AppHandle) {
     }
 }
 
-/// 視窗收起來就回 Accessory：Dock 圖示與選單列跟著消失，回到純系統匣常駐
-/// 的樣子，跟 `enter_foreground` 對稱。
-pub fn retire_to_tray(app: &AppHandle) {
+/// 切到 Accessory 並在失敗時記一行。
+///
+/// 底下兩支對外函式（[`retire_to_tray`]／[`initial_policy_for_tray_start`]）的
+/// 本體逐字相同——**那不是巧合，也不是可以合併成一支的重複**：它們是兩個不同的
+/// 時機（收視窗、啟動定調），各自帶著一整段為什麼要在那個時機這樣做的說明，
+/// 呼叫端讀的是名字。所以這裡只把「怎麼做」收成一份（少一份會漏掉的 `log::warn!`
+/// 措辭），「什麼時候做、為什麼」原樣留在各自的 doc 上。
+///
+/// 刻意**不**用 `pub use retire_to_tray as initial_policy_for_tray_start` 那種
+/// 別名：別名會讓兩份 doc 塌成一份，而模組開頭那段 M1 的否證紀錄正是掛在
+/// `initial_policy_for_tray_start` 上的。
+fn set_accessory(app: &AppHandle) {
     if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
         log::warn!("could not switch to the Accessory activation policy: {e}");
     }
+}
+
+/// 視窗收起來就回 Accessory：Dock 圖示與選單列跟著消失，回到純系統匣常駐
+/// 的樣子，跟 `enter_foreground` 對稱。
+pub fn retire_to_tray(app: &AppHandle) {
+    set_accessory(app);
 }
 
 /// 啟動時的起始 policy：純 tray 常駐，不要 Dock 圖示、不要出現在 Cmd+Tab
@@ -91,7 +106,5 @@ pub fn retire_to_tray(app: &AppHandle) {
 /// launch 時的 `activateIgnoringOtherApps` 生效並永久搶走鍵盤焦點。三個時機的
 /// 實測數據與結論見模組開頭。
 pub fn initial_policy_for_tray_start(app: &AppHandle) {
-    if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
-        log::warn!("could not switch to the Accessory activation policy: {e}");
-    }
+    set_accessory(app);
 }

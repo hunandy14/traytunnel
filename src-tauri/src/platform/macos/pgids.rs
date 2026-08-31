@@ -296,13 +296,11 @@ fn write_at(path: &Path, reg: &Registry) -> io::Result<()> {
 }
 
 /// 檔案沒有東西可留時就刪掉，不留一份空殼在使用者的資料夾裡。
+/// 「刪掉，本來就沒有也算成功」是 [`super::paths::remove_file_if_present`]
+/// （這個平台另一條路也要同一件事）。
 fn write_or_clear_at(path: &Path, reg: &Registry) -> io::Result<()> {
     if reg.entries.is_empty() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
+        return super::paths::remove_file_if_present(path);
     }
     write_at(path, reg)
 }

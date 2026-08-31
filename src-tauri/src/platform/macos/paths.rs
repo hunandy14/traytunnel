@@ -1,6 +1,25 @@
-//! 設定檔落腳處的 macOS 實作。
+//! 設定檔落腳處的 macOS 實作，以及這個平台幾支共用的檔案系統小工具。
 
+use std::io;
 use std::path::{Path, PathBuf};
+
+/// 刪掉一個檔案，**本來就沒有也算成功**。
+///
+/// 這個平台有兩條路要的是完全同一件事，原本各手寫一份逐字相同的 match：
+/// `sys::remove_autostart_plist_at`（關掉開機自啟＝刪 LaunchAgent plist）與
+/// `pgids::write_or_clear_at`（登記簿沒東西可留就把檔案刪掉）。兩者都是冪等的
+/// 「確保它不在」，而不是「刪一個一定存在的東西」，`NotFound` 因此是成功而不是
+/// 失敗——這正是 `platform/mod.rs` 開頭第四條規則（同一件事不准有第二份實作）
+/// 要收掉的那種重複。
+///
+/// 只吞 `NotFound`：權限不足、路徑上有東西不是檔案這些都是真的失敗，照實往上回。
+pub(super) fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 /// macOS 的設定檔家目錄：`$HOME`，語意與 Windows 的 `%USERPROFILE%` 對得上。
 ///

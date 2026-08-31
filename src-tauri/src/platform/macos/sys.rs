@@ -547,13 +547,10 @@ fn write_autostart_plist_at(base: &Path, name: &str, exe: &Path) -> io::Result<P
     Ok(path)
 }
 
-/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功）。
+/// 從 `base` 資料夾刪掉 plist；冪等（本來就沒有檔案也算成功，見
+/// [`super::paths::remove_file_if_present`]）。
 fn remove_autostart_plist_at(base: &Path, name: &str) -> io::Result<()> {
-    match std::fs::remove_file(plist_path_in(base, name)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    super::paths::remove_file_if_present(&plist_path_in(base, name))
 }
 
 /// 開機自啟目前是不是真的登記著。
