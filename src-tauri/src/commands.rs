@@ -908,7 +908,7 @@ pub fn get_config_path(state: State<'_, Shared>) -> String {
 //
 // 底下三支都是「請系統開一個東西給使用者看」，共同的紀律是**不可以在指令函式
 // 裡同步等它**：Tauri 的同步指令跑在主執行緒上，而這幾條路底下是
-// `open`（macOS）／`ShellExecuteW`（Windows），冷啟一個 Finder 視窗或瀏覽器
+// `open`（macOS）／`ShellExecuteExW`（Windows），冷啟一個 Finder 視窗或瀏覽器
 // 動輒一到三秒——那段時間整個 UI 會凍住。
 //
 // 作法是把阻塞那一段丟到 `spawn_blocking`（阻塞 I/O 專用的執行緒池，不佔

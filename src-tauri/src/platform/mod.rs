@@ -85,8 +85,34 @@ pub use imp::fix_gui_launch_path;
 
 // ---------------------------------------------------------------- 本地埠偵測
 //
+// **兩平台的可見範圍不一樣，這是這組門面唯一沒有被抹平的差異**（WRP-1）：
+//
+// * Windows 讀的是 `GetExtendedTcpTable` 的**全系統** LISTEN 表，不管那個埠是
+//   誰開的都看得見。
+// * macOS 走 libproc 逐一問程序的 fd，只看得到**同一個 uid** 的程序。root
+//   或別的使用者佔住的埠（例如 launchd 隨選啟動、uid 0 的 `sshd`）在沒有
+//   root 權限時一律查不到，會回「沒人在聽」。
+//
+// 本專案自己會綁的監聽者（SOCKS5、我們 spawn 出來的 ssh）一律跟查詢者同一個
+// uid，所以日常路徑不受影響；現形的情境是「別人的程序剛好佔住我們要用的埠」
+// ——那時 mac 上會判成沒人佔、照樣 spawn，ssh 的 `-L` bind 失敗、
+// `ExitOnForwardFailure` 讓它退出，狀態一路停在 RECONNECTING 而沒有 PORT_BUSY
+// 提示。真正的補洞是把 ssh 的 stderr 接起來分流成 PORT_BUSY（backlog 的
+// 「方案 A」），不是在這一層再想辦法——libproc 這條路徑本身就到這裡為止。
+//
 /// 本地是否有程序在該埠 Listen。連線判定與 spawn 前的埠檢查都靠它。
+///
+/// 可見範圍在兩個平台不同（macOS 只看得到同 uid 的程序），見上面那段說明。
 pub use imp::is_listening;
+
+/// 一次取回本機所有正在 TCP LISTEN 的埠號。
+///
+/// 給「一口氣要問很多個埠」的呼叫端（`wg::busy_rows`）用：語意與
+/// [`is_listening`] 逐字相同（含上面那條 macOS 只看得到同 uid 的限制），
+/// 差別只在成本——取一次快照再 `contains`，不必每個埠各跑一次全表走訪，
+/// 而且那一批答案來自同一個瞬間。查表失敗一律回空集合，方向與
+/// `is_listening` 回 `false` 一致。
+pub use imp::listening_ports;
 
 // ---------------------------------------------------------------- 時間
 //

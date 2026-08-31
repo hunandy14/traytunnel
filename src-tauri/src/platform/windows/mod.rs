@@ -20,6 +20,6 @@ pub use spawn::ProcessSupervisor;
 pub use trayicon::{tray_icon, TRAY_OPEN_GESTURE_HINT};
 pub use winsys::{
     autostart_enabled, disable_autostart, enable_autostart, is_listening, large_icon_size,
-    local_time_hms, read_run_value as read_autostart_command,
+    listening_ports, local_time_hms, read_run_value as read_autostart_command,
     reveal_in_explorer as reveal_in_file_manager, small_icon_size,
 };

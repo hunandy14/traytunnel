@@ -490,6 +490,38 @@ pub fn is_listening(port: u16) -> bool {
     }
 }
 
+/// 一次取回本機所有正在 TCP LISTEN 的埠號。
+///
+/// 存在的理由是**成本**，不是語意：`is_listening` 每問一個埠就要跑一次
+/// `listeners::get_all()`（一次全枚舉）。要問 K 個埠的呼叫端（`wg::busy_rows`
+/// 一次要問一整條連線底下的每一列，重連迴圈每 5 秒又來一輪）於是做了 K 次
+/// 同樣的全表走訪，答案還都來自不同的瞬間。取一次快照再 `contains` 只走一次
+/// 表，順帶讓那 K 個答案來自同一個時間點。
+///
+/// 語意與 [`is_listening`] 逐字相同（同一份表、同一組過濾條件），**包含那條
+/// 已知限制**：libproc 只看得到同一個 uid 的程序，root 或別的使用者佔住的埠
+/// 不會出現在這份集合裡。理由與實測都寫在 [`is_listening`] 上面，不重抄。
+///
+/// 查表失敗時回**空集合**，方向與 `is_listening` 的 `false` 一致：不要把
+/// 「問不到」誤判成「有人佔著」，害呼叫端擋掉一條原本走得通的隧道。
+pub fn listening_ports() -> std::collections::HashSet<u16> {
+    match listeners::get_all() {
+        Ok(all) => all
+            .iter()
+            .filter(|l| {
+                l.protocol == listeners::Protocol::TCP && l.state == listeners::SocketState::Listen
+            })
+            .map(|l| l.socket.port())
+            .collect(),
+        Err(e) => {
+            log::debug!(
+                "listening_ports: querying the local listener table failed: {e}, treating as nothing listening"
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 時間
 
 /// 本地時間的 `HH:mm:ss`，活動日誌每一行的時間戳。對應 Windows 的 `GetLocalTime`。
@@ -902,7 +934,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     run_open(&mut cmd)
 }
 
-/// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteW）。
+/// 用系統預設瀏覽器開一個網址，對應 Windows 的 `winsys::open_url`（ShellExecuteExW）。
 ///
 /// 刻意**不**放進 `platform::mod` 那份跨平台門面：唯一的呼叫端是更新那條路
 /// （`update::open_release_page`／`open_releases_page`），而 update 整個子模組本來

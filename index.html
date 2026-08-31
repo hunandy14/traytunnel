@@ -23,8 +23,14 @@
       <span class="app-title" data-tauri-drag-region>Traytunnel</span>
       <!-- Windows 專用的自繪最小化／關閉鈕。mac 上原生紅綠燈接手，這一組整組
            靠 styles.css 的 [data-platform="macos"] 規則隱藏（見該檔說明），
-           DOM 與事件繫結不變——隱藏純粹是視覺，避免兩邊按鈕重疊。 -->
-      <div class="win-controls">
+           DOM 與事件繫結不變——隱藏純粹是視覺，避免兩邊按鈕重疊。
+
+           這層容器要 data-tauri-drag-region：按鈕之間與右緣那幾 px 空隙
+           以前是 .titlebar 的拖曳區，包進這個 div 之後點到就拖不動了。
+           **不加 deep 值**：drag.js 只把 composedPath[0] 恰好等於帶屬性的
+           那個元素視為拖曳，兩顆 −／× 是 BUTTON、被 isClickableElement
+           擋掉，照樣點得到；bare 版剛好只補回空隙那一塊。 -->
+      <div class="win-controls" data-tauri-drag-region>
         <button class="tbtn" id="btn-min" title="Minimize" data-icon="minus"></button>
         <button class="tbtn close" id="btn-close" title="Close" data-icon="x"></button>
       </div>

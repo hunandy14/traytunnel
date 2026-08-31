@@ -56,12 +56,7 @@ fn show_main(app: &AppHandle) {
         let _ = w.set_focus();
         // 視窗藏著的時候被系統回收掉 content process 的話，reload 被延到
         // 這裡才做——理由見 WEBVIEW_NEEDS_RELOAD 那段。
-        if take_pending_reload(&WEBVIEW_NEEDS_RELOAD) {
-            log::info!("reloading the webview that was reclaimed while hidden");
-            if let Err(e) = w.reload() {
-                log::warn!("could not reload the webview on show: {e}");
-            }
-        }
+        reload_if_pending(&w, "show");
     }
 }
 
@@ -85,8 +80,9 @@ fn show_main(app: &AppHandle) {
 // * **視窗藏著**：只立旗標（外加一行 warn），什麼都不畫。等視窗真的回到使用者
 //   面前才 reload，那時他本來就在等畫面，重生一個 WebContent 行程是划算的。
 //
-// 欠下的那次 reload 有**兩個**還款點，缺一不可，兩邊都靠
-// [`take_pending_reload`]（`swap(false)`）保證只還一次：
+// 欠下的那次 reload 有**兩個**還款點，缺一不可，兩邊都走同一支
+// [`reload_if_pending`]（底下的 [`take_pending_reload`] 是 `swap(false)`，
+// 保證只還一次）：
 //
 // * `show_main`——系統匣的 Open window、第二實例喚醒、Windows 的雙擊圖示。
 // * 主視窗的 `WindowEvent::Focused(true)`（見 `setup` 裡那顆處理常式）——
@@ -97,31 +93,15 @@ fn show_main(app: &AppHandle) {
 static WEBVIEW_NEEDS_RELOAD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 回收發生時該怎麼辦。抽成純函式是為了能單獨測——這條分支就是上面那段
-/// 說明的全部內容，而它本身跟 webview 無關。
-///
-/// 掛 `cfg(target_os = "macos")` 不是因為這條規則有平台特性，是因為
-/// `on_web_content_process_terminate` 這顆掛鉤本身只有 macOS／iOS 有
-/// （Windows 的 WebView2 沒有對應事件），Windows 上連呼叫端都不存在。旗標與
-/// [`take_pending_reload`] 反而是跨平台的：`show_main` 與視窗的 `Focused(true)`
-/// 兩邊都會問一次，Windows 上那顆旗標永遠是 false，行為零變化。
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadPlan {
-    /// 有人在看，立刻重載。
-    Now,
-    /// 沒人在看，立旗標等下次前景化。
-    Defer,
-}
-
-#[cfg(target_os = "macos")]
-fn plan_reload_after_terminate(window_visible: bool) -> ReloadPlan {
-    if window_visible {
-        ReloadPlan::Now
-    } else {
-        ReloadPlan::Defer
-    }
-}
+// 那條分支（可見就立刻 reload、藏著就立旗標）直接寫在
+// `on_web_content_process_terminate` 的掛鉤裡：它就是一個 if／else，包成
+// 兩變體的 enum ＋ 一支 `plan_…` 函式再 match 回來，只是把同一件事講兩遍，
+// 連帶那條「Now 對應 true、Defer 對應 false」的測試也只是在測改名本身。
+//
+// 掛鉤本身只有 macOS／iOS 有（Windows 的 WebView2 沒有對應事件），所以呼叫端
+// 整段 `cfg(target_os = "macos")`。旗標與 [`take_pending_reload`]／
+// [`reload_if_pending`] 反而是跨平台的：`show_main` 與視窗的 `Focused(true)`
+// 兩邊都會問一次，Windows 上那顆旗標永遠是 false，行為零變化。
 
 /// 領取「欠一次 reload」的旗標：有的話回 true 並就地清掉，重複呼叫只會生效
 /// 一次（`show_main` 每次開窗都會問，不能每次都重載）。
@@ -130,6 +110,21 @@ fn plan_reload_after_terminate(window_visible: bool) -> ReloadPlan {
 /// 一顆來測，不必碰行程全域狀態。
 fn take_pending_reload(flag: &std::sync::atomic::AtomicBool) -> bool {
     flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 欠下的那次 reload 的**還款動作**：領得到旗標就重載，領不到就什麼都不做。
+///
+/// 兩個還款點（`show_main` 與主視窗的 `Focused(true)`）逐字做同一件事，只差
+/// warn 那一行的字尾，所以抽在這裡；`why` 就是那個字尾（`"show"`／`"focus"`），
+/// 使用者回報時看得出是哪一條路把畫面救回來的。
+fn reload_if_pending(win: &tauri::WebviewWindow, why: &str) {
+    if !take_pending_reload(&WEBVIEW_NEEDS_RELOAD) {
+        return;
+    }
+    log::info!("reloading the webview that was reclaimed while hidden");
+    if let Err(e) = win.reload() {
+        log::warn!("could not reload the webview on {why}: {e}");
+    }
 }
 
 // ------------------------------------------------- 白屏診斷（前端就緒複查）
@@ -222,7 +217,7 @@ pub(crate) fn mark_frontend_ready() {
 #[cfg(dev)]
 const PAGE_LOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 寬限時間到時的三種結局。抽成純函式（[`verdict`]）是為了讓它可以單獨測——
+/// 寬限時間到時的四種結局。抽成純函式（[`verdict`]）是為了讓它可以單獨測——
 /// 這是整段診斷唯一真的有分支的地方，其餘都是 I/O。
 #[cfg(dev)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,20 +227,89 @@ enum LoadVerdict {
     /// 沒就緒，但 webview 指的不是 dev server：只記一行 warn。這種情況畫面上
     /// 是什麼我們並不知道（可能正在慢慢載），不該擅自覆蓋掉。
     WarnOnly,
-    /// 沒就緒又確實指著 `build.devUrl`：記 warn 並把說明頁蓋上去。
+    /// 沒就緒、指著 `build.devUrl`，而那個 host:port **敲得到**：dev server
+    /// 就在那裡，只是還沒把第一份模組送到（Vite 冷機時 pre-bundling ＋ 抓幾十
+    /// 個 ESM 模組很容易超過寬限時間）。記一行 warn 就好，**永不接管畫面**。
+    WaitForDevServer,
+    /// 沒就緒、指著 `build.devUrl`，而那個 host:port **連不上**：這才是真的
+    /// 「裸執行檔配沒開的 Vite」。記 warn 並把說明頁蓋上去。
     ShowDevNotice,
 }
 
-/// 寬限時間到之後要做什麼，只看兩顆布林。
+/// 寬限時間到之後要做什麼，只看三顆布林。
+///
+/// 第三顆 `dev_server_reachable` 是對 `build.devUrl` 的 host:port 敲一次 TCP
+/// 的結果（見 [`dev_server_reachable`]）。加這一顆是因為原本的兩顆布林會把
+/// **正常的 `npm run dev`** 誤判成「沒有開發伺服器」：Vite 冷機第一次啟動要
+/// 做 dependency pre-bundling 再送幾十個 ESM 模組，超過 5 秒是常態，而一旦
+/// 被 `navigate` 到說明頁，之後前端就算送出 `frontend_ready` 也回不去，HMR
+/// 一併死掉——開發者只能重開。多敲這一次 TCP 之後，**只有 dev server 真的
+/// 不在**（連線被拒／逾時）才會接管，與 `tauri dev` CLI 自己等 dev server
+/// 的判準同一套語意。
+///
+/// 前兩格（`frontend_ready` 為真，或根本不是 dev URL）的結論與探測無關，
+/// 呼叫端因此可以在那兩格直接傳 `false` 省下那一次連線，不必真的去敲。
 #[cfg(dev)]
-fn verdict(frontend_ready: bool, is_dev_url: bool) -> LoadVerdict {
+fn verdict(frontend_ready: bool, is_dev_url: bool, dev_server_reachable: bool) -> LoadVerdict {
     if frontend_ready {
         LoadVerdict::Ready
-    } else if is_dev_url {
-        LoadVerdict::ShowDevNotice
-    } else {
+    } else if !is_dev_url {
         LoadVerdict::WarnOnly
+    } else if dev_server_reachable {
+        LoadVerdict::WaitForDevServer
+    } else {
+        LoadVerdict::ShowDevNotice
     }
+}
+
+/// 「等到寬限時間都沒等到前端」那行 warn。兩種結局（[`LoadVerdict::WarnOnly`]
+/// 與 [`LoadVerdict::ShowDevNotice`]）共用同一段字，抽出來才不會哪天只改一邊。
+#[cfg(dev)]
+fn blank_window_warning(url_text: &str) -> String {
+    format!(
+        "the frontend has not reported ready {}s after start (webview url {url_text}), the \
+         window will be blank; a binary from a plain `cargo build` points at build.devUrl and \
+         needs `npm run web:dev` running alongside it, build with `tauri build` for one that \
+         stands alone",
+        PAGE_LOAD_GRACE.as_secs()
+    )
+}
+
+/// 敲一次 dev server 的 host:port，看它在不在。連得上就是在。
+///
+/// 只用 TCP 連線、不發 HTTP 請求：要回答的問題是「有沒有人在那個埠上聽」，
+/// 三次交握就已經給完答案；發 GET 反而要處理 Vite 對未知路徑的各種回應。
+///
+/// 位址由 `Url` 的 host 與 port 現組（`port_or_known_default` 讓沒寫埠的
+/// `http://…` 也有 80 可用），不寫死 `127.0.0.1:1420`——`build.devUrl` 是設定，
+/// 不是規格。`to_socket_addrs` 一併涵蓋兩種寫法：字面位址（含 IPv6 的
+/// `[::1]` 方括號形式）直接 parse，主機名則走系統解析。
+///
+/// 解析結果可能同時有 IPv4 與 IPv6（`localhost` 就是），**逐個試到第一個連得
+/// 上為止**：Vite 預設只綁一族，只試第一個會把「綁在另一族」誤判成沒開。
+/// 逾時給 1 秒——對象是本機，連得上的話遠遠用不到；這個數字只是「不要在
+/// 一個沒人聽的位址上無限等下去」的上限。
+#[cfg(dev)]
+fn dev_server_reachable(dev_url: Option<&tauri::Url>) -> bool {
+    use std::net::ToSocketAddrs as _;
+
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let Some(url) = dev_url else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        log::debug!("build.devUrl ({url}) has no host:port to probe");
+        return false;
+    };
+    let addrs = match format!("{host}:{port}").to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            log::debug!("could not resolve the dev server address {host}:{port}: {e}");
+            return false;
+        }
+    };
+    addrs.into_iter().any(|addr| std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
 }
 
 /// 空白 webview 要 `navigate` 過去的說明頁。深色底、繁體中文，讓拿到裸執行檔的
@@ -295,7 +359,12 @@ const DEV_BUILD_NOTICE_HTML: &str = r##"<!doctype html>
 "##;
 
 /// 記下主 webview 的來源，並在寬限時間後複查一次前端有沒有真的跑起來；沒有、
-/// 又指著 dev URL 的話，順手把說明頁 `navigate` 進空白的 webview。
+/// 又指著 dev URL、**而且那個 dev server 敲不到**的話，才把說明頁 `navigate`
+/// 進空白的 webview。
+///
+/// 那道 TCP 探測是接管前的最後一道閘（見 [`verdict`]）：`npm run dev` 冷機時
+/// Vite 的 pre-bundling 超過寬限時間是常態，少了這道閘，正常的開發流程會被
+/// 說明頁劫持，而且回不去。
 ///
 /// `dev_url` 的單一來源是 `app.config().build.dev_url`（呼叫端傳進來，見
 /// `setup()`），不在這裡寫死 `"http://localhost:1420"`——那是目前
@@ -330,34 +399,50 @@ fn watch_first_page_load<R: tauri::Runtime>(
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(PAGE_LOAD_GRACE).await;
             let ready = FRONTEND_READY.load(std::sync::atomic::Ordering::Relaxed);
-            let verdict = verdict(ready, is_dev_url);
-            if verdict == LoadVerdict::Ready {
-                return;
-            }
-            log::warn!(
-                "the frontend has not reported ready {}s after start (webview url {url_text}), \
-                 the window will be blank; a binary from a plain `cargo build` points at \
-                 build.devUrl and needs `npm run web:dev` running alongside it, build with \
-                 `tauri build` for one that stands alone",
-                PAGE_LOAD_GRACE.as_secs()
-            );
-            // 只有真的指著 dev server 才覆蓋畫面：其餘情形我們並不知道畫面上
-            // 是什麼（可能正在慢慢載），蓋上去會把使用者正在等的頁面吃掉。
-            if verdict != LoadVerdict::ShowDevNotice {
-                return;
-            }
-            use base64::Engine as _;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
-            let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
-            match tauri::Url::parse(&data_url) {
-                Ok(notice_url) => {
-                    if let Err(e) = win.navigate(notice_url) {
-                        log::warn!(
-                            "could not navigate the blank webview to the dev-build notice: {e}"
-                        );
+            // 探測只在「沒就緒又指著 dev server」那一格才有意義（另外兩格的
+            // 結論與它無關，見 `verdict` 的說明），`&&` 的短路正好省掉那一次
+            // 連線。`connect_timeout` 是同步阻塞的（最多 1 秒 × 解析出來的
+            // 位址數），丟進阻塞執行緒池，不要佔著 tokio 的工作執行緒。
+            let dev_server_alive = !ready
+                && is_dev_url
+                && tauri::async_runtime::spawn_blocking(move || {
+                    dev_server_reachable(dev_url.as_ref())
+                })
+                .await
+                .unwrap_or(false);
+            match verdict(ready, is_dev_url, dev_server_alive) {
+                LoadVerdict::Ready => {}
+                // dev server 就在那裡，只是還沒把第一份模組送過來。**不接管**
+                // ——蓋上說明頁之後前端再送 `frontend_ready` 也回不去，HMR 一起
+                // 死掉，開發者只能重開；等它自己載完才是對的。
+                LoadVerdict::WaitForDevServer => log::warn!(
+                    "the frontend has not reported ready {}s after start, but the dev server at \
+                     {url_text} answers a TCP connect: it is probably still pre-bundling, \
+                     leaving the webview alone",
+                    PAGE_LOAD_GRACE.as_secs()
+                ),
+                // 畫面上是什麼我們並不知道（可能正在慢慢載），不擅自覆蓋。
+                LoadVerdict::WarnOnly => log::warn!("{}", blank_window_warning(&url_text)),
+                // 指著 dev server、那個埠又沒人在聽：這才是「裸執行檔配沒開的
+                // Vite」，把說明頁蓋上去。
+                LoadVerdict::ShowDevNotice => {
+                    log::warn!("{}", blank_window_warning(&url_text));
+                    use base64::Engine as _;
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(DEV_BUILD_NOTICE_HTML);
+                    let data_url = format!("data:text/html;charset=utf-8;base64,{encoded}");
+                    match tauri::Url::parse(&data_url) {
+                        Ok(notice_url) => {
+                            if let Err(e) = win.navigate(notice_url) {
+                                log::warn!(
+                                    "could not navigate the blank webview to the dev-build \
+                                     notice: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
                     }
                 }
-                Err(e) => log::warn!("could not build the dev-build notice data: URL: {e}"),
             }
         });
     }
@@ -599,10 +684,14 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 // 改成**執行期**由 Rust 端決定：值來自 `cfg(target_os = "macos")`，跟執行機
 // 保證一致，不必像 `@tauri-apps/plugin-os` 那樣引入新依賴或執行期偵測。用官方
 // 的 webview initialization script（`tauri::plugin::Builder::js_init_script`，
-// 語意等同各別 webview 的 `initialization_script`：在全域物件建立後、HTML
-// 文件被解析之前、任何頁面自己的 script 執行之前跑）在頁面載入前把值寫進
-// `<html data-platform>`，vite.config.ts 的 htmlPlatformPlugin 與 index.html
-// 的佔位字串因此可以整段刪掉。
+// 語意等同各別 webview 的 `initialization_script`：在全域物件建立後、任何頁面
+// 自己的 script 執行之前跑）在頁面載入前把值寫進 `<html data-platform>`，
+// vite.config.ts 的 htmlPlatformPlugin 與 index.html 的佔位字串因此可以整段
+// 刪掉。
+//
+// 「全域物件建好了」是這顆 API **唯一**的保證，`<html>` 在不在是另一回事，
+// 兩個 webview 後端在這一點上不一樣——腳本因此不能只寫一行直接設。整段理由
+// 與作法在 `PLATFORM_FLAG_INIT_JS` 的說明。
 //
 // 值直接用 `std::env::consts::OS`，不自己抄一組 `cfg` 常數：那組常數要抄的
 // 正是編譯目標本身，而標準函式庫已經有一份**由編譯器填的**同義字串，兩者
@@ -611,6 +700,49 @@ fn prepare_notifications(app: &AppHandle) -> Vec<String> {
 // 與原本手抄的兩個字面值逐字相同，styles.css 的
 // `[data-platform="macos"]` 選擇器不必動。
 const PLATFORM_FLAG: &str = std::env::consts::OS;
+
+/// 把 [`PLATFORM_FLAG`] 寫進 `<html data-platform>` 的初始化腳本模板
+/// （`__PLATFORM__` 由 [`platform_flag_init_script`] 換掉）。
+///
+/// ## 為什麼不能只寫一行 `document.documentElement.dataset.platform = …`
+///
+/// 初始化腳本在兩個平台跑的時機**不一樣**，而舊寫法只在其中一邊成立：
+///
+/// * **WKWebView**（macOS，wry 走 `WKUserScript` 的 `AtDocumentStart`）：
+///   文件的 `<html>` 元素這時已經建好了，直接設就會中。
+/// * **WebView2**（Windows，wry 走 `AddScriptToExecuteOnDocumentCreated`）：
+///   那顆 API 保證的是「global object 建好了」，**HTML 還沒開始解析**，
+///   `document.documentElement` 是 `null`——舊寫法在這裡拋 TypeError，
+///   Windows 於是永遠沒有 `data-platform`，與 index.html／這個模組宣稱的
+///   「執行期保證一致、不存在沒有屬性的 frame」正好相反。
+///
+/// 所以先試直接設；設不到就掛一顆 `MutationObserver` 監聽 `document` 的
+/// `childList`，`<html>` 一被建出來就補寫並 `disconnect()`。
+///
+/// **不用 `DOMContentLoaded`**：那要等整份文件解析完，中間 CSS 已經套完一輪，
+/// mac 上會先畫出一組自繪的 −/×（`[data-platform="macos"]` 那條規則還沒生效）
+/// 再閃掉——正是要避免的 FOUC。MutationObserver 在 `<html>` 出現的那個
+/// microtask 就補上，早於任何樣式套用。
+const PLATFORM_FLAG_INIT_JS: &str = r#"(function () {
+  var flag = "__PLATFORM__";
+  function stamp() {
+    var el = document.documentElement;
+    if (!el) { return false; }
+    el.dataset.platform = flag;
+    return true;
+  }
+  if (stamp()) { return; }
+  var observer = new MutationObserver(function () {
+    if (stamp()) { observer.disconnect(); }
+  });
+  observer.observe(document, { childList: true });
+})();"#;
+
+/// 初始化腳本的成品。抽成函式是為了讓 [`PLATFORM_FLAG`] 真的被換進去這件事
+/// 測得到——模板裡留著沒換掉的佔位字串會是一個完全無聲的錯誤。
+fn platform_flag_init_script() -> String {
+    PLATFORM_FLAG_INIT_JS.replace("__PLATFORM__", PLATFORM_FLAG)
+}
 
 // ---------------------------------------------------------------- 進入點
 
@@ -677,15 +809,13 @@ pub fn run() {
         // 更新外掛只在 Rust 側用（設定與公鑰讀 tauri.conf.json 的 plugins.updater），
         // 前端一律走我們自己的指令，不開它的 JS 權限
         .plugin(tauri_plugin_updater::Builder::new().build())
-        // 前端平台旗標（見上方 PLATFORM_FLAG 說明）：頁面解析前把
-        // data-platform 寫進 <html>，取代建置期蓋章。這是一個只帶 init
-        // script、沒有 invoke handler 的迷你外掛，不是真的要接 JS 那一側的
+        // 前端平台旗標（見上方 PLATFORM_FLAG 與 PLATFORM_FLAG_INIT_JS 說明）：
+        // 頁面解析前把 data-platform 寫進 <html>，取代建置期蓋章。這是一個只帶
+        // init script、沒有 invoke handler 的迷你外掛，不是真的要接 JS 那一側的
         // 訊息——`tauri::plugin::Builder` 本身就是官方 API，不算新依賴。
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("platform-flag")
-                .js_init_script(format!(
-                    "document.documentElement.dataset.platform = {PLATFORM_FLAG:?};"
-                ))
+                .js_init_script(platform_flag_init_script())
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
@@ -744,7 +874,7 @@ pub fn run() {
     // **reload 的時機由視窗可不可見決定**，不是無條件立刻做：觸發這顆掛鉤的
     // 前提就是系統缺記憶體，藏著的時候立刻重生一個 WebContent 行程去畫沒有人
     // 在看的頁面，只會被系統再回收一次，一路轉圈。規則整段寫在
-    // `plan_reload_after_terminate` 上面。
+    // `WEBVIEW_NEEDS_RELOAD` 上面。
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(|webview| {
         let visible = webview
@@ -753,26 +883,21 @@ pub fn run() {
             // 問不到就當作看得見：立刻重載最多是多花一次重生，判成藏著卻其實
             // 有人在看的話，那片白屏會一直留到使用者自己去點系統匣才好。
             .unwrap_or(true);
-        match plan_reload_after_terminate(visible) {
-            ReloadPlan::Now => {
-                log::warn!(
-                    "webview content process terminated (label: {}), reloading to self-heal",
-                    webview.label()
-                );
-                if let Err(e) = webview.reload() {
-                    log::warn!(
-                        "could not reload the webview after content process termination: {e}"
-                    );
-                }
+        if visible {
+            log::warn!(
+                "webview content process terminated (label: {}), reloading to self-heal",
+                webview.label()
+            );
+            if let Err(e) = webview.reload() {
+                log::warn!("could not reload the webview after content process termination: {e}");
             }
-            ReloadPlan::Defer => {
-                log::warn!(
-                    "webview content process terminated (label: {}) while the window was hidden, \
-                     deferring the reload until the window is shown again",
-                    webview.label()
-                );
-                WEBVIEW_NEEDS_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+        } else {
+            log::warn!(
+                "webview content process terminated (label: {}) while the window was hidden, \
+                 deferring the reload until the window is shown again",
+                webview.label()
+            );
+            WEBVIEW_NEEDS_RELOAD.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     });
 
@@ -901,20 +1026,15 @@ pub fn run() {
                     // 點「Open window」為止（舊碼在這一格是立刻 reload，這是
                     // 延後 reload 之後才開出來的窄縫）。
                     //
-                    // 兩條路各領一次不會重複 reload：`take_pending_reload` 是
-                    // `swap(false)`，`show_main` 先領走的話這裡拿到的就是 false。
+                    // 兩條路各領一次不會重複 reload：領旗標的 `take_pending_reload`
+                    // 是 `swap(false)`，`show_main` 先領走的話這裡拿到的就是 false。
                     //
                     // 用 `matches!` 併成一個條件、不寫成 match arm 加 guard：
-                    // `take_pending_reload` 會改狀態，藏進 match guard 就變成
-                    // 「條件沒過但旗標已經被領走」，那是最不該放在 guard 裡的
-                    // 那種副作用。
-                    if matches!(event, WindowEvent::Focused(true))
-                        && take_pending_reload(&WEBVIEW_NEEDS_RELOAD)
-                    {
-                        log::info!("reloading the webview that was reclaimed while hidden");
-                        if let Err(e) = focus_target.reload() {
-                            log::warn!("could not reload the webview on focus: {e}");
-                        }
+                    // `reload_if_pending` 會改狀態（它領旗標），藏進 match guard
+                    // 就變成「條件沒過但旗標已經被領走」，那是最不該放在 guard
+                    // 裡的那種副作用。
+                    if matches!(event, WindowEvent::Focused(true)) {
+                        reload_if_pending(&focus_target, "focus");
                     }
                 });
             }
@@ -1153,35 +1273,48 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     /// 白屏複查的判斷（M13）：**唯一**讓說明頁蓋上去的組合是「前端沒回報就緒」
-    /// 且「webview 指著 build.devUrl」。
+    /// 且「webview 指著 build.devUrl」且「那個 dev server 敲不到」。
     ///
     /// 舊版守衛看的是 `on_page_load` 的 Started／Finished，而 WebView2 對連線
     /// 失敗的錯誤頁也照發那兩顆事件——說明頁在 Windows 上因此永遠不會出現。
     /// 換成前端自己 invoke 的就緒信標之後，兩個平台走的才是同一套語意；這條
     /// 測試釘住的就是那張真值表。
+    ///
+    /// 第三顆輸入（TCP 探測結果）是 CORE-1 補的：少了它，冷機時 Vite
+    /// pre-bundling 超過 5 秒的**正常** `npm run dev` 會被說明頁劫持，而且
+    /// 之後前端回報就緒也回不去。這裡直接注入布林，測試本身不連任何線。
     #[cfg(dev)]
     #[test]
-    fn dev_notice_only_when_the_frontend_is_silent_on_a_dev_url() {
-        // 前端回報就緒 → 不管是不是 dev URL 都不必做任何事
-        assert_eq!(verdict(true, true), LoadVerdict::Ready);
-        assert_eq!(verdict(true, false), LoadVerdict::Ready);
-        // 沒回報就緒又指著 dev server → 這才是要蓋說明頁的那一格
-        assert_eq!(verdict(false, true), LoadVerdict::ShowDevNotice);
+    fn dev_notice_only_when_the_frontend_is_silent_and_the_dev_server_is_gone() {
+        // 前端回報就緒 → 不管是不是 dev URL、dev server 在不在，都不必做任何事
+        for is_dev_url in [true, false] {
+            for reachable in [true, false] {
+                assert_eq!(verdict(true, is_dev_url, reachable), LoadVerdict::Ready);
+            }
+        }
         // 沒回報就緒但不是 dev URL（例如正式協定真的取不到資源）→ 只記一行
-        // warn，畫面上是什麼我們不知道，不擅自覆蓋
-        assert_eq!(verdict(false, false), LoadVerdict::WarnOnly);
+        // warn，畫面上是什麼我們不知道，不擅自覆蓋。探測結果在這一格不影響結論
+        assert_eq!(verdict(false, false, false), LoadVerdict::WarnOnly);
+        assert_eq!(verdict(false, false, true), LoadVerdict::WarnOnly);
+        // 沒回報就緒、指著 dev server，而 dev server 敲得到 → 它只是還在
+        // pre-bundling，永遠不接管
+        assert_eq!(verdict(false, true, true), LoadVerdict::WaitForDevServer);
+        // 沒回報就緒、指著 dev server，那個埠又沒人在聽 → 這才是要蓋說明頁的
+        // 那一格（裸執行檔配沒開的 Vite）
+        assert_eq!(verdict(false, true, false), LoadVerdict::ShowDevNotice);
     }
 
-    /// content process 被回收時的處置（M14）：可見才立刻重載。
+    /// 探測本身的兩道退場：沒有 dev_url、或那個 URL 沒有 host 可以敲，
+    /// 一律回 false（＝當作 dev server 不在）。
     ///
-    /// 藏著的時候立刻 reload 會馬上重生一個 WebContent 行程去畫沒有人在看的
-    /// 頁面——而觸發這顆掛鉤的前提正是系統缺記憶體，於是它再被回收、再 reload，
-    /// 一路轉圈。這條測試釘住「藏著就只立旗標」。
-    #[cfg(target_os = "macos")]
+    /// 真的去連線的那一格不在這裡測——那要靠一個真的在聽的埠，屬於整合層；
+    /// 這條只釘住「拿不到位址時不會 panic，也不會誤判成連得上」。
+    #[cfg(dev)]
     #[test]
-    fn a_hidden_window_defers_the_reload() {
-        assert_eq!(plan_reload_after_terminate(true), ReloadPlan::Now);
-        assert_eq!(plan_reload_after_terminate(false), ReloadPlan::Defer);
+    fn the_dev_server_probe_gives_up_without_a_host() {
+        assert!(!dev_server_reachable(None), "沒有 dev_url 就沒有東西可以敲");
+        let no_host = tauri::Url::parse("data:text/html,hi").expect("data: URL 要 parse 得起來");
+        assert!(!dev_server_reachable(Some(&no_host)), "data: URL 沒有 host:port 可以敲");
     }
 
     /// 欠下的那次 reload 只還一次：`show_main` 每次開窗都會問這顆旗標，
@@ -1220,6 +1353,21 @@ mod tests {
         assert_eq!(PLATFORM_FLAG, "macos");
         #[cfg(windows)]
         assert_eq!(PLATFORM_FLAG, "windows");
+    }
+
+    /// 初始化腳本真的把旗標換進去了，而且**不會只寫一行直接設**（CORE-2）。
+    ///
+    /// WebView2 的 `AddScriptToExecuteOnDocumentCreated` 在 HTML 解析前就跑，
+    /// 那時 `document.documentElement` 是 null；少了 `MutationObserver` 那條
+    /// 退路，Windows 上這行腳本會拋 TypeError、`data-platform` 永遠不存在，
+    /// 而且完全無聲。這條測試釘住兩件事：佔位字串換掉了，退路還在。
+    #[test]
+    fn the_platform_flag_init_script_survives_a_null_document_element() {
+        let js = platform_flag_init_script();
+        assert!(!js.contains("__PLATFORM__"), "佔位字串沒被換掉，前端會拿到一個假的平台名");
+        assert!(js.contains(&format!("\"{PLATFORM_FLAG}\"")), "腳本裡要有這個編譯目標的旗標");
+        assert!(js.contains("MutationObserver"), "documentElement 為 null 時要有退路");
+        assert!(js.contains("disconnect"), "補寫完要把 observer 收掉");
     }
 
     /// 通知裡那句手勢提示由平台門面常數接出來，兩種語境共用同一份描述（M18）。
