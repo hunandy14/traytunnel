@@ -33,11 +33,10 @@
  * 無相依，直接 node scripts/release.mjs <x.y.z> [--dry-run]。
  */
 
-import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readCargoVersion } from "./lib/cargo-version.mjs";
+import { readRepoCargoVersion } from "./lib/cargo-version.mjs";
 import { SEMVER_RE, compareSemver } from "./lib/semver.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -180,11 +179,10 @@ if (authResult.status !== 0) {
 }
 console.log("  gh 已登入");
 
-const cargoTomlPath = join(root, "src-tauri", "Cargo.toml");
 let currentVersion;
 let versionCompare;
 try {
-  currentVersion = readCargoVersion(cargoTomlPath, readFileSync(cargoTomlPath, "utf8"));
+  currentVersion = readRepoCargoVersion(root);
   versionCompare = compareSemver(version, currentVersion);
 } catch (err) {
   fail(

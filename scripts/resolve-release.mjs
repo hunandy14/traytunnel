@@ -20,15 +20,14 @@
  * 無相依，直接 node scripts/resolve-release.mjs。
  */
 
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readCargoVersion } from "./lib/cargo-version.mjs";
+import { readRepoCargoVersion } from "./lib/cargo-version.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const cargoTomlPath = join(root, "src-tauri", "Cargo.toml");
-const version = readCargoVersion(cargoTomlPath, readFileSync(cargoTomlPath, "utf8"));
+const version = readRepoCargoVersion(root);
 console.log(`Cargo.toml 版本：${version}`);
 
 const eventName = process.env.GITHUB_EVENT_NAME || "";

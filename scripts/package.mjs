@@ -67,21 +67,15 @@
  * 無外部套件相依，直接 node scripts/package.mjs。
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
-import { readCargoVersion } from "./lib/cargo-version.mjs";
+import { readRepoCargoVersion } from "./lib/cargo-version.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(root, "out");
-
-/** 版本號的單一來源：src-tauri/Cargo.toml 的 [package] version（解析邏輯見 scripts/lib/cargo-version.mjs） */
-function readVersion() {
-  const cargoToml = join(root, "src-tauri", "Cargo.toml");
-  return readCargoVersion(cargoToml, readFileSync(cargoToml, "utf8"));
-}
 
 /** 位元組數字加上千分位，只是印出來好讀 */
 function bytes(n) {
@@ -113,7 +107,8 @@ function parseCliTarget() {
   return values.target || process.env.TAURI_BUILD_TARGET || null;
 }
 
-const version = readVersion();
+// 版本號的單一來源：src-tauri/Cargo.toml 的 [package] version（見 scripts/lib/cargo-version.mjs）
+const version = readRepoCargoVersion(root);
 const target = parseCliTarget();
 
 // Cargo／Tauri 的建置輸出目錄規則：完全不帶 --target 時，輸出在
