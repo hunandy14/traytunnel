@@ -342,7 +342,7 @@ jobs:
       # SHA256SUMS.txt as merge baseline」過去是兩段幾乎逐字重複的 bash
       # curl 重試迴圈（重試次數、退避秒數、200/404/其他狀態碼的分流邏輯都
       # 一樣，只有 URL 跟「200 之後怎麼驗證內容合法」不同），抽成同一支
-      # 腳本，這裡跟下一步各呼叫一次、帶不同的 --url／--validator／--on-404。
+      # 腳本，這裡跟下一步各呼叫一次、帶不同的 --url／--validator。
       #
       # 關鍵：必須區分「確定沒有底稿」與「這次沒抓到」，這條分野是
       # fetch-baseline.mjs 存在的核心理由：
@@ -361,7 +361,6 @@ jobs:
             --url "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" \
             --out baseline-latest.json \
             --validator json \
-            --on-404 empty-json \
             --label "releases/latest 的 latest.json"
 
       # SHA256SUMS.txt 的底稿，取得方式刻意跟上面 latest.json 不同源，而且
@@ -400,7 +399,6 @@ jobs:
             --url "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS.txt" \
             --out baseline-SHA256SUMS.txt \
             --validator sha256sums \
-            --on-404 empty \
             --label "${tag} 的 SHA256SUMS.txt"
 
       # 這次應建置的平台清單直接從 plan job 輸出的 matrix 用

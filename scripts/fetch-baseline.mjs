@@ -8,8 +8,7 @@
  *
  * Usage:
  *   node scripts/fetch-baseline.mjs --url <URL> --out <輸出檔> \
- *     --validator json|sha256sums --on-404 empty-json|empty \
- *     [--attempts 5] [--label <log 用說明文字>]
+ *     --validator json|sha256sums [--attempts 5] [--label <log 用說明文字>]
  *
  * --validator  200 回應後，用什麼邏輯確認內容真的是合法底稿（不是被中間層
  *              換掉的錯誤頁、或半截內容）：
@@ -18,15 +17,14 @@
  *                             能解開即可（給 SHA256SUMS.txt 用）
  *              驗證失敗跟其他狀態碼一樣，視為暫時性失敗、進入重試。
  *
- * --on-404     確定 404（該資產目前線上真的不存在——首發，或這個 tag 還沒
- *              發過任何一腿）時要寫進 --out 的內容：
- *                empty-json   寫 `{}`（latest.json 用：mergeLatestJson 讀到
- *                             空物件視為沒有底稿）
- *                empty        寫空字串（SHA256SUMS.txt 用：mergeSha256Sums
- *                             讀到空字串視為沒有底稿）
+ * 確定 404（該資產目前線上真的不存在——首發，或這個 tag 還沒發過任何一腿）
+ * 時一律寫空字串。兩邊的合併邏輯對「空底稿」的判定本來就一致：
+ * compose-latest-json.mjs 的底稿讀取把純空白視為「沒有底稿」（等同 {}），
+ * mergeSha256Sums 讀到空字串也視為沒有底稿——過去的 --on-404 empty-json|empty
+ * 兩個值下游沒有任何行為差異，純粹是死重量（SIM-2）。
  *
  * 404 與「其他任何失敗」的分野是這支腳本存在的核心理由，不能弄反：
- *   HTTP 404      → 確定沒有底稿，寫 --on-404 指定的內容，不擋流程。
+ *   HTTP 404      → 確定沒有底稿，寫空字串，不擋流程。
  *   其他任何失敗  → 網路抖動、5xx、rate limit、或 200 但驗證不過（被攔截的
  *                   錯誤頁、半截內容）——一律視為暫時性，重試；重試用盡仍
  *                   失敗就以非零狀態退出，並印 ::error::。
@@ -56,27 +54,21 @@ const VALIDATORS = {
   },
 };
 
-const ON_404_CONTENT = {
-  "empty-json": "{}\n",
-  empty: "",
-};
-
 async function main() {
   const { values } = parseArgs({
     options: {
       url: { type: "string" },
       out: { type: "string" },
       validator: { type: "string" },
-      "on-404": { type: "string" },
       attempts: { type: "string", default: "5" },
       label: { type: "string" },
     },
   });
 
-  if (!values.url || !values.out || !values.validator || !values["on-404"]) {
+  if (!values.url || !values.out || !values.validator) {
     console.error(
       "用法：node scripts/fetch-baseline.mjs --url <URL> --out <輸出檔> " +
-        "--validator json|sha256sums --on-404 empty-json|empty [--attempts 5] [--label <說明文字>]",
+        "--validator json|sha256sums [--attempts 5] [--label <說明文字>]",
     );
     process.exit(1);
   }
@@ -84,11 +76,6 @@ async function main() {
   const validate = VALIDATORS[values.validator];
   if (!validate) {
     console.error(`::error::不認得的 --validator ${values.validator}（要 json 或 sha256sums）`);
-    process.exit(1);
-  }
-  const emptyContent = ON_404_CONTENT[values["on-404"]];
-  if (emptyContent === undefined) {
-    console.error(`::error::不認得的 --on-404 ${values["on-404"]}（要 empty-json 或 empty）`);
     process.exit(1);
   }
 
@@ -106,7 +93,7 @@ async function main() {
 
   if (result.notFound) {
     console.log(`HTTP 404：${label} 目前不存在——視為空底稿`);
-    writeFileSync(values.out, emptyContent, "utf8");
+    writeFileSync(values.out, "", "utf8");
     return;
   }
 
