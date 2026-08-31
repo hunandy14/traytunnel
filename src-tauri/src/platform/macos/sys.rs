@@ -580,18 +580,39 @@ pub fn read_autostart_command(name: &str) -> Option<String> {
 /// 這個路徑是**這一次執行才存在的**：app 結束、掛載點消失，下次登入時它不存在。
 /// 比對整段 `/AppTranslocation/` 而不是只比 `AppTranslocation`，是為了確保比到的
 /// 是一整層路徑元件，不會被某個剛好叫 `MyAppTranslocationTool` 的資料夾騙過去。
-fn is_app_translocated(exe: &Path) -> bool {
+///
+/// `pub(super)` 是因為更新那條路也要問同一件事：translocated 的掛載點是**唯讀**的，
+/// 就地替換 bundle 會死在 `EROFS`（見 `update` 模組開頭「App Translocation」那段），
+/// 所以 `update::is_installed`／`update::install` 與這裡共用同一份判定，不要有第二種寫法。
+pub(super) fn is_app_translocated(exe: &Path) -> bool {
     exe.to_string_lossy().contains("/AppTranslocation/")
 }
 
-/// 從 App Translocation 的唯讀影本跑起來時，寫開機自啟一律拒絕，錯誤訊息直接
-/// 是給使用者看的處理方式（`commands::set_autostart` 原樣往前端送）。
-fn translocation_refusal() -> io::Error {
-    io::Error::other(
+/// 從 App Translocation 的唯讀影本跑起來時，給使用者看的那一段話。
+///
+/// 兩個呼叫端共用同一份文案：這裡的 [`enable_autostart`]（寫 LaunchAgent plist）
+/// 與 `update::install`（就地替換 bundle）。兩者拒絕的**理由**不同（一個是「登記的
+/// 路徑下次登入不存在」，一個是「掛載點是唯讀的」），但**處理方式**一模一樣
+/// ——把 app 搬進應用程式資料夾、從那裡打開——而那句話才是使用者真正要看的東西。
+/// 各寫一份的話遲早會漂成兩種說法，所以差異的那半句由呼叫端傳進來，共同的那半句
+/// 只有這一份。
+///
+/// `consequence`：這一次「所以會怎樣」；`next_step`：搬完之後請他再做什麼。
+pub(super) fn translocation_refusal_text(consequence: &str, next_step: &str) -> String {
+    format!(
         "Traytunnel is running from a temporary read-only copy made by macOS App Translocation, \
-         so the path it would record here no longer exists at the next login. Move Traytunnel.app \
-         into the Applications folder, open it from there, and turn this on again.",
+         so {consequence}. Move Traytunnel.app into the Applications folder, open it from there, \
+         and {next_step}."
     )
+}
+
+/// 寫開機自啟一律拒絕，錯誤訊息直接是給使用者看的處理方式
+/// （`commands::set_autostart` 原樣往前端送）。
+fn translocation_refusal() -> io::Error {
+    io::Error::other(translocation_refusal_text(
+        "the path it would record here no longer exists at the next login",
+        "turn this on again",
+    ))
 }
 
 /// 寫出（或覆寫）LaunchAgent plist，**下次登入生效**。
