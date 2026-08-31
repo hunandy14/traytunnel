@@ -99,11 +99,10 @@
 use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::Update;
 
 use crate::platform::update_common::{
-    self, accept, current_version, normalize_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY,
-    INTERVAL,
+    self, accept, current_version, normalize_version, FIRST_DELAY, INTERVAL,
 };
 use crate::state::UpdateInfo;
 use crate::Shared;
@@ -228,12 +227,10 @@ fn is_target_missing(e: &tauri_plugin_updater::Error) -> bool {
 /// 吞掉，同一件事在活動日誌裡看起來厚此薄彼。統一在這裡記那一行日誌，兩個呼叫端
 /// 都看得到同一句話，也不會有人漏記。
 ///
-/// 不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
-/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道
-/// [`CHECK_TIMEOUT`]。
+/// 建 updater 那一步（連同它那道非有不可的檢查逾時）走
+/// [`update_common::build_updater`]——兩個平台三個呼叫點共用同一份，理由見那裡。
 async fn fetch_update(app: &AppHandle) -> Result<Option<Update>, String> {
-    let updater =
-        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    let updater = update_common::build_updater(app)?;
     match updater.check().await {
         Ok(found) => Ok(found),
         // latest.json 還沒有這個平台的條目＝這個平台沒有更新可拿，不是失敗
@@ -405,17 +402,16 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if accept(&update.version, current_version(), true).is_none() {
         return Err("No update available".into());
     }
-    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
-    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
-    update.timeout = Some(DOWNLOAD_TIMEOUT);
-
     let version = normalize_version(&update.version).to_string();
     st.log(format!("downloading update v{version}"));
+    // 下載那一步（連同外掛寫死成 None、只能事後補上的 DOWNLOAD_TIMEOUT）走
+    // [`update_common::download`]，三個呼叫點共用同一份逾時。
+    //
     // 下載回來的 bytes **已經過 minisign 驗簽**（外掛 updater.rs 的
     // `verify_signature`，驗不過就是 Err），所以交給 install 的一定是簽章對得上
     // 的那一份。macOS 不像 Windows 需要再記一份 SHA-256——那是給「在磁碟上躺到
     // 下一次啟動」的暫存檔用的，這裡的 bytes 從驗簽到解開都沒有離開過記憶體。
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    let bytes = update_common::download(&mut update).await?;
 
     st.log(format!("installing update v{version}"));
     tauri::async_runtime::spawn_blocking(move || update.install(bytes).map_err(|e| e.to_string()))

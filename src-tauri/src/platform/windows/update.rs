@@ -25,14 +25,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::Update;
 use tauri_plugin_window_state::AppHandleExt as _;
 
 pub use staged::Pending;
 
 use crate::platform::update_common::{
-    self, accept, current_version, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, FIRST_DELAY, IDENTIFIER,
-    INTERVAL, LATEST_JSON, PRODUCT_NAME, USER_AGENT,
+    self, accept, current_version, FIRST_DELAY, IDENTIFIER, INTERVAL, LATEST_JSON, PRODUCT_NAME,
+    USER_AGENT,
 };
 use crate::state::{UpdateInfo, MAIN_WINDOW};
 use crate::Shared;
@@ -283,13 +283,12 @@ async fn check_lane(app: &AppHandle) -> Result<Found, String> {
 ///
 /// 外掛給的 Some 不直接照收，再過一次 [`accept`]（固定 `installed: true`）——
 /// 理由見那支函式。
-/// 這裡不能用 `app.updater()` 那個便利方法：它建出來的 updater 沒有逾時上限，
-/// 遇到半開的連線會讓整個檢查任務永遠掛著。改走 builder 自己補一道 CHECK_TIMEOUT。
+/// 建 updater 那一步（連同它那道非有不可的檢查逾時）走
+/// [`update_common::build_updater`]——兩個平台三個呼叫點共用同一份，理由見那裡。
 /// 拿到的 `Update` 物件**連同結果一起交出去**，下載那一步才不必再查一次
 /// latest.json（見 [`Found`]）。
 async fn check_installed(app: &AppHandle) -> Result<Found, String> {
-    let updater =
-        app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    let updater = update_common::build_updater(app)?;
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
         return Ok(Found::None);
     };
@@ -421,12 +420,10 @@ async fn download_and_stage(
     dir: &Path,
     mut update: Update,
 ) -> Result<Pending, String> {
-    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
-    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
-    update.timeout = Some(DOWNLOAD_TIMEOUT);
-
     st.log(format!("downloading update v{} in the background", update.version));
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    // 下載那一步（連同外掛寫死成 None、只能事後補上的 DOWNLOAD_TIMEOUT）走
+    // [`update_common::download`]，三個呼叫點共用同一份逾時。
+    let bytes = update_common::download(&mut update).await?;
 
     accept_staging(st.checks_for_updates())?;
     staged::stage(dir, &update.version, &bytes).map_err(|e| e.to_string())
@@ -719,19 +716,17 @@ pub async fn install(st: &Shared) -> Result<(), String> {
     if st.staged_version().is_some() {
         return hand_over(st).await;
     }
-    let updater =
-        st.app.updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+    let updater = update_common::build_updater(&st.app)?;
     let mut update = updater
         .check()
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No update available".to_string())?;
-    // builder 上那個逾時只管 check 那次請求，Update 物件的 timeout 是外掛寫死的
-    // None（＝下載沒有任何上限）。兩段的合理值差了一個數量級，理由見常數本身。
-    update.timeout = Some(DOWNLOAD_TIMEOUT);
 
     st.log(format!("downloading update v{}", update.version));
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    // 下載那一步（連同外掛寫死成 None、只能事後補上的 DOWNLOAD_TIMEOUT）走
+    // [`update_common::download`]，三個呼叫點共用同一份逾時。
+    let bytes = update_common::download(&mut update).await?;
 
     let pending = staged::stage(&dir, &update.version, &bytes).map_err(|e| e.to_string())?;
     st.set_staged(Some(pending));
