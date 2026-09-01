@@ -70,7 +70,7 @@ sha2 = "0.11"
 boringtun = { version = "0.7.1", default-features = false }
 # 使用者態 TCP/IP。medium-ip = 純 IP 介面（無乙太網標頭、無 ARP／鄰居探索）。
 # 釘 0.13.1 而不是 0.14：0.14 只多 TSO 與擁塞控制重整，對本設計沒有價值。
-smoltcp = { version = "0.13.1", default-features = false, features = [
+smoltcp = { version = "0.14.0", default-features = false, features = [
   "std",
   "log",
   "medium-ip",
