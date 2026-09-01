@@ -63,7 +63,7 @@ tauri-plugin-updater = { version = "2", default-features = false, features = ["r
 semver = "1"
 # 下載好的安裝檔要在磁碟上躺到下一次啟動，交棒之前得重算一次雜湊確認它沒被動過
 # （簽章驗的是下載當時那串 bytes，不是現在磁碟上那顆檔案）
-sha2 = "0.10"
+sha2 = "0.11"
 
 # ---- WireGuard → 本地 SOCKS5（wg 模組）----
 # 使用者態 WireGuard：只要 noise 那一層，不要它自己的 device（那是 Linux/macOS 的 TUN 實作）
