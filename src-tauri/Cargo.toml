@@ -193,4 +193,4 @@ listeners = "0.6"
 # 相依樹不會因此多長一顆陌生的東西：它底下的 signal-hook-registry 本來就已經
 # 在鎖檔裡（tokio 的 unix signal 支援間接帶進來的）。features 只留 iterator
 # （`Signals::forever()`），不要 channel／extended-siginfo 那些用不到的。
-signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
